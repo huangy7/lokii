@@ -1,0 +1,45 @@
+name: Lokii
+options:
+  bundleIdPrefix: com.lokii
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+packages:
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    from: 2.4.0
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+targets:
+  Lokii:
+    type: application
+    platform: macOS
+    sources:
+      - path: Lokii
+        excludes:
+          - "*.xcassets/*/.*"
+    dependencies:
+      - package: KeyboardShortcuts
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lokii.app
+        PRODUCT_NAME: Lokii
+        INFOPLIST_FILE: Lokii/Info.plist
+        SWIFT_INCLUDE_PATHS: "$(SRCROOT)/LokiiCore/Headers"
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../target/aarch64-apple-darwin/release"
+        OTHER_LDFLAGS:
+          - "-llokii_core"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: true
+        ARCHS: arm64
+    entitlements:
+      path: Lokii/Lokii.entitlements
+      properties:
+        com.apple.security.app-sandbox: false

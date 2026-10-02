@@ -1,0 +1,60 @@
+name: CI
+
+# 校验闸门：PR 与 main 分支推送自动执行。
+# 确保 Rust 核心库与 macOS Swift/AppKit 原生界面在合并前通过全目标类型检查、单测与双架构构建。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}（检查/测试 + 构建）
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 'arm64'
+            target: 'aarch64-apple-darwin'
+          - arch: 'x86_64'
+            target: 'x86_64-apple-darwin'
+    steps:
+      - uses: actions/checkout@v4
+
+      # 切换至 Xcode 16（Swift 6），兼容现代化依赖包工具链规范
+      - name: select Xcode 16
+        run: |
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          if [ -n "$XCODE_PATH" ]; then
+            echo "Selecting $XCODE_PATH"
+            sudo xcode-select -s "$XCODE_PATH"
+            echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> $GITHUB_ENV
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # 确保 macOS runner 具备 Rosetta 2 转译支持（用于 x86_64 单元测试执行）
+      - name: setup rosetta (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: sudo softwareupdate --install-rosetta --agree-to-license || true
+
+      # 检查所有目标架构（包括测试与示例代码），防止类型错误或废弃 API 漏过
+      - name: check
+        run: make check ARCH=${{ matrix.arch }}
+
+      # 运行 Rust 核心单元测试（158 项）与 Swift 编译校验
+      - name: test
+        run: make test ARCH=${{ matrix.arch }}
+
+      # 验证 macOS AppKit 前端 release 模式编译、静态链接与 .app 组装
+      - name: build release
+        run: make release ARCH=${{ matrix.arch }}

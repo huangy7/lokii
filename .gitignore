@@ -1,0 +1,51 @@
+# ==============================================================================
+# Lokii 运行期数据（config.toml、bitcode 索引缓存等）默认落在系统的用户目录
+# ~/.config/lokii/ 与 ~/Library/Caches/com.lokii.app/ 下，不会写进仓库。
+# 因此这里主要覆盖编译产物、Xcode/SwiftPM 状态、打包临时文件与操作系统缓存。
+# ==============================================================================
+
+# Rust 构建产物
+# workspace 各成员 crate 共用仓库根目录下的 target/
+target/
+
+# Swift / SwiftPM 构建产物
+Lokii/.build/
+.swiftpm/
+
+# 应用打包与安装包输出目录
+output/
+*.dmg.tmp
+*.iconset/
+
+# Xcode 用户状态与工作空间缓存
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+**/*.xcworkspace/xcshareddata/
+
+# 编辑器与开发工具配置
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+*.sw?
+*.swo
+*.swp
+*~
+
+# 操作系统生成文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 日志与崩溃报告
+*.log
+*.crash
+
+# Git 多分支工作树
+.worktrees/

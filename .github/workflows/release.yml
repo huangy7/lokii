@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # 版本一致性校验与草稿预建统一收在 prepare 任务中。
+  # 避免多矩阵腿并发创建 draft 产生竞态与权限问题，同时在编译前阻断 tag 与 VERSION 不一致的发布。
+  prepare:
+    name: 准备发布（版本校验与草稿创建）
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: verify tag matches crate version
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            v*) ;;
+            *)
+              echo "[FAIL] tag '${GITHUB_REF_NAME}' 不以 v 开头，无法解析出发布版本号"
+              echo "       约定的发布 tag 形如 v0.1.0；请改用带 v 前缀的 tag 重新发布。"
+              exit 1
+              ;;
+          esac
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(grep -m1 '^version = ' lokii-core/Cargo.toml | cut -d '"' -f2)"
+          if [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
+            echo "[FAIL] tag 版本与 lokii-core/Cargo.toml 版本不一致"
+            echo "       tag:                   ${GITHUB_REF_NAME} -> ${TAG_VERSION}"
+            echo "       lokii-core/Cargo.toml: ${PKG_VERSION}"
+            echo "       请将 lokii-core/Cargo.toml 的 version 更新为 ${TAG_VERSION} 后重新打 tag。"
+            exit 1
+          fi
+          echo "[INFO] tag 与 lokii-core/Cargo.toml 版本一致：${PKG_VERSION}"
+
+      - name: ensure draft release exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "[INFO] draft release $GITHUB_REF_NAME 已存在，复用"
+            exit 0
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "Lokii $GITHUB_REF_NAME" \
+            --notes "See the assets to download this version and install." \
+          || gh release view "$GITHUB_REF_NAME" >/dev/null
+
+  release:
+    name: 构建发布包（macOS ${{ matrix.arch }}）
+    needs: prepare
+    runs-on: macos-15
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: 'arm64'
+            target: 'aarch64-apple-darwin'
+          - arch: 'x86_64'
+            target: 'x86_64-apple-darwin'
+    steps:
+      - uses: actions/checkout@v4
+
+      # 切换至 Xcode 16（Swift 6），兼容现代化依赖包工具链规范
+      - name: select Xcode 16
+        run: |
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          if [ -n "$XCODE_PATH" ]; then
+            echo "Selecting $XCODE_PATH"
+            sudo xcode-select -s "$XCODE_PATH"
+            echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> $GITHUB_ENV
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # 优雅兼容开发者正式证书：若仓库配置了证书 Secret 则自动导入并激活签名钥匙串
+      - name: setup apple certificate (optional)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "[INFO] 未配置 APPLE_CERTIFICATE 密钥，跳过开发者证书导入并启用 Ad-hoc 签名。"
+            exit 0
+          fi
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      # 安装 create-dmg 以生成原生拖拽布局的 DMG（若 brew 异常脚本自带 fallback 至 hdiutil）
+      - name: install create-dmg
+        run: brew install create-dmg || true
+
+      # 执行打包脚本产出固定资产名 Lokii-<arch>.dmg
+      - name: package app and dmg
+        env:
+          LOKII_SIGN_IDENTITY: ${{ secrets.LOKII_SIGN_IDENTITY }}
+          LOKII_NOTARY_PROFILE: ${{ secrets.LOKII_NOTARY_PROFILE }}
+        run: |
+          make package ARCH=${{ matrix.arch }}
+
+      # 上传至工作流 Artifact，便于构建日志追踪与产物留存
+      - name: upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lokii-${{ matrix.arch }}
+          path: output/Lokii-*.dmg
+          if-no-files-found: error
+
+      # 挂载产物至 GitHub Draft Release
+      - name: upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" output/Lokii-*.dmg --clobber
+
+  # 所有矩阵构建任务成功后，将 Draft Release 一键转为正式发布并标记为 Latest
+  publish:
+    name: 正式发布 Release
+    needs: release
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: publish draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest -R "$GITHUB_REPOSITORY"
+
+
+

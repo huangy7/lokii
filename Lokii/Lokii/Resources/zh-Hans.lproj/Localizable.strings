@@ -1,0 +1,215 @@
+/* AppDelegate - tray menu */
+"menu.preferences" = "偏好设置…";
+"menu.quit" = "退出 Lokii";
+
+/* AppDelegate - main menu: app */
+"menu.about" = "关于 Lokii";
+
+/* AppDelegate - main menu: edit */
+"menu.edit" = "编辑";
+"menu.cut" = "剪切";
+"menu.copy" = "拷贝";
+"menu.paste" = "粘贴";
+"menu.selectAll" = "全选";
+
+/* AppDelegate - main menu: window */
+"menu.window" = "窗口";
+"menu.close" = "关闭";
+"menu.minimize" = "最小化";
+
+/* AppDelegate - about panel */
+"about.appName" = "Lokii";
+"about.tagline" = "macOS 即时文件搜索";
+
+/* PreferencesWindowController - window */
+"prefs.windowTitle" = "Lokii 设置";
+
+/* PreferencesWindowController - toolbar */
+"prefs.tab.general" = "通用";
+"prefs.tab.index" = "索引";
+"prefs.tab.privacy" = "隐私";
+
+/* PreferencesWindowController - General */
+"prefs.section.behavior" = "行为";
+"prefs.section.behavior.description" = "控制主窗口在日常使用中的显示方式。";
+"prefs.hideOnBlur" = "失去焦点时隐藏";
+"prefs.hideOnBlur.description" = "切换到其他应用后自动收起窗口，保持桌面更清爽。";
+"prefs.rememberPosition" = "记住窗口位置";
+"prefs.rememberPosition.description" = "重新打开 Lokii 时恢复到你上次摆放的位置和大小。";
+
+"prefs.section.search" = "搜索";
+"prefs.section.search.description" = "调整 Lokii 每次返回结果的数量上限。";
+"prefs.maxResults" = "最大搜索结果数";
+"prefs.maxResults.description" = "结果越多，列表越完整；一般保持默认值即可。";
+
+"prefs.section.shortcuts" = "快捷键";
+"prefs.section.shortcuts.description" = "设置唤起或隐藏 Lokii 的全局快捷键。";
+"prefs.globalShortcut" = "全局快捷键";
+"prefs.globalShortcut.description" = "无论当前在哪个应用，都可以通过这个快捷键快速呼出搜索框。";
+
+"prefs.section.language" = "语言";
+"prefs.section.language.description" = "选择应用界面语言。";
+"prefs.language" = "语言";
+"prefs.language.description" = "切换后会应用到菜单、设置页和主窗口文案。";
+"prefs.language.restartHint" = "重启 Lokii 后生效";
+"prefs.language.zh-Hans" = "中文";
+"prefs.language.en" = "English";
+
+/* PreferencesWindowController - Index */
+"prefs.indexPaths" = "索引路径";
+"prefs.indexPaths.description" = "Lokii 会扫描这些目录来建立文件名索引。";
+"prefs.indexPaths.empty" = "暂无索引路径";
+"prefs.excludePatterns" = "排除规则";
+"prefs.excludePatterns.description" = "按目录名排除不需要扫描的内容，可减少噪音和索引时间。";
+"prefs.excludePatterns.empty" = "暂无排除规则";
+"prefs.excludePatterns.editor.addTitle" = "添加排除规则";
+"prefs.excludePatterns.editor.editTitle" = "编辑排除规则";
+"prefs.excludePatterns.editor.message" = "输入要按目录名排除的规则，例如 `node_modules` 或 `.git`。";
+"prefs.excludePatterns.editor.placeholder" = "例如：node_modules";
+"prefs.excludePatterns.editor.confirm" = "保存";
+"prefs.excludePatterns.editor.cancel" = "取消";
+"prefs.indexOptions" = "索引选项";
+"prefs.indexOptions.description" = "这些选项会影响扫描范围，修改后通常需要重建索引。";
+"prefs.includeHidden" = "索引隐藏文件";
+"prefs.includeHidden.description" = "包含以点开头的文件和目录，例如 `.ssh`、`.config`。";
+"prefs.includeHidden.hint" = "包含以点开头的文件（如 .config、.ssh）。\n更改后需重建索引才能生效。";
+"prefs.index.unsaved" = "有未保存的更改";
+"prefs.resetToDefaults" = "恢复默认";
+"prefs.save" = "保存";
+"prefs.unsavedChanges.title" = "索引更改尚未保存";
+"prefs.unsavedChanges.message" = "你对索引路径、排除规则或隐藏文件选项的修改还没有保存。";
+"prefs.unsavedChanges.save" = "保存";
+"prefs.unsavedChanges.discard" = "不保存";
+"prefs.unsavedChanges.cancel" = "继续编辑";
+"prefs.action.add" = "添加";
+"prefs.action.edit" = "编辑";
+"prefs.action.remove" = "移除";
+
+/* PreferencesWindowController - Privacy */
+"prefs.section.privacy" = "隐私与权限";
+"prefs.section.privacy.description" = "管理 Lokii 访问受保护目录所需的系统权限。";
+"prefs.section.privacy.actions" = "快速操作";
+"prefs.section.privacy.actions.description" = "需要授权时，可以直接前往系统设置，或查看分步引导。";
+"prefs.privacy.fullDiskAccess" = "完全磁盘访问权限";
+"prefs.privacy.badge.granted" = "已授权";
+"prefs.privacy.badge.missing" = "建议开启";
+"prefs.privacy.status.granted" = "完全磁盘访问权限已启用";
+"prefs.privacy.status.granted.description" = "Lokii 现在可以覆盖桌面、文稿、下载等系统受保护目录。";
+"prefs.privacy.status.granted.footnote" = "如果结果仍不完整，请回到主窗口重建一次索引。";
+"prefs.privacy.status.missing" = "尚未启用完全磁盘访问权限";
+"prefs.privacy.status.missing.description" = "未授权时，Lokii 无法完整索引桌面、文稿、下载等系统保护位置。";
+"prefs.privacy.status.missing.footnote" = "授权完成后回到 Lokii，重新构建索引即可纳入完整搜索范围。";
+"prefs.privacy.openSettings" = "打开系统设置";
+"prefs.privacy.openSettings.description" = "前往“隐私与安全性 > 完全磁盘访问权限”为 Lokii 授权。";
+"prefs.privacy.viewGuide" = "查看步骤";
+"prefs.privacy.viewGuide.description" = "打开简洁引导窗口，按步骤完成授权。";
+"prefs.privacy.rebuildHint" = "如果你刚刚完成授权，建议回到主窗口执行一次“重建索引”。";
+
+/* PreferencesWindowController - FDA banner */
+"fda.bannerTitle" = "解锁完整搜索范围";
+"fda.bannerDescription" = "授予“完全磁盘访问权限”后，Lokii 才能索引桌面、文稿、下载等受保护目录。";
+"fda.bannerFootnote" = "完成授权后，返回 Lokii 并重建索引即可看到完整结果。";
+"fda.viewGuide" = "查看步骤";
+"fda.bannerText" = "需要完全磁盘访问权限才能索引所有文件。";
+"fda.setupNow" = "立即设置";
+
+/* SearchWindow - search field */
+"search.placeholder" = "搜索文件...";
+
+/* SearchWindow - toolbar */
+"search.toggleInfo" = "显示或隐藏详情面板";
+"search.rebuildIndex" = "重建索引";
+
+/* SearchWindow - status */
+"search.indexing" = "正在索引...";
+"search.indexingIncomplete" = "索引构建中，结果可能不完整";
+"search.backgroundRefresh" = "正在后台刷新";
+"search.searching" = "正在搜索...";
+"search.buildingIndex" = "正在构建索引...";
+"search.scanningFiles" = "正在扫描文件...";
+
+/* SearchWindow - context menu */
+"search.ctx.open" = "打开";
+"search.ctx.revealInFinder" = "在访达中显示";
+"search.ctx.copyPath" = "拷贝路径";
+"search.ctx.copyName" = "拷贝名称";
+
+/* SearchWindow - table columns */
+"search.col.name" = "名称";
+"search.col.path" = "路径";
+"search.col.dateModified" = "修改日期";
+"search.col.size" = "大小";
+
+/* SearchWindow - info panel */
+"search.info.kind" = "种类";
+"search.info.size" = "大小";
+"search.info.created" = "创建时间";
+"search.info.modified" = "修改时间";
+"search.info.where" = "位置";
+
+/* SearchWindow - search mode */
+"search.mode.title" = "搜索模式";
+"search.mode.auto" = "自动";
+"search.mode.substring" = "子字符串";
+"search.mode.wildcard" = "通配符";
+"search.mode.regex" = "正则表达式";
+"search.mode.fuzzy" = "模糊";
+
+/* SearchWindow - kind labels */
+"kind.folder" = "文件夹";
+"kind.document" = "文稿";
+"kind.file" = "文件";
+
+/* FDAGuideWindowController */
+"fda.windowTitle" = "将 Lokii 添加到完全磁盘访问权限";
+"fda.title" = "将 Lokii 添加到完全磁盘访问权限";
+"fda.description" = "打开系统设置，将左侧图标拖入列表中即可完成授权。";
+"fda.drag.badge" = "可拖拽";
+"fda.showInFinder" = "在访达中显示 Lokii";
+"fda.dontShowAgain" = "不再提示";
+"fda.later" = "稍后";
+"fda.openSystemSettings" = "打开系统设置";
+
+/* Preferences - About & Group Titles */
+"prefs.tab.about" = "关于";
+"prefs.index.group.paths" = "索引路径";
+"prefs.index.group.excludes" = "排除规则";
+"prefs.index.group.options" = "扫描选项";
+"prefs.index.addPath" = "添加索引路径…";
+"prefs.index.addExclude" = "添加排除规则…";
+"prefs.about.version" = "版本";
+"prefs.about.architecture" = "核心架构";
+"prefs.about.architecture.value" = "Rust (lokii-core) + FSEvents 引擎";
+"prefs.about.license" = "开源协议";
+"prefs.about.license.value" = "MIT License";
+"prefs.about.source" = "项目源码";
+"prefs.about.source.action" = "在 GitHub 查看";
+
+/* Preferences - Appearance */
+"prefs.section.appearance" = "外观";
+"prefs.appearance" = "外观";
+"prefs.appearance.description" = "选择 Lokii 的显示外观";
+"prefs.appearance.system" = "跟随系统";
+"prefs.appearance.light" = "浅色";
+"prefs.appearance.dark" = "深色";
+
+/* Preferences - Update */
+"prefs.about.update.section" = "软件更新";
+"prefs.about.update.status" = "更新检查";
+"prefs.about.update.checkNow" = "检查更新";
+"prefs.about.update.checking" = "正在检查…";
+"prefs.about.update.latest" = "已是最新版本";
+"prefs.about.update.available" = "发现新版本 %@";
+"prefs.about.update.download" = "下载更新";
+"menu.checkUpdates" = "检查更新…";
+
+/* Shortcut Recorder */
+"record_shortcut" = "设置快捷键";
+"press_shortcut" = "按下快捷键";
+"keyboard_shortcut_used_by_menu_item" = "当前快捷键无法使用，因为它已被用作菜单项“%@”的快捷键。";
+"keyboard_shortcut_used_by_system" = "当前快捷键无法使用，因为它已被用作系统快捷键。";
+"keyboard_shortcuts_can_be_changed" = "可以在“系统设置 › 键盘 › 键盘快捷键”中更改大多数系统快捷键。";
+"keyboard_shortcut_disallowed" = "Option键必须与Command键或Control键组合使用。";
+"force_use_shortcut" = "强制使用";
+"ok" = "好";
+"space_key" = "空格";

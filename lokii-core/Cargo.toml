@@ -1,0 +1,29 @@
+[package]
+name = "lokii-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lokii_core"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+uniffi = { version = "0.29", features = ["cli"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+jwalk = "0.8"
+parking_lot = "0.12"
+bitcode = { version = "0.6", features = ["derive"] }
+toml = "0.9"
+dirs = "6"
+notify = "8.2"
+glob-match = "0.2"
+regex = "1"
+nucleo-matcher = "0.3"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dev-dependencies]
+tempfile = "3"

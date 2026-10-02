@@ -1,0 +1,3 @@
+[workspace]
+members = ["lokii-core"]
+resolver = "2"
