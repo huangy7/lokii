@@ -7,21 +7,33 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAD6916CAB8EDC0C1974B6F /* Key.swift */; };
 		15AAEC0CDA3C27720C7F2E18 /* KeyboardShortcuts in Frameworks */ = {isa = PBXBuildFile; productRef = 484225E67DB191B3777194BF /* KeyboardShortcuts */; };
+		1B4BCC5BF4FE72D28BAEF0A4 /* Name.swift in Sources */ = {isa = PBXBuildFile; fileRef = 927DA1B3D54D6EE81E6EE89C /* Name.swift */; };
 		220E4427CE25A98CD96F9AA1 /* lokii_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1ABEB6DD96D45D2B3AB5A122 /* lokii_core.swift */; };
+		29140F081BAFBB147E42A200 /* Lokii.icns in Resources */ = {isa = PBXBuildFile; fileRef = B32FC7DD2AD33DB9A5618344 /* Lokii.icns */; };
+		3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */; };
 		368436915AC064B1A3606C73 /* PreferencesWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */; };
 		43E1EA3946E3F6FDE146A8EB /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04B808522771C196E501D47E /* ThemeManager.swift */; };
+		4C5C8F57CA90E399F78A9D0C /* NSMenuItem++.swift in Sources */ = {isa = PBXBuildFile; fileRef = 947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */; };
+		5361A50B42CFD165A023AC82 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */; };
 		55670C6273A3B5887190D820 /* L10n.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4945594BBD178DAC175979A5 /* L10n.swift */; };
 		5BDEA0E43887673E2EFB6AF5 /* PreferencesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD253FF760C302BEBDAD521E /* PreferencesView.swift */; };
 		6036F92156A6FB17F31A8EC5 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */; };
+		6B5B50FC9B03A912526CECD0 /* RecorderCocoa.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76AE17B289006D96A51F7B4B /* RecorderCocoa.swift */; };
 		6C65440D3707233BEDDD2F59 /* FDAGuideView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBF42044E61241F1D42161BC /* FDAGuideView.swift */; };
 		72AA0A7A1F0334891902B63B /* SearchEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 379816002C0A5D5D8096C54B /* SearchEngine.swift */; };
 		7472ED6EAE1690E80EB277EB /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 315BC0505768DC1262CABEDA /* main.swift */; };
+		76F036A0CA671FE174936DA4 /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A96470450AEE87C889A593F5 /* Recorder.swift */; };
+		857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */; };
 		9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD267E77C749892BFB3B6BFA /* SearchWindow.swift */; };
+		CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = E44E26FAF1C1762428B98CEB /* Utilities.swift */; };
 		D845C945605829EFD6777B02 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */; };
 		E4CC034498F0BD54589D670D /* FileKindMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */; };
+		E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8727ED2D2029A80C7739E625 /* ViewModifiers.swift */; };
 		E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */; };
 		E8F36883205D0492A3F9917E /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 32DCF9A42DF27EEDA3F2ED92 /* Localizable.strings */; };
+		F25F859C77AB2A06F57CC09F /* Shortcut.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E72A2DABCA6C6F23E1053A /* Shortcut.swift */; };
 		F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */; };
 		FE8E1519D288E897B2E0A137 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */; };
 /* End PBXBuildFile section */
@@ -36,17 +48,29 @@
 		315BC0505768DC1262CABEDA /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		379816002C0A5D5D8096C54B /* SearchEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchEngine.swift; sourceTree = "<group>"; };
 		4945594BBD178DAC175979A5 /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
+		53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcuts.swift; sourceTree = "<group>"; };
 		65BA160DCBC72B8377D8BDE6 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileKindMap.swift; sourceTree = "<group>"; };
 		6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LokiiWindow.swift; sourceTree = "<group>"; };
+		71E72A2DABCA6C6F23E1053A /* Shortcut.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shortcut.swift; sourceTree = "<group>"; };
+		76AE17B289006D96A51F7B4B /* RecorderCocoa.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderCocoa.swift; sourceTree = "<group>"; };
+		85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
+		8727ED2D2029A80C7739E625 /* ViewModifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModifiers.swift; sourceTree = "<group>"; };
 		8B947458DDBFC6998183062C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		927DA1B3D54D6EE81E6EE89C /* Name.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Name.swift; sourceTree = "<group>"; };
+		947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSMenuItem++.swift"; sourceTree = "<group>"; };
 		A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesWindowController.swift; sourceTree = "<group>"; };
+		A96470450AEE87C889A593F5 /* Recorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recorder.swift; sourceTree = "<group>"; };
 		B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		B32FC7DD2AD33DB9A5618344 /* Lokii.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Lokii.icns; sourceTree = "<group>"; };
 		BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsComponents.swift; sourceTree = "<group>"; };
 		C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FDAGuideWindowController.swift; sourceTree = "<group>"; };
+		CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarbonKeyboardShortcuts.swift; sourceTree = "<group>"; };
 		CBF42044E61241F1D42161BC /* FDAGuideView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FDAGuideView.swift; sourceTree = "<group>"; };
 		CD253FF760C302BEBDAD521E /* PreferencesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesView.swift; sourceTree = "<group>"; };
 		CD267E77C749892BFB3B6BFA /* SearchWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchWindow.swift; sourceTree = "<group>"; };
+		E44E26FAF1C1762428B98CEB /* Utilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Utilities.swift; sourceTree = "<group>"; };
+		FFAD6916CAB8EDC0C1974B6F /* Key.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Key.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -65,6 +89,7 @@
 			isa = PBXGroup;
 			children = (
 				B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */,
+				85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */,
 				2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */,
 				CBF42044E61241F1D42161BC /* FDAGuideView.swift */,
 				C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */,
@@ -81,9 +106,27 @@
 				CD267E77C749892BFB3B6BFA /* SearchWindow.swift */,
 				BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */,
 				04B808522771C196E501D47E /* ThemeManager.swift */,
+				260F6214BF9ED6B99CC06647 /* KeyboardShortcuts */,
 				AC5F4C27F9F94A645F5F7458 /* Resources */,
 			);
 			path = Lokii;
+			sourceTree = "<group>";
+		};
+		260F6214BF9ED6B99CC06647 /* KeyboardShortcuts */ = {
+			isa = PBXGroup;
+			children = (
+				CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */,
+				FFAD6916CAB8EDC0C1974B6F /* Key.swift */,
+				53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */,
+				927DA1B3D54D6EE81E6EE89C /* Name.swift */,
+				947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */,
+				A96470450AEE87C889A593F5 /* Recorder.swift */,
+				76AE17B289006D96A51F7B4B /* RecorderCocoa.swift */,
+				71E72A2DABCA6C6F23E1053A /* Shortcut.swift */,
+				E44E26FAF1C1762428B98CEB /* Utilities.swift */,
+				8727ED2D2029A80C7739E625 /* ViewModifiers.swift */,
+			);
+			path = KeyboardShortcuts;
 			sourceTree = "<group>";
 		};
 		88ECA066C464C2072D91B368 = {
@@ -97,6 +140,7 @@
 		AC5F4C27F9F94A645F5F7458 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				B32FC7DD2AD33DB9A5618344 /* Lokii.icns */,
 				32DCF9A42DF27EEDA3F2ED92 /* Localizable.strings */,
 			);
 			path = Resources;
@@ -177,6 +221,7 @@
 			files = (
 				D845C945605829EFD6777B02 /* Assets.xcassets in Resources */,
 				E8F36883205D0492A3F9917E /* Localizable.strings in Resources */,
+				29140F081BAFBB147E42A200 /* Lokii.icns in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -188,17 +233,28 @@
 			buildActionMask = 2147483647;
 			files = (
 				6036F92156A6FB17F31A8EC5 /* AppDelegate.swift in Sources */,
+				5361A50B42CFD165A023AC82 /* AppUpdater.swift in Sources */,
+				857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */,
 				6C65440D3707233BEDDD2F59 /* FDAGuideView.swift in Sources */,
 				F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */,
 				E4CC034498F0BD54589D670D /* FileKindMap.swift in Sources */,
+				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
+				3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */,
 				55670C6273A3B5887190D820 /* L10n.swift in Sources */,
 				E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */,
+				4C5C8F57CA90E399F78A9D0C /* NSMenuItem++.swift in Sources */,
+				1B4BCC5BF4FE72D28BAEF0A4 /* Name.swift in Sources */,
 				5BDEA0E43887673E2EFB6AF5 /* PreferencesView.swift in Sources */,
 				368436915AC064B1A3606C73 /* PreferencesWindowController.swift in Sources */,
+				76F036A0CA671FE174936DA4 /* Recorder.swift in Sources */,
+				6B5B50FC9B03A912526CECD0 /* RecorderCocoa.swift in Sources */,
 				72AA0A7A1F0334891902B63B /* SearchEngine.swift in Sources */,
 				9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */,
 				FE8E1519D288E897B2E0A137 /* SettingsComponents.swift in Sources */,
+				F25F859C77AB2A06F57CC09F /* Shortcut.swift in Sources */,
 				43E1EA3946E3F6FDE146A8EB /* ThemeManager.swift in Sources */,
+				CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */,
+				E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */,
 				220E4427CE25A98CD96F9AA1 /* lokii_core.swift in Sources */,
 				7472ED6EAE1690E80EB277EB /* main.swift in Sources */,
 			);
