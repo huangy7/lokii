@@ -134,28 +134,29 @@ build_app() {
     mkdir -p "$output_dir"
     local xcassets="$repo_root/Lokii/Lokii/Assets.xcassets"
     local icns_path="$output_dir/Lokii.icns"
+    # 优先使用 iconutil 从 10 档分辨率资源直接编译包含 1024x1024 Retina 的全量高清 Lokii.icns
     local iconset_tmp
     iconset_tmp="$(mktemp -d)/Lokii.iconset"
     mkdir -p "$iconset_tmp"
+    find "$xcassets/AppIcon.appiconset" -name "*.png" -exec cp {} "$iconset_tmp/" \;
+    iconutil -c icns "$iconset_tmp" -o "$icns_path" 2>/dev/null || true
+    rm -rf "$(dirname "$iconset_tmp")"
 
-    # 生成应用图标 (.icns)
+    if [[ ! -s "$icns_path" && -f "$repo_root/Lokii/Lokii/Resources/Lokii.icns" ]]; then
+        cp "$repo_root/Lokii/Lokii/Resources/Lokii.icns" "$icns_path"
+    fi
+
+    # 编译资源束 Assets.car（包含 AppIcon 多分辨率原生图集）
+    local partial_plist="$output_dir/partial.plist"
     xcrun actool \
         --compile "$output_dir" \
         --platform macosx \
         --minimum-deployment-target 13.0 \
+        --app-icon AppIcon \
+        --output-partial-info-plist "$partial_plist" \
         --output-format human-readable-text \
         "$xcassets" >/dev/null 2>&1 || true
-
-    if [[ ! -f "$output_dir/AppIcon.icns" ]]; then
-        sips -s format png -z 512 512 \
-            /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns \
-            --out "$iconset_tmp/icon_512x512.png" 2>/dev/null || true
-        iconutil -c icns "$iconset_tmp" -o "$icns_path" 2>/dev/null || \
-            cp /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns "$icns_path"
-    else
-        mv "$output_dir/AppIcon.icns" "$icns_path"
-    fi
-    rm -rf "$(dirname "$iconset_tmp")"
+    rm -f "$partial_plist" "$output_dir/AppIcon.icns"
 
     # 组装 Bundle 目录结构
     rm -rf "$bundle_dir"
@@ -163,6 +164,9 @@ build_app() {
 
     cp "$bin_dir/Lokii" "$bundle_dir/Contents/MacOS/Lokii"
     cp "$icns_path"     "$bundle_dir/Contents/Resources/Lokii.icns"
+    if [[ -f "$output_dir/Assets.car" ]]; then
+        cp "$output_dir/Assets.car" "$bundle_dir/Contents/Resources/Assets.car"
+    fi
     chmod +x "$bundle_dir/Contents/MacOS/Lokii"
 
     # 拷贝多语言资源到标准 macOS Contents/Resources/
@@ -188,6 +192,8 @@ build_app() {
     <string>Lokii</string>
     <key>CFBundleIconFile</key>
     <string>Lokii</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>${bundle_id}</string>
     <key>CFBundleInfoDictionaryVersion</key>

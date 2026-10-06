@@ -521,12 +521,11 @@ struct PreferencesView: View {
     private var aboutPane: some View {
         // Header
         VStack(spacing: 8) {
-            if let appIcon = NSImage(named: "AppIcon") {
+            if let appIcon = NSImage(named: "AppIcon") ?? NSApp.applicationIconImage {
                 Image(nsImage: appIcon)
                     .resizable()
                     .scaledToFit()
                     .frame(width: 80, height: 80)
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             } else {
                 Image(systemName: "magnifyingglass.circle.fill")
                     .resizable()
