@@ -1,0 +1,80 @@
+name: Update Homebrew Cask
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v0.1.1)'
+        required: false
+        default: ''
+
+jobs:
+  update-cask:
+    runs-on: macos-latest
+    steps:
+      - name: Extract version
+        id: get_version
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.get_version.outputs.tag }}" \
+            -p "Lokii-arm64.dmg" -p "Lokii-x86_64.dmg" \
+            -R "${{ github.repository }}"
+
+      - name: Calculate SHA256 checksums
+        id: calc_sha
+        run: |
+          ARM_SHA=$(shasum -a 256 "Lokii-arm64.dmg" | awk '{print $1}')
+          INTEL_SHA=$(shasum -a 256 "Lokii-x86_64.dmg" | awk '{print $1}')
+          echo "arm_sha=$ARM_SHA" >> $GITHUB_OUTPUT
+          echo "intel_sha=$INTEL_SHA" >> $GITHUB_OUTPUT
+
+      - name: Checkout Homebrew Tap
+        uses: actions/checkout@v4
+        with:
+          repository: huangy7/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Cask file
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          ARM_SHA="${{ steps.calc_sha.outputs.arm_sha }}"
+          INTEL_SHA="${{ steps.calc_sha.outputs.intel_sha }}"
+          CASK_FILE="homebrew-tap/Casks/lokii.rb"
+
+          awk -v v="$VERSION" -v intel="$INTEL_SHA" -v arm="$ARM_SHA" '
+          /version "/ { sub(/version ".+"/, "version \"" v "\"") }
+          /Hardware::CPU\.intel\?/ { in_intel = 1; in_arm = 0 }
+          /else/ { in_intel = 0; in_arm = 1 }
+          /end/ { in_intel = 0; in_arm = 0 }
+          /sha256 "/ {
+            if (in_intel) {
+              sub(/sha256 ".+"/, "sha256 \"" intel "\"")
+            } else if (in_arm) {
+              sub(/sha256 ".+"/, "sha256 \"" arm "\"")
+            }
+          }
+          { print }
+          ' $CASK_FILE > tmp.rb && mv tmp.rb $CASK_FILE
+
+      - name: Commit and push changes
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/lokii.rb
+          git commit -m "chore: update lokii cask to v${{ steps.get_version.outputs.version }}"
+          git push
