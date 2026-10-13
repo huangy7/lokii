@@ -18,8 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 应用存储的外观主题
         ThemeManager.shared.applyCurrentTheme()
 
-        // LSUIElement apps must explicitly set activation policy to accept keyboard input
-        NSApp.setActivationPolicy(.accessory)
+        // 根据配置设置应用激活策略（是否常驻 Dock）
+        let showInDock = engine.getConfig()?.general.showInDock ?? true
+        NSApp.setActivationPolicy(showInDock ? .regular : .accessory)
 
         setupStatusItem()
         setupMainMenu()

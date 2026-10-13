@@ -32,6 +32,8 @@
 /* PreferencesWindowController - General */
 "prefs.section.behavior" = "行为";
 "prefs.section.behavior.description" = "控制主窗口在日常使用中的显示方式。";
+"prefs.showInDock" = "在程序坞中显示图标";
+"prefs.showInDock.description" = "在 Dock 栏常驻图标，方便通过点击快速唤起搜索窗口（重启生效）。";
 "prefs.hideOnBlur" = "失去焦点时隐藏";
 "prefs.hideOnBlur.description" = "切换到其他应用后自动收起窗口，保持桌面更清爽。";
 "prefs.rememberPosition" = "记住窗口位置";

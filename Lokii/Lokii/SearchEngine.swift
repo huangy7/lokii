@@ -9,9 +9,22 @@ struct LokiiConfig: Codable {
 
     struct GeneralConfig: Codable {
         var language: String
+        var showInDock: Bool
 
         enum CodingKeys: String, CodingKey {
             case language
+            case showInDock = "show_in_dock"
+        }
+
+        init(language: String = "zh-Hans", showInDock: Bool = true) {
+            self.language = language
+            self.showInDock = showInDock
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? "zh-Hans"
+            self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? true
         }
     }
 

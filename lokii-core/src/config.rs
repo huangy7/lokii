@@ -12,12 +12,15 @@ use serde::{Deserialize, Serialize};
 pub struct GeneralConfig {
     /// UI language: "zh-Hans" (default) or "en".
     pub language: String,
+    /// Whether to show the application icon in the macOS Dock.
+    pub show_in_dock: bool,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             language: "zh-Hans".to_string(),
+            show_in_dock: true,
         }
     }
 }
@@ -250,7 +253,11 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Lokii 配置文件
 # 修改后大部分设置自动生效，快捷键需要重启应用
 
 [general]
-# 预留给未来通用设置
+# 界面语言: "zh-Hans", "en"
+language = "zh-Hans"
+
+# 是否在程序坞中显示图标
+show_in_dock = true
 
 [index]
 # 索引目录列表（支持 ~ 表示用户主目录）
@@ -457,6 +464,8 @@ max_results = 100
     fn test_full_toml_all_sections() {
         let toml_str = r#"
 [general]
+language = "en"
+show_in_dock = false
 
 [index]
 index_paths = ["/Users/test", "~/Documents"]
@@ -472,6 +481,8 @@ remember_position = true
 toggle_window = "Cmd+Alt+F"
 "#;
         let config = AppConfig::from_toml(toml_str).expect("parse failed");
+        assert_eq!(config.general.language, "en");
+        assert!(!config.general.show_in_dock);
         assert_eq!(
             config.index.index_paths,
             vec!["/Users/test", "~/Documents"]
@@ -485,6 +496,13 @@ toggle_window = "Cmd+Alt+F"
     }
 
     // --- Default value tests ---
+
+    #[test]
+    fn test_general_config_defaults() {
+        let config = GeneralConfig::default();
+        assert_eq!(config.language, "zh-Hans");
+        assert!(config.show_in_dock);
+    }
 
     #[test]
     fn test_index_config_defaults() {
@@ -611,6 +629,7 @@ max_results = 200
         assert!(DEFAULT_CONFIG_TOML.contains("[window]"));
         assert!(DEFAULT_CONFIG_TOML.contains("[shortcut]"));
         assert!(DEFAULT_CONFIG_TOML.contains("[general]"));
+        assert!(DEFAULT_CONFIG_TOML.contains("show_in_dock = true"));
         assert!(DEFAULT_CONFIG_TOML.contains("Cmd+Shift+Space"));
         assert!(DEFAULT_CONFIG_TOML.contains(r#"index_paths = ["~"]"#));
         assert!(DEFAULT_CONFIG_TOML.contains("hide_on_blur = true"));
@@ -650,6 +669,8 @@ max_results = 200
         let original = AppConfig::default();
         let json = serde_json::to_string_pretty(&original).expect("serialize");
         let restored: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.general.language, original.general.language);
+        assert_eq!(restored.general.show_in_dock, original.general.show_in_dock);
         assert_eq!(restored.index.max_results, original.index.max_results);
         assert_eq!(restored.index.index_paths, original.index.index_paths);
         assert_eq!(restored.index.include_hidden, original.index.include_hidden);
@@ -663,6 +684,7 @@ max_results = 200
     #[test]
     fn test_config_json_custom_values_round_trip() {
         let mut config = AppConfig::default();
+        config.general.show_in_dock = false;
         config.index.max_results = 1000;
         config.index.include_hidden = true;
         config.window.hide_on_blur = false;
@@ -671,6 +693,7 @@ max_results = 200
         assert_eq!(restored.index.max_results, 1000);
         assert!(restored.index.include_hidden);
         assert!(!restored.window.hide_on_blur);
+        assert!(!restored.general.show_in_dock);
     }
 
     #[test]

@@ -5,6 +5,12 @@ import AppKit
 class PreferencesViewModel: ObservableObject {
     let engine: SearchEngine
     
+    @Published var showInDock: Bool = true {
+        didSet {
+            saveGeneralConfig()
+        }
+    }
+    
     @Published var hideOnBlur: Bool = false {
         didSet {
             saveGeneralConfig()
@@ -67,6 +73,7 @@ class PreferencesViewModel: ObservableObject {
         isLoading = true
         self.hideOnBlur = config.window.hideOnBlur
         self.rememberPosition = config.window.rememberPosition
+        self.showInDock = config.general.showInDock
         self.maxResults = config.index.maxResults
         self.language = config.general.language
         self.theme = ThemeManager.shared.currentTheme
@@ -84,7 +91,7 @@ class PreferencesViewModel: ObservableObject {
     private func saveGeneralConfig() {
         guard !isLoading else { return }
         _ = engine.updateConfig(LokiiConfig(
-            general: .init(language: language),
+            general: .init(language: language, showInDock: showInDock),
             index: .init(
                 indexPaths: savedIndexPaths,
                 exclude: savedExcludePatterns,
@@ -239,6 +246,12 @@ struct PreferencesView: View {
     @ViewBuilder
     private var generalPane: some View {
         SettingsGroup(L("prefs.section.behavior")) {
+            SettingsRow(L("prefs.showInDock"), description: L("prefs.showInDock.description")) {
+                Toggle("", isOn: $viewModel.showInDock)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            SettingsRowDivider()
             SettingsRow(L("prefs.hideOnBlur"), description: L("prefs.hideOnBlur.description")) {
                 Toggle("", isOn: $viewModel.hideOnBlur)
                     .toggleStyle(.switch)
@@ -281,7 +294,7 @@ struct PreferencesView: View {
         }
         
         SettingsGroup(L("prefs.section.language")) {
-            SettingsRow(L("prefs.language"), description: L("prefs.language.restartHint")) {
+            SettingsRow(L("prefs.language"), description: L("prefs.language.description")) {
                 Picker("", selection: $viewModel.language) {
                     Text(L("prefs.language.zh-Hans")).tag("zh-Hans")
                     Text(L("prefs.language.en")).tag("en")

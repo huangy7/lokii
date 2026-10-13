@@ -32,6 +32,8 @@
 /* PreferencesWindowController - General */
 "prefs.section.behavior" = "Behavior";
 "prefs.section.behavior.description" = "Choose how the main window should behave during everyday use.";
+"prefs.showInDock" = "Show in Dock";
+"prefs.showInDock.description" = "Keep the app icon in the Dock for quick access by clicking (takes effect after restart).";
 "prefs.hideOnBlur" = "Hide on focus lost";
 "prefs.hideOnBlur.description" = "Automatically hide the window when you switch to another app.";
 "prefs.rememberPosition" = "Remember window position";
