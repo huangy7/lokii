@@ -27,7 +27,7 @@ fi
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 version="$(grep -m1 '^version = ' "$repo_root/lokii-core/Cargo.toml" | cut -d '"' -f2)"
-build_number="$(git -C "$repo_root" rev-list --count HEAD 2>/dev/null || echo 1)"
+build_number="$version"
 
 command="${1:-help}"
 if [[ $# -gt 0 ]]; then
@@ -178,6 +178,12 @@ build_app() {
         cp -R "$b" "$bundle_dir/Contents/Resources/"
     done
 
+    local update_framework
+    update_framework="$(find "$repo_root/Lokii/.build/artifacts" -path '*/macos-arm64_x86_64/Sparkle.framework' -type d -print -quit)"
+    [[ -n "$update_framework" ]] || { echo "[FAIL] 更新框架缺失" >&2; exit 1; }
+    mkdir -p "$bundle_dir/Contents/Frameworks"
+    ditto "$update_framework" "$bundle_dir/Contents/Frameworks/Sparkle.framework"
+
     # 生成 Info.plist
     cat <<EOF > "$bundle_dir/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -214,11 +220,36 @@ build_app() {
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>SUPublicEDKey</key>
+    <string>$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$repo_root/Lokii/Lokii/Info.plist")</string>
+    <key>SUFeedURL</key>
+    <string>https://huangy7.github.io/lokii/updates/${arch_flag}.xml</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUUpdateCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
+    <key>SUAllowsAutomaticUpdates</key>
+    <false/>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
 </dict>
 </plist>
 EOF
 
     plutil -lint "$bundle_dir/Contents/Info.plist" >/dev/null
+
+    local framework_root
+    framework_root="$(cd "$bundle_dir/Contents/Frameworks/Sparkle.framework/Versions/Current" && pwd -P)"
+    local nested_identity="${signing_identity:--}"
+    local signing_options=()
+    if [[ -n "$signing_identity" ]]; then signing_options=(--options runtime --timestamp); fi
+    codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$framework_root/Autoupdate"
+    find "$framework_root" -depth \( -name '*.xpc' -o -name '*.app' \) -type d | while IFS= read -r nested; do
+        codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$nested"
+    done
+    codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$bundle_dir/Contents/Frameworks/Sparkle.framework"
 
     # 签名 .app（若无身份则进行 ad-hoc 签名）
     if [[ -n "$signing_identity" ]]; then
@@ -239,6 +270,8 @@ EOF
         codesign --force --sign - "$bundle_dir"
     fi
 
+    bash "$repo_root/scripts/verify-update-bundle.sh" "$bundle_dir" "$arch_flag"
+    ditto -c -k --keepParent "$bundle_dir" "$output_dir/${app_name}-${version}-${arch_flag}.zip"
     echo "==> App Bundle 组装完成: $bundle_dir"
 }
 
@@ -253,6 +286,7 @@ package_dmg() {
         ditto -c -k --keepParent "$bundle_dir" "$tmp_zip"
         xcrun notarytool submit "$tmp_zip" --keychain-profile "$notary_profile" --wait
         xcrun stapler staple -v "$bundle_dir"
+        ditto -c -k --keepParent "$bundle_dir" "$output_dir/${app_name}-${version}-${arch_flag}.zip"
         rm -f "$tmp_zip"
     fi
 

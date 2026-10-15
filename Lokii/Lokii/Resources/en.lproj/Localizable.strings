@@ -218,3 +218,6 @@
 "space_key" = "Space";
 "search.initializationFailed" = "Index initialization failed";
 "search.initializationFailedHelp" = "Search is unavailable because the index could not be initialized. Restart Lokii to try again.";
+"prefs.about.update.automatic" = "Automatically check for updates";
+"prefs.about.update.found" = "Update available";
+"prefs.about.update.manualDownload" = "Download manually if updating fails";

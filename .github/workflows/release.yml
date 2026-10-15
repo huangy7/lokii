@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: lokii-release-updates
+  cancel-in-progress: false
+
 jobs:
   # 版本一致性校验与草稿预建统一收在 prepare 任务中。
   # 避免多矩阵腿并发创建 draft 产生竞态与权限问题，同时在编译前阻断 tag 与 VERSION 不一致的发布。
@@ -126,7 +130,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Lokii-${{ matrix.arch }}
-          path: output/Lokii-*.dmg
+          path: |
+            output/Lokii-*.dmg
+            output/Lokii-*.zip
           if-no-files-found: error
 
       # 挂载产物至 GitHub Draft Release
@@ -134,12 +140,56 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" output/Lokii-*.dmg --clobber
+          gh release upload "$GITHUB_REF_NAME" output/Lokii-*.dmg output/Lokii-*.zip --clobber
+
+  update-feed:
+    name: 验证更新资产和清单
+    needs: release
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Lokii-*
+          merge-multiple: true
+          path: output
+      - name: resolve update tools
+        run: swift package --package-path Lokii resolve
+      - name: create verified update feeds
+        env:
+          LOKII_UPDATE_PRIVATE_KEY: ${{ secrets.LOKII_UPDATE_PRIVATE_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "$LOKII_UPDATE_PRIVATE_KEY"
+          umask 077
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s' "$LOKII_UPDATE_PRIVATE_KEY" > "$KEY_FILE"
+          mkdir -p feeds/updates
+          for ARCH in arm64 x86_64; do
+            STATUS="$(curl --silent --show-error --output "feeds/updates/$ARCH.xml" --write-out '%{http_code}' "https://huangy7.github.io/lokii/updates/$ARCH.xml")"
+            if [ "$STATUS" = 404 ]; then
+              rm "feeds/updates/$ARCH.xml"
+            elif [ "$STATUS" != 200 ]; then
+              exit 1
+            fi
+            gh release view "$GITHUB_REF_NAME" --json body --jq .body > "output/Lokii-${GITHUB_REF_NAME#v}-$ARCH.md"
+          done
+          LOKII_UPDATE_PRIVATE_KEY_FILE="$KEY_FILE" bash scripts/publish-update-feed.sh "${GITHUB_REF_NAME#v}" output feeds/updates
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-update-feeds
+          path: feeds
+          if-no-files-found: error
 
   # 所有矩阵构建任务成功后，将 Draft Release 一键转为正式发布并标记为 Latest
   publish:
     name: 正式发布 Release
-    needs: release
+    needs: [release, update-feed]
     runs-on: macos-15
     permissions:
       contents: write
@@ -153,5 +203,41 @@ jobs:
         run: |
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest -R "$GITHUB_REPOSITORY"
 
-
+  deploy-updates:
+    name: 发布更新清单
+    needs: publish
+    runs-on: macos-15
+    concurrency:
+      group: lokii-update-feed
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-update-feeds
+          path: feeds
+      - name: verify public downloads
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded
+          PUBLIC_KEY="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' Lokii/Lokii/Info.plist)"
+          for ARCH in arm64 x86_64; do
+            NAME="Lokii-${GITHUB_REF_NAME#v}-$ARCH.zip"
+            curl --fail --location --retry 3 "https://github.com/huangy7/lokii/releases/download/$GITHUB_REF_NAME/$NAME" --output "downloaded/$NAME"
+            swift scripts/verify-update-feed.swift "feeds/updates/$ARCH.xml" "downloaded/$NAME" "$PUBLIC_KEY" "${GITHUB_REF_NAME#v}" "$ARCH"
+          done
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: feeds
+      - name: deploy update feeds
+        id: deployment
+        uses: actions/deploy-pages@v4
 

@@ -28,5 +28,19 @@
     <string>NSApplication</string>
     <key>NSMainNibFile</key>
     <string></string>
+    <key>SUPublicEDKey</key>
+    <string>pxrsUMDmDnkDlrD0UqaLGc8tIGwWuY7xmmVT2G3SXtE=</string>
+    <key>SUFeedURL</key>
+    <string>https://huangy7.github.io/lokii/updates/$(CURRENT_ARCH).xml</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUUpdateCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
+    <key>SUAllowsAutomaticUpdates</key>
+    <false/>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
 </dict>
 </plist>

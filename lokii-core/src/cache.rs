@@ -187,6 +187,23 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_update_keeps_previous_cache_readable() {
+        let directory = TempDir::new().unwrap();
+        let path = temp_cache_path(&directory);
+        let previous = make_entries(3);
+        save_cache(&previous, &path).unwrap();
+        fs::write(path.with_extension("tmp"), b"LOKI\x04\x00").unwrap();
+
+        let recovered = load_cache(&path).unwrap();
+        assert_eq!(recovered.len(), previous.len());
+        assert_eq!(recovered[0].path, previous[0].path);
+
+        save_cache(&make_entries(5), &path).unwrap();
+        assert_eq!(load_cache(&path).unwrap().len(), 5);
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
     fn test_save_header() {
         let tmp = TempDir::new().unwrap();
         let path = temp_cache_path(&tmp);

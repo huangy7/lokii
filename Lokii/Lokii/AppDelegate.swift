@@ -33,12 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         engine.initialize()
 
-        // 后台静默检查更新（延迟 3 秒，避免阻塞冷启动性能）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-            Task { @MainActor in
-                AppUpdater.shared.checkForUpdates(isUserInitiated: false)
-            }
-        }
+        AppUpdater.shared.start()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -211,11 +206,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     @objc private func checkForUpdates() {
-        if preferencesController == nil {
-            preferencesController = PreferencesWindowController(engine: engine)
-        }
-        preferencesController?.showWindow(tab: "about")
-        preferencesController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         AppUpdater.shared.checkForUpdates(isUserInitiated: true)
     }

@@ -568,61 +568,49 @@ struct PreferencesView: View {
         
         // Update Section
         SettingsGroup(L("prefs.about.update.section")) {
-            if updater.hasNewVersion, let release = updater.latestRelease {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .center, spacing: 10) {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .font(.system(size: 20))
-                            .foregroundStyle(.green)
-                        
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(String(format: L("prefs.about.update.available"), release.tagName))
-                                .font(.system(size: 13, weight: .semibold))
-                            if let body = release.body, !body.isEmpty {
-                                Text(body.prefix(120) + (body.count > 120 ? "..." : ""))
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                            }
-                        }
-                        
-                        Spacer()
-                        
-                        Button(L("prefs.about.update.download")) {
-                            updater.openDownloadPage()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+            SettingsRow(L("prefs.about.update.automatic")) {
+                Toggle("", isOn: Binding(
+                    get: { updater.automaticallyChecksForUpdates },
+                    set: { updater.automaticallyChecksForUpdates = $0 }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel(L("prefs.about.update.automatic"))
+            }
+            SettingsRowDivider()
+            SettingsRow(L("prefs.about.update.status")) {
+                HStack(spacing: 8) {
+                    if updater.isChecking {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(L("prefs.about.update.checking"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else if let error = updater.errorMessage {
+                        Text(error)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                    } else if updater.lastCheckTime != nil {
+                        Text(L(updater.hasNewVersion ? "prefs.about.update.found" : "prefs.about.update.latest"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
+
+                    Button(L("prefs.about.update.checkNow")) {
+                        updater.checkForUpdates(isUserInitiated: true)
+                    }
+                    .disabled(updater.isChecking)
+                    .controlSize(.small)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-            } else {
-                SettingsRow(L("prefs.about.update.status")) {
-                    HStack(spacing: 8) {
-                        if updater.isChecking {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text(L("prefs.about.update.checking"))
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        } else if let error = updater.errorMessage {
-                            Text(error)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.red)
-                                .lineLimit(1)
-                        } else if updater.lastCheckTime != nil {
-                            Text(L("prefs.about.update.latest"))
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                        
-                        Button(L("prefs.about.update.checkNow")) {
-                            updater.checkForUpdates(isUserInitiated: true)
-                        }
-                        .disabled(updater.isChecking)
-                        .controlSize(.small)
+            }
+            if updater.errorMessage != nil {
+                SettingsRow(L("prefs.about.update.manualDownload")) {
+                    Button(L("prefs.about.update.download")) {
+                        updater.openDownloadPage()
                     }
+                    .controlSize(.small)
                 }
             }
         }

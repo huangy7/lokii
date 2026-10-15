@@ -218,3 +218,6 @@
 "space_key" = "空格";
 "search.initializationFailed" = "索引初始化失败";
 "search.initializationFailedHelp" = "索引未能初始化，搜索暂不可用。请重新启动 Lokii 后重试。";
+"prefs.about.update.automatic" = "自动检查更新";
+"prefs.about.update.found" = "有可用更新";
+"prefs.about.update.manualDownload" = "更新失败时手动下载";
