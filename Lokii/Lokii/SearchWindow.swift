@@ -122,9 +122,6 @@ final class SearchWindow: NSWindowController {
 
         super.init(window: window)
 
-        window.delegate = self
-        applyInitialWindowFrame()
-
         window.onEscape = { [weak self] in
             self?.hideWindowWithAnimation()
         }
@@ -133,6 +130,8 @@ final class SearchWindow: NSWindowController {
         }
 
         setupUI()
+        applyInitialWindowFrame()
+        window.delegate = self
         window.contentView?.wantsLayer = true
         setupSearchModeMenu()
         setupNotifications()
