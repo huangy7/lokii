@@ -1,6 +1,6 @@
 use crate::indexer::{score_match, IndexStore, MatchScore};
 
-use super::{AdvancedSearchResult, SearchMode};
+use super::{find_positions, AdvancedSearchResult, SearchMode};
 
 /// Convert MatchScore to normalized f64 per research recommendation.
 fn score_to_f64(score: MatchScore) -> f64 {
@@ -9,18 +9,6 @@ fn score_to_f64(score: MatchScore) -> f64 {
         MatchScore::Prefix => 0.75,
         MatchScore::Substring => 0.5,
     }
-}
-
-/// Compute match positions for substring matches.
-/// Returns byte ranges of each keyword match in the name.
-fn find_positions(name_lower: &str, keywords: &[String]) -> Vec<(usize, usize)> {
-    let mut positions = Vec::new();
-    for kw in keywords {
-        if let Some(start) = name_lower.find(kw.as_str()) {
-            positions.push((start, start + kw.len()));
-        }
-    }
-    positions
 }
 
 /// Substring search wrapping existing IndexStore logic.
@@ -60,8 +48,9 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
                 match_positions: if extension.is_some() {
                     Vec::new()
                 } else {
-                    find_positions(&view.name.to_lowercase(), &keywords)
+                    find_positions(&view.name.to_lowercase(), keywords.iter().map(String::as_str))
                 },
+                parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Substring,
             }
         })

@@ -1401,11 +1401,12 @@ public struct FfiSearchResult {
     public var `extension`: String
     public var score: Double
     public var matchPositions: [FfiMatchRange]
+    public var parentMatchPositions: [FfiMatchRange]
     public var searchMode: FfiSearchMode
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, path: String, isDir: Bool, size: UInt64, modified: UInt64, created: UInt64, `extension`: String, score: Double, matchPositions: [FfiMatchRange], searchMode: FfiSearchMode) {
+    public init(name: String, path: String, isDir: Bool, size: UInt64, modified: UInt64, created: UInt64, `extension`: String, score: Double, matchPositions: [FfiMatchRange], parentMatchPositions: [FfiMatchRange], searchMode: FfiSearchMode) {
         self.name = name
         self.path = path
         self.isDir = isDir
@@ -1415,6 +1416,7 @@ public struct FfiSearchResult {
         self.`extension` = `extension`
         self.score = score
         self.matchPositions = matchPositions
+        self.parentMatchPositions = parentMatchPositions
         self.searchMode = searchMode
     }
 }
@@ -1453,6 +1455,9 @@ extension FfiSearchResult: Equatable, Hashable {
         if lhs.matchPositions != rhs.matchPositions {
             return false
         }
+        if lhs.parentMatchPositions != rhs.parentMatchPositions {
+            return false
+        }
         if lhs.searchMode != rhs.searchMode {
             return false
         }
@@ -1469,6 +1474,7 @@ extension FfiSearchResult: Equatable, Hashable {
         hasher.combine(`extension`)
         hasher.combine(score)
         hasher.combine(matchPositions)
+        hasher.combine(parentMatchPositions)
         hasher.combine(searchMode)
     }
 }
@@ -1491,6 +1497,7 @@ public struct FfiConverterTypeFfiSearchResult: FfiConverterRustBuffer {
                 extension: FfiConverterString.read(from: &buf), 
                 score: FfiConverterDouble.read(from: &buf), 
                 matchPositions: FfiConverterSequenceTypeFfiMatchRange.read(from: &buf), 
+                parentMatchPositions: FfiConverterSequenceTypeFfiMatchRange.read(from: &buf), 
                 searchMode: FfiConverterTypeFfiSearchMode.read(from: &buf)
         )
     }
@@ -1505,6 +1512,7 @@ public struct FfiConverterTypeFfiSearchResult: FfiConverterRustBuffer {
         FfiConverterString.write(value.`extension`, into: &buf)
         FfiConverterDouble.write(value.score, into: &buf)
         FfiConverterSequenceTypeFfiMatchRange.write(value.matchPositions, into: &buf)
+        FfiConverterSequenceTypeFfiMatchRange.write(value.parentMatchPositions, into: &buf)
         FfiConverterTypeFfiSearchMode.write(value.searchMode, into: &buf)
     }
 }

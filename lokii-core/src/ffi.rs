@@ -25,6 +25,7 @@ pub struct FfiSearchResult {
     pub extension: String,
     pub score: f64,
     pub match_positions: Vec<FfiMatchRange>,
+    pub parent_match_positions: Vec<FfiMatchRange>,
     pub search_mode: FfiSearchMode,
 }
 
@@ -119,6 +120,14 @@ fn convert_results(results: Vec<AdvancedSearchResult>) -> Vec<FfiSearchResult> {
             score: r.score,
             match_positions: r
                 .match_positions
+                .into_iter()
+                .map(|(s, e)| FfiMatchRange {
+                    start: s as u32,
+                    end: e as u32,
+                })
+                .collect(),
+            parent_match_positions: r
+                .parent_match_positions
                 .into_iter()
                 .map(|(s, e)| FfiMatchRange {
                     start: s as u32,

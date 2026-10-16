@@ -49,7 +49,7 @@ private final class SearchTableView: NSTableView {
 
     // 视窗在非激活状态下接收初次点按，保证点击即选中，消除二次点击开销
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        return true
+        true
     }
 }
 
@@ -1392,11 +1392,7 @@ final class SearchWindow: NSWindowController {
     }
 
     private func abbreviatePath(_ path: String) -> String {
-        let home = NSHomeDirectory()
-        if path.hasPrefix(home) {
-            return "~" + path.dropFirst(home.count)
-        }
-        return path
+        abbreviateHomePrefix(path).display
     }
 }
 
@@ -1460,9 +1456,7 @@ extension SearchWindow: NSTableViewDelegate {
         case .columnName:
             return nameCell(for: result, in: tableView)
         case .columnPath:
-            let parent = (result.path as NSString).deletingLastPathComponent
-            return textCell(string: abbreviatePath(parent), font: .systemFont(ofSize: 13),
-                            color: .secondaryLabelColor, alignment: .left, identifier: colID, in: tableView)
+            return pathCell(for: result, in: tableView)
         case .columnModified:
             let date = Date(timeIntervalSince1970: TimeInterval(result.modified))
             let str = Self.dateFormatter.string(from: date)
@@ -1489,6 +1483,21 @@ extension SearchWindow: NSTableViewDelegate {
         }
     }
 
+    /// 构造表格单元格内的单行标签：统一关闭换行、滚动、编辑与背景绘制。
+    private func makeCellLabel(lineBreakMode: NSLineBreakMode) -> NSTextField {
+        let textField = NSTextField(labelWithString: "")
+        textField.translatesAutoresizingMaskIntoConstraints = false
+        textField.font = .systemFont(ofSize: 13)
+        textField.lineBreakMode = lineBreakMode
+        textField.maximumNumberOfLines = 1
+        textField.cell?.wraps = false
+        textField.cell?.isScrollable = false
+        textField.isEditable = false
+        textField.isBezeled = false
+        textField.drawsBackground = false
+        return textField
+    }
+
     private func nameCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier("NameCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
@@ -1511,16 +1520,7 @@ extension SearchWindow: NSTableViewDelegate {
         cell.addSubview(imageView)
         cell.imageView = imageView
 
-        let textField = NSTextField(labelWithString: "")
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.font = .systemFont(ofSize: 13)
-        textField.lineBreakMode = .byTruncatingTail
-        textField.maximumNumberOfLines = 1
-        textField.cell?.wraps = false
-        textField.cell?.isScrollable = false
-        textField.isEditable = false
-        textField.isBezeled = false
-        textField.drawsBackground = false
+        let textField = makeCellLabel(lineBreakMode: .byTruncatingTail)
         cell.addSubview(textField)
         cell.textField = textField
 
@@ -1536,6 +1536,30 @@ extension SearchWindow: NSTableViewDelegate {
 
         cell.configure(name: result.name, matchPositions: result.matchPositions)
 
+        return cell
+    }
+
+    private func pathCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
+        let id = NSUserInterfaceItemIdentifier("PathCell")
+        if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchPathTableCellView {
+            reused.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
+            return reused
+        }
+
+        let cell = SearchPathTableCellView()
+        cell.identifier = id
+
+        let textField = makeCellLabel(lineBreakMode: .byTruncatingMiddle)
+        cell.addSubview(textField)
+        cell.textField = textField
+
+        NSLayoutConstraint.activate([
+            textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+
+        cell.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
         return cell
     }
 
@@ -1678,64 +1702,141 @@ final class ThemedBackgroundView: NSView {
     }
 }
 
-// MARK: - Search Name Table Cell View
-final class SearchNameTableCellView: NSTableCellView {
-    private var matchPositions: [FfiMatchRange] = []
-    private var rawName: String = ""
+// MARK: - Highlighted Table Cell Views
+
+/// 用户家目录，进程生命周期内恒定。
+private let homeDirectory = NSHomeDirectory()
+
+/// 家目录缩写结果：展示串与被替换前缀的 UTF-8 字节数。
+private struct AbbreviatedHomePath {
+    let display: String
+    /// 被替换的家目录前缀字节数；高亮区间起点落在此范围内即属于被缩写部分。
+    let prefixBytes: Int
+    /// 展示串相对原串净减少的字节数，用于平移命中区间。
+    let byteDelta: Int
+}
+
+/// 将路径开头的家目录前缀缩写为 '~'；无需缩写时原样返回。
+private func abbreviateHomePrefix(_ path: String) -> AbbreviatedHomePath {
+    // 关键守卫：必须完全匹配家目录或以家目录+斜杠为前缀，避免虚假匹配同名开头的其他目录
+    guard path == homeDirectory || path.hasPrefix(homeDirectory + "/") else {
+        return AbbreviatedHomePath(display: path, prefixBytes: 0, byteDelta: 0)
+    }
+
+    let prefixIndex = path.index(path.startIndex, offsetBy: homeDirectory.count)
+    // 直接测量 path 切片内部实际的 UTF-8 字节数，免疫 NFC 与 NFD 规范化形式不一致导致的偏移偏差
+    let prefixBytes = path[..<prefixIndex].utf8.count
+    return AbbreviatedHomePath(
+        display: "~" + path[prefixIndex...],
+        prefixBytes: prefixBytes,
+        byteDelta: prefixBytes - 1
+    )
+}
+
+/// 高亮单元格基类：统一名称列与路径列的字体、选中态配色阶梯与 UTF-8 字节区间渲染。
+///
+/// 展示串与命中区间在 `configure` 阶段算好并缓存，选中态变化只重新着色，
+/// 避免 AppKit 每次回填选中态时重跑字符串换算。
+class SearchHighlightCellView: NSTableCellView {
+    /// 未选中时的基准字色。
+    var baseColor: NSColor { .labelColor }
+    /// 选中态下基准字色的不透明度，保留命中字符的视觉焦点。
+    var selectedAlpha: CGFloat { 1 }
+
+    private var displayString = ""
+    private var displayRanges: [(start: Int, end: Int)] = []
 
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet {
-            updateText()
+            renderText()
         }
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        updateText()
+        renderText()
     }
 
-    func configure(name: String, matchPositions: [FfiMatchRange]) {
-        self.rawName = name
-        self.matchPositions = matchPositions
-        updateText()
+    /// 更新展示串与 UTF-8 字节高亮区间。
+    func setDisplay(_ string: String, ranges: [(start: Int, end: Int)]) {
+        displayString = string
+        displayRanges = ranges
+        renderText()
     }
 
-    private func updateText() {
-        guard !rawName.isEmpty else {
+    private func renderText() {
+        guard !displayString.isEmpty else {
             textField?.stringValue = ""
             return
         }
 
-        let isSelected = backgroundStyle == .emphasized
         let regularFont = NSFont.systemFont(ofSize: 13)
         let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
-
+        let isSelected = backgroundStyle == .emphasized
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        // 选中态下采用高雅的透明度对比阶梯：普通字符采用微透明白保持层级感，命中字符采用纯白加粗突出视觉焦点，移除断裂下划线
-        let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(0.82) : .labelColor
+        let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(selectedAlpha) : baseColor
         let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
 
-        let attributed = NSMutableAttributedString(string: rawName, attributes: [
+        let attributed = NSMutableAttributedString(string: displayString, attributes: [
             .font: regularFont,
-            .foregroundColor: defaultColor
+            .foregroundColor: defaultColor,
         ])
 
-        let utf8 = rawName.utf8
-        for range in matchPositions {
-            let startByte = Int(range.start)
-            let endByte = Int(range.end)
-            guard let startIdx = utf8.index(utf8.startIndex, offsetBy: startByte, limitedBy: utf8.endIndex),
-                  let endIdx = utf8.index(utf8.startIndex, offsetBy: endByte, limitedBy: utf8.endIndex) else {
+        // 后端下发的高亮区间基于 UTF-8 字节偏移，需按字节安全夹取后再映射为 NSRange
+        let utf8 = displayString.utf8
+        for range in displayRanges {
+            guard range.start < range.end,
+                  let start = utf8.index(utf8.startIndex, offsetBy: range.start, limitedBy: utf8.endIndex),
+                  let end = utf8.index(utf8.startIndex, offsetBy: range.end, limitedBy: utf8.endIndex),
+                  start < end else {
                 continue
             }
-            let nsRange = NSRange(startIdx..<endIdx, in: rawName)
-            let attrs: [NSAttributedString.Key: Any] = [
+            attributed.addAttributes([
                 .font: boldFont,
-                .foregroundColor: highlightColor
-            ]
-            attributed.addAttributes(attrs, range: nsRange)
+                .foregroundColor: highlightColor,
+            ], range: NSRange(start..<end, in: displayString))
         }
         textField?.attributedStringValue = attributed
+    }
+}
+
+// MARK: - Search Name Table Cell View
+
+final class SearchNameTableCellView: SearchHighlightCellView {
+    /// 选中态下普通字符采用微透明白保持层级感，命中字符采用纯白加粗突出视觉焦点。
+    override var selectedAlpha: CGFloat { 0.82 }
+
+    func configure(name: String, matchPositions: [FfiMatchRange]) {
+        setDisplay(name, ranges: matchPositions.map { (Int($0.start), Int($0.end)) })
+    }
+}
+
+// MARK: - Search Path Table Cell View
+
+/// 路径列单元格视图：支持父目录高亮与家目录缩写重映射。
+final class SearchPathTableCellView: SearchHighlightCellView {
+    override var baseColor: NSColor { .secondaryLabelColor }
+    override var selectedAlpha: CGFloat { 0.75 }
+
+    func configure(fullPath: String, parentMatchPositions: [FfiMatchRange]) {
+        let parent = (fullPath as NSString).deletingLastPathComponent
+        guard !parent.isEmpty else {
+            setDisplay("", ranges: [])
+            return
+        }
+
+        let abbreviated = abbreviateHomePrefix(parent)
+        let ranges = parentMatchPositions.compactMap { range -> (start: Int, end: Int)? in
+            // 落在被缩写家目录前缀内的区间没有对应的展示字符，直接丢弃
+            let start = Int(range.start)
+            guard start >= abbreviated.prefixBytes else { return nil }
+            let adjustedStart = start - abbreviated.byteDelta
+            let adjustedEnd = Int(range.end) - abbreviated.byteDelta
+            guard adjustedStart >= 0, adjustedStart < adjustedEnd,
+                  adjustedEnd <= abbreviated.display.utf8.count else { return nil }
+            return (adjustedStart, adjustedEnd)
+        }
+        setDisplay(abbreviated.display, ranges: ranges)
     }
 }
 

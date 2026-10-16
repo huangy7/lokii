@@ -37,6 +37,7 @@ pub fn search(
                 entry: view.materialize(),
                 score: 1.0,
                 match_positions: vec![(matched.start(), matched.end())],
+                parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Regex,
             }
         })

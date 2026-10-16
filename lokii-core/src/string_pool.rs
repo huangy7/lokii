@@ -158,10 +158,21 @@ impl StringPool {
         self.release_hashed(id, hash);
     }
 
-    pub(crate) fn matching_ids(&self, mut predicate: impl FnMut(&str) -> bool) -> Vec<bool> {
+    pub(crate) fn matching_ids(&self, predicate: impl FnMut(&str) -> bool) -> Vec<bool> {
+        self.evaluate_ids(false, predicate)
+    }
+
+    pub(crate) fn evaluate_ids<T: Clone>(
+        &self,
+        default: T,
+        mut mapper: impl FnMut(&str) -> T,
+    ) -> Vec<T> {
         self.slots
             .iter()
-            .map(|slot| slot.as_ref().is_some_and(|slot| predicate(&slot.text)))
+            .map(|slot| match slot {
+                Some(slot) => mapper(&slot.text),
+                None => default.clone(),
+            })
             .collect()
     }
 

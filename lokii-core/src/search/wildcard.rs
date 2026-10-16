@@ -26,6 +26,7 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
             entry: view.materialize(),
             score: 1.0,
             match_positions: vec![(0, view.name.len())],
+            parent_match_positions: Vec::new(),
             search_mode: SearchMode::Wildcard,
         }
     })

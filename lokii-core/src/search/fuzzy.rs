@@ -54,6 +54,7 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
                 entry: view.materialize(),
                 score: (candidate.score as f64 / 1000.0).min(1.0),
                 match_positions: positions,
+                parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Fuzzy,
             }
         })

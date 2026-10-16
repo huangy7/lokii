@@ -76,12 +76,13 @@ fn marked(mask: &[bool], ordinal: u32) -> bool {
 }
 
 #[derive(Clone, Copy, bitcode::Encode, bitcode::Decode)]
-struct CompactRecord {
+pub(crate) struct CompactRecord {
     name: u32,
-    path: u32,
-    extension: u32,
-    raw_path: bool,
-    is_dir: bool,
+    /// 父目录池槽位（或原始路径槽位），流式检索据此查表定位父目录约束。
+    pub(crate) path: u32,
+    pub(crate) extension: u32,
+    pub(crate) raw_path: bool,
+    pub(crate) is_dir: bool,
     size: u64,
     modified: u64,
     created_at: u64,
@@ -362,6 +363,45 @@ impl CompactIndex {
                 self.names.get(record.name).expect("valid name reference"),
             )
         })
+    }
+
+    pub(crate) fn records(&self) -> &[CompactRecord] {
+        &self.records
+    }
+
+    /// 解析记录的父目录与文件名切片：原始路径记录现场按 '/' 切分，池化记录直接取池内字符串。
+    /// 与 `EntryView::path_key` 同规则，此处按记录惰性求值，
+    /// 避免流式扫描时为每条记录提前解析整条视图。
+    pub(crate) fn split_record(&self, record: &CompactRecord) -> (&str, &str) {
+        if record.raw_path {
+            self.raw_paths.get(record.path).map_or(("", ""), split_path)
+        } else {
+            (
+                self.parents.get(record.path).unwrap_or(""),
+                self.names.get(record.name).unwrap_or(""),
+            )
+        }
+    }
+
+    /// 仅解析记录的文件名切片，避免在不需要父目录时产生额外的父目录池查表开销。
+    pub(crate) fn record_name(&self, record: &CompactRecord) -> &str {
+        if record.raw_path {
+            self.raw_paths.get(record.path).map_or("", |p| split_path(p).1)
+        } else {
+            self.names.get(record.name).unwrap_or("")
+        }
+    }
+
+    pub(crate) fn extension(&self, id: u32) -> Option<&str> {
+        self.extensions.get(id)
+    }
+
+    pub(crate) fn evaluate_parents<T: Clone>(
+        &self,
+        default: T,
+        mapper: impl FnMut(&str) -> T,
+    ) -> Vec<T> {
+        self.parents.evaluate_ids(default, mapper)
     }
 
     pub fn materialize(&self, id: EntryId) -> Result<FileEntry, IndexError> {

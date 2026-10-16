@@ -9,6 +9,7 @@
 target/
 
 # Swift / SwiftPM 构建产物
+.build/
 Lokii/.build/
 .swiftpm/
 
