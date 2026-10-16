@@ -52,8 +52,6 @@
 "prefs.section.language" = "语言";
 "prefs.section.language.description" = "选择应用界面语言。";
 "prefs.language" = "语言";
-"prefs.language.description" = "切换后会应用到菜单、设置页和主窗口文案。";
-"prefs.language.restartHint" = "重启 Lokii 后生效";
 "prefs.language.zh-Hans" = "中文";
 "prefs.language.en" = "English";
 
@@ -130,6 +128,11 @@
 "search.searching" = "正在搜索...";
 "search.buildingIndex" = "正在构建索引...";
 "search.scanningFiles" = "正在扫描文件...";
+"search.scannedCount" = "已扫描 %@ 个文件";
+"search.indexingCount" = "正在索引 %@ 个文件...";
+"search.indexedCount" = "已索引 %@ 个文件";
+"search.foundCount" = "找到 %@ 个文件";
+"search.indexReady" = "索引已就绪";
 
 /* SearchWindow - context menu */
 "search.ctx.open" = "打开";

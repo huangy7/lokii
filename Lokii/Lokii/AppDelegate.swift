@@ -24,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
         setupMainMenu()
+        NotificationCenter.default.addObserver(self, selector: #selector(onLanguageChanged),
+                                               name: L10n.languageChangedNotification, object: nil)
         registerGlobalShortcut()
 
         mainWindow = SearchWindow(engine: engine)
@@ -116,6 +118,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Main Menu
 
+    @objc private func onLanguageChanged() {
+        NSApp.mainMenu?.refreshLocalizedTitles()
+        statusItem?.menu?.refreshLocalizedTitles()
+    }
+
     private func setupMainMenu() {
         let mainMenu = NSMenu()
 
@@ -124,44 +131,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
 
         // About Lokii — custom About panel with version, copyright, description
-        let aboutItem = NSMenuItem(title: L("menu.about"), action: #selector(showAboutPanel), keyEquivalent: "")
+        let aboutItem = NSMenuItem(localizedKey: "menu.about", action: #selector(showAboutPanel), keyEquivalent: "")
         aboutItem.target = self
         appMenu.addItem(aboutItem)
 
-        let checkUpdatesItem = NSMenuItem(title: L("menu.checkUpdates"), action: #selector(checkForUpdates), keyEquivalent: "")
+        let checkUpdatesItem = NSMenuItem(localizedKey: "menu.checkUpdates", action: #selector(checkForUpdates), keyEquivalent: "")
         checkUpdatesItem.target = self
         appMenu.addItem(checkUpdatesItem)
 
         appMenu.addItem(NSMenuItem.separator())
 
         // Preferences... with Cmd+,
-        let prefsItem = NSMenuItem(title: L("menu.preferences"), action: #selector(openPreferences), keyEquivalent: ",")
+        let prefsItem = NSMenuItem(localizedKey: "menu.preferences", action: #selector(openPreferences), keyEquivalent: ",")
         prefsItem.target = self
         appMenu.addItem(prefsItem)
 
         appMenu.addItem(NSMenuItem.separator())
 
         // Quit Lokii with Cmd+Q
-        appMenu.addItem(withTitle: L("menu.quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addLocalizedItem("menu.quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
         // Edit menu (for copy/paste in search field)
         let editMenuItem = NSMenuItem()
+        editMenuItem.representedObject = "menu.edit"
+        editMenuItem.title = L("menu.edit")
         let editMenu = NSMenu(title: L("menu.edit"))
-        editMenu.addItem(withTitle: L("menu.cut"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: L("menu.copy"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: L("menu.paste"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: L("menu.selectAll"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addLocalizedItem("menu.cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addLocalizedItem("menu.copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addLocalizedItem("menu.paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addLocalizedItem("menu.selectAll", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
         // Window menu
         let windowMenuItem = NSMenuItem()
+        windowMenuItem.representedObject = "menu.window"
+        windowMenuItem.title = L("menu.window")
         let windowMenu = NSMenu(title: L("menu.window"))
-        windowMenu.addItem(withTitle: L("menu.close"), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        windowMenu.addItem(withTitle: L("menu.minimize"), action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addLocalizedItem("menu.close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addLocalizedItem("menu.minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenuItem.submenu = windowMenu
         mainMenu.addItem(windowMenuItem)
 

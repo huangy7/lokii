@@ -31,6 +31,7 @@ class PreferencesViewModel: ObservableObject {
     
     @Published var language: String = "zh-Hans" {
         didSet {
+            guard language != oldValue else { return }
             saveGeneralConfig()
             L10n.configure(language: language)
         }
@@ -215,17 +216,11 @@ struct PreferencesView: View {
     var body: some View {
         splitView
             .frame(minWidth: 580, idealWidth: 620, minHeight: 480, idealHeight: 520)
-            .id(viewModel.language) // Force full layout redraw on language changes
             .onAppear {
                 viewModel.updateFDAStatus()
-                // Observe window active updates to check Full Disk Access status in real-time
-                NotificationCenter.default.addObserver(
-                    forName: NSApplication.didBecomeActiveNotification,
-                    object: nil,
-                    queue: .main
-                ) { _ in
-                    viewModel.updateFDAStatus()
-                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                viewModel.updateFDAStatus()
             }
     }
     
@@ -294,7 +289,7 @@ struct PreferencesView: View {
         }
         
         SettingsGroup(L("prefs.section.language")) {
-            SettingsRow(L("prefs.language"), description: L("prefs.language.description")) {
+            SettingsRow(L("prefs.language")) {
                 Picker("", selection: $viewModel.language) {
                     Text(L("prefs.language.zh-Hans")).tag("zh-Hans")
                     Text(L("prefs.language.en")).tag("en")

@@ -52,8 +52,6 @@
 "prefs.section.language" = "Language";
 "prefs.section.language.description" = "Pick the language used across the app.";
 "prefs.language" = "Language";
-"prefs.language.description" = "This affects menus, preferences, and the main window copy.";
-"prefs.language.restartHint" = "Restart Lokii to apply language change";
 "prefs.language.zh-Hans" = "中文";
 "prefs.language.en" = "English";
 
@@ -130,6 +128,11 @@
 "search.searching" = "Searching...";
 "search.buildingIndex" = "Building Index...";
 "search.scanningFiles" = "Scanning files...";
+"search.scannedCount" = "Scanned %@ files";
+"search.indexingCount" = "Indexing %@ files...";
+"search.indexedCount" = "%@ files indexed";
+"search.foundCount" = "%@ files found";
+"search.indexReady" = "Index ready";
 
 /* SearchWindow - context menu */
 "search.ctx.open" = "Open";

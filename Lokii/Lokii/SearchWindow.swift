@@ -38,6 +38,16 @@ final class SearchWindow: NSWindowController {
     private var statusLabel: NSTextField!
     private var searchWorkItem: DispatchWorkItem?
     private var currentMode: FfiSearchMode = .auto
+    private var statusText: LocalizedText = .key("search.indexing") {
+        didSet { statusLabel?.stringValue = statusText.string }
+    }
+    private var resultCountText: LocalizedText = .verbatim("") {
+        didSet { countLabel?.stringValue = resultCountText.string }
+    }
+    private var overlaySubtext: LocalizedText = .key("search.scanningFiles") {
+        didSet { overlaySubtextLabel?.stringValue = overlaySubtext.string }
+    }
+    private weak var refreshToastLabel: NSTextField?
 
     // Info panel
     private var infoPanelView: NSView!
@@ -58,7 +68,7 @@ final class SearchWindow: NSWindowController {
     private var isColdStart: Bool = true  // Default true until startup mode known
     private var overlayProgressIndicator: NSProgressIndicator?
     private var inlineProgressIndicator: NSView?
-    private var originalSearchPlaceholder: String = L("search.placeholder")
+    private var originalSearchPlaceholder: String { L("search.placeholder") }
 
     /// Tracks why the loading overlay is showing, so `onIndexReady` from
     /// a concurrent initialize/verify doesn't accidentally dismiss a rebuild overlay.
@@ -126,6 +136,7 @@ final class SearchWindow: NSWindowController {
         window.contentView?.wantsLayer = true
         setupSearchModeMenu()
         setupNotifications()
+        onLanguageChanged()
     }
 
     @available(*, unavailable)
@@ -365,11 +376,11 @@ final class SearchWindow: NSWindowController {
 
         // Context menu
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: L("search.ctx.open"), action: #selector(openSelected), keyEquivalent: "\r"))
-        menu.addItem(NSMenuItem(title: L("search.ctx.revealInFinder"), action: #selector(revealSelected), keyEquivalent: ""))
+        menu.addLocalizedItem("search.ctx.open", action: #selector(openSelected), keyEquivalent: "\r")
+        menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(revealSelected), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: L("search.ctx.copyPath"), action: #selector(copyPath), keyEquivalent: "c"))
-        menu.addItem(NSMenuItem(title: L("search.ctx.copyName"), action: #selector(copyName), keyEquivalent: ""))
+        menu.addLocalizedItem("search.ctx.copyPath", action: #selector(copyPath), keyEquivalent: "c")
+        menu.addLocalizedItem("search.ctx.copyName", action: #selector(copyName), keyEquivalent: "")
         tableView.menu = menu
     }
 
@@ -584,15 +595,15 @@ final class SearchWindow: NSWindowController {
 
     private func setupSearchModeMenu() {
         let menu = NSMenu(title: L("search.mode.title"))
-        let titles = [
-            L("search.mode.auto"),
-            L("search.mode.substring"),
-            L("search.mode.wildcard"),
-            L("search.mode.regex"),
-            L("search.mode.fuzzy"),
+        let keys = [
+            "search.mode.auto",
+            "search.mode.substring",
+            "search.mode.wildcard",
+            "search.mode.regex",
+            "search.mode.fuzzy",
         ]
-        for (i, title) in titles.enumerated() {
-            let item = NSMenuItem(title: title, action: #selector(searchModeSelected(_:)), keyEquivalent: "")
+        for (i, key) in keys.enumerated() {
+            let item = NSMenuItem(localizedKey: key, action: #selector(searchModeSelected(_:)), keyEquivalent: "")
             item.target = self
             item.tag = i
             if i == 0 { item.state = .on }
@@ -625,6 +636,8 @@ final class SearchWindow: NSWindowController {
 
     private func setupNotifications() {
         let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(onLanguageChanged),
+                       name: L10n.languageChangedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onIndexProgress(_:)),
                        name: SearchEngine.indexProgressNotification, object: nil)
         nc.addObserver(self, selector: #selector(onIndexReady(_:)),
@@ -637,6 +650,36 @@ final class SearchWindow: NSWindowController {
                        name: SearchEngine.initializationFailedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onConfigReloaded(_:)),
                        name: SearchEngine.configReloadedNotification, object: nil)
+    }
+
+    @objc private func onLanguageChanged() {
+        Self.fullDateFormatter.locale = L10n.locale
+        searchField.placeholderString = L(inlineProgressIndicator == nil ? "search.placeholder" : "search.indexingIncomplete")
+        toggleInfoButton.toolTip = L("search.toggleInfo")
+        toggleInfoButton.setAccessibilityLabel(L("search.toggleInfo"))
+        rebuildButton.toolTip = L("search.rebuildIndex")
+        rebuildButton.setAccessibilityLabel(L("search.rebuildIndex"))
+        let columns: [(NSUserInterfaceItemIdentifier, String)] = [
+            (.columnName, "search.col.name"), (.columnPath, "search.col.path"),
+            (.columnModified, "search.col.dateModified"), (.columnSize, "search.col.size"),
+        ]
+        for (identifier, key) in columns {
+            tableView.tableColumn(withIdentifier: identifier)?.title = L(key)
+        }
+        tableView.headerView?.needsDisplay = true
+        let detailKeys = ["search.info.kind", "search.info.size", "search.info.created", "search.info.modified", "search.info.where"]
+        for (labels, key) in zip(infoDetailLabels, detailKeys) { labels.key.stringValue = L(key) }
+        tableView.menu?.refreshLocalizedTitles()
+        if let menu = (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate {
+            menu.title = L("search.mode.title")
+            menu.refreshLocalizedTitles()
+        }
+        statusLabel.stringValue = statusText.string
+        countLabel.stringValue = resultCountText.string
+        overlayHeadingLabel?.stringValue = L("search.buildingIndex")
+        overlaySubtextLabel?.stringValue = overlaySubtext.string
+        refreshToastLabel?.stringValue = L("search.backgroundRefresh")
+        updateInfoPanel()
     }
 
     @objc private func onIndexProgress(_ note: Notification) {
@@ -653,11 +696,11 @@ final class SearchWindow: NSWindowController {
 
         if isColdStart && indexingState == .initializing {
             // Cold start: update overlay
-            overlaySubtextLabel?.stringValue = "Scanned \(formatted) files"
-            statusLabel.stringValue = "Indexing \(formatted)..."
+            overlaySubtext = .formatted("search.scannedCount", formatted)
+            statusText = .formatted("search.indexingCount", formatted)
         } else {
             // Hot start or rebuild: update inline status bar
-            statusLabel.stringValue = "Indexing... \(formatted) files"
+            statusText = .formatted("search.indexingCount", formatted)
         }
     }
 
@@ -670,10 +713,10 @@ final class SearchWindow: NSWindowController {
             return
         case .initializing:
             guard source != "rebuild" else {
-                statusLabel.stringValue = "\(formatCount(total)) indexed"
+                statusText = .formatted("search.indexedCount", formatCount(total))
                 return
             }
-            statusLabel.stringValue = "\(formatCount(total)) indexed"
+            statusText = .formatted("search.indexedCount", formatCount(total))
             if isColdStart {
                 hideLoadingOverlay()
             } else {
@@ -683,22 +726,22 @@ final class SearchWindow: NSWindowController {
             indexingState = .idle
         case .rebuilding:
             guard source == "rebuild" else {
-                statusLabel.stringValue = "\(formatCount(total)) indexed"
+                statusText = .formatted("search.indexedCount", formatCount(total))
                 return
             }
-            statusLabel.stringValue = "\(formatCount(total)) indexed"
+            statusText = .formatted("search.indexedCount", formatCount(total))
             hideInlineProgress()
             stopRebuildButtonAnimation()
             indexingState = .idle
         case .idle:
-            statusLabel.stringValue = "\(formatCount(total)) indexed"
+            statusText = .formatted("search.indexedCount", formatCount(total))
         }
     }
 
     @objc private func onIndexUpdated(_ note: Notification) {
         guard indexingState != .failed else { return }
         let total = note.userInfo?["total"] as? UInt64 ?? 0
-        statusLabel.stringValue = "\(formatCount(total)) indexed"
+        statusText = .formatted("search.indexedCount", formatCount(total))
     }
 
     @objc private func onStartupMode(_ note: Notification) {
@@ -709,7 +752,7 @@ final class SearchWindow: NSWindowController {
             // Cold start — show overlay
             showLoadingOverlay(heading: L("search.buildingIndex"))
         } else {
-            statusLabel.stringValue = L("search.loadingIndex")
+            statusText = .key("search.loadingIndex")
         }
     }
 
@@ -725,7 +768,7 @@ final class SearchWindow: NSWindowController {
         hideInlineProgress()
         searchField.isEnabled = false
         rebuildButton.isEnabled = false
-        statusLabel.stringValue = L("search.initializationFailed")
+        statusText = .key("search.initializationFailed")
 
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -804,6 +847,7 @@ final class SearchWindow: NSWindowController {
             return
         }
         overlayShownAt = Date()
+        overlaySubtext = .key("search.scanningFiles")
         guard let contentView = window?.contentView else { return }
 
         // Full-window event-blocking overlay
@@ -914,7 +958,7 @@ final class SearchWindow: NSWindowController {
         // Accessibility: announce index ready
         if let mainWindow = NSApp.mainWindow {
             NSAccessibility.post(element: mainWindow as Any, notification: .announcementRequested,
-                                 userInfo: [NSAccessibility.NotificationUserInfoKey.announcement: "Index ready"])
+                                 userInfo: [NSAccessibility.NotificationUserInfoKey.announcement: L("search.indexReady")])
         }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.3
@@ -988,7 +1032,7 @@ final class SearchWindow: NSWindowController {
 
     // MARK: - Toast
 
-    private func showToast(_ message: String) {
+    private func showBackgroundRefreshToast() {
         guard let contentView = window?.contentView else { return }
 
         // Card — same material as loading overlay for visual consistency
@@ -1016,7 +1060,8 @@ final class SearchWindow: NSWindowController {
         iconContainer.addSubview(iconView)
 
         // Heading — same font as loading overlay
-        let label = NSTextField(labelWithString: message)
+        let label = NSTextField(labelWithString: L("search.backgroundRefresh"))
+        refreshToastLabel = label
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 16, weight: .semibold)
         label.textColor = .labelColor
@@ -1090,7 +1135,7 @@ final class SearchWindow: NSWindowController {
         guard indexingState == .idle else { return }
 
         if engine.isScanning {
-            showToast(L("search.backgroundRefresh"))
+            showBackgroundRefreshToast()
             return
         }
 
@@ -1098,7 +1143,7 @@ final class SearchWindow: NSWindowController {
         rebuildButton.isEnabled = false
         startRebuildButtonAnimation()
         showInlineProgress()
-        statusLabel.stringValue = L("search.indexing")
+        statusText = .key("search.indexing")
         engine.rebuildIndex()
     }
 
@@ -1170,10 +1215,10 @@ final class SearchWindow: NSWindowController {
             iconCache.removeAll()
             tableView.sortDescriptors = []
             tableView.reloadData()
-            countLabel.stringValue = ""
+            resultCountText = .verbatim("")
             pathBar.url = nil
             let stats = engine.stats
-            statusLabel.stringValue = stats.isReady ? "\(formatCount(stats.totalCount)) indexed" : L("search.indexing")
+            statusText = stats.isReady ? .formatted("search.indexedCount", formatCount(stats.totalCount)) : .key("search.indexing")
             return
         }
 
@@ -1189,7 +1234,7 @@ final class SearchWindow: NSWindowController {
     private func performSearch(query: String) {
         guard indexingState != .failed, !isSearching else { return }
         isSearching = true
-        countLabel.stringValue = L("search.searching")
+        resultCountText = .key("search.searching")
 
         let mode = currentMode
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1212,9 +1257,9 @@ final class SearchWindow: NSWindowController {
                 self.tableView.reloadData()
 
                 if let error = response.error {
-                    self.countLabel.stringValue = error
+                    self.resultCountText = .verbatim(error)
                 } else {
-                    self.countLabel.stringValue = "\(self.formatCount(UInt64(self.results.count))) files found"
+                    self.resultCountText = .formatted("search.foundCount", self.formatCount(UInt64(self.results.count)))
                 }
 
                 // If user typed more while searching, trigger new search
