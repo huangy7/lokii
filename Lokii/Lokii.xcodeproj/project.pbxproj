@@ -13,6 +13,7 @@
 		220E4427CE25A98CD96F9AA1 /* lokii_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1ABEB6DD96D45D2B3AB5A122 /* lokii_core.swift */; };
 		29140F081BAFBB147E42A200 /* Lokii.icns in Resources */ = {isa = PBXBuildFile; fileRef = B32FC7DD2AD33DB9A5618344 /* Lokii.icns */; };
 		3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */; };
+		322DC1AF3FB9D3ECEC310A29 /* LocalizedMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */; };
 		368436915AC064B1A3606C73 /* PreferencesWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */; };
 		43E1EA3946E3F6FDE146A8EB /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04B808522771C196E501D47E /* ThemeManager.swift */; };
 		4C5C8F57CA90E399F78A9D0C /* NSMenuItem++.swift in Sources */ = {isa = PBXBuildFile; fileRef = 947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */; };
@@ -29,6 +30,7 @@
 		9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD267E77C749892BFB3B6BFA /* SearchWindow.swift */; };
 		CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = E44E26FAF1C1762428B98CEB /* Utilities.swift */; };
 		D845C945605829EFD6777B02 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */; };
+		DB72F207E9C6F823A2970A05 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 732101997548517319E501C8 /* Sparkle */; };
 		E4CC034498F0BD54589D670D /* FileKindMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */; };
 		E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8727ED2D2029A80C7739E625 /* ViewModifiers.swift */; };
 		E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */; };
@@ -59,6 +61,7 @@
 		8B947458DDBFC6998183062C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		927DA1B3D54D6EE81E6EE89C /* Name.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Name.swift; sourceTree = "<group>"; };
 		947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSMenuItem++.swift"; sourceTree = "<group>"; };
+		A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizedMenu.swift; sourceTree = "<group>"; };
 		A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesWindowController.swift; sourceTree = "<group>"; };
 		A96470450AEE87C889A593F5 /* Recorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recorder.swift; sourceTree = "<group>"; };
 		B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -79,6 +82,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				15AAEC0CDA3C27720C7F2E18 /* KeyboardShortcuts in Frameworks */,
+				DB72F207E9C6F823A2970A05 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -96,6 +100,7 @@
 				695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */,
 				8B947458DDBFC6998183062C /* Info.plist */,
 				4945594BBD178DAC175979A5 /* L10n.swift */,
+				A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */,
 				1ABEB6DD96D45D2B3AB5A122 /* lokii_core.swift */,
 				245A938DDC4CD962CF827FD1 /* Lokii.entitlements */,
 				6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */,
@@ -172,6 +177,7 @@
 			name = Lokii;
 			packageProductDependencies = (
 				484225E67DB191B3777194BF /* KeyboardShortcuts */,
+				732101997548517319E501C8 /* Sparkle */,
 			);
 			productName = Lokii;
 			productReference = 0EEF1864B7BFEBFEB32B4C84 /* Lokii.app */;
@@ -203,6 +209,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				F9F1E479B270D7BB6842A1E0 /* XCRemoteSwiftPackageReference "KeyboardShortcuts" */,
+				6DE6D8E2441CF09D5B3D9F5A /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C5102A6210EAC3B741344AED /* Products */;
@@ -241,6 +248,7 @@
 				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
 				3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */,
 				55670C6273A3B5887190D820 /* L10n.swift in Sources */,
+				322DC1AF3FB9D3ECEC310A29 /* LocalizedMenu.swift in Sources */,
 				E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */,
 				4C5C8F57CA90E399F78A9D0C /* NSMenuItem++.swift in Sources */,
 				1B4BCC5BF4FE72D28BAEF0A4 /* Name.swift in Sources */,
@@ -474,6 +482,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		6DE6D8E2441CF09D5B3D9F5A /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = exactVersion;
+				version = 2.10.0;
+			};
+		};
 		F9F1E479B270D7BB6842A1E0 /* XCRemoteSwiftPackageReference "KeyboardShortcuts" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/sindresorhus/KeyboardShortcuts";
@@ -489,6 +505,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = F9F1E479B270D7BB6842A1E0 /* XCRemoteSwiftPackageReference "KeyboardShortcuts" */;
 			productName = KeyboardShortcuts;
+		};
+		732101997548517319E501C8 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 6DE6D8E2441CF09D5B3D9F5A /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

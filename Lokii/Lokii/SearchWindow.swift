@@ -26,13 +26,40 @@ private final class CenterSpinContainerView: NSView {
     }
 }
 
+/// 原生 AppKit 高信息密度虚拟列表，封装右键智能选区联动与前台即时响应机制。
+private final class SearchTableView: NSTableView {
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = self.row(at: point)
+
+        // 边界守卫：点击虚拟列表末尾空白区域时阻断上下文菜单，规避悬空操作
+        guard row >= 0 && row < numberOfRows else {
+            return nil
+        }
+
+        // 选区智能维护：
+        // 若右键命中的行未被包含在当前选区，则将选区收拢重置为该单行；
+        // 若命中的行已在选中集合内（例如用户已多选多项），则完整保持多选集合不被破坏。
+        if !selectedRowIndexes.contains(row) {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+
+        return super.menu(for: event)
+    }
+
+    // 视窗在非激活状态下接收初次点按，保证点击即选中，消除二次点击开销
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+}
+
 final class SearchWindow: NSWindowController {
     private let engine: SearchEngine
     private let defaultWindowFrame = NSRect(x: 0, y: 0, width: 900, height: 580)
     private let savedWindowFrameKey = "LokiiMainWindowFrame"
     private var results: [FfiSearchResult] = []
     private var searchField: NSSearchField!
-    private var tableView: NSTableView!
+    private var tableView: SearchTableView!
     private var countLabel: NSTextField!
     private var pathBar: NSPathControl!
     private var statusLabel: NSTextField!
@@ -257,7 +284,7 @@ final class SearchWindow: NSWindowController {
         contentView.addSubview(middleView)
 
         // Table
-        tableView = NSTableView()
+        tableView = SearchTableView()
         tableView.style = .fullWidth
         tableView.rowHeight = 20
         tableView.intercellSpacing = NSSize(width: 0, height: 0)
@@ -1285,30 +1312,44 @@ final class SearchWindow: NSWindowController {
         engine.openFile(path: results[row].path)
     }
 
+    private var selectedResults: [FfiSearchResult] {
+        let indices = tableView.selectedRowIndexes.filter { $0 >= 0 && $0 < results.count }
+        return indices.map { results[$0] }
+    }
+
     @objc private func openSelected() {
-        let row = tableView.selectedRow
-        guard row >= 0, row < results.count else { return }
-        engine.openFile(path: results[row].path)
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+        for item in selected {
+            engine.openFile(path: item.path)
+        }
     }
 
     @objc private func revealSelected() {
-        let row = tableView.selectedRow
-        guard row >= 0, row < results.count else { return }
-        engine.revealInFinder(path: results[row].path)
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+        if selected.count == 1 {
+            engine.revealInFinder(path: selected[0].path)
+        } else {
+            let urls = selected.map { URL(fileURLWithPath: $0.path) }
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+        }
     }
 
     @objc private func copyPath() {
-        let row = tableView.selectedRow
-        guard row >= 0, row < results.count else { return }
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+        let joined = selected.map(\.path).joined(separator: "\n")
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(results[row].path, forType: .string)
+        NSPasteboard.general.setString(joined, forType: .string)
     }
 
     @objc private func copyName() {
-        let row = tableView.selectedRow
-        guard row >= 0, row < results.count else { return }
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+        let joined = selected.map(\.name).joined(separator: "\n")
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(results[row].name, forType: .string)
+        NSPasteboard.general.setString(joined, forType: .string)
     }
 
     // MARK: - Helpers
@@ -1670,7 +1711,8 @@ final class SearchNameTableCellView: NSTableCellView {
         let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
 
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let defaultColor: NSColor = isSelected ? .white : .labelColor
+        // 选中态下采用高雅的透明度对比阶梯：普通字符采用微透明白保持层级感，命中字符采用纯白加粗突出视觉焦点，移除断裂下划线
+        let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(0.82) : .labelColor
         let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
 
         let attributed = NSMutableAttributedString(string: rawName, attributes: [
@@ -1687,15 +1729,28 @@ final class SearchNameTableCellView: NSTableCellView {
                 continue
             }
             let nsRange = NSRange(startIdx..<endIdx, in: rawName)
-            var attrs: [NSAttributedString.Key: Any] = [
+            let attrs: [NSAttributedString.Key: Any] = [
                 .font: boldFont,
                 .foregroundColor: highlightColor
             ]
-            if isSelected {
-                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-            }
             attributed.addAttributes(attrs, range: nsRange)
         }
         textField?.attributedStringValue = attributed
+    }
+}
+
+// MARK: - NSMenuItemValidation
+
+extension SearchWindow: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(openSelected),
+             #selector(revealSelected),
+             #selector(copyPath),
+             #selector(copyName):
+            return !selectedResults.isEmpty
+        default:
+            return true
+        }
     }
 }

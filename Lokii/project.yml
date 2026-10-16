@@ -9,6 +9,9 @@ packages:
   KeyboardShortcuts:
     url: https://github.com/sindresorhus/KeyboardShortcuts
     from: 2.4.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0
 
 settings:
   base:
@@ -25,6 +28,7 @@ targets:
           - "*.xcassets/*/.*"
     dependencies:
       - package: KeyboardShortcuts
+      - package: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lokii.app
