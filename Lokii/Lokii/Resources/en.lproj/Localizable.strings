@@ -117,8 +117,9 @@
 "search.placeholder" = "Search files...";
 
 /* SearchWindow - toolbar */
-"search.toggleInfo" = "Show or hide the details pane";
+"search.toggleSidebar" = "Toggle Sidebar";
 "search.rebuildIndex" = "Rebuild Index";
+"window.resetSize" = "Reset Window Size";
 
 /* SearchWindow - status */
 "search.indexing" = "Indexing...";
@@ -131,7 +132,9 @@
 "search.scannedCount" = "Scanned %@ files";
 "search.indexingCount" = "Indexing %@ files...";
 "search.indexedCount" = "%@ files indexed";
-"search.foundCount" = "%@ files found";
+"search.matchedCount" = "%@ matches";
+"search.matchedCount.one" = "1 match";
+"search.statusWithMatches" = "%1$@ | %2$@";
 "search.indexReady" = "Index ready";
 
 /* SearchWindow - context menu */
@@ -140,18 +143,15 @@
 "search.ctx.copyPath" = "Copy Path";
 "search.ctx.copyName" = "Copy Name";
 
+/* SearchWindow - sidebar */
+"search.sidebar.emptyHint" = "Directory distribution will appear here";
+"search.sidebar.allResults" = "All Results";
+
 /* SearchWindow - table columns */
 "search.col.name" = "Name";
 "search.col.path" = "Path";
 "search.col.dateModified" = "Date Modified";
 "search.col.size" = "Size";
-
-/* SearchWindow - info panel */
-"search.info.kind" = "Kind";
-"search.info.size" = "Size";
-"search.info.created" = "Created";
-"search.info.modified" = "Modified";
-"search.info.where" = "Where";
 
 /* SearchWindow - search mode */
 "search.mode.title" = "Search Mode";

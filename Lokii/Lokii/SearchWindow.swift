@@ -1,5 +1,6 @@
 import AppKit
 import UniformTypeIdentifiers
+import Quartz
 
 /// Blocks all mouse and keyboard events so the UI beneath is not interactive.
 private final class EventBlockingView: NSView {
@@ -12,87 +13,57 @@ private final class EventBlockingView: NSView {
     override func keyUp(with event: NSEvent) {}
 }
 
-/// Container view that perfectly stabilizes rotation for a subview
-/// to prevent AppKit's frame syncing from breaking the anchor point.
-private final class CenterSpinContainerView: NSView {
-    override func layout() {
-        super.layout()
-        guard let subview = subviews.first else { return }
-        subview.frame = bounds
-        if let layer = subview.layer {
-            layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-            layer.position = CGPoint(x: bounds.midX, y: bounds.midY)
-        }
-    }
-}
-
-/// 搜索结果虚拟列表：右键联动选区，非激活状态下点击即选中。
-private final class SearchTableView: NSTableView {
-    override func menu(for event: NSEvent) -> NSMenu? {
-        let point = convert(event.locationInWindow, from: nil)
-        let row = self.row(at: point)
-
-        // 空白区域不弹菜单；row(at:) 对非行区域返回 -1，非负即已排除越界
-        guard row >= 0 else {
-            return nil
-        }
-
-        // 命中行不在选区内时收拢为单行；已在选区内则保持多选集合，避免误清空
-        if !selectedRowIndexes.contains(row) {
-            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        }
-
-        return super.menu(for: event)
-    }
-
-    // 非激活状态下点击即选中，省掉一次用于激活窗口的点击
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
-    }
-}
-
 final class SearchWindow: NSWindowController {
     private let engine: SearchEngine
-    private let defaultWindowFrame = NSRect(x: 0, y: 0, width: 900, height: 580)
+    private var defaultWindowFrame: NSRect {
+        Self.calculateDefaultWindowFrame()
+    }
+
+    /// 基于当前主屏幕可用工作区几何尺寸，按黄金视觉比例自适应计算默认尺寸与居中位置
+    static func calculateDefaultWindowFrame() -> NSRect {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            return NSRect(x: 0, y: 0, width: 960, height: 640)
+        }
+        let visible = screen.visibleFrame
+        // 宽度取可见屏幕宽度的 60%，钳制在 [960, 1280] pt
+        let width = min(max(visible.width * 0.60, 960), 1280)
+        // 高度取可见屏幕高度的 62%，钳制在 [600, 860] pt
+        let height = min(max(visible.height * 0.62, 600), 860)
+
+        // 水平居中，垂直方向位于视窗黄金中心（屏幕中心微偏上 5% 屏幕高度）
+        let x = visible.origin.x + (visible.width - width) / 2
+        let y = visible.origin.y + (visible.height - height) / 2 + (visible.height * 0.05)
+        return NSRect(x: round(x), y: round(y), width: round(width), height: round(height))
+    }
+
     private let savedWindowFrameKey = "LokiiMainWindowFrame"
-    private var results: [FfiSearchResult] = []
+    let splitViewController = SearchMainSplitViewController()
+    var searchResultsViewController: SearchResultsViewController { splitViewController.searchResultsViewController }
+    var sidebarTreeViewController: SidebarTreeViewController { splitViewController.sidebarTreeViewController }
+
     private var searchField: NSSearchField!
-    private var tableView: SearchTableView!
-    private var countLabel: NSTextField!
-    private var pathBar: NSPathControl!
-    private var statusLabel: NSTextField!
+    private let searchContainer = NSView()
     private var searchWorkItem: DispatchWorkItem?
     private var currentMode: FfiSearchMode = .auto
     private var statusText: LocalizedText = .key("search.indexing") {
-        didSet { statusLabel?.stringValue = statusText.string }
+        didSet { updateStatusLabel() }
     }
-    private var resultCountText: LocalizedText = .verbatim("") {
-        didSet { countLabel?.stringValue = resultCountText.string }
+    private var searchMatchText: LocalizedText? = nil {
+        didSet { updateStatusLabel() }
     }
     private var overlaySubtext: LocalizedText = .key("search.scanningFiles") {
         didSet { overlaySubtextLabel?.stringValue = overlaySubtext.string }
     }
     private weak var refreshToastLabel: NSTextField?
 
-    // Info panel
-    private var infoPanelView: NSView!
-    private var infoIconView: NSImageView!
-    private var infoNameLabel: NSTextField!
-    private var infoKindLabel: NSTextField!
-    private var infoDetailLabels: [(key: NSTextField, value: NSTextField)] = []
-    private var infoPanelWidth: NSLayoutConstraint!
-    private var infoPanelVisible = false
-    private var toggleInfoButton: NSButton!
-
-    // Rebuild button and loading overlay
-    private var rebuildButton: NSButton!
+    // Loading overlay
     private var loadingOverlay: NSView?
     private var overlayHeadingLabel: NSTextField?
     private var overlaySubtextLabel: NSTextField?
     private var overlayShownAt: Date?
     private var isColdStart: Bool = true  // Default true until startup mode known
     private var overlayProgressIndicator: NSProgressIndicator?
-    private var inlineProgressIndicator: NSView?
+    private var isInlineProgressActive: Bool = false
     private var originalSearchPlaceholder: String { L("search.placeholder") }
 
     /// Tracks why the loading overlay is showing, so `onIndexReady` from
@@ -100,27 +71,11 @@ final class SearchWindow: NSWindowController {
     private enum IndexingState { case idle, initializing, rebuilding, failed }
     private var indexingState: IndexingState = .initializing
 
-    // Main split: table scroll + info panel
-    private var tableScrollView: NSScrollView!
-
-    // Icon cache
-    private var iconCache: [String: NSImage] = [:]
-
     // Shared formatters
-    private static let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy/M/d, HH:mm"
-        return f
-    }()
     private static let fullDateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateStyle = .long
         f.timeStyle = .medium
-        return f
-    }()
-    private static let sizeFormatter: ByteCountFormatter = {
-        let f = ByteCountFormatter()
-        f.countStyle = .file
         return f
     }()
     private static let countFormatter: NumberFormatter = {
@@ -133,19 +88,22 @@ final class SearchWindow: NSWindowController {
         self.engine = engine
 
         let window = LokiiWindow(
-            contentRect: defaultWindowFrame,
-            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            contentRect: Self.calculateDefaultWindowFrame(),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+        window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.title = "Lokii"
         window.toolbarStyle = .unified
-        window.minSize = NSSize(width: 700, height: 400)
-        window.contentMinSize = NSSize(width: 700, height: 370)
+        window.minSize = NSSize(width: 780, height: 420)
         window.isReleasedWhenClosed = false
 
         super.init(window: window)
+
+        splitViewController.delegate = self
+        window.contentViewController = splitViewController
 
         window.onEscape = { [weak self] in
             self?.hideWindowWithAnimation()
@@ -161,6 +119,17 @@ final class SearchWindow: NSWindowController {
         setupSearchModeMenu()
         setupNotifications()
         onLanguageChanged()
+
+        if engine.stats.isReady {
+            loadDefaultResults()
+        }
+    }
+
+    /// 一键恢复自适应默认窗口尺寸并清除持久化位置
+    @objc func resetToDefaultWindowFrame() {
+        guard let window else { return }
+        clearSavedWindowFrame()
+        window.animator().setFrame(defaultWindowFrame, display: true)
     }
 
     @available(*, unavailable)
@@ -212,6 +181,9 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func hideWindowWithAnimation() {
+        if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
+            QLPreviewPanel.shared().orderOut(nil)
+        }
         guard let window = window, window.isVisible else { return }
         
         // Remove scale pop on close for cleaner exit
@@ -226,19 +198,14 @@ final class SearchWindow: NSWindowController {
         })
     }
 
-    // MARK: - Toolbar item identifiers
-
-    private static let searchBarItem = NSToolbarItem.Identifier("searchBar")
-
     // MARK: - UI Setup
 
     private func setupUI() {
-        guard let contentView = window?.contentView,
-              let layoutGuide = window?.contentLayoutGuide as? NSLayoutGuide else { return }
-
-        // ── Toolbar with search field ──
+        // ── Toolbar with standard sidebar toggle, tracking separator, and search field ──
+        searchContainer.translatesAutoresizingMaskIntoConstraints = false
 
         searchField = NSSearchField()
+        searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.placeholderString = L("search.placeholder")
         searchField.font = .systemFont(ofSize: 14)
         searchField.focusRingType = .exterior
@@ -246,373 +213,29 @@ final class SearchWindow: NSWindowController {
         searchField.sendsSearchStringImmediately = false
         searchField.sendsWholeSearchString = false
 
-        countLabel = NSTextField(labelWithString: "")
-        countLabel.font = .systemFont(ofSize: 12)
-        countLabel.textColor = .secondaryLabelColor
-        countLabel.alignment = .right
-        countLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        searchContainer.addSubview(searchField)
 
-        // Toggle info panel button (sidebar icon)
-        toggleInfoButton = NSButton(image: NSImage(systemSymbolName: "sidebar.right",
-                                                   accessibilityDescription: "Toggle Info")!,
-                                    target: self, action: #selector(toggleInfoPanel))
-        toggleInfoButton.bezelStyle = .toolbar
-        toggleInfoButton.isBordered = false
-        toggleInfoButton.toolTip = L("search.toggleInfo")
+        NSLayoutConstraint.activate([
+            searchContainer.heightAnchor.constraint(equalToConstant: 28),
+            searchContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
+
+            searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
+            searchField.leadingAnchor.constraint(equalTo: searchContainer.leadingAnchor),
+            searchField.trailingAnchor.constraint(equalTo: searchContainer.trailingAnchor),
+            searchField.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            searchField.heightAnchor.constraint(equalToConstant: 28),
+        ])
 
         let toolbar = NSToolbar(identifier: "LokiiMainToolbar")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         window?.toolbar = toolbar
-
-        // Rebuild index button — placed in bottom bar, not toolbar
-        rebuildButton = NSButton(image: NSImage(systemSymbolName: "arrow.clockwise",
-                                                 accessibilityDescription: "Rebuild Index")!,
-                                  target: self, action: #selector(rebuildIndexClicked))
-        rebuildButton.bezelStyle = .toolbar
-        rebuildButton.isBordered = false
-        rebuildButton.toolTip = L("search.rebuildIndex")
-        rebuildButton.contentTintColor = .secondaryLabelColor
-
-        // ── Middle area: table + info panel side by side ──
-        let middleView = NSView()
-        middleView.translatesAutoresizingMaskIntoConstraints = false
-        middleView.wantsLayer = true
-        middleView.layer?.masksToBounds = true
-        contentView.addSubview(middleView)
-
-        // Table
-        tableView = SearchTableView()
-        tableView.style = .fullWidth
-        tableView.rowHeight = 20
-        tableView.intercellSpacing = NSSize(width: 0, height: 0)
-        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
-        tableView.allowsColumnReordering = true
-        tableView.allowsColumnResizing = true
-        tableView.allowsMultipleSelection = true
-        tableView.allowsColumnSelection = false
-        tableView.gridStyleMask = []
-        tableView.selectionHighlightStyle = .regular
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.dataSource = self
-        tableView.delegate = self
-        tableView.doubleAction = #selector(tableDoubleClicked)
-        tableView.target = self
-
-        addTableColumns()
-
-        tableScrollView = NSScrollView()
-        tableScrollView.translatesAutoresizingMaskIntoConstraints = false
-        tableScrollView.documentView = tableView
-        tableScrollView.hasVerticalScroller = true
-        tableScrollView.hasHorizontalScroller = false
-        tableScrollView.autohidesScrollers = true
-        tableScrollView.borderType = .noBorder
-        tableScrollView.drawsBackground = true
-        middleView.addSubview(tableScrollView)
-
-        // Info panel (right side, initially hidden)
-        setupInfoPanel(in: middleView)
-
-        // ── Bottom bar: path bar + status ──
-        let bottomBar = NSView()
-        bottomBar.translatesAutoresizingMaskIntoConstraints = false
-        bottomBar.wantsLayer = true
-        contentView.addSubview(bottomBar)
-
-        // Separator line above bottom bar
-        let separator = NSBox()
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        separator.boxType = .separator
-        contentView.addSubview(separator)
-
-        pathBar = NSPathControl()
-        pathBar.translatesAutoresizingMaskIntoConstraints = false
-        pathBar.pathStyle = .standard
-        pathBar.isEditable = false
-        pathBar.font = .systemFont(ofSize: 11)
-        pathBar.backgroundColor = .clear
-        pathBar.focusRingType = .none
-        pathBar.refusesFirstResponder = true
-        pathBar.target = self
-        pathBar.action = #selector(pathBarClicked)
-        pathBar.url = nil
-        pathBar.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        pathBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        bottomBar.addSubview(pathBar)
-
-        statusLabel = NSTextField(labelWithString: L("search.indexing"))
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .tertiaryLabelColor
-        statusLabel.alignment = .right
-        statusLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        bottomBar.addSubview(statusLabel)
-
-        // Container to stabilize anchor point for rotation
-        let rebuildContainer = CenterSpinContainerView()
-        rebuildContainer.translatesAutoresizingMaskIntoConstraints = false
-        bottomBar.addSubview(rebuildContainer)
-
-        rebuildButton.translatesAutoresizingMaskIntoConstraints = true
-        rebuildButton.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
-        rebuildButton.wantsLayer = true
-        rebuildContainer.addSubview(rebuildButton)
-
-        // ── Layout ──
-        NSLayoutConstraint.activate([
-            middleView.topAnchor.constraint(equalTo: layoutGuide.topAnchor),
-            middleView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            middleView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            middleView.bottomAnchor.constraint(equalTo: separator.topAnchor),
-            middleView.heightAnchor.constraint(greaterThanOrEqualToConstant: 300),
-
-            tableScrollView.topAnchor.constraint(equalTo: middleView.topAnchor),
-            tableScrollView.leadingAnchor.constraint(equalTo: middleView.leadingAnchor),
-            tableScrollView.bottomAnchor.constraint(equalTo: middleView.bottomAnchor),
-
-            separator.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            separator.bottomAnchor.constraint(equalTo: bottomBar.topAnchor),
-
-            bottomBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            bottomBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            bottomBar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            bottomBar.heightAnchor.constraint(equalToConstant: 24),
-
-            pathBar.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 8),
-            pathBar.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-            pathBar.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -8),
-
-            statusLabel.trailingAnchor.constraint(equalTo: rebuildContainer.leadingAnchor, constant: -4),
-            statusLabel.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-
-            rebuildContainer.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -8),
-            rebuildContainer.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-            rebuildContainer.widthAnchor.constraint(equalToConstant: 20),
-            rebuildContainer.heightAnchor.constraint(equalToConstant: 20),
-        ])
-
-        // Table takes full width when info panel hidden
-        tableScrollView.trailingAnchor.constraint(equalTo: infoPanelView.leadingAnchor).isActive = true
-
-        rebuildButton.isEnabled = false
-
-        // Context menu
-        let menu = NSMenu()
-        menu.addLocalizedItem("search.ctx.open", action: #selector(openSelected), keyEquivalent: "\r")
-        menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(revealSelected), keyEquivalent: "")
-        menu.addItem(NSMenuItem.separator())
-        menu.addLocalizedItem("search.ctx.copyPath", action: #selector(copyPath), keyEquivalent: "c")
-        menu.addLocalizedItem("search.ctx.copyName", action: #selector(copyName), keyEquivalent: "")
-        tableView.menu = menu
     }
 
-    private func addTableColumns() {
-        let nameCol = NSTableColumn(identifier: .columnName)
-        nameCol.title = L("search.col.name")
-        nameCol.width = 280
-        nameCol.minWidth = 140
-        nameCol.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true,
-                                                           selector: #selector(NSString.localizedStandardCompare(_:)))
-        tableView.addTableColumn(nameCol)
+    // MARK: - Panel Collapse Actions
 
-        let pathCol = NSTableColumn(identifier: .columnPath)
-        pathCol.title = L("search.col.path")
-        pathCol.width = 240
-        pathCol.minWidth = 100
-        pathCol.sortDescriptorPrototype = NSSortDescriptor(key: "path", ascending: true,
-            selector: #selector(NSString.localizedStandardCompare(_:)))
-        tableView.addTableColumn(pathCol)
-
-        let modifiedCol = NSTableColumn(identifier: .columnModified)
-        modifiedCol.title = L("search.col.dateModified")
-        modifiedCol.width = 160
-        modifiedCol.minWidth = 100
-        modifiedCol.sortDescriptorPrototype = NSSortDescriptor(key: "modified", ascending: false)
-        tableView.addTableColumn(modifiedCol)
-
-        let sizeCol = NSTableColumn(identifier: .columnSize)
-        sizeCol.title = L("search.col.size")
-        sizeCol.width = 80
-        sizeCol.minWidth = 50
-        sizeCol.headerCell.alignment = .right
-        sizeCol.sortDescriptorPrototype = NSSortDescriptor(key: "size", ascending: false)
-        tableView.addTableColumn(sizeCol)
-    }
-
-    // MARK: - Info Panel
-
-    private func setupInfoPanel(in parent: NSView) {
-        infoPanelView = ThemedBackgroundView()
-        infoPanelView.translatesAutoresizingMaskIntoConstraints = false
-        infoPanelView.wantsLayer = true
-        infoPanelView.layer?.masksToBounds = true
-        parent.addSubview(infoPanelView)
-
-        // Vertical separator
-        let sep = NSBox()
-        sep.translatesAutoresizingMaskIntoConstraints = false
-        sep.boxType = .separator
-        infoPanelView.addSubview(sep)
-
-        // Large icon
-        infoIconView = NSImageView()
-        infoIconView.translatesAutoresizingMaskIntoConstraints = false
-        infoIconView.imageScaling = .scaleProportionallyUpOrDown
-        infoPanelView.addSubview(infoIconView)
-
-        // Name
-        infoNameLabel = NSTextField(wrappingLabelWithString: "")
-        infoNameLabel.translatesAutoresizingMaskIntoConstraints = false
-        infoNameLabel.font = .boldSystemFont(ofSize: 13)
-        infoNameLabel.alignment = .center
-        infoNameLabel.maximumNumberOfLines = 2
-        infoNameLabel.lineBreakMode = .byTruncatingMiddle
-        infoPanelView.addSubview(infoNameLabel)
-
-        // Kind subtitle
-        infoKindLabel = NSTextField(labelWithString: "")
-        infoKindLabel.translatesAutoresizingMaskIntoConstraints = false
-        infoKindLabel.font = .systemFont(ofSize: 11)
-        infoKindLabel.textColor = .secondaryLabelColor
-        infoKindLabel.alignment = .center
-        infoPanelView.addSubview(infoKindLabel)
-
-        // Detail rows container
-        let detailStack = NSStackView()
-        detailStack.translatesAutoresizingMaskIntoConstraints = false
-        detailStack.orientation = .vertical
-        detailStack.alignment = .leading
-        detailStack.spacing = 4
-        infoPanelView.addSubview(detailStack)
-
-        let fields = [
-            L("search.info.kind"),
-            L("search.info.size"),
-            L("search.info.created"),
-            L("search.info.modified"),
-            L("search.info.where"),
-        ]
-        for (i, label) in fields.enumerated() {
-            let row = NSStackView()
-            row.orientation = .horizontal
-            row.spacing = 6
-            row.alignment = .top
-
-            let key = NSTextField(labelWithString: label)
-            key.font = .systemFont(ofSize: 11)
-            key.textColor = .secondaryLabelColor
-            key.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-            key.widthAnchor.constraint(equalToConstant: 60).isActive = true
-            key.alignment = .right
-
-            let value = NSTextField(wrappingLabelWithString: "—")
-            value.font = .systemFont(ofSize: 11)
-            value.textColor = .labelColor
-            value.maximumNumberOfLines = 2
-            value.lineBreakMode = .byTruncatingMiddle
-
-            if i == 4 {  // Where (last field)
-                value.maximumNumberOfLines = 0
-                value.lineBreakMode = .byCharWrapping
-            }
-
-            row.addArrangedSubview(key)
-            row.addArrangedSubview(value)
-            detailStack.addArrangedSubview(row)
-            infoDetailLabels.append((key: key, value: value))
-        }
-
-        infoPanelWidth = infoPanelView.widthAnchor.constraint(equalToConstant: 0)
-
-        NSLayoutConstraint.activate([
-            infoPanelView.topAnchor.constraint(equalTo: parent.topAnchor),
-            infoPanelView.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
-            infoPanelView.bottomAnchor.constraint(equalTo: parent.bottomAnchor),
-            infoPanelWidth,
-
-            sep.topAnchor.constraint(equalTo: infoPanelView.topAnchor),
-            sep.bottomAnchor.constraint(equalTo: infoPanelView.bottomAnchor),
-            sep.leadingAnchor.constraint(equalTo: infoPanelView.leadingAnchor),
-            sep.widthAnchor.constraint(equalToConstant: 1),
-
-            infoIconView.topAnchor.constraint(equalTo: infoPanelView.topAnchor, constant: 20),
-            infoIconView.centerXAnchor.constraint(equalTo: infoPanelView.centerXAnchor),
-            infoIconView.widthAnchor.constraint(equalToConstant: 64),
-            infoIconView.heightAnchor.constraint(equalToConstant: 64),
-
-            infoNameLabel.topAnchor.constraint(equalTo: infoIconView.bottomAnchor, constant: 8),
-            infoNameLabel.leadingAnchor.constraint(equalTo: sep.trailingAnchor, constant: 12),
-            infoNameLabel.trailingAnchor.constraint(equalTo: infoPanelView.trailingAnchor, constant: -12),
-
-            infoKindLabel.topAnchor.constraint(equalTo: infoNameLabel.bottomAnchor, constant: 2),
-            infoKindLabel.leadingAnchor.constraint(equalTo: infoNameLabel.leadingAnchor),
-            infoKindLabel.trailingAnchor.constraint(equalTo: infoNameLabel.trailingAnchor),
-
-            detailStack.topAnchor.constraint(equalTo: infoKindLabel.bottomAnchor, constant: 16),
-            detailStack.leadingAnchor.constraint(equalTo: sep.trailingAnchor, constant: 8),
-            detailStack.trailingAnchor.constraint(equalTo: infoPanelView.trailingAnchor, constant: -8),
-        ])
-    }
-
-    @objc private func toggleInfoPanel() {
-        infoPanelVisible.toggle()
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.25
-            // Swift, native snappy curve
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.4, 1.0)
-            ctx.allowsImplicitAnimation = true
-            infoPanelWidth.constant = infoPanelVisible ? 240 : 0
-            window?.contentView?.layoutSubtreeIfNeeded()
-        }) { [weak self] in
-            self?.tableView.sizeLastColumnToFit()
-        }
-        if infoPanelVisible {
-            updateInfoPanel()
-        }
-    }
-
-    private func updateInfoPanel() {
-        let row = tableView.selectedRow
-        guard row >= 0, row < results.count else {
-            infoIconView.image = nil
-            infoNameLabel.stringValue = ""
-            infoKindLabel.stringValue = ""
-            for (_, v) in infoDetailLabels { v.stringValue = "—" }
-            return
-        }
-        let result = results[row]
-
-        let icon = NSWorkspace.shared.icon(forFile: result.path)
-        icon.size = NSSize(width: 64, height: 64)
-        infoIconView.image = icon
-
-        infoNameLabel.stringValue = result.name
-        infoKindLabel.stringValue = kindDescription(for: result)
-
-        // Kind
-        infoDetailLabels[0].value.stringValue = kindDescription(for: result)
-
-        // Size
-        infoDetailLabels[1].value.stringValue = result.isDir ? "--"
-            : Self.sizeFormatter.string(fromByteCount: Int64(result.size))
-
-        // Created
-        if result.created > 0 {
-            let createdDate = Date(timeIntervalSince1970: TimeInterval(result.created))
-            infoDetailLabels[2].value.stringValue = Self.fullDateFormatter.string(from: createdDate)
-        } else {
-            infoDetailLabels[2].value.stringValue = "---"
-        }
-
-        // Modified
-        let date = Date(timeIntervalSince1970: TimeInterval(result.modified))
-        infoDetailLabels[3].value.stringValue = Self.fullDateFormatter.string(from: date)
-
-        // Where (parent dir)
-        let parent = (result.path as NSString).deletingLastPathComponent
-        infoDetailLabels[4].value.stringValue = abbreviatePath(parent)
+    @objc func toggleSidebar(_ sender: Any? = nil) {
+        splitViewController.toggleSidebar()
     }
 
     // MARK: - Search Mode Menu (on the magnifying glass)
@@ -678,32 +301,46 @@ final class SearchWindow: NSWindowController {
 
     @objc private func onLanguageChanged() {
         Self.fullDateFormatter.locale = L10n.locale
-        searchField.placeholderString = L(inlineProgressIndicator == nil ? "search.placeholder" : "search.indexingIncomplete")
-        toggleInfoButton.toolTip = L("search.toggleInfo")
-        toggleInfoButton.setAccessibilityLabel(L("search.toggleInfo"))
-        rebuildButton.toolTip = L("search.rebuildIndex")
-        rebuildButton.setAccessibilityLabel(L("search.rebuildIndex"))
-        let columns: [(NSUserInterfaceItemIdentifier, String)] = [
-            (.columnName, "search.col.name"), (.columnPath, "search.col.path"),
-            (.columnModified, "search.col.dateModified"), (.columnSize, "search.col.size"),
-        ]
-        for (identifier, key) in columns {
-            tableView.tableColumn(withIdentifier: identifier)?.title = L(key)
+        searchField.placeholderString = L(isInlineProgressActive ? "search.indexingIncomplete" : "search.placeholder")
+        if let toolbar = window?.toolbar {
+            for item in toolbar.items {
+                if item.itemIdentifier == .toggleSidebar {
+                    item.label = L("search.toggleSidebar")
+                    item.paletteLabel = L("search.toggleSidebar")
+                    item.toolTip = L("search.toggleSidebar")
+                } else if item.itemIdentifier == .searchField {
+                    item.label = L("search.placeholder")
+                    item.paletteLabel = L("search.placeholder")
+                } else if item.itemIdentifier == .resetWindowSize {
+                    item.label = L("window.resetSize")
+                    item.paletteLabel = L("window.resetSize")
+                    item.toolTip = L("window.resetSize")
+                    (item.view as? NSButton)?.toolTip = L("window.resetSize")
+                }
+            }
         }
-        tableView.headerView?.needsDisplay = true
-        let detailKeys = ["search.info.kind", "search.info.size", "search.info.created", "search.info.modified", "search.info.where"]
-        for (labels, key) in zip(infoDetailLabels, detailKeys) { labels.key.stringValue = L(key) }
-        tableView.menu?.refreshLocalizedTitles()
+        splitViewController.onLanguageChanged()
         if let menu = (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate {
             menu.title = L("search.mode.title")
             menu.refreshLocalizedTitles()
         }
-        statusLabel.stringValue = statusText.string
-        countLabel.stringValue = resultCountText.string
+        updateStatusLabel()
         overlayHeadingLabel?.stringValue = L("search.buildingIndex")
         overlaySubtextLabel?.stringValue = overlaySubtext.string
         refreshToastLabel?.stringValue = L("search.backgroundRefresh")
-        updateInfoPanel()
+    }
+
+    private func updateStatusLabel() {
+        let formatted: String
+        if let match = searchMatchText, !match.string.isEmpty {
+            let template = L("search.statusWithMatches")
+            formatted = template == "search.statusWithMatches"
+                ? "\(match.string) | \(statusText.string)"
+                : String(format: template, match.string, statusText.string)
+        } else {
+            formatted = statusText.string
+        }
+        searchResultsViewController.updateStatusText(formatted)
     }
 
     @objc private func onIndexProgress(_ note: Notification) {
@@ -746,8 +383,12 @@ final class SearchWindow: NSWindowController {
             } else {
                 hideInlineProgress()
             }
-            rebuildButton.isEnabled = true
+            searchResultsViewController.setRebuildEnabled(true)
+            searchResultsViewController.setRebuildSpinning(false)
             indexingState = .idle
+            if searchField.stringValue.isEmpty {
+                loadDefaultResults()
+            }
         case .rebuilding:
             guard source == "rebuild" else {
                 statusText = .formatted("search.indexedCount", formatCount(total))
@@ -755,8 +396,12 @@ final class SearchWindow: NSWindowController {
             }
             statusText = .formatted("search.indexedCount", formatCount(total))
             hideInlineProgress()
-            stopRebuildButtonAnimation()
+            searchResultsViewController.setRebuildSpinning(false)
+            searchResultsViewController.setRebuildEnabled(true)
             indexingState = .idle
+            if searchField.stringValue.isEmpty {
+                loadDefaultResults()
+            }
         case .idle:
             statusText = .formatted("search.indexedCount", formatCount(total))
         }
@@ -791,7 +436,8 @@ final class SearchWindow: NSWindowController {
         overlayProgressIndicator = nil
         hideInlineProgress()
         searchField.isEnabled = false
-        rebuildButton.isEnabled = false
+        searchResultsViewController.setRebuildEnabled(false)
+        searchResultsViewController.setRebuildSpinning(false)
         statusText = .key("search.initializationFailed")
 
         let alert = NSAlert()
@@ -866,6 +512,7 @@ final class SearchWindow: NSWindowController {
     // MARK: - Loading Overlay
 
     private func showLoadingOverlay(heading: String) {
+        searchField.isEnabled = false
         guard loadingOverlay == nil else {
             overlayHeadingLabel?.stringValue = heading
             return
@@ -979,6 +626,8 @@ final class SearchWindow: NSWindowController {
             return
         }
 
+        searchField.isEnabled = true
+
         // Accessibility: announce index ready
         if let mainWindow = NSApp.mainWindow {
             NSAccessibility.post(element: mainWindow as Any, notification: .announcementRequested,
@@ -1000,57 +649,14 @@ final class SearchWindow: NSWindowController {
     // MARK: - Inline Progress (Hot Start / Rebuild)
 
     private func showInlineProgress() {
-        guard inlineProgressIndicator == nil else { return }
-
-        // Small indeterminate spinner in status bar area (per D-06)
-        let spinnerContainer: NSView
-        if #available(macOS 14.0, *) {
-            let imageView = NSImageView()
-            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-            imageView.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)?.withSymbolConfiguration(config)
-            imageView.contentTintColor = .secondaryLabelColor
-            imageView.addSymbolEffect(.variableColor.iterative.reversing)
-            spinnerContainer = imageView
-        } else {
-            let pi = NSProgressIndicator()
-            pi.style = .spinning
-            pi.controlSize = .small
-            pi.isIndeterminate = true
-            pi.wantsLayer = true
-            pi.startAnimation(nil)
-            spinnerContainer = pi
-        }
-        spinnerContainer.translatesAutoresizingMaskIntoConstraints = false
-
-        // Insert spinner into bottom bar, before statusLabel
-        guard let bottomBar = statusLabel.superview else { return }
-        bottomBar.addSubview(spinnerContainer)
-        inlineProgressIndicator = spinnerContainer
-
-        // Layout: place spinner just before statusLabel (per D-07)
-        NSLayoutConstraint.activate([
-            spinnerContainer.trailingAnchor.constraint(equalTo: statusLabel.leadingAnchor, constant: -4),
-            spinnerContainer.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-            spinnerContainer.widthAnchor.constraint(equalToConstant: 16),
-            spinnerContainer.heightAnchor.constraint(equalToConstant: 16),
-        ])
-
-        // Change search field placeholder (per D-08)
+        isInlineProgressActive = true
+        searchResultsViewController.setInlineProgressVisible(true)
         searchField.placeholderString = L("search.indexingIncomplete")
     }
 
     private func hideInlineProgress() {
-        if let pi = inlineProgressIndicator as? NSProgressIndicator {
-            pi.stopAnimation(nil)
-        } else if #available(macOS 14.0, *) {
-            if let imageView = inlineProgressIndicator as? NSImageView {
-                imageView.removeAllSymbolEffects()
-            }
-        }
-        inlineProgressIndicator?.removeFromSuperview()
-        inlineProgressIndicator = nil
-
-        // Restore search field placeholder (per D-09)
+        isInlineProgressActive = false
+        searchResultsViewController.setInlineProgressVisible(false)
         searchField.placeholderString = originalSearchPlaceholder
     }
 
@@ -1070,7 +676,7 @@ final class SearchWindow: NSWindowController {
         contentView.addSubview(card)
 
         // Spinning refresh icon — wrapped in a stable container
-        let iconContainer = CenterSpinContainerView()
+        let iconContainer = SearchResultsCenterSpinContainerView()
         iconContainer.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(iconContainer)
 
@@ -1112,14 +718,7 @@ final class SearchWindow: NSWindowController {
         ])
 
         // Spin animation (must be linear to avoid stuttering)
-        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-        spin.fromValue = 0
-        spin.toValue = -CGFloat.pi * 2 // AppKit clockwise
-        spin.duration = 1.0
-        spin.repeatCount = .infinity
-        spin.timingFunction = CAMediaTimingFunction(name: .linear)
-        spin.isRemovedOnCompletion = false
-        iconView.layer?.add(spin, forKey: "spin")
+        iconView.layer?.addInfiniteSpin()
 
         // Fade in + Spring Scale for Apple native pop effect
         card.layer?.transform = CATransform3DMakeScale(0.8, 0.8, 1.0)
@@ -1164,63 +763,11 @@ final class SearchWindow: NSWindowController {
         }
 
         indexingState = .rebuilding
-        rebuildButton.isEnabled = false
-        startRebuildButtonAnimation()
+        searchResultsViewController.setRebuildEnabled(false)
+        searchResultsViewController.setRebuildSpinning(true)
         showInlineProgress()
         statusText = .key("search.indexing")
         engine.rebuildIndex()
-    }
-
-    private func startRebuildButtonAnimation() {
-        guard let layer = rebuildButton.layer else { return }
-
-        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
-        rotation.fromValue = 0
-        rotation.toValue = -CGFloat.pi * 2 // AppKit: negative is clockwise
-        rotation.duration = 1.0
-        rotation.repeatCount = .infinity
-        // Linear is strictly required for continuous rotation so it doesn't stutter
-        rotation.timingFunction = CAMediaTimingFunction(name: .linear)
-        rotation.isRemovedOnCompletion = false
-        layer.add(rotation, forKey: "spin")
-    }
-
-    private func stopRebuildButtonAnimation() {
-        guard let layer = rebuildButton.layer else { return }
-        
-        if let currentRotation = layer.presentation()?.value(forKeyPath: "transform.rotation.z") as? CGFloat {
-            layer.removeAnimation(forKey: "spin")
-            
-            let fullRotation = -CGFloat.pi * 2
-            var targetMultiplier = ceil(currentRotation / fullRotation)
-            // If it's too close to snapping, give it an extra spin to decelerate gracefully
-            if abs((targetMultiplier * fullRotation) - currentRotation) < 0.5 {
-                targetMultiplier += 1
-            }
-            let targetRotation = targetMultiplier * fullRotation
-            
-            CATransaction.begin()
-            CATransaction.setCompletionBlock {
-                layer.transform = CATransform3DIdentity
-                layer.removeAnimation(forKey: "stopSpin")
-            }
-            
-            let stop = CABasicAnimation(keyPath: "transform.rotation.z")
-            stop.fromValue = currentRotation
-            stop.toValue = targetRotation
-            stop.duration = 0.4
-            stop.timingFunction = CAMediaTimingFunction(controlPoints: 0.1, 0.7, 0.3, 1.0)
-            stop.fillMode = .forwards
-            stop.isRemovedOnCompletion = false
-            
-            layer.add(stop, forKey: "stopSpin")
-            CATransaction.commit()
-        } else {
-            layer.removeAnimation(forKey: "spin")
-        }
-        
-        rebuildButton.isEnabled = true
-        rebuildButton.contentTintColor = .secondaryLabelColor
     }
 
     // MARK: - Search
@@ -1235,14 +782,8 @@ final class SearchWindow: NSWindowController {
         searchWorkItem?.cancel()
 
         if query.isEmpty {
-            results = []
-            iconCache.removeAll()
-            tableView.sortDescriptors = []
-            tableView.reloadData()
-            resultCountText = .verbatim("")
-            pathBar.url = nil
-            let stats = engine.stats
-            statusText = stats.isReady ? .formatted("search.indexedCount", formatCount(stats.totalCount)) : .key("search.indexing")
+            searchResultsViewController.updateBottomPath(with: nil)
+            loadDefaultResults()
             return
         }
 
@@ -1255,35 +796,69 @@ final class SearchWindow: NSWindowController {
 
     private var isSearching = false
 
+    /// 搜索框为空时自动呈现全量索引文件与目录树（按文件名自然字母顺序排列，且清除匹配高亮）
+    private func loadDefaultResults() {
+        guard indexingState != .failed, !isSearching else { return }
+        isSearching = true
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let response = self.engine.search(query: "*", mode: .wildcard)
+            // 按文件名自然字母顺序（A-Z）排列，并清除匹配范围（默认未检索状态下不施加高亮）
+            let items: [FfiSearchResult] = response.results
+                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                .map { item in
+                    FfiSearchResult(
+                        name: item.name,
+                        path: item.path,
+                        isDir: item.isDir,
+                        size: item.size,
+                        modified: item.modified,
+                        created: item.created,
+                        extension: item.extension,
+                        score: item.score,
+                        matchPositions: [],
+                        parentMatchPositions: [],
+                        searchMode: item.searchMode
+                    )
+                }
+            let tree: ResultDirectoryTree? = items.isEmpty ? nil : ResultDirectoryTree.build(from: items)
+
+            DispatchQueue.main.async {
+                self.isSearching = false
+                guard self.indexingState != .failed else { return }
+                guard self.searchField.stringValue.isEmpty else { return }
+                self.splitViewController.updateSearchResults(rawResults: items, tree: tree)
+                self.searchMatchText = nil
+                self.updateStatusLabel()
+            }
+        }
+    }
+
     private func performSearch(query: String) {
         guard indexingState != .failed, !isSearching else { return }
         isSearching = true
-        resultCountText = .key("search.searching")
+        searchMatchText = .key("search.searching")
 
         let mode = currentMode
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.engine.search(query: query, mode: mode)
+            let tree: ResultDirectoryTree? = response.results.isEmpty ? nil : ResultDirectoryTree.build(from: response.results)
             DispatchQueue.main.async {
                 self.isSearching = false
                 guard self.indexingState != .failed else { return }
-                self.results = response.results
-                self.iconCache.removeAll()
-                self.tableView.sortDescriptors = []  // Reset sort to relevance order (D-06)
-                
-                // Crossfade animation for list refresh
-                let transition = CATransition()
-                transition.type = .fade
-                transition.duration = 0.15
-                transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                self.tableView.layer?.add(transition, forKey: "fade")
-                
-                self.tableView.reloadData()
+                self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
 
                 if let error = response.error {
-                    self.resultCountText = .verbatim(error)
+                    self.searchMatchText = .verbatim(error)
                 } else {
-                    self.resultCountText = .formatted("search.foundCount", self.formatCount(UInt64(self.results.count)))
+                    let count = response.results.count
+                    if count == 1 {
+                        self.searchMatchText = .key("search.matchedCount.one")
+                    } else {
+                        self.searchMatchText = .formatted("search.matchedCount", self.formatCount(UInt64(count)))
+                    }
                 }
 
                 // If user typed more while searching, trigger new search
@@ -1298,21 +873,8 @@ final class SearchWindow: NSWindowController {
 
     // MARK: - Actions
 
-    @objc private func pathBarClicked() {
-        guard let item = pathBar.clickedPathItem,
-              let url = item.url else { return }
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.path)
-    }
-
-    @objc private func tableDoubleClicked() {
-        let row = tableView.clickedRow
-        guard row >= 0, row < results.count else { return }
-        engine.openFile(path: results[row].path)
-    }
-
     private var selectedResults: [FfiSearchResult] {
-        let indices = tableView.selectedRowIndexes.filter { $0 >= 0 && $0 < results.count }
-        return indices.map { results[$0] }
+        searchResultsViewController.selectedResults
     }
 
     @objc private func openSelected() {
@@ -1323,269 +885,26 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    @objc private func revealSelected() {
-        let selected = selectedResults
-        guard !selected.isEmpty else { return }
-        if selected.count == 1 {
-            engine.revealInFinder(path: selected[0].path)
-        } else {
-            let urls = selected.map { URL(fileURLWithPath: $0.path) }
-            NSWorkspace.shared.activateFileViewerSelecting(urls)
-        }
-    }
-
-    @objc private func copyPath() {
-        copySelected(\.path)
-    }
-
-    @objc private func copyName() {
-        copySelected(\.name)
-    }
-
-    /// 以换行连接选区的指定字段写入剪贴板，便于直接粘贴到列表或脚本。
-    private func copySelected(_ field: KeyPath<FfiSearchResult, String>) {
-        let selected = selectedResults
-        guard !selected.isEmpty else { return }
-        let joined = selected.map { $0[keyPath: field] }.joined(separator: "\n")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(joined, forType: .string)
-    }
-
     // MARK: - Helpers
 
     private func formatCount(_ n: UInt64) -> String {
         Self.countFormatter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
-
-    private func iconForFile(at path: String, isDir: Bool) -> NSImage {
-        if let cached = iconCache[path] { return cached }
-        let icon = NSWorkspace.shared.icon(forFile: path)
-        icon.size = NSSize(width: 16, height: 16)
-        iconCache[path] = icon
-        return icon
-    }
-
-    fileprivate func kindDescription(for result: FfiSearchResult) -> String {
-        if result.isDir { return L("kind.folder") }
-
-        let ext = result.extension.lowercased()
-
-        // Tier 1: Custom mapping table — developer file types (D-07: custom map takes priority over UTType)
-        if !ext.isEmpty, let custom = FileKindMap.extensionToKind[ext] {
-            return custom
-        }
-
-        // Tier 2: UTType system description — PDF, PNG, MP3, etc. (D-08)
-        // CRITICAL: Must check isDeclared to avoid dyn.xxx identifiers for unknown extensions
-        if !ext.isEmpty, let uttype = UTType(filenameExtension: ext),
-           uttype.isDeclared,
-           let desc = uttype.localizedDescription {
-            return desc
-        }
-
-        // Tier 3: Fallback (D-09, D-10)
-        if ext.isEmpty {
-            return L("kind.document")  // D-10: no extension, non-directory
-        }
-        return "\(ext.uppercased()) \(L("kind.file"))"  // D-09: unknown extension -> "XYZ File"
-    }
-
-    private func abbreviatePath(_ path: String) -> String {
-        abbreviateHomePrefix(path).display
-    }
 }
 
-// MARK: - NSTableViewDataSource
+// MARK: - SearchMainSplitViewControllerDelegate
 
-extension SearchWindow: NSTableViewDataSource {
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        results.count
+extension SearchWindow: SearchMainSplitViewControllerDelegate {
+    func searchMainSplitViewDidSelect(result: FfiSearchResult?) {
+        searchResultsViewController.updateBottomPath(with: result?.path)
     }
 
-    func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
-        guard let descriptor = tableView.sortDescriptors.first,
-              let key = descriptor.key else { return }
-
-        results.sort { a, b in
-            let cmp: ComparisonResult
-            switch key {
-            case "name":
-                cmp = a.name.localizedStandardCompare(b.name)
-            case "path":
-                let pathA = (a.path as NSString).deletingLastPathComponent
-                let pathB = (b.path as NSString).deletingLastPathComponent
-                cmp = pathA.localizedStandardCompare(pathB)
-            case "modified":
-                if a.modified < b.modified { cmp = .orderedAscending }
-                else if a.modified > b.modified { cmp = .orderedDescending }
-                else { cmp = .orderedSame }
-            case "size":
-                if a.size < b.size { cmp = .orderedAscending }
-                else if a.size > b.size { cmp = .orderedDescending }
-                else { cmp = .orderedSame }
-            default:
-                cmp = .orderedSame
-            }
-            return descriptor.ascending ? cmp == .orderedAscending : cmp == .orderedDescending
-        }
-
-        // Clear selection (simpler than preserving; matches Finder behavior)
-        tableView.deselectAll(nil)
-        pathBar.url = nil
-        
-        let transition = CATransition()
-        transition.type = .fade
-        transition.duration = 0.15
-        transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        tableView.layer?.add(transition, forKey: "fade")
-        
-        tableView.reloadData()
-    }
-}
-
-// MARK: - NSTableViewDelegate
-
-extension SearchWindow: NSTableViewDelegate {
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < results.count, let column = tableColumn else { return nil }
-        let result = results[row]
-        let colID = column.identifier
-
-        switch colID {
-        case .columnName:
-            return nameCell(for: result, in: tableView)
-        case .columnPath:
-            return pathCell(for: result, in: tableView)
-        case .columnModified:
-            let date = Date(timeIntervalSince1970: TimeInterval(result.modified))
-            let str = Self.dateFormatter.string(from: date)
-            return textCell(string: str, font: .systemFont(ofSize: 13),
-                            color: .labelColor, alignment: .left, identifier: colID, in: tableView)
-        case .columnSize:
-            let str = result.isDir ? "--" : Self.sizeFormatter.string(fromByteCount: Int64(result.size))
-            return textCell(string: str, font: .monospacedDigitSystemFont(ofSize: 13, weight: .regular),
-                            color: .secondaryLabelColor, alignment: .right, identifier: colID, in: tableView)
-        default:
-            return nil
-        }
+    func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {
+        engine.openFile(path: result.path)
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        let row = tableView.selectedRow
-        if row >= 0, row < results.count {
-            pathBar.url = URL(fileURLWithPath: results[row].path)
-        } else {
-            pathBar.url = nil
-        }
-        if infoPanelVisible {
-            updateInfoPanel()
-        }
-    }
-
-    /// 构造单元格单行标签：统一关闭换行、滚动、编辑与背景绘制。
-    private func makeCellLabel(lineBreakMode: NSLineBreakMode = .byTruncatingTail,
-                               font: NSFont = .systemFont(ofSize: 13),
-                               color: NSColor? = nil,
-                               alignment: NSTextAlignment = .left) -> NSTextField {
-        let textField = NSTextField(labelWithString: "")
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.font = font
-        if let color { textField.textColor = color }
-        textField.alignment = alignment
-        textField.lineBreakMode = lineBreakMode
-        textField.maximumNumberOfLines = 1
-        textField.cell?.wraps = false
-        textField.cell?.isScrollable = false
-        textField.isEditable = false
-        textField.isBezeled = false
-        textField.drawsBackground = false
-        return textField
-    }
-
-    private func nameCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
-        let id = NSUserInterfaceItemIdentifier("NameCell")
-        if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
-            reused.imageView?.image = iconForFile(at: result.path, isDir: result.isDir)
-            reused.configure(name: result.name, matchPositions: result.matchPositions)
-            return reused
-        }
-
-        let cell = SearchNameTableCellView()
-        cell.identifier = id
-
-        let imageView = NSImageView()
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.image = iconForFile(at: result.path, isDir: result.isDir)
-        cell.addSubview(imageView)
-        cell.imageView = imageView
-
-        let textField = makeCellLabel(lineBreakMode: .byTruncatingTail)
-        cell.addSubview(textField)
-        cell.textField = textField
-
-        NSLayoutConstraint.activate([
-            imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            imageView.widthAnchor.constraint(equalToConstant: 16),
-            imageView.heightAnchor.constraint(equalToConstant: 16),
-            textField.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 4),
-            textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-            textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-
-        cell.configure(name: result.name, matchPositions: result.matchPositions)
-
-        return cell
-    }
-
-    private func pathCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
-        let id = NSUserInterfaceItemIdentifier("PathCell")
-        if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchPathTableCellView {
-            reused.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
-            return reused
-        }
-
-        let cell = SearchPathTableCellView()
-        cell.identifier = id
-
-        let textField = makeCellLabel(lineBreakMode: .byTruncatingMiddle)
-        cell.addSubview(textField)
-        cell.textField = textField
-
-        NSLayoutConstraint.activate([
-            textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-            textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-
-        cell.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
-        return cell
-    }
-
-    private func textCell(string: String, font: NSFont, color: NSColor, alignment: NSTextAlignment,
-                          identifier: NSUserInterfaceItemIdentifier, in tableView: NSTableView) -> NSView {
-        let cellID = NSUserInterfaceItemIdentifier(identifier.rawValue + "Cell")
-        if let reused = tableView.makeView(withIdentifier: cellID, owner: nil) as? NSTableCellView {
-            reused.textField?.stringValue = string
-            return reused
-        }
-
-        let cell = NSTableCellView()
-        cell.identifier = cellID
-
-        let textField = makeCellLabel(font: font, color: color, alignment: alignment)
-        textField.stringValue = string
-        cell.addSubview(textField)
-        cell.textField = textField
-
-        NSLayoutConstraint.activate([
-            textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-            textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-
-        return cell
+    func searchMainSplitViewDidRequestRebuild() {
+        rebuildIndexClicked()
     }
 }
 
@@ -1606,15 +925,6 @@ extension SearchWindow: NSWindowDelegate {
     }
 }
 
-// MARK: - Column Identifiers
-
-extension NSUserInterfaceItemIdentifier {
-    static let columnName = NSUserInterfaceItemIdentifier("Name")
-    static let columnPath = NSUserInterfaceItemIdentifier("Path")
-    static let columnSize = NSUserInterfaceItemIdentifier("Size")
-    static let columnModified = NSUserInterfaceItemIdentifier("DateModified")
-}
-
 // MARK: - NSSearchFieldDelegate
 
 extension SearchWindow: NSSearchFieldDelegate {
@@ -1623,232 +933,72 @@ extension SearchWindow: NSSearchFieldDelegate {
     }
 }
 
+// MARK: - Toolbar Item Identifiers
+
+extension NSToolbarItem.Identifier {
+    static let searchField = NSToolbarItem.Identifier("lokii.toolbar.searchField")
+    static let resetWindowSize = NSToolbarItem.Identifier("lokii.toolbar.resetWindowSize")
+}
+
 // MARK: - NSToolbarDelegate
 
 extension SearchWindow: NSToolbarDelegate {
-    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
-        guard itemIdentifier == Self.searchBarItem else { return nil }
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        switch itemIdentifier {
+        case .toggleSidebar:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = L("search.toggleSidebar")
+            item.paletteLabel = L("search.toggleSidebar")
+            item.toolTip = L("search.toggleSidebar")
+            return item
 
-        // Container holds searchField + countLabel + toggleInfoButton in a single toolbar item
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
+        case .sidebarTrackingSeparator:
+            return NSTrackingSeparatorToolbarItem(
+                identifier: itemIdentifier,
+                splitView: splitViewController.splitView,
+                dividerIndex: 0
+            )
 
-        searchField.translatesAutoresizingMaskIntoConstraints = true
-        countLabel.translatesAutoresizingMaskIntoConstraints = true
-        toggleInfoButton.translatesAutoresizingMaskIntoConstraints = true
+        case .searchField:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.view = searchContainer
+            item.label = L("search.placeholder")
+            item.paletteLabel = L("search.placeholder")
+            item.isNavigational = true
+            return item
 
-        searchField.translatesAutoresizingMaskIntoConstraints = false
-        countLabel.translatesAutoresizingMaskIntoConstraints = false
-        toggleInfoButton.translatesAutoresizingMaskIntoConstraints = false
+        case .resetWindowSize:
+            let button = NSButton()
+            button.image = NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left", accessibilityDescription: L("window.resetSize"))
+            button.bezelStyle = .toolbar
+            button.isBordered = false
+            button.toolTip = L("window.resetSize")
+            button.contentTintColor = .secondaryLabelColor
+            button.target = self
+            button.action = #selector(resetToDefaultWindowFrame)
 
-        container.addSubview(searchField)
-        container.addSubview(countLabel)
-        container.addSubview(toggleInfoButton)
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.view = button
+            item.label = L("window.resetSize")
+            item.paletteLabel = L("window.resetSize")
+            item.toolTip = L("window.resetSize")
+            return item
 
-        countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        countLabel.setContentHuggingPriority(.required, for: .horizontal)
-        toggleInfoButton.setContentHuggingPriority(.required, for: .horizontal)
-        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        NSLayoutConstraint.activate([
-            searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            searchField.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-
-            countLabel.leadingAnchor.constraint(equalTo: searchField.trailingAnchor, constant: 10),
-            countLabel.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-
-            toggleInfoButton.leadingAnchor.constraint(equalTo: countLabel.trailingAnchor, constant: 8),
-            toggleInfoButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            toggleInfoButton.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            toggleInfoButton.widthAnchor.constraint(equalToConstant: 28),
-
-            container.heightAnchor.constraint(equalToConstant: 28),
-        ])
-
-        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-        item.view = container
-        item.label = ""
-        item.isNavigational = true  // Expand to fill available toolbar space
-        return item
+        default:
+            return nil
+        }
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.searchBarItem]
+        [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .resetWindowSize]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.searchBarItem]
+        [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .resetWindowSize]
     }
 }
 
-// MARK: - Themed Background View
-final class ThemedBackgroundView: NSView {
-    override var wantsUpdateLayer: Bool { true }
-
-    override func updateLayer() {
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        updateLayer()
-    }
-}
-
-// MARK: - Highlighted Table Cell Views
-
-/// 用户家目录，进程内恒定。
-private let homeDirectory = NSHomeDirectory()
-
-/// 家目录缩写结果：展示串与换算所需的前缀字节数。
-private struct AbbreviatedHomePath {
-    let display: String
-    /// 被 '~' 替换掉的前缀字节数；为 0 表示未发生缩写。
-    let prefixBytes: Int
-
-    /// 把原串的 UTF-8 字节区间映射到展示串。
-    ///
-    /// 起点落在被缩写前缀内的区间没有对应字符，返回 nil 交由调用方丢弃。
-    func displayRange(for range: FfiMatchRange) -> (start: Int, end: Int)? {
-        let start = Int(range.start)
-        guard start >= prefixBytes else { return nil }
-        // '~' 占 1 字节，故整体前移 (prefixBytes - 1)；prefixBytes 为 0 时位移取 0
-        let shift = max(prefixBytes - 1, 0)
-        return (start - shift, Int(range.end) - shift)
-    }
-}
-
-/// 把路径开头的家目录前缀缩写为 '~'；无需缩写时原样返回。
-private func abbreviateHomePrefix(_ path: String) -> AbbreviatedHomePath {
-    // 必须精确匹配家目录或其子路径，避免误伤同名前缀的其他目录
-    guard path == homeDirectory || path.hasPrefix(homeDirectory + "/") else {
-        return AbbreviatedHomePath(display: path, prefixBytes: 0)
-    }
-
-    let prefixIndex = path.index(path.startIndex, offsetBy: homeDirectory.count)
-    // 直接量 path 切片内的实际字节数，规避 NFC/NFD 规范化差异带来的偏移
-    let prefixBytes = path[..<prefixIndex].utf8.count
-    return AbbreviatedHomePath(display: "~" + path[prefixIndex...], prefixBytes: prefixBytes)
-}
-
-/// 高亮单元格基类：统一字体、选中态配色与高亮渲染。
-///
-/// 展示串与 NSRange 在 `setDisplay` 阶段算好缓存，选中态变化只重新着色。
-private class SearchHighlightCellView: NSTableCellView {
-    /// 未选中时的基准字色。
-    var baseColor: NSColor { .labelColor }
-    /// 选中态下基准字色的不透明度，突出命中字符。
-    var selectedAlpha: CGFloat { 1 }
-
-    /// 字号恒定，字体对象全类复用。
-    private static let regularFont = NSFont.systemFont(ofSize: 13)
-    private static let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
-
-    private var displayString = ""
-    private var displayRanges: [NSRange] = []
-
-    override var backgroundStyle: NSView.BackgroundStyle {
-        didSet {
-            renderText()
-        }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        renderText()
-    }
-
-    /// 更新展示串与 UTF-8 字节高亮区间；区间在此一次性换算为 NSRange 并缓存。
-    func setDisplay(_ string: String, ranges: [(start: Int, end: Int)]) {
-        displayString = string
-        displayRanges = Self.nsRanges(in: string, byteRanges: ranges)
-        renderText()
-    }
-
-    /// 后端下发的是 UTF-8 字节偏移，需夹取后映射为 NSRange。
-    private static func nsRanges(in string: String,
-                                 byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
-        let utf8 = string.utf8
-        return byteRanges.compactMap { range in
-            guard range.start < range.end,
-                  let start = utf8.index(utf8.startIndex, offsetBy: range.start, limitedBy: utf8.endIndex),
-                  let end = utf8.index(utf8.startIndex, offsetBy: range.end, limitedBy: utf8.endIndex),
-                  start < end else {
-                return nil
-            }
-            return NSRange(start..<end, in: string)
-        }
-    }
-
-    private func renderText() {
-        guard !displayString.isEmpty else {
-            textField?.stringValue = ""
-            return
-        }
-
-        let isSelected = backgroundStyle == .emphasized
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(selectedAlpha) : baseColor
-        let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
-
-        let attributed = NSMutableAttributedString(string: displayString, attributes: [
-            .font: Self.regularFont,
-            .foregroundColor: defaultColor,
-        ])
-
-        for range in displayRanges {
-            attributed.addAttributes([
-                .font: Self.boldFont,
-                .foregroundColor: highlightColor,
-            ], range: range)
-        }
-        textField?.attributedStringValue = attributed
-    }
-}
-
-// MARK: - Search Name Table Cell View
-
-private final class SearchNameTableCellView: SearchHighlightCellView {
-    /// 选中态下普通字符用微透明白保持层级，命中字符用纯白加粗突出。
-    override var selectedAlpha: CGFloat { 0.82 }
-
-    func configure(name: String, matchPositions: [FfiMatchRange]) {
-        setDisplay(name, ranges: matchPositions.map { (Int($0.start), Int($0.end)) })
-    }
-}
-
-// MARK: - Search Path Table Cell View
-
-/// 路径列单元格：父目录高亮 + 家目录缩写重映射。
-private final class SearchPathTableCellView: SearchHighlightCellView {
-    override var baseColor: NSColor { .secondaryLabelColor }
-    override var selectedAlpha: CGFloat { 0.75 }
-
-    func configure(fullPath: String, parentMatchPositions: [FfiMatchRange]) {
-        let parent = (fullPath as NSString).deletingLastPathComponent
-        guard !parent.isEmpty else {
-            setDisplay("", ranges: [])
-            return
-        }
-
-        let abbreviated = abbreviateHomePrefix(parent)
-        setDisplay(abbreviated.display,
-                   ranges: parentMatchPositions.compactMap { abbreviated.displayRange(for: $0) })
-    }
-}
-
-// MARK: - NSMenuItemValidation
-
-extension SearchWindow: NSMenuItemValidation {
-    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        switch menuItem.action {
-        case #selector(openSelected),
-             #selector(revealSelected),
-             #selector(copyPath),
-             #selector(copyName):
-            return !selectedResults.isEmpty
-        default:
-            return true
-        }
-    }
-}

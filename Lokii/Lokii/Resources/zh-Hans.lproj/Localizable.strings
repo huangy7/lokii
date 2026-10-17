@@ -117,8 +117,9 @@
 "search.placeholder" = "搜索文件...";
 
 /* SearchWindow - toolbar */
-"search.toggleInfo" = "显示或隐藏详情面板";
+"search.toggleSidebar" = "切换侧边栏";
 "search.rebuildIndex" = "重建索引";
+"window.resetSize" = "恢复默认窗口大小";
 
 /* SearchWindow - status */
 "search.indexing" = "正在索引...";
@@ -131,7 +132,9 @@
 "search.scannedCount" = "已扫描 %@ 个文件";
 "search.indexingCount" = "正在索引 %@ 个文件...";
 "search.indexedCount" = "已索引 %@ 个文件";
-"search.foundCount" = "找到 %@ 个文件";
+"search.matchedCount" = "已匹配 %@ 项";
+"search.matchedCount.one" = "已匹配 1 项";
+"search.statusWithMatches" = "%1$@ | %2$@";
 "search.indexReady" = "索引已就绪";
 
 /* SearchWindow - context menu */
@@ -140,18 +143,15 @@
 "search.ctx.copyPath" = "拷贝路径";
 "search.ctx.copyName" = "拷贝名称";
 
+/* SearchWindow - sidebar */
+"search.sidebar.emptyHint" = "输入关键词后在此查看目录分布";
+"search.sidebar.allResults" = "全部结果";
+
 /* SearchWindow - table columns */
 "search.col.name" = "名称";
 "search.col.path" = "路径";
 "search.col.dateModified" = "修改日期";
 "search.col.size" = "大小";
-
-/* SearchWindow - info panel */
-"search.info.kind" = "种类";
-"search.info.size" = "大小";
-"search.info.created" = "创建时间";
-"search.info.modified" = "修改时间";
-"search.info.where" = "位置";
 
 /* SearchWindow - search mode */
 "search.mode.title" = "搜索模式";

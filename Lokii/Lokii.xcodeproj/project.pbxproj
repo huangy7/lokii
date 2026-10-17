@@ -27,11 +27,14 @@
 		7472ED6EAE1690E80EB277EB /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 315BC0505768DC1262CABEDA /* main.swift */; };
 		76F036A0CA671FE174936DA4 /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A96470450AEE87C889A593F5 /* Recorder.swift */; };
 		857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */; };
+		87860C9B63B288E5747D5F5E /* SidebarTreeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D0F2BCF8E46E2EBC3770B95 /* SidebarTreeViewController.swift */; };
+		92AC1F76A67199CD539E3A27 /* SearchMainSplitViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4C9FAED6C7E08E9EE9C482 /* SearchMainSplitViewController.swift */; };
+		936E3DE734BD1E2769EEE65C /* SearchResultsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13D34F183E4D57DC9DB688CD /* SearchResultsViewController.swift */; };
 		9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD267E77C749892BFB3B6BFA /* SearchWindow.swift */; };
+		AEA8B664BE46D819FA9CEC5E /* ResultDirectoryTree.swift in Sources */ = {isa = PBXBuildFile; fileRef = 029F8156A3FE4133E39F1024 /* ResultDirectoryTree.swift */; };
 		CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = E44E26FAF1C1762428B98CEB /* Utilities.swift */; };
 		D845C945605829EFD6777B02 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */; };
 		DB72F207E9C6F823A2970A05 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 732101997548517319E501C8 /* Sparkle */; };
-		E4CC034498F0BD54589D670D /* FileKindMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */; };
 		E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8727ED2D2029A80C7739E625 /* ViewModifiers.swift */; };
 		E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */; };
 		E8F36883205D0492A3F9917E /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 32DCF9A42DF27EEDA3F2ED92 /* Localizable.strings */; };
@@ -41,9 +44,11 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		029F8156A3FE4133E39F1024 /* ResultDirectoryTree.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultDirectoryTree.swift; sourceTree = "<group>"; };
 		04B808522771C196E501D47E /* ThemeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeManager.swift; sourceTree = "<group>"; };
 		0EEF1864B7BFEBFEB32B4C84 /* Lokii.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Lokii.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13527D399236306E42D34EB3 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
+		13D34F183E4D57DC9DB688CD /* SearchResultsViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchResultsViewController.swift; sourceTree = "<group>"; };
 		1ABEB6DD96D45D2B3AB5A122 /* lokii_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = lokii_core.swift; sourceTree = "<group>"; };
 		245A938DDC4CD962CF827FD1 /* Lokii.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Lokii.entitlements; sourceTree = "<group>"; };
 		2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -52,13 +57,14 @@
 		4945594BBD178DAC175979A5 /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
 		53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcuts.swift; sourceTree = "<group>"; };
 		65BA160DCBC72B8377D8BDE6 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
-		695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileKindMap.swift; sourceTree = "<group>"; };
 		6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LokiiWindow.swift; sourceTree = "<group>"; };
 		71E72A2DABCA6C6F23E1053A /* Shortcut.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shortcut.swift; sourceTree = "<group>"; };
 		76AE17B289006D96A51F7B4B /* RecorderCocoa.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderCocoa.swift; sourceTree = "<group>"; };
 		85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
 		8727ED2D2029A80C7739E625 /* ViewModifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModifiers.swift; sourceTree = "<group>"; };
 		8B947458DDBFC6998183062C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		8D0F2BCF8E46E2EBC3770B95 /* SidebarTreeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarTreeViewController.swift; sourceTree = "<group>"; };
+		8D4C9FAED6C7E08E9EE9C482 /* SearchMainSplitViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchMainSplitViewController.swift; sourceTree = "<group>"; };
 		927DA1B3D54D6EE81E6EE89C /* Name.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Name.swift; sourceTree = "<group>"; };
 		947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSMenuItem++.swift"; sourceTree = "<group>"; };
 		A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizedMenu.swift; sourceTree = "<group>"; };
@@ -97,7 +103,6 @@
 				2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */,
 				CBF42044E61241F1D42161BC /* FDAGuideView.swift */,
 				C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */,
-				695422B3A5FB5EBC85A0D766 /* FileKindMap.swift */,
 				8B947458DDBFC6998183062C /* Info.plist */,
 				4945594BBD178DAC175979A5 /* L10n.swift */,
 				A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */,
@@ -107,9 +112,13 @@
 				315BC0505768DC1262CABEDA /* main.swift */,
 				CD253FF760C302BEBDAD521E /* PreferencesView.swift */,
 				A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */,
+				029F8156A3FE4133E39F1024 /* ResultDirectoryTree.swift */,
 				379816002C0A5D5D8096C54B /* SearchEngine.swift */,
+				8D4C9FAED6C7E08E9EE9C482 /* SearchMainSplitViewController.swift */,
+				13D34F183E4D57DC9DB688CD /* SearchResultsViewController.swift */,
 				CD267E77C749892BFB3B6BFA /* SearchWindow.swift */,
 				BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */,
+				8D0F2BCF8E46E2EBC3770B95 /* SidebarTreeViewController.swift */,
 				04B808522771C196E501D47E /* ThemeManager.swift */,
 				260F6214BF9ED6B99CC06647 /* KeyboardShortcuts */,
 				AC5F4C27F9F94A645F5F7458 /* Resources */,
@@ -244,7 +253,6 @@
 				857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */,
 				6C65440D3707233BEDDD2F59 /* FDAGuideView.swift in Sources */,
 				F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */,
-				E4CC034498F0BD54589D670D /* FileKindMap.swift in Sources */,
 				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
 				3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */,
 				55670C6273A3B5887190D820 /* L10n.swift in Sources */,
@@ -256,10 +264,14 @@
 				368436915AC064B1A3606C73 /* PreferencesWindowController.swift in Sources */,
 				76F036A0CA671FE174936DA4 /* Recorder.swift in Sources */,
 				6B5B50FC9B03A912526CECD0 /* RecorderCocoa.swift in Sources */,
+				AEA8B664BE46D819FA9CEC5E /* ResultDirectoryTree.swift in Sources */,
 				72AA0A7A1F0334891902B63B /* SearchEngine.swift in Sources */,
+				92AC1F76A67199CD539E3A27 /* SearchMainSplitViewController.swift in Sources */,
+				936E3DE734BD1E2769EEE65C /* SearchResultsViewController.swift in Sources */,
 				9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */,
 				FE8E1519D288E897B2E0A137 /* SettingsComponents.swift in Sources */,
 				F25F859C77AB2A06F57CC09F /* Shortcut.swift in Sources */,
+				87860C9B63B288E5747D5F5E /* SidebarTreeViewController.swift in Sources */,
 				43E1EA3946E3F6FDE146A8EB /* ThemeManager.swift in Sources */,
 				CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */,
 				E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */,
