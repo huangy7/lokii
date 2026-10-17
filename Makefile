@@ -36,6 +36,12 @@ release:
 test: bindings
 	@cargo test --workspace --target $(RUST_TARGET)
 	@cd Lokii && LOKII_RUST_TARGET=$(RUST_TARGET) swift build --arch $(ARCH)
+	@swift tests/result_directory_tree_test.swift
+	@swift tests/search_results_view_controller_test.swift
+	@swift tests/sidebar_tree_view_controller_test.swift
+	@swift tests/toolbar_test.swift
+	@swift tests/split_view_controller_test.swift
+
 
 check:
 	@cargo check --workspace --all-targets --target $(RUST_TARGET)
