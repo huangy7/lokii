@@ -26,20 +26,18 @@ private final class CenterSpinContainerView: NSView {
     }
 }
 
-/// 原生 AppKit 高信息密度虚拟列表，封装右键智能选区联动与前台即时响应机制。
+/// 搜索结果虚拟列表：右键联动选区，非激活状态下点击即选中。
 private final class SearchTableView: NSTableView {
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         let row = self.row(at: point)
 
-        // 边界守卫：点击虚拟列表末尾空白区域时阻断上下文菜单，规避悬空操作
-        guard row >= 0 && row < numberOfRows else {
+        // 空白区域不弹菜单；row(at:) 对非行区域返回 -1，非负即已排除越界
+        guard row >= 0 else {
             return nil
         }
 
-        // 选区智能维护：
-        // 若右键命中的行未被包含在当前选区，则将选区收拢重置为该单行；
-        // 若命中的行已在选中集合内（例如用户已多选多项），则完整保持多选集合不被破坏。
+        // 命中行不在选区内时收拢为单行；已在选区内则保持多选集合，避免误清空
         if !selectedRowIndexes.contains(row) {
             selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
@@ -47,7 +45,7 @@ private final class SearchTableView: NSTableView {
         return super.menu(for: event)
     }
 
-    // 视窗在非激活状态下接收初次点按，保证点击即选中，消除二次点击开销
+    // 非激活状态下点击即选中，省掉一次用于激活窗口的点击
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
     }
@@ -1337,17 +1335,18 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func copyPath() {
-        let selected = selectedResults
-        guard !selected.isEmpty else { return }
-        let joined = selected.map(\.path).joined(separator: "\n")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(joined, forType: .string)
+        copySelected(\.path)
     }
 
     @objc private func copyName() {
+        copySelected(\.name)
+    }
+
+    /// 以换行连接选区的指定字段写入剪贴板，便于直接粘贴到列表或脚本。
+    private func copySelected(_ field: KeyPath<FfiSearchResult, String>) {
         let selected = selectedResults
         guard !selected.isEmpty else { return }
-        let joined = selected.map(\.name).joined(separator: "\n")
+        let joined = selected.map { $0[keyPath: field] }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(joined, forType: .string)
     }
@@ -1483,11 +1482,16 @@ extension SearchWindow: NSTableViewDelegate {
         }
     }
 
-    /// 构造表格单元格内的单行标签：统一关闭换行、滚动、编辑与背景绘制。
-    private func makeCellLabel(lineBreakMode: NSLineBreakMode) -> NSTextField {
+    /// 构造单元格单行标签：统一关闭换行、滚动、编辑与背景绘制。
+    private func makeCellLabel(lineBreakMode: NSLineBreakMode = .byTruncatingTail,
+                               font: NSFont = .systemFont(ofSize: 13),
+                               color: NSColor? = nil,
+                               alignment: NSTextAlignment = .left) -> NSTextField {
         let textField = NSTextField(labelWithString: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.font = .systemFont(ofSize: 13)
+        textField.font = font
+        if let color { textField.textColor = color }
+        textField.alignment = alignment
         textField.lineBreakMode = lineBreakMode
         textField.maximumNumberOfLines = 1
         textField.cell?.wraps = false
@@ -1502,10 +1506,6 @@ extension SearchWindow: NSTableViewDelegate {
         let id = NSUserInterfaceItemIdentifier("NameCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
             reused.imageView?.image = iconForFile(at: result.path, isDir: result.isDir)
-            if let tf = reused.textField {
-                tf.maximumNumberOfLines = 1
-                tf.cell?.wraps = false
-            }
             reused.configure(name: result.name, matchPositions: result.matchPositions)
             return reused
         }
@@ -1574,15 +1574,8 @@ extension SearchWindow: NSTableViewDelegate {
         let cell = NSTableCellView()
         cell.identifier = cellID
 
-        let textField = NSTextField(labelWithString: string)
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.font = font
-        textField.textColor = color
-        textField.alignment = alignment
-        textField.lineBreakMode = .byTruncatingTail
-        textField.isEditable = false
-        textField.isBezeled = false
-        textField.drawsBackground = false
+        let textField = makeCellLabel(font: font, color: color, alignment: alignment)
+        textField.stringValue = string
         cell.addSubview(textField)
         cell.textField = textField
 
@@ -1704,47 +1697,55 @@ final class ThemedBackgroundView: NSView {
 
 // MARK: - Highlighted Table Cell Views
 
-/// 用户家目录，进程生命周期内恒定。
+/// 用户家目录，进程内恒定。
 private let homeDirectory = NSHomeDirectory()
 
-/// 家目录缩写结果：展示串与被替换前缀的 UTF-8 字节数。
+/// 家目录缩写结果：展示串与换算所需的前缀字节数。
 private struct AbbreviatedHomePath {
     let display: String
-    /// 被替换的家目录前缀字节数；高亮区间起点落在此范围内即属于被缩写部分。
+    /// 被 '~' 替换掉的前缀字节数；为 0 表示未发生缩写。
     let prefixBytes: Int
-    /// 展示串相对原串净减少的字节数，用于平移命中区间。
-    let byteDelta: Int
+
+    /// 把原串的 UTF-8 字节区间映射到展示串。
+    ///
+    /// 起点落在被缩写前缀内的区间没有对应字符，返回 nil 交由调用方丢弃。
+    func displayRange(for range: FfiMatchRange) -> (start: Int, end: Int)? {
+        let start = Int(range.start)
+        guard start >= prefixBytes else { return nil }
+        // '~' 占 1 字节，故整体前移 (prefixBytes - 1)；prefixBytes 为 0 时位移取 0
+        let shift = max(prefixBytes - 1, 0)
+        return (start - shift, Int(range.end) - shift)
+    }
 }
 
-/// 将路径开头的家目录前缀缩写为 '~'；无需缩写时原样返回。
+/// 把路径开头的家目录前缀缩写为 '~'；无需缩写时原样返回。
 private func abbreviateHomePrefix(_ path: String) -> AbbreviatedHomePath {
-    // 关键守卫：必须完全匹配家目录或以家目录+斜杠为前缀，避免虚假匹配同名开头的其他目录
+    // 必须精确匹配家目录或其子路径，避免误伤同名前缀的其他目录
     guard path == homeDirectory || path.hasPrefix(homeDirectory + "/") else {
-        return AbbreviatedHomePath(display: path, prefixBytes: 0, byteDelta: 0)
+        return AbbreviatedHomePath(display: path, prefixBytes: 0)
     }
 
     let prefixIndex = path.index(path.startIndex, offsetBy: homeDirectory.count)
-    // 直接测量 path 切片内部实际的 UTF-8 字节数，免疫 NFC 与 NFD 规范化形式不一致导致的偏移偏差
+    // 直接量 path 切片内的实际字节数，规避 NFC/NFD 规范化差异带来的偏移
     let prefixBytes = path[..<prefixIndex].utf8.count
-    return AbbreviatedHomePath(
-        display: "~" + path[prefixIndex...],
-        prefixBytes: prefixBytes,
-        byteDelta: prefixBytes - 1
-    )
+    return AbbreviatedHomePath(display: "~" + path[prefixIndex...], prefixBytes: prefixBytes)
 }
 
-/// 高亮单元格基类：统一名称列与路径列的字体、选中态配色阶梯与 UTF-8 字节区间渲染。
+/// 高亮单元格基类：统一字体、选中态配色与高亮渲染。
 ///
-/// 展示串与命中区间在 `configure` 阶段算好并缓存，选中态变化只重新着色，
-/// 避免 AppKit 每次回填选中态时重跑字符串换算。
-class SearchHighlightCellView: NSTableCellView {
+/// 展示串与 NSRange 在 `setDisplay` 阶段算好缓存，选中态变化只重新着色。
+private class SearchHighlightCellView: NSTableCellView {
     /// 未选中时的基准字色。
     var baseColor: NSColor { .labelColor }
-    /// 选中态下基准字色的不透明度，保留命中字符的视觉焦点。
+    /// 选中态下基准字色的不透明度，突出命中字符。
     var selectedAlpha: CGFloat { 1 }
 
+    /// 字号恒定，字体对象全类复用。
+    private static let regularFont = NSFont.systemFont(ofSize: 13)
+    private static let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
+
     private var displayString = ""
-    private var displayRanges: [(start: Int, end: Int)] = []
+    private var displayRanges: [NSRange] = []
 
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet {
@@ -1757,11 +1758,26 @@ class SearchHighlightCellView: NSTableCellView {
         renderText()
     }
 
-    /// 更新展示串与 UTF-8 字节高亮区间。
+    /// 更新展示串与 UTF-8 字节高亮区间；区间在此一次性换算为 NSRange 并缓存。
     func setDisplay(_ string: String, ranges: [(start: Int, end: Int)]) {
         displayString = string
-        displayRanges = ranges
+        displayRanges = Self.nsRanges(in: string, byteRanges: ranges)
         renderText()
+    }
+
+    /// 后端下发的是 UTF-8 字节偏移，需夹取后映射为 NSRange。
+    private static func nsRanges(in string: String,
+                                 byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
+        let utf8 = string.utf8
+        return byteRanges.compactMap { range in
+            guard range.start < range.end,
+                  let start = utf8.index(utf8.startIndex, offsetBy: range.start, limitedBy: utf8.endIndex),
+                  let end = utf8.index(utf8.startIndex, offsetBy: range.end, limitedBy: utf8.endIndex),
+                  start < end else {
+                return nil
+            }
+            return NSRange(start..<end, in: string)
+        }
     }
 
     private func renderText() {
@@ -1770,31 +1786,21 @@ class SearchHighlightCellView: NSTableCellView {
             return
         }
 
-        let regularFont = NSFont.systemFont(ofSize: 13)
-        let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
         let isSelected = backgroundStyle == .emphasized
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(selectedAlpha) : baseColor
         let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
 
         let attributed = NSMutableAttributedString(string: displayString, attributes: [
-            .font: regularFont,
+            .font: Self.regularFont,
             .foregroundColor: defaultColor,
         ])
 
-        // 后端下发的高亮区间基于 UTF-8 字节偏移，需按字节安全夹取后再映射为 NSRange
-        let utf8 = displayString.utf8
         for range in displayRanges {
-            guard range.start < range.end,
-                  let start = utf8.index(utf8.startIndex, offsetBy: range.start, limitedBy: utf8.endIndex),
-                  let end = utf8.index(utf8.startIndex, offsetBy: range.end, limitedBy: utf8.endIndex),
-                  start < end else {
-                continue
-            }
             attributed.addAttributes([
-                .font: boldFont,
+                .font: Self.boldFont,
                 .foregroundColor: highlightColor,
-            ], range: NSRange(start..<end, in: displayString))
+            ], range: range)
         }
         textField?.attributedStringValue = attributed
     }
@@ -1802,8 +1808,8 @@ class SearchHighlightCellView: NSTableCellView {
 
 // MARK: - Search Name Table Cell View
 
-final class SearchNameTableCellView: SearchHighlightCellView {
-    /// 选中态下普通字符采用微透明白保持层级感，命中字符采用纯白加粗突出视觉焦点。
+private final class SearchNameTableCellView: SearchHighlightCellView {
+    /// 选中态下普通字符用微透明白保持层级，命中字符用纯白加粗突出。
     override var selectedAlpha: CGFloat { 0.82 }
 
     func configure(name: String, matchPositions: [FfiMatchRange]) {
@@ -1813,8 +1819,8 @@ final class SearchNameTableCellView: SearchHighlightCellView {
 
 // MARK: - Search Path Table Cell View
 
-/// 路径列单元格视图：支持父目录高亮与家目录缩写重映射。
-final class SearchPathTableCellView: SearchHighlightCellView {
+/// 路径列单元格：父目录高亮 + 家目录缩写重映射。
+private final class SearchPathTableCellView: SearchHighlightCellView {
     override var baseColor: NSColor { .secondaryLabelColor }
     override var selectedAlpha: CGFloat { 0.75 }
 
@@ -1826,17 +1832,8 @@ final class SearchPathTableCellView: SearchHighlightCellView {
         }
 
         let abbreviated = abbreviateHomePrefix(parent)
-        let ranges = parentMatchPositions.compactMap { range -> (start: Int, end: Int)? in
-            // 落在被缩写家目录前缀内的区间没有对应的展示字符，直接丢弃
-            let start = Int(range.start)
-            guard start >= abbreviated.prefixBytes else { return nil }
-            let adjustedStart = start - abbreviated.byteDelta
-            let adjustedEnd = Int(range.end) - abbreviated.byteDelta
-            guard adjustedStart >= 0, adjustedStart < adjustedEnd,
-                  adjustedEnd <= abbreviated.display.utf8.count else { return nil }
-            return (adjustedStart, adjustedEnd)
-        }
-        setDisplay(abbreviated.display, ranges: ranges)
+        setDisplay(abbreviated.display,
+                   ranges: parentMatchPositions.compactMap { abbreviated.displayRange(for: $0) })
     }
 }
 

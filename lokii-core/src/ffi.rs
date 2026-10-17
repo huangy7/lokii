@@ -118,23 +118,20 @@ fn convert_results(results: Vec<AdvancedSearchResult>) -> Vec<FfiSearchResult> {
             created: r.entry.created_at,
             extension: r.entry.extension,
             score: r.score,
-            match_positions: r
-                .match_positions
-                .into_iter()
-                .map(|(s, e)| FfiMatchRange {
-                    start: s as u32,
-                    end: e as u32,
-                })
-                .collect(),
-            parent_match_positions: r
-                .parent_match_positions
-                .into_iter()
-                .map(|(s, e)| FfiMatchRange {
-                    start: s as u32,
-                    end: e as u32,
-                })
-                .collect(),
+            match_positions: convert_ranges(r.match_positions),
+            parent_match_positions: convert_ranges(r.parent_match_positions),
             search_mode: r.search_mode.into(),
+        })
+        .collect()
+}
+
+/// 把搜索核心的字节区间转换为 FFI 记录形态。
+fn convert_ranges(ranges: Vec<(usize, usize)>) -> Vec<FfiMatchRange> {
+    ranges
+        .into_iter()
+        .map(|(s, e)| FfiMatchRange {
+            start: s as u32,
+            end: e as u32,
         })
         .collect()
 }

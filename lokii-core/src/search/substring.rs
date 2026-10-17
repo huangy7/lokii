@@ -48,7 +48,10 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
                 match_positions: if extension.is_some() {
                     Vec::new()
                 } else {
-                    find_positions(&view.name.to_lowercase(), keywords.iter().map(String::as_str))
+                    find_positions(
+                        &view.name.to_lowercase(),
+                        keywords.iter().map(String::as_str),
+                    )
                 },
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Substring,

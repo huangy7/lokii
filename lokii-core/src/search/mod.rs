@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use top_k::{Candidate, TopK};
 
-/// 计算各关键词在 `name_lower` 中的字节区间，供前端渲染命中高亮。
+/// 计算各关键词在 `name_lower` 中的字节区间，供前端高亮。
 pub(crate) fn find_positions<'a>(
     name_lower: &str,
     keywords: impl IntoIterator<Item = &'a str>,
@@ -98,7 +98,7 @@ pub fn dispatch(
         other => other,
     };
 
-    // 若包含路径语法（'/' 或 'in:'），优先交由路径流式检索器执行
+    // 含路径语法（'/' 或 'in:'）时交由路径检索器。
     if effective_mode != SearchMode::Regex {
         if let Some(path_query) = path_query::PathQuery::parse(query) {
             let results = path_search::search(store, &path_query, max_results);

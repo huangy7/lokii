@@ -1,31 +1,30 @@
-/// 解析后的路径感知查询结构体。
-///
-/// 封装包含路径限定符（`/` 或 `in:` 作用域）的用户查询，
-/// 将父目录过滤条件与终端文件名检索词元分离，赋能单趟流式计算。
+use crate::compact_index::split_path;
+
+/// 路径感知查询：父目录约束与终端文件名词元分离。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathQuery {
-    /// 父路径必须匹配的模式串（已转小写），如 "src/"、"/usr/local/"
+    /// 父路径匹配模式（小写），如 "src/"。
     pub path_pattern: Option<String>,
-    /// 终端文件名必须满足的关键词切片（已转小写）
+    /// 文件名关键词（小写）。
     pub name_terms: Vec<String>,
-    /// 扩展名约束（已转小写，不含点号）
+    /// 扩展名约束（小写，不含点号）。
     pub extension: Option<String>,
-    /// 是否仅检索目录本身或其直接下级内容（以 '/' 结尾的查询）
+    /// 查询以 '/' 结尾：仅匹配目录本身及其下级。
     pub is_dir_only: bool,
-    /// 是否从绝对根路径开始匹配（以 '/' 开头）
+    /// 查询以 '/' 开头：从根路径匹配。
     pub is_absolute_prefix: bool,
-    /// 显式作用域前缀路径（已规范化、展开家目录并以 '/' 结尾）
+    /// `in:` 作用域前缀（已展开 '~'，以 '/' 结尾）。
     pub scope_prefix: Option<String>,
 }
 
 impl PathQuery {
-    /// 快速检测用户查询是否包含路径级语法（'/' 或 'in:' 作用域过滤）。
-    pub fn is_path_query(query: &str) -> bool {
+    /// 查询是否含路径语法（'/' 或 `in:`）。
+    pub(crate) fn is_path_query(query: &str) -> bool {
         let trimmed = query.trim();
         trimmed.contains('/') || trimmed.starts_with("in:") || trimmed.contains(" in:")
     }
 
-    /// 解析用户查询。若查询中无任何路径限定语法，则返回 None，直接短路至常规搜索。
+    /// 解析查询；无路径语法时返回 None。
     pub fn parse(query: &str) -> Option<Self> {
         let trimmed = query.trim();
         if trimmed.is_empty() || !Self::is_path_query(trimmed) {
@@ -56,7 +55,7 @@ impl PathQuery {
                 continue;
             }
 
-            // 3. 包含路径分隔符的词元
+            // 3. 含 '/' 的词元
             if word.contains('/') {
                 let expanded = expand_tilde(word);
                 let collapsed = collapse_consecutive_slashes(&expanded);
@@ -66,15 +65,13 @@ impl PathQuery {
                 }
 
                 if collapsed.ends_with('/') {
-                    // 以 '/' 结尾，例如 "Desktop/" 或 "/usr/local/"
+                    // 以 '/' 结尾
                     is_dir_only = true;
                     path_pattern = Some(collapsed.to_lowercase());
                 } else {
-                    // 中间含有 '/'，例如 "src/main.rs" 或 "/usr/bin/git"
-                    if let Some(last_slash_idx) = collapsed.rfind('/') {
-                        let dir_part = &collapsed[..=last_slash_idx];
-                        let name_part = &collapsed[last_slash_idx + 1..];
-
+                    // 中间含 '/'：拆成目录与文件名
+                    let (dir_part, name_part) = split_path(&collapsed);
+                    if !dir_part.is_empty() {
                         path_pattern = Some(dir_part.to_lowercase());
                         if !name_part.is_empty() {
                             name_terms.push(name_part.to_lowercase());
@@ -84,7 +81,7 @@ impl PathQuery {
                 continue;
             }
 
-            // 4. 普通终端名词元
+            // 4. 普通文件名词元
             name_terms.push(word.to_lowercase());
         }
 
@@ -105,7 +102,7 @@ impl PathQuery {
 }
 
 /// 规约连续斜杠（如 "///foo///bar//" -> "/foo/bar/"）。
-pub fn collapse_consecutive_slashes(path: &str) -> String {
+pub(crate) fn collapse_consecutive_slashes(path: &str) -> String {
     let mut result = String::with_capacity(path.len());
     let mut prev_slash = false;
     for ch in path.chars() {
@@ -123,7 +120,7 @@ pub fn collapse_consecutive_slashes(path: &str) -> String {
 }
 
 /// 展开路径开头的 '~' 为用户家目录。
-pub fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     if path == "~" {
         dirs::home_dir()
             .map(|h| h.to_string_lossy().to_string())
