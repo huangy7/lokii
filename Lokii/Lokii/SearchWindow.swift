@@ -64,9 +64,6 @@ final class SearchWindow: NSWindowController {
     private var searchMatchText: LocalizedText? = nil {
         didSet { updateStatusLabel() }
     }
-    private var overlaySubtext: LocalizedText = .key("search.scanningFiles") {
-        didSet { overlayState?.statusText = overlaySubtext.string }
-    }
     private weak var refreshToastLabel: NSTextField?
 
     // Loading overlay
@@ -75,12 +72,7 @@ final class SearchWindow: NSWindowController {
     private var overlayShownAt: Date?
     private var isColdStart: Bool = true  // Default true until startup mode known
     private var isInlineProgressActive: Bool = false
-    private var lastOverlayProgressUpdate: TimeInterval = 0
     private var originalSearchPlaceholder: String { L("search.placeholder") }
-
-    var isGuidingOnboarding: Bool {
-        FDAGuideWindowController.current?.window?.isVisible == true
-    }
 
     var isOverlayVisible: Bool {
         loadingOverlay != nil
@@ -90,13 +82,6 @@ final class SearchWindow: NSWindowController {
     /// a concurrent initialize/verify doesn't accidentally dismiss a rebuild overlay.
     private enum IndexingState { case idle, initializing, rebuilding, failed }
     private var indexingState: IndexingState = .initializing
-
-    // Shared formatters
-    private static let countFormatter: NumberFormatter = {
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        return f
-    }()
 
     init(engine: SearchEngine) {
         self.engine = engine
@@ -360,7 +345,7 @@ final class SearchWindow: NSWindowController {
         }
         updateStatusLabel()
         overlayState?.headingText = L("search.buildingIndex")
-        overlayState?.statusText = overlaySubtext.string
+        overlayState?.statusText = L("search.scanningFiles")
         refreshToastLabel?.stringValue = L("search.backgroundRefresh")
     }
 
@@ -387,18 +372,12 @@ final class SearchWindow: NSWindowController {
         if indexingState == .initializing && source == "rebuild" { return }
 
         let count = note.userInfo?["scannedFiles"] as? UInt64 ?? 0
-        let formatted = formatCount(count)
+        let formatted = formatFileCount(count)
 
         statusText = .formatted("search.indexingCount", formatted)
-        // 冷启动期间额外把扫描计数同步到遮罩副标题与一体化卡片状态
+        // 冷启动期间额外把扫描计数同步到全屏建库遮罩卡片
         if isColdStart && indexingState == .initializing {
-            overlaySubtext = .formatted("search.scannedCount", formatted)
-            let now = CACurrentMediaTime()
-            if now - lastOverlayProgressUpdate > 0.033 {
-                lastOverlayProgressUpdate = now
-                overlayState?.scannedCount = count
-                overlayState?.statusText = L("search.scanningFiles")
-            }
+            overlayState?.scannedCount = count
         }
     }
 
@@ -407,7 +386,7 @@ final class SearchWindow: NSWindowController {
         let source = note.userInfo?["source"] as? String ?? ""
 
         guard indexingState != .failed else { return }
-        statusText = .formatted("search.indexedCount", formatCount(total))
+        statusText = .formatted("search.indexedCount", formatFileCount(total))
 
         // 完成事件必须与当前所处阶段同源：并发触发的 initialize/rebuild 事件
         // 到达时仅刷新计数，不得据此结束当前阶段
@@ -425,9 +404,6 @@ final class SearchWindow: NSWindowController {
         // 冷启动以全窗遮罩呈现进度，热启动与重建以内联指示器呈现，故收起方式不同
         if indexingState == .initializing && isColdStart {
             hideLoadingOverlay()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                (NSApp.delegate as? AppDelegate)?.checkAndPromptFDA()
-            }
         } else {
             hideInlineProgress()
         }
@@ -443,7 +419,7 @@ final class SearchWindow: NSWindowController {
     @objc private func onIndexUpdated(_ note: Notification) {
         guard indexingState != .failed else { return }
         let total = note.userInfo?["total"] as? UInt64 ?? 0
-        statusText = .formatted("search.indexedCount", formatCount(total))
+        statusText = .formatted("search.indexedCount", formatFileCount(total))
         overlayState?.scannedCount = total
     }
 
@@ -554,15 +530,11 @@ final class SearchWindow: NSWindowController {
             return
         }
         overlayShownAt = Date()
-        overlaySubtext = .key("search.scanningFiles")
         guard let contentView = window?.contentView else { return }
 
-        let hasFDA = engine.hasFullDiskAccess
-        let promptDismissed = UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey)
         let state = IndexingOverlayState(
-            hasFDA: hasFDA,
-            promptDismissed: promptDismissed,
-            isColdStart: isColdStart,
+            hasFDA: engine.hasFullDiskAccess,
+            promptDismissed: FDAGuideWindowController.isPromptDismissed,
             heading: heading
         )
         self.overlayState = state
@@ -628,6 +600,8 @@ final class SearchWindow: NSWindowController {
             overlay.removeFromSuperview()
             self?.loadingOverlay = nil
             self?.overlayState = nil
+            // 遮罩已彻底收起，此时再弹出权限引导，避免引导浮窗被建库遮罩覆盖
+            (NSApp.delegate as? AppDelegate)?.checkAndPromptFDA()
         })
     }
 
@@ -842,7 +816,7 @@ final class SearchWindow: NSWindowController {
                     if count == 1 {
                         self.searchMatchText = .key("search.matchedCount.one")
                     } else {
-                        self.searchMatchText = .formatted("search.matchedCount", self.formatCount(UInt64(count)))
+                        self.searchMatchText = .formatted("search.matchedCount", formatFileCount(UInt64(count)))
                     }
                 }
 
@@ -881,12 +855,6 @@ final class SearchWindow: NSWindowController {
             editor.selectedRange = NSRange(location: length, length: 0)
         }
     }
-
-    // MARK: - Helpers
-
-    private func formatCount(_ n: UInt64) -> String {
-        Self.countFormatter.string(from: NSNumber(value: n)) ?? "\(n)"
-    }
 }
 
 // MARK: - SearchMainSplitViewControllerDelegate
@@ -912,7 +880,7 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
         if remainingCount == 1 {
             searchMatchText = .key("search.matchedCount.one")
         } else {
-            searchMatchText = .formatted("search.matchedCount", formatCount(UInt64(remainingCount)))
+            searchMatchText = .formatted("search.matchedCount", formatFileCount(UInt64(remainingCount)))
         }
     }
 }

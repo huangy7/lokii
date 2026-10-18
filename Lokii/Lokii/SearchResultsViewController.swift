@@ -133,15 +133,12 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidRequestFocusSearchField()
     /// 检索结果条目成功移入废纸篓回调（用于联动上层容器与目录聚合树同步）
     func searchResultsDidTrashItems(paths: Set<String>)
-    /// 触发完全磁盘访问指引交互回调
-    func searchResultsDidRequestFDAGuide()
 }
 
 extension SearchResultsViewControllerDelegate {
     func searchResultsDidRequestRebuild() {}
     func searchResultsDidRequestFocusSearchField() {}
     func searchResultsDidTrashItems(paths: Set<String>) {}
-    func searchResultsDidRequestFDAGuide() {}
 }
 
 // MARK: - SearchResultsViewController
@@ -553,19 +550,10 @@ final class SearchResultsViewController: NSViewController {
 
     /// 根据当前路径选中状态与完全磁盘访问权限协同控制显隐让位
     private func updateBottomBarVisibility() {
-        let hasPath = pathBar.url != nil
-        if hasPath {
-            pathBar.isHidden = false
-            fdaHintButton.isHidden = true
-        } else {
-            if !hasFullDiskAccess {
-                pathBar.isHidden = true
-                fdaHintButton.isHidden = false
-            } else {
-                pathBar.isHidden = false
-                fdaHintButton.isHidden = true
-            }
-        }
+        // 路径展示优先级高于权限提示：有选中路径时始终让位给路径
+        let showFDAHint = pathBar.url == nil && !hasFullDiskAccess
+        pathBar.isHidden = showFDAHint
+        fdaHintButton.isHidden = !showFDAHint
     }
 
     /// 更新底栏状态统计文本
@@ -623,11 +611,7 @@ final class SearchResultsViewController: NSViewController {
     // MARK: - Bottom Bar Actions & Animation
 
     @objc private func fdaHintButtonClicked() {
-        if let onOpenFDAGuide {
-            onOpenFDAGuide()
-        } else {
-            delegate?.searchResultsDidRequestFDAGuide()
-        }
+        onOpenFDAGuide?()
     }
 
     private func updateFDAButtonContent() {

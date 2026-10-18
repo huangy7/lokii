@@ -137,7 +137,6 @@
 "search.searching" = "Searching...";
 "search.buildingIndex" = "Building Index...";
 "search.scanningFiles" = "Scanning files...";
-"search.scannedCount" = "Scanned %@ files";
 "search.scannedFilesLabel" = "Scanned files";
 "search.indexingCount" = "Indexing %@ files...";
 "search.indexedCount" = "%@ files indexed";

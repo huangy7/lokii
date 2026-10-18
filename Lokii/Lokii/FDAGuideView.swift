@@ -229,7 +229,7 @@ struct FDAGuideView: View {
                 .ignoresSafeArea()
         )
         .onAppear {
-            dontShowAgain = UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey)
+            dontShowAgain = FDAGuideWindowController.isPromptDismissed
         }
     }
 
@@ -308,29 +308,6 @@ struct FDAGuideView: View {
     }
 }
 
-// MARK: - Native Visual Effect View
-private struct FDAVisualEffectView: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.blendingMode = .behindWindow
-        view.state = .active
-        view.material = .underWindowBackground
-        return view
-    }
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
-// MARK: - File Count Formatter Helper
-private let fileCountFormatter: NumberFormatter = {
-    let formatter = NumberFormatter()
-    formatter.numberStyle = .decimal
-    return formatter
-}()
-
-func formatFileCount(_ count: UInt64) -> String {
-    fileCountFormatter.string(from: NSNumber(value: count)) ?? "\(count)"
-}
-
 // MARK: - Indexing Overlay State
 final class IndexingOverlayState: ObservableObject {
     @Published var hasFDA: Bool
@@ -339,7 +316,7 @@ final class IndexingOverlayState: ObservableObject {
     @Published var headingText: String
     @Published var statusText: String
 
-    init(hasFDA: Bool, promptDismissed: Bool, isColdStart: Bool, heading: String) {
+    init(hasFDA: Bool, promptDismissed: Bool, heading: String) {
         self.hasFDA = hasFDA
         self.promptDismissed = promptDismissed
         self.headingText = heading
@@ -351,82 +328,16 @@ final class IndexingOverlayState: ObservableObject {
         withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
             hasFDA = true
         }
-        UserDefaults.standard.removeObject(forKey: FDAGuideWindowController.promptDismissedKey)
+        FDAGuideWindowController.clearPromptDismissed()
     }
 
     func syncDismissedState() {
-        let dismissed = UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey)
+        let dismissed = FDAGuideWindowController.isPromptDismissed
         if self.promptDismissed != dismissed {
             withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
                 self.promptDismissed = dismissed
             }
         }
-    }
-}
-
-// MARK: - Radar Wave Ring & Crystal Lens
-private struct RadarWaveRing: View {
-    let delay: Double
-    @State private var waveScale: CGFloat = 0.5
-    @State private var waveOpacity: Double = 0.5
-
-    var body: some View {
-        Circle()
-            .stroke(Color.accentColor.opacity(waveOpacity), lineWidth: 1.2)
-            .frame(width: 120, height: 120)
-            .scaleEffect(waveScale)
-            .opacity(waveOpacity)
-            .onAppear {
-                withAnimation(
-                    .easeOut(duration: 2.4)
-                    .repeatForever(autoreverses: false)
-                    .delay(delay)
-                ) {
-                    waveScale = 1.0
-                    waveOpacity = 0.0
-                }
-            }
-    }
-}
-
-private struct CrystalLensView: View {
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(nsColor: .controlBackgroundColor).opacity(0.85),
-                            Color(nsColor: .windowBackgroundColor).opacity(0.95)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .frame(width: 60, height: 60)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.25), lineWidth: 1)
-                )
-                .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 4)
-
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 26, weight: .semibold))
-                .foregroundColor(.accentColor)
-        }
-    }
-}
-
-// MARK: - Halo Radar Waves View
-struct HaloRadarWavesView: View {
-    var body: some View {
-        ZStack {
-            RadarWaveRing(delay: 0.0)
-            RadarWaveRing(delay: 0.8)
-            RadarWaveRing(delay: 1.6)
-            CrystalLensView()
-        }
-        .frame(width: 130, height: 130)
     }
 }
 
@@ -576,5 +487,3 @@ struct IndexingFullScreenOverlayView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
-
-typealias UnifiedOnboardingCardView = IndexingFullScreenOverlayView

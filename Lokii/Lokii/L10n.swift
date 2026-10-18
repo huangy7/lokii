@@ -54,3 +54,14 @@ enum LocalizedText {
 func L(_ key: String, comment: String = "") -> String {
     NSLocalizedString(key, bundle: L10n.bundle, comment: comment)
 }
+
+// 文件计数千分位格式化；实例复用避免高频索引进度回调中反复构造
+private let fileCountFormatter: NumberFormatter = {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    return formatter
+}()
+
+func formatFileCount(_ count: UInt64) -> String {
+    fileCountFormatter.string(from: NSNumber(value: count)) ?? "\(count)"
+}

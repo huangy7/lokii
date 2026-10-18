@@ -7,6 +7,21 @@ final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
     /// “不再提示”标记的持久化键；引导窗、视图与应用代理共用同一份定义，避免字面量拼写漂移
     static let promptDismissedKey = "FDAPromptDismissed"
 
+    /// 引导窗是否正在展示；供上层判断当前是否处于权限引导流程
+    static var isPresenting: Bool {
+        current?.window?.isVisible == true
+    }
+
+    /// 用户是否已勾选“不再提示”
+    static var isPromptDismissed: Bool {
+        UserDefaults.standard.bool(forKey: promptDismissedKey)
+    }
+
+    /// 清除“不再提示”标记，使权限引导在下次权限受限时重新可见
+    static func clearPromptDismissed() {
+        UserDefaults.standard.removeObject(forKey: promptDismissedKey)
+    }
+
     static func show() {
         if let existing = current, existing.window?.isVisible == true {
             existing.window?.makeKeyAndOrderFront(nil)
@@ -85,7 +100,7 @@ final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
         if dontShowAgain {
             UserDefaults.standard.set(true, forKey: Self.promptDismissedKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: Self.promptDismissedKey)
+            Self.clearPromptDismissed()
         }
     }
 

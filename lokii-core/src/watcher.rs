@@ -67,16 +67,20 @@ pub struct EventBatch {
 /// Each path may have multiple event kinds accumulated during the debounce window.
 /// Uses priority-based decision per path:
 ///   1. RenameMode::From → remove (FSEvents unpaired rename = file gone)
-///   2. RenameMode::To → create (FSEvents unpaired rename = file appeared)
-///   3. Create → create
-///   4. Remove → remove
-///   5. Fallback: check path.exists() on disk
+///   2. Remove, RenameMode::Any/Other, or any other non-Create-only shape → check disk
+///   3. RenameMode::To or Create → create
 ///
 /// RenameMode::From takes highest priority because FSEvents often sends only
 /// the "From" half of a rename (the "To" may land in a different debounce window
 /// or be lost entirely). Treating an unpaired From as a remove ensures the stale
 /// entry is cleaned up; the reconciliation timer or a later event will re-add it
 /// if the file still exists under a new name.
+///
+/// Deleting, trashing or recreating a file all produce compound streams on macOS
+/// (Remove or Rename(Any) mixed with Create and Modify), so the presence of a
+/// Remove-like kind cannot decide the outcome on its own. Every such path — and
+/// every path whose kinds carry no clear intent, such as a lone Modify(Metadata)
+/// — is resolved by consulting the disk instead.
 pub fn classify_events(raw: HashMap<PathBuf, Vec<EventKind>>) -> EventBatch {
     let mut batch = EventBatch::default();
     for (path, kinds) in raw {
@@ -97,27 +101,16 @@ pub fn classify_events(raw: HashMap<PathBuf, Vec<EventKind>>) -> EventBatch {
 
         if has_rename_from {
             batch.removes.push(path);
-        } else if has_remove || has_rename_other {
-            // In macOS FSEvents, deleting or trashing/moving a file produces compound event
-            // streams containing Remove or Rename(Any) along with Create and Modify.
-            // If the file does not exist on disk, it must be classified as a remove.
-            // If it exists on disk, it was recreated within the debounce window and
-            // should be classified as a create (upsert).
+        } else if has_remove || has_rename_other || !(has_rename_to || has_create) {
+            // A file still on disk was recreated within the debounce window (upsert);
+            // otherwise the path is genuinely gone.
             if path.exists() {
                 batch.creates.push(path);
             } else {
                 batch.removes.push(path);
             }
-        } else if has_rename_to || has_create {
-            batch.creates.push(path);
         } else {
-            // FSEvents on macOS may deliver new file events as Modify(Metadata)
-            // or other non-Create kinds. Check disk to determine intent.
-            if path.exists() {
-                batch.creates.push(path);
-            } else {
-                batch.removes.push(path);
-            }
+            batch.creates.push(path);
         }
     }
     batch
@@ -1361,15 +1354,11 @@ mod tests {
         let file_path = tmp.path().join("ghost_file.txt");
 
         let store = IndexStore::new();
-        store.add_entries(vec![FileEntry {
-            name: "ghost_file.txt".to_string(),
-            path: file_path.to_string_lossy().into_owned(),
-            is_dir: false,
-            size: 42,
-            modified: 1700000000,
-            created_at: 0,
-            extension: "txt".to_string(),
-        }]);
+        store.add_entries(vec![make_entry(
+            "ghost_file.txt",
+            &file_path.to_string_lossy(),
+            false,
+        )]);
         assert_eq!(store.len(), 1);
 
         // File is deleted on disk
@@ -1417,15 +1406,11 @@ mod tests {
         let file_path = tmp.path().join("trashed_file.txt");
 
         let store = IndexStore::new();
-        store.add_entries(vec![FileEntry {
-            name: "trashed_file.txt".to_string(),
-            path: file_path.to_string_lossy().into_owned(),
-            is_dir: false,
-            size: 10,
-            modified: 1700000000,
-            created_at: 0,
-            extension: "txt".to_string(),
-        }]);
+        store.add_entries(vec![make_entry(
+            "trashed_file.txt",
+            &file_path.to_string_lossy(),
+            false,
+        )]);
         assert_eq!(store.len(), 1);
 
         assert!(!file_path.exists());
@@ -1445,5 +1430,3 @@ mod tests {
         assert_eq!(store.len(), 0);
     }
 }
-
-

@@ -51,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidResignActive(_ notification: Notification) {
-        if mainWindow?.isGuidingOnboarding == true || FDAGuideWindowController.current?.window?.isVisible == true {
+        if FDAGuideWindowController.isPresenting {
             return
         }
         guard engine.getConfig()?.window.hideOnBlur ?? true else { return }
@@ -111,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func checkAndPromptFDA() {
         guard !clearFDAPromptIfGranted() else { return }
-        guard !UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey) else { return }
+        guard !FDAGuideWindowController.isPromptDismissed else { return }
         // 若主窗口处于冷启动全屏建库遮罩状态，暂不弹出，待索引就绪遮罩收起后再弹出
         if mainWindow?.isOverlayVisible == true {
             return
@@ -123,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func clearFDAPromptIfGranted() -> Bool {
         guard engine.hasFullDiskAccess else { return false }
-        UserDefaults.standard.removeObject(forKey: FDAGuideWindowController.promptDismissedKey)
+        FDAGuideWindowController.clearPromptDismissed()
         FDAGuideWindowController.closeIfOpen()
         return true
     }

@@ -137,7 +137,6 @@
 "search.searching" = "正在搜索...";
 "search.buildingIndex" = "正在构建索引...";
 "search.scanningFiles" = "正在扫描文件...";
-"search.scannedCount" = "已扫描 %@ 个文件";
 "search.scannedFilesLabel" = "已扫描文件";
 "search.indexingCount" = "正在索引 %@ 个文件...";
 "search.indexedCount" = "已索引 %@ 个文件";
