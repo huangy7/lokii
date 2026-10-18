@@ -86,17 +86,30 @@ pub fn classify_events(raw: HashMap<PathBuf, Vec<EventKind>>) -> EventBatch {
         let has_rename_to = kinds
             .iter()
             .any(|k| matches!(k, EventKind::Modify(ModifyKind::Name(RenameMode::To))));
+        let has_rename_other = kinds.iter().any(|k| {
+            matches!(
+                k,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other))
+            )
+        });
         let has_create = kinds.iter().any(|k| matches!(k, EventKind::Create(_)));
         let has_remove = kinds.iter().any(|k| matches!(k, EventKind::Remove(_)));
 
         if has_rename_from {
             batch.removes.push(path);
-        } else if has_rename_to {
+        } else if has_remove || has_rename_other {
+            // In macOS FSEvents, deleting or trashing/moving a file produces compound event
+            // streams containing Remove or Rename(Any) along with Create and Modify.
+            // If the file does not exist on disk, it must be classified as a remove.
+            // If it exists on disk, it was recreated within the debounce window and
+            // should be classified as a create (upsert).
+            if path.exists() {
+                batch.creates.push(path);
+            } else {
+                batch.removes.push(path);
+            }
+        } else if has_rename_to || has_create {
             batch.creates.push(path);
-        } else if has_create {
-            batch.creates.push(path);
-        } else if has_remove {
-            batch.removes.push(path);
         } else {
             // FSEvents on macOS may deliver new file events as Modify(Metadata)
             // or other non-Create kinds. Check disk to determine intent.
@@ -1304,4 +1317,133 @@ mod tests {
         );
         assert_eq!(q.len(), 4);
     }
+
+    #[test]
+    fn test_classify_compound_create_and_remove_for_deleted_file() {
+        // macOS FSEvents produces compound events with both Create and Remove for deleted files.
+        let mut raw = HashMap::new();
+        let path = PathBuf::from("/tmp/deleted_nonexistent_file_12345.txt");
+        raw.insert(
+            path.clone(),
+            vec![
+                EventKind::Create(CreateKind::File),
+                EventKind::Remove(RemoveKind::File),
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            ],
+        );
+        let batch = classify_events(raw);
+        assert_eq!(batch.removes, vec![path]);
+        assert!(batch.creates.is_empty());
+    }
+
+    #[test]
+    fn test_classify_compound_create_and_remove_for_recreated_file() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("recreated.txt");
+        fs::write(&file_path, "fresh content").unwrap();
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            file_path.clone(),
+            vec![
+                EventKind::Create(CreateKind::File),
+                EventKind::Remove(RemoveKind::File),
+            ],
+        );
+        let batch = classify_events(raw);
+        assert_eq!(batch.creates, vec![file_path]);
+        assert!(batch.removes.is_empty());
+    }
+
+    #[test]
+    fn test_process_event_batch_compound_delete_removes_from_store() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("ghost_file.txt");
+
+        let store = IndexStore::new();
+        store.add_entries(vec![FileEntry {
+            name: "ghost_file.txt".to_string(),
+            path: file_path.to_string_lossy().into_owned(),
+            is_dir: false,
+            size: 42,
+            modified: 1700000000,
+            created_at: 0,
+            extension: "txt".to_string(),
+        }]);
+        assert_eq!(store.len(), 1);
+
+        // File is deleted on disk
+        assert!(!file_path.exists());
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            file_path,
+            vec![
+                EventKind::Create(CreateKind::File),
+                EventKind::Remove(RemoveKind::File),
+                EventKind::Modify(ModifyKind::Any),
+            ],
+        );
+        let batch = classify_events(raw);
+        let (_added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
+        assert_eq!(removed, 1);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_classify_trash_events_with_rename_any() {
+        // macOS FSEvents produces [Create, Modify(Name(Any)), Modify(Data)] when moving to trash
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("trashed_item.txt");
+        assert!(!file_path.exists());
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            file_path.clone(),
+            vec![
+                EventKind::Create(CreateKind::File),
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            ],
+        );
+        let batch = classify_events(raw);
+        assert_eq!(batch.removes, vec![file_path]);
+        assert!(batch.creates.is_empty());
+    }
+
+    #[test]
+    fn test_process_event_batch_trash_removes_from_store() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("trashed_file.txt");
+
+        let store = IndexStore::new();
+        store.add_entries(vec![FileEntry {
+            name: "trashed_file.txt".to_string(),
+            path: file_path.to_string_lossy().into_owned(),
+            is_dir: false,
+            size: 10,
+            modified: 1700000000,
+            created_at: 0,
+            extension: "txt".to_string(),
+        }]);
+        assert_eq!(store.len(), 1);
+
+        assert!(!file_path.exists());
+
+        let mut raw = HashMap::new();
+        raw.insert(
+            file_path,
+            vec![
+                EventKind::Create(CreateKind::File),
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            ],
+        );
+        let batch = classify_events(raw);
+        let (_added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
+        assert_eq!(removed, 1);
+        assert_eq!(store.len(), 0);
+    }
 }
+
+
