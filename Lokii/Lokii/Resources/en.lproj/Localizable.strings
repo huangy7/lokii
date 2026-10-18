@@ -147,9 +147,19 @@
 
 /* SearchWindow - context menu */
 "search.ctx.open" = "Open";
+"search.ctx.quickLook" = "Quick Look";
 "search.ctx.revealInFinder" = "Reveal in Finder";
+"search.ctx.getInfo" = "Get Info";
+"search.ctx.copyFile" = "Copy File";
 "search.ctx.copyPath" = "Copy Path";
 "search.ctx.copyName" = "Copy Name";
+"search.ctx.moveToTrash" = "Move to Trash";
+"search.trash.confirmTitle" = "Move %d items to Trash?";
+"search.trash.confirmMessage" = "Items moved to Trash can be restored from Finder.";
+"search.trash.confirmButton" = "Move to Trash";
+"search.trash.cancelButton" = "Cancel";
+"search.trash.failedTitle" = "Cannot Move to Trash";
+"search.trash.failedMessage" = "Failed to move %1$d item(s) to Trash:\n%2$@";
 
 /* SearchWindow - sidebar */
 "search.sidebar.emptyHint" = "Directory distribution will appear here";

@@ -100,6 +100,16 @@ final class MockSplitDelegate: SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidRequestFocusSearchField() {
         focusSearchFieldCallCount += 1
     }
+
+    var trashedPaths: Set<String> = []
+    var trashedRemainingCount = 0
+    var trashCallCount = 0
+
+    func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {
+        trashedPaths = paths
+        trashedRemainingCount = remainingCount
+        trashCallCount += 1
+    }
 }
 
 print("[1/5] 测试双栏容器分栏条目（NSSplitViewItem）配置参数...")
@@ -196,6 +206,16 @@ assertEqual(mockDelegate.rebuildCallCount, 1, "中介协调器应将索引重建
 // 模拟中栏列表首行上移回焦请求并验证中介转发
 splitVC.searchResultsDidRequestFocusSearchField()
 assertEqual(mockDelegate.focusSearchFieldCallCount, 1, "中介协调器应将回焦搜索框请求转发至外部代理")
+
+// 模拟中栏列表完成移入废纸篓，验证中介协调器同步移除 rawResults、重建目录树并向外部代理通知
+splitVC.searchResultsDidTrashItems(paths: [itemA.path])
+assertEqual(splitVC.rawResults.count, 2, "中介协调器 rawResults 应已同步移除被删除项，从 3 项变为 2 项")
+assertTrue(!splitVC.rawResults.contains(itemA), "剩余项中不应再包含 itemA")
+assertTrue(splitVC.rawResults.contains(itemB), "剩余项中应包含 itemB")
+assertTrue(splitVC.rawResults.contains(itemC), "剩余项中应包含 itemC")
+assertEqual(mockDelegate.trashCallCount, 1, "外部代理应收到废纸篓完成通知")
+assertEqual(mockDelegate.trashedRemainingCount, 2, "外部代理收到的剩余计数应为 2")
+assertTrue(mockDelegate.trashedPaths.contains(itemA.path), "外部代理收到的路径集合应包含 itemA")
 
 // 测试空结果集与重置状态清空（Empty State & Clear）
 splitVC.updateSearchResults(rawResults: [], tree: nil)

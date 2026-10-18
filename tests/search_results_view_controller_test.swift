@@ -121,6 +121,14 @@ final class MockDelegate: SearchResultsViewControllerDelegate {
     func searchResultsDidRequestFocusSearchField() {
         focusSearchFieldCallCount += 1
     }
+
+    var trashedPaths: Set<String> = []
+    var trashCallCount = 0
+
+    func searchResultsDidTrashItems(paths: Set<String>) {
+        trashedPaths = paths
+        trashCallCount += 1
+    }
 }
 
 print("[1/8] 测试控制器初始化与内聚底栏视图层次构建...")
@@ -217,8 +225,14 @@ assertEqual(mockDelegate.selectedResult?.name, "alpha.rs", "代理应接收到�
 controller.openSelected()
 assertEqual(mockDelegate.doubleClickedResult?.name, "alpha.rs", "openSelected 应触发首选条目确认回调")
 
-print("[6/8] 测试剪贴板拷贝行为 (copyPath & copyName)...")
+print("[6/8] 测试剪贴板拷贝行为与右键菜单结构 (copyFile, copyPath, copyName & contextMenu)...")
 controller.selectFirstRow()
+controller.copyFile()
+let copiedUrls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: nil) as? [URL]
+assertEqual(copiedUrls?.first?.path, "/tmp/src/alpha.rs", "copyFile 应将所选条目作为文件对象写入系统剪贴板")
+let pasteboardFilePath = NSPasteboard.general.string(forType: .string)
+assertEqual(pasteboardFilePath, "/tmp/src/alpha.rs", "copyFile 应同时将所选条目路径文本写入系统剪贴板作为兼容降级")
+
 controller.copyPath()
 let pasteboardPath = NSPasteboard.general.string(forType: .string)
 assertEqual(pasteboardPath, "/tmp/src/alpha.rs", "copyPath 应将所选条目路径写入系统剪贴板")
@@ -227,11 +241,98 @@ controller.copyName()
 let pasteboardName = NSPasteboard.general.string(forType: .string)
 assertEqual(pasteboardName, "alpha.rs", "copyName 应将所选条目名称写入系统剪贴板")
 
+// 校验右键菜单项结构与动作绑定
+guard let menu = controller.tableView.menu else {
+    fputs("断言失败: tableView.menu 不能为空\\n", stderr)
+    exit(1)
+}
+assertEqual(menu.items.count, 10, "右键上下文菜单应包含 8 个功能项加 2 个分隔线")
+assertEqual(menu.items[0].action, #selector(controller.openSelected), "第 0 项应绑定 openSelected")
+assertEqual(menu.items[1].action, #selector(controller.quickLookSelected), "第 1 项应绑定 quickLookSelected")
+assertEqual(menu.items[1].keyEquivalent, " ", "quickLookSelected 快捷键应为 Space")
+assertTrue(menu.items[1].keyEquivalentModifierMask.isEmpty, "quickLookSelected 修饰键掩码应为空")
+assertEqual(menu.items[2].action, #selector(controller.revealSelected), "第 2 项应绑定 revealSelected")
+assertEqual(menu.items[3].action, #selector(controller.showInfoSelected), "第 3 项应绑定 showInfoSelected")
+assertEqual(menu.items[3].keyEquivalent, "i", "showInfoSelected 快捷键应为 i")
+assertTrue(menu.items[4].isSeparatorItem, "第 4 项应为分隔线")
+assertEqual(menu.items[5].action, #selector(controller.copyFile), "第 5 项应绑定 copyFile")
+assertEqual(menu.items[5].keyEquivalent, "c", "copyFile 快捷键应为 c")
+assertEqual(menu.items[6].action, #selector(controller.copyPath), "第 6 项应绑定 copyPath")
+assertEqual(menu.items[7].action, #selector(controller.copyName), "第 7 项应绑定 copyName")
+assertTrue(menu.items[8].isSeparatorItem, "第 8 项应为分隔线")
+assertEqual(menu.items[9].action, #selector(controller.moveToTrashSelected), "第 9 项应绑定 moveToTrashSelected")
+assertEqual(menu.items[9].keyEquivalent, String(format: "%c", NSDeleteCharacter), "moveToTrashSelected 快捷键应为 Delete")
+assertEqual(menu.items[9].keyEquivalentModifierMask, [.command], "moveToTrashSelected 修饰键应为 Command")
+
+// 校验菜单项可用性验证逻辑 (validateMenuItem)
+for item in menu.items where !item.isSeparatorItem {
+    assertTrue(controller.validateMenuItem(item), "有选中项时上下文菜单项 \\(item.title) 应通过校验")
+}
+
+// 校验 SearchTableView 键盘事件分发与 ⌘⌫ 按键等效处理
+let deleteEvent = NSEvent.keyEvent(
+    with: .keyDown,
+    location: .zero,
+    modifierFlags: [.command],
+    timestamp: 0,
+    windowNumber: 0,
+    context: nil,
+    characters: "\\u{7f}",
+    charactersIgnoringModifiers: "\\u{7f}",
+    isARepeat: false,
+    keyCode: 51
+)!
+assertTrue(controller.tableView.performKeyEquivalent(with: deleteEvent), "tableView.performKeyEquivalent 应识别并拦截 ⌘⌫")
+
+// 校验 moveToTrashSelected 异步执行、依赖注入、选区顺延与中介者代理通知
+var interceptedTrashURLs: [URL] = []
+controller.trashItemHandler = { url in
+    interceptedTrashURLs.append(url)
+    return url
+}
+var confirmRequested = false
+controller.confirmTrashHandler = { count, completion in
+    confirmRequested = true
+    completion(true)
+}
+
+let initialCount = controller.results.count
+controller.selectFirstRow()
+controller.moveToTrashSelected()
+
+// 等待后台队列文件 I/O 与主线程 UI 回调完成
+let deadline = Date().addingTimeInterval(2.0)
+while mockDelegate.trashCallCount == 0 && Date() < deadline {
+    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+}
+
+assertEqual(mockDelegate.trashCallCount, 1, "移到废纸篓完成后应向代理派发 searchResultsDidTrashItems 回调")
+assertTrue(mockDelegate.trashedPaths.contains("/tmp/src/alpha.rs"), "代理回调的路径集合中应包含所删除的项目路径")
+assertEqual(interceptedTrashURLs.first?.path, "/tmp/src/alpha.rs", "trashItemHandler 应接收到对应文件 URL")
+assertEqual(controller.results.count, initialCount - 1, "本地检索结果集中应已剔除被删除的项目")
+assertEqual(controller.selectedResult?.name, "beta.md", "删除首行后选区应顺延聚焦至原第 1 项 (beta.md)")
+
+// 校验自愈容错：当目标文件在磁盘上已不存在（抛出 NSFileNoSuchFileError）时，静默自愈剔除而不报警
+let countBeforeStale = controller.results.count
+controller.trashItemHandler = { _ in
+    throw NSError(domain: NSCocoaErrorDomain, code: NSFileNoSuchFileError, userInfo: nil)
+}
+controller.moveToTrashSelected()
+let deadlineStale = Date().addingTimeInterval(2.0)
+while mockDelegate.trashCallCount == 1 && Date() < deadlineStale {
+    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+}
+assertEqual(mockDelegate.trashCallCount, 2, "遇到已不存在的文件时应自愈完成并向代理派发移除回调")
+assertEqual(controller.results.count, countBeforeStale - 1, "已不存在的幽灵条目应自愈从本地列表中剔除")
+
 print("[7/8] 测试 Quick Look 快速预览响应者协议与数据源契约...")
 // 无选中条目时
 controller.displayResults([], preserveSelection: false)
 assertEqual(controller.acceptsPreviewPanelControl(nil), false, "列表为空或无选区时 acceptsPreviewPanelControl 应返回 false")
 assertEqual(controller.numberOfPreviewItems(in: nil), 0, "无选中时预览项数量应为 0")
+for item in menu.items where !item.isSeparatorItem {
+    assertTrue(!controller.validateMenuItem(item), "无选中项时上下文菜单项 \\(item.title) 应禁用")
+}
 
 // 有选中条目时
 controller.displayResults(sampleItems, preserveSelection: false)

@@ -914,6 +914,14 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidRequestFocusSearchField() {
         focusSearchField()
     }
+
+    func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {
+        if remainingCount == 1 {
+            searchMatchText = .key("search.matchedCount.one")
+        } else {
+            searchMatchText = .formatted("search.matchedCount", formatCount(UInt64(remainingCount)))
+        }
+    }
 }
 
 // MARK: - NSWindowDelegate

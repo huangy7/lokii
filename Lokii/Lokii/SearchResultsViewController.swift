@@ -123,11 +123,14 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidRequestRebuild()
     /// 虚拟列表首行上移回调，用于将焦点交还搜索输入框
     func searchResultsDidRequestFocusSearchField()
+    /// 检索结果条目成功移入废纸篓回调（用于联动上层容器与目录聚合树同步）
+    func searchResultsDidTrashItems(paths: Set<String>)
 }
 
 extension SearchResultsViewControllerDelegate {
     func searchResultsDidRequestRebuild() {}
     func searchResultsDidRequestFocusSearchField() {}
+    func searchResultsDidTrashItems(paths: Set<String>) {}
 }
 
 // MARK: - SearchResultsViewController
@@ -171,6 +174,16 @@ final class SearchResultsViewController: NSViewController {
     private(set) var currentFontSize: CGFloat = CGFloat(TableDensity.defaultFontSize)
     private(set) var fontCache = TableFontCache(fontSize: CGFloat(TableDensity.defaultFontSize))
     private(set) var currentIconSize: CGFloat = TableDensity.calculateIconSize(for: CGFloat(TableDensity.defaultFontSize))
+
+    /// 注入式废纸篓操作闭包，默认调用系统 Foundation 标准接口
+    var trashItemHandler: (URL) throws -> URL = { url in
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        return (resultingURL as URL?) ?? url
+    }
+
+    /// 注入式确认弹窗闭包，默认通过主视窗弹出原生确认 Sheet，返回用户是否确认执行
+    var confirmTrashHandler: ((Int, @escaping (Bool) -> Void) -> Void)?
 
     /// 时间与体积的展示串只取决于原始数值与当前语言，按原始值缓存以规避滚动时对每个进入视口的行重复格式化
     private var dateTextCache: [TimeInterval: String] = [:]
@@ -402,10 +415,21 @@ final class SearchResultsViewController: NSViewController {
     private func setupContextMenu() {
         let menu = NSMenu()
         menu.addLocalizedItem("search.ctx.open", action: #selector(openSelected), keyEquivalent: "\r")
+        let qlItem = menu.addLocalizedItem("search.ctx.quickLook", action: #selector(quickLookSelected), keyEquivalent: " ")
+        qlItem.keyEquivalentModifierMask = []
         menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(revealSelected), keyEquivalent: "")
+        menu.addLocalizedItem("search.ctx.getInfo", action: #selector(showInfoSelected), keyEquivalent: "i")
         menu.addItem(NSMenuItem.separator())
-        menu.addLocalizedItem("search.ctx.copyPath", action: #selector(copyPath), keyEquivalent: "c")
+        menu.addLocalizedItem("search.ctx.copyFile", action: #selector(copyFile), keyEquivalent: "c")
+        menu.addLocalizedItem("search.ctx.copyPath", action: #selector(copyPath), keyEquivalent: "")
         menu.addLocalizedItem("search.ctx.copyName", action: #selector(copyName), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        let trashItem = menu.addLocalizedItem(
+            "search.ctx.moveToTrash",
+            action: #selector(moveToTrashSelected),
+            keyEquivalent: String(format: "%c", NSDeleteCharacter)
+        )
+        trashItem.keyEquivalentModifierMask = [.command]
         tableView.menu = menu
     }
 
@@ -616,6 +640,53 @@ final class SearchResultsViewController: NSViewController {
         delegate?.searchResultsDidDoubleClick(result: result)
     }
 
+    @objc func copyFile(_ sender: Any? = nil) {
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+        let urls = selected.map { NSURL(fileURLWithPath: $0.path) }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects(urls)
+        let joinedPaths = selected.map(\.path).joined(separator: "\n")
+        pasteboard.setString(joinedPaths, forType: .string)
+    }
+
+    @objc func quickLookSelected(_ sender: Any? = nil) {
+        guard selectedResult != nil else { return }
+        let panel = QLPreviewPanel.shared()
+        panel?.reloadData()
+        panel?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func showInfoSelected(_ sender: Any? = nil) {
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+        // 限制并发打开的最大窗口数，避免多选场景下瞬时弹出过多视窗造成系统卡顿
+        let targets = selected.prefix(10).filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !targets.isEmpty else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let statements = targets.map { item -> String in
+                let escaped = item.path
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                return "open information window of (POSIX file \"\(escaped)\" as alias)"
+            }.joined(separator: "\n            ")
+
+            let scriptSource = """
+            tell application "Finder"
+                \(statements)
+                activate
+            end tell
+            """
+
+            var error: NSDictionary?
+            if let script = NSAppleScript(source: scriptSource) {
+                script.executeAndReturnError(&error)
+            }
+        }
+    }
+
     @objc func copyPath(_ sender: Any? = nil) {
         let selected = selectedResults
         guard !selected.isEmpty else { return }
@@ -648,6 +719,120 @@ final class SearchResultsViewController: NSViewController {
         } else {
             let urls = selected.map { URL(fileURLWithPath: $0.path) }
             NSWorkspace.shared.activateFileViewerSelecting(urls)
+        }
+    }
+
+    @objc func moveToTrashSelected(_ sender: Any? = nil) {
+        let selected = selectedResults
+        guard !selected.isEmpty else { return }
+
+        confirmTrashIfNeeded(count: selected.count) { [weak self] confirmed in
+            guard let self = self, confirmed else { return }
+
+            let handler = self.trashItemHandler
+            // 调度至后台用户交互队列执行同步阻塞式文件系统 I/O，规避大目录或外接磁盘下的主线程掉帧
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                var trashedPaths = Set<String>()
+                var errors: [(String, Error)] = []
+
+                for item in selected {
+                    let url = URL(fileURLWithPath: item.path)
+                    do {
+                        _ = try handler(url)
+                        trashedPaths.insert(item.path)
+                    } catch {
+                        let nsError = error as NSError
+                        if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError {
+                            // 边界守卫与自愈容错：若目标文件在物理文件系统上已不存在（如已在终端被清理），
+                            // 表明该项目在源路径消除的业务诉求已达成，直接顺势将其作为已移除项从视图与结果集中剔除，
+                            // 规避误报弹窗打扰用户
+                            trashedPaths.insert(item.path)
+                        } else {
+                            errors.append((item.name, error))
+                        }
+                    }
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    if !trashedPaths.isEmpty {
+                        self.applyTrashedItems(trashedPaths)
+                        self.playTrashSound()
+                    }
+                    if !errors.isEmpty {
+                        self.showTrashErrors(errors)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 批量删除安全阈值确认：超过 5 项时弹出原生警示表单，防止误触全选造成破坏性删除
+    private func confirmTrashIfNeeded(count: Int, completion: @escaping (Bool) -> Void) {
+        if let customHandler = confirmTrashHandler {
+            customHandler(count, completion)
+            return
+        }
+        guard count > 5, let window = view.window else {
+            completion(true)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(format: L("search.trash.confirmTitle"), count)
+        alert.informativeText = L("search.trash.confirmMessage")
+        alert.addButton(withTitle: L("search.trash.confirmButton"))
+        alert.addButton(withTitle: L("search.trash.cancelButton"))
+        alert.beginSheetModal(for: window) { response in
+            completion(response == .alertFirstButtonReturn)
+        }
+    }
+
+    /// 乐观更新：在主列表内使用原生行滑动与淡出动画即时剔除已移入废纸篓的项目，并自动维护选区顺延
+    private func applyTrashedItems(_ trashedPaths: Set<String>) {
+        let selectedRow = tableView.selectedRow
+        let indexSet = NSMutableIndexSet()
+        for (idx, item) in results.enumerated() {
+            if trashedPaths.contains(item.path) {
+                indexSet.add(idx)
+            }
+        }
+
+        results.removeAll { trashedPaths.contains($0.path) }
+
+        if indexSet.count > 0 {
+            tableView.beginUpdates()
+            tableView.removeRows(at: indexSet as IndexSet, withAnimation: [.slideUp, .effectFade])
+            tableView.endUpdates()
+        }
+
+        if !results.isEmpty {
+            let nextRow = min(max(0, selectedRow), results.count - 1)
+            tableView.selectRowIndexes(IndexSet(integer: nextRow), byExtendingSelection: false)
+            tableView.scrollRowToVisible(nextRow)
+        } else {
+            tableView.deselectAll(nil)
+        }
+
+        notifySelectionChanged()
+        delegate?.searchResultsDidTrashItems(paths: trashedPaths)
+    }
+
+    private func showTrashErrors(_ errors: [(String, Error)]) {
+        guard let window = view.window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L("search.trash.failedTitle")
+        let detail = errors.map { "\($0.0): \($0.1.localizedDescription)" }.joined(separator: "\n")
+        alert.informativeText = String(format: L("search.trash.failedMessage"), errors.count, detail)
+        alert.addButton(withTitle: L("ok"))
+        alert.beginSheetModal(for: window, completionHandler: nil)
+    }
+
+    private func playTrashSound() {
+        let soundPath = "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/dock/drag to trash.aif"
+        if FileManager.default.fileExists(atPath: soundPath) {
+            NSSound(contentsOfFile: soundPath, byReference: true)?.play()
         }
     }
 
@@ -900,9 +1085,13 @@ extension SearchResultsViewController: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(openSelected),
+             #selector(quickLookSelected),
              #selector(revealSelected),
+             #selector(showInfoSelected),
+             #selector(copyFile),
              #selector(copyPath),
-             #selector(copyName):
+             #selector(copyName),
+             #selector(moveToTrashSelected):
             return !selectedResults.isEmpty
         default:
             return true
@@ -1042,7 +1231,23 @@ final class SearchTableView: NSTableView {
             return
         }
 
+        // ⌘⌫ (Command + Delete，keyCode 51)：当焦点处于列表且存在选区时，触发移到废纸篓动作
+        if event.keyCode == 51 && event.modifierFlags.contains(.command) {
+            if let targetController = delegate as? SearchResultsViewController,
+               !targetController.selectedResults.isEmpty {
+                targetController.moveToTrashSelected()
+                return
+            }
+        }
+
         super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let menu = self.menu, menu.performKeyEquivalent(with: event) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)

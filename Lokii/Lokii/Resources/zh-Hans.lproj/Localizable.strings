@@ -147,9 +147,19 @@
 
 /* SearchWindow - context menu */
 "search.ctx.open" = "打开";
+"search.ctx.quickLook" = "快速查看";
 "search.ctx.revealInFinder" = "在访达中显示";
+"search.ctx.getInfo" = "显示简介";
+"search.ctx.copyFile" = "拷贝文件";
 "search.ctx.copyPath" = "拷贝路径";
 "search.ctx.copyName" = "拷贝名称";
+"search.ctx.moveToTrash" = "移到废纸篓";
+"search.trash.confirmTitle" = "将选中的 %d 项移到废纸篓？";
+"search.trash.confirmMessage" = "移到废纸篓的项目可以在访达中放回原处。";
+"search.trash.confirmButton" = "移到废纸篓";
+"search.trash.cancelButton" = "取消";
+"search.trash.failedTitle" = "无法移到废纸篓";
+"search.trash.failedMessage" = "未能将以下 %1$d 个项目移到废纸篓：\n%2$@";
 
 /* SearchWindow - sidebar */
 "search.sidebar.emptyHint" = "输入关键词后在此查看目录分布";

@@ -42,5 +42,7 @@
     <false/>
     <key>SUVerifyUpdateBeforeExtraction</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Lokii uses AppleScript to display file information in Finder.</string>
 </dict>
 </plist>

@@ -12,6 +12,8 @@ protocol SearchMainSplitViewControllerDelegate: AnyObject {
     func searchMainSplitViewDidRequestRebuild()
     /// 虚拟列表首行上移回调，用于将焦点交还搜索输入框
     func searchMainSplitViewDidRequestFocusSearchField()
+    /// 检索结果条目被移入废纸篓回调（用于联动外部窗口更新命中项计数等）
+    func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int)
 }
 
 extension SearchMainSplitViewControllerDelegate {
@@ -19,6 +21,7 @@ extension SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {}
     func searchMainSplitViewDidRequestRebuild() {}
     func searchMainSplitViewDidRequestFocusSearchField() {}
+    func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {}
 }
 
 // MARK: - SearchMainSplitViewController
@@ -167,5 +170,12 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
 
     func searchResultsDidRequestFocusSearchField() {
         delegate?.searchMainSplitViewDidRequestFocusSearchField()
+    }
+
+    func searchResultsDidTrashItems(paths: Set<String>) {
+        rawResults.removeAll { paths.contains($0.path) }
+        let tree = ResultDirectoryTree.build(from: rawResults)
+        sidebarTreeViewController.updateTree(tree)
+        delegate?.searchMainSplitViewDidTrashItems(paths: paths, remainingCount: rawResults.count)
     }
 }
