@@ -42,6 +42,7 @@ test: bindings
 	@swift tests/toolbar_test.swift
 	@swift tests/split_view_controller_test.swift
 	@swift tests/keyboard_navigation_test.swift
+	@swift tests/shortcut_recorder_test.swift
 
 
 check:
