@@ -229,9 +229,13 @@ final class SearchWindow: NSWindowController {
             searchField.heightAnchor.constraint(equalToConstant: 28),
         ])
 
-        let toolbar = NSToolbar(identifier: "LokiiMainToolbar")
+        let toolbar = LokiiToolbar(identifier: "LokiiMainToolbar")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        if #available(macOS 15.0, *) {
+            toolbar.allowsDisplayModeCustomization = false
+        }
         window?.toolbar = toolbar
     }
 
@@ -315,10 +319,13 @@ final class SearchWindow: NSWindowController {
                     item.label = L("search.placeholder")
                     item.paletteLabel = L("search.placeholder")
                 } else if item.itemIdentifier == .resetWindowSize {
-                    item.label = L("window.resetSize")
-                    item.paletteLabel = L("window.resetSize")
-                    item.toolTip = L("window.resetSize")
-                    (item.view as? NSButton)?.toolTip = L("window.resetSize")
+                    item.label = L("window.viewOptions")
+                    item.paletteLabel = L("window.viewOptions")
+                    item.toolTip = L("window.viewOptions")
+                    if let button = item.view as? NSButton {
+                        button.toolTip = L("window.viewOptions")
+                        button.menu = buildViewOptionsMenu()
+                    }
                 }
             }
         }
@@ -972,6 +979,14 @@ extension NSToolbarItem.Identifier {
     static let resetWindowSize = NSToolbarItem.Identifier("lokii.toolbar.resetWindowSize")
 }
 
+/// 锁定为纯图标模式的主工具栏，屏蔽系统右键“图标和文本”切换，保证通栏检索布局紧凑稳定
+final class LokiiToolbar: NSToolbar {
+    override var displayMode: NSToolbar.DisplayMode {
+        get { .iconOnly }
+        set { /* 强制锁定纯图标显示模式 */ }
+    }
+}
+
 // MARK: - NSToolbarDelegate
 
 extension SearchWindow: NSToolbarDelegate {
@@ -1005,19 +1020,19 @@ extension SearchWindow: NSToolbarDelegate {
 
         case .resetWindowSize:
             let button = NSButton()
-            button.image = NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left", accessibilityDescription: L("window.resetSize"))
+            button.image = NSImage(systemSymbolName: "textformat.size", accessibilityDescription: L("window.viewOptions"))
             button.bezelStyle = .toolbar
             button.isBordered = false
-            button.toolTip = L("window.resetSize")
+            button.toolTip = L("window.viewOptions")
             button.contentTintColor = .secondaryLabelColor
             button.target = self
-            button.action = #selector(resetToDefaultWindowFrame)
+            button.action = #selector(showViewOptionsMenu(_:))
 
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.view = button
-            item.label = L("window.resetSize")
-            item.paletteLabel = L("window.resetSize")
-            item.toolTip = L("window.resetSize")
+            item.label = L("window.viewOptions")
+            item.paletteLabel = L("window.viewOptions")
+            item.toolTip = L("window.viewOptions")
             return item
 
         default:
@@ -1031,6 +1046,171 @@ extension SearchWindow: NSToolbarDelegate {
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .resetWindowSize]
+    }
+}
+
+// MARK: - View Options & Density Control
+
+extension SearchWindow: NSMenuItemValidation {
+    private var currentTableFontSize: CGFloat {
+        get {
+            let saved = UserDefaults.standard.double(forKey: TableDensity.fontSizeUserDefaultsKey)
+            return saved > 0 ? CGFloat(saved) : CGFloat(TableDensity.defaultFontSize)
+        }
+        set {
+            UserDefaults.standard.set(Double(newValue), forKey: TableDensity.fontSizeUserDefaultsKey)
+            NotificationCenter.default.post(
+                name: .tableDensityDidChange,
+                object: nil,
+                userInfo: ["fontSize": newValue]
+            )
+        }
+    }
+
+    @objc private func showViewOptionsMenu(_ sender: NSButton) {
+        let menu = buildViewOptionsMenu()
+        let location = NSPoint(x: 0, y: sender.bounds.height + 4)
+        menu.popUp(positioning: nil, at: location, in: sender)
+    }
+
+    func buildViewOptionsMenu() -> NSMenu {
+        let menu = NSMenu(title: L("window.viewOptions"))
+        menu.autoenablesItems = true
+
+        let zoomInItem = NSMenuItem(
+            title: L("menu.zoomIn"),
+            action: #selector(zoomInAction(_:)),
+            keyEquivalent: "+"
+        )
+        zoomInItem.target = self
+        menu.addItem(zoomInItem)
+
+        let zoomOutItem = NSMenuItem(
+            title: L("menu.zoomOut"),
+            action: #selector(zoomOutAction(_:)),
+            keyEquivalent: "-"
+        )
+        zoomOutItem.target = self
+        menu.addItem(zoomOutItem)
+
+        let actualSizeItem = NSMenuItem(
+            title: L("menu.actualSize"),
+            action: #selector(zoomActualSizeAction(_:)),
+            keyEquivalent: "0"
+        )
+        actualSizeItem.target = self
+        menu.addItem(actualSizeItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let compactItem = NSMenuItem(
+            title: L("density.compact"),
+            action: #selector(selectDensityAction(_:)),
+            keyEquivalent: ""
+        )
+        compactItem.tag = TableDensity.compact.rawValue
+        compactItem.target = self
+        menu.addItem(compactItem)
+
+        let standardItem = NSMenuItem(
+            title: L("density.standard"),
+            action: #selector(selectDensityAction(_:)),
+            keyEquivalent: ""
+        )
+        standardItem.tag = TableDensity.standard.rawValue
+        standardItem.target = self
+        menu.addItem(standardItem)
+
+        let comfortableItem = NSMenuItem(
+            title: L("density.comfortable"),
+            action: #selector(selectDensityAction(_:)),
+            keyEquivalent: ""
+        )
+        comfortableItem.tag = TableDensity.comfortable.rawValue
+        comfortableItem.target = self
+        menu.addItem(comfortableItem)
+
+        let largeItem = NSMenuItem(
+            title: L("density.large"),
+            action: #selector(selectDensityAction(_:)),
+            keyEquivalent: ""
+        )
+        largeItem.tag = TableDensity.large.rawValue
+        largeItem.target = self
+        menu.addItem(largeItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let resetWindowItem = NSMenuItem(
+            title: L("window.resetSize"),
+            action: #selector(resetToDefaultWindowFrame),
+            keyEquivalent: "0"
+        )
+        resetWindowItem.keyEquivalentModifierMask = [.command, .option]
+        resetWindowItem.target = self
+        menu.addItem(resetWindowItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let preferencesItem = NSMenuItem(
+            title: L("menu.preferences"),
+            action: #selector(openPreferencesAction(_:)),
+            keyEquivalent: ","
+        )
+        preferencesItem.target = self
+        menu.addItem(preferencesItem)
+
+        return menu
+    }
+
+    @objc private func zoomInAction(_ sender: Any?) {
+        let current = currentTableFontSize
+        let next = min(CGFloat(TableDensity.maxFontSize), current + 2)
+        if next != current {
+            currentTableFontSize = next
+        }
+    }
+
+    @objc private func zoomOutAction(_ sender: Any?) {
+        let current = currentTableFontSize
+        let next = max(CGFloat(TableDensity.minFontSize), current - 2)
+        if next != current {
+            currentTableFontSize = next
+        }
+    }
+
+    @objc private func zoomActualSizeAction(_ sender: Any?) {
+        currentTableFontSize = CGFloat(TableDensity.defaultFontSize)
+    }
+
+    @objc private func selectDensityAction(_ sender: NSMenuItem) {
+        if let density = TableDensity(rawValue: sender.tag) {
+            currentTableFontSize = density.fontSize
+        }
+    }
+
+    @objc private func openPreferencesAction(_ sender: Any?) {
+        (NSApp.delegate as? AppDelegate)?.openPreferences()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(zoomInAction(_:)) {
+            return currentTableFontSize < CGFloat(TableDensity.maxFontSize)
+        }
+        if menuItem.action == #selector(zoomOutAction(_:)) {
+            return currentTableFontSize > CGFloat(TableDensity.minFontSize)
+        }
+        if menuItem.action == #selector(zoomActualSizeAction(_:)) {
+            return currentTableFontSize != CGFloat(TableDensity.defaultFontSize)
+        }
+        if menuItem.action == #selector(selectDensityAction(_:)) {
+            menuItem.state = (Int(currentTableFontSize) == menuItem.tag) ? .on : .off
+            return true
+        }
+        if menuItem.action == #selector(resetToDefaultWindowFrame) || menuItem.action == #selector(openPreferencesAction(_:)) {
+            return true
+        }
+        return true
     }
 }
 

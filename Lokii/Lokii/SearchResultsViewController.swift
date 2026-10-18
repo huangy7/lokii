@@ -29,6 +29,97 @@ extension CALayer {
     }
 }
 
+// MARK: - Notification & Density Model
+
+extension Notification.Name {
+    static let tableDensityDidChange = Notification.Name("LokiiTableDensityDidChange")
+}
+
+/// 检索结果列表排版密度与尺寸联动模型
+public enum TableDensity: Int, CaseIterable {
+    case compact = 11
+    case standard = 13
+    case comfortable = 15
+    case large = 17
+
+    public static let minFontSize: Int = 11
+    public static let maxFontSize: Int = 19
+    public static let defaultFontSize: Int = 13
+    public static let fontSizeUserDefaultsKey = "LokiiTableFontSize"
+
+    public var fontSize: CGFloat { CGFloat(rawValue) }
+
+    public var rowHeight: CGFloat {
+        switch self {
+        case .compact: return 21
+        case .standard: return 24
+        case .comfortable: return 27
+        case .large: return 30
+        }
+    }
+
+    public var iconSize: CGFloat {
+        switch self {
+        case .compact: return 14
+        case .standard: return 16
+        case .comfortable: return 18
+        case .large: return 20
+        }
+    }
+
+    public var dateColumnMinWidth: CGFloat {
+        switch self {
+        case .compact: return 130
+        case .standard: return 150
+        case .comfortable: return 170
+        case .large: return 190
+        }
+    }
+
+    public static func calculateRowHeight(for fontSize: CGFloat) -> CGFloat {
+        switch Int(fontSize) {
+        case ...11: return 21
+        case 12...13: return 24
+        case 14...15: return 27
+        case 16...17: return 30
+        default: return 33
+        }
+    }
+
+    public static func calculateIconSize(for fontSize: CGFloat) -> CGFloat {
+        switch Int(fontSize) {
+        case ...11: return 14
+        case 12...13: return 16
+        case 14...15: return 18
+        case 16...17: return 20
+        default: return 22
+        }
+    }
+
+    public static func calculateDateMinWidth(for fontSize: CGFloat) -> CGFloat {
+        switch Int(fontSize) {
+        case ...11: return 130
+        case 12...13: return 150
+        case 14...15: return 170
+        case 16...17: return 190
+        default: return 210
+        }
+    }
+}
+
+/// 列表字体缓存池：按生效字号集中构建，避免高频滚动时重复分配 CoreText 字体描述符
+struct TableFontCache {
+    let regular: NSFont
+    let bold: NSFont
+    let monospacedDigit: NSFont
+
+    init(fontSize: CGFloat) {
+        self.regular = .systemFont(ofSize: fontSize)
+        self.bold = .systemFont(ofSize: fontSize, weight: .bold)
+        self.monospacedDigit = .monospacedDigitSystemFont(ofSize: fontSize, weight: .regular)
+    }
+}
+
 // MARK: - SearchResultsViewControllerDelegate
 
 /// 检索虚拟列表事件代理协议
@@ -82,6 +173,9 @@ final class SearchResultsViewController: NSViewController {
     private(set) var results: [FfiSearchResult] = []
     private var iconCache: [String: NSImage] = [:]
     private var lastReportedPath: String?
+    private(set) var currentFontSize: CGFloat = CGFloat(TableDensity.defaultFontSize)
+    private(set) var fontCache = TableFontCache(fontSize: CGFloat(TableDensity.defaultFontSize))
+    private(set) var currentIconSize: CGFloat = CGFloat(TableDensity.standard.iconSize)
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -221,11 +315,22 @@ final class SearchResultsViewController: NSViewController {
             name: L10n.languageChangedNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onTableDensityChanged(_:)),
+            name: .tableDensityDidChange,
+            object: nil
+        )
     }
 
     private func setupTableView() {
         tableView.style = .fullWidth
-        tableView.rowHeight = 24
+        let savedSize = UserDefaults.standard.double(forKey: TableDensity.fontSizeUserDefaultsKey)
+        let initialFontSize = savedSize > 0 ? CGFloat(savedSize) : CGFloat(TableDensity.defaultFontSize)
+        currentFontSize = initialFontSize
+        fontCache = TableFontCache(fontSize: initialFontSize)
+        currentIconSize = TableDensity.calculateIconSize(for: initialFontSize)
+        tableView.rowHeight = TableDensity.calculateRowHeight(for: initialFontSize)
         tableView.intercellSpacing = NSSize(width: 0, height: 0)
         tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         tableView.allowsColumnReordering = true
@@ -270,7 +375,7 @@ final class SearchResultsViewController: NSViewController {
         let modifiedCol = NSTableColumn(identifier: .columnModified)
         modifiedCol.title = L("search.col.dateModified")
         modifiedCol.width = 160
-        modifiedCol.minWidth = 100
+        modifiedCol.minWidth = TableDensity.calculateDateMinWidth(for: currentFontSize)
         modifiedCol.sortDescriptorPrototype = NSSortDescriptor(key: "modified", ascending: false)
         tableView.addTableColumn(modifiedCol)
 
@@ -281,6 +386,29 @@ final class SearchResultsViewController: NSViewController {
         sizeCol.headerCell.alignment = .right
         sizeCol.sortDescriptorPrototype = NSSortDescriptor(key: "size", ascending: false)
         tableView.addTableColumn(sizeCol)
+    }
+
+    @objc private func onTableDensityChanged(_ notification: Notification) {
+        let newSize: CGFloat
+        if let size = notification.userInfo?["fontSize"] as? CGFloat {
+            newSize = size
+        } else {
+            let saved = UserDefaults.standard.double(forKey: TableDensity.fontSizeUserDefaultsKey)
+            newSize = saved > 0 ? CGFloat(saved) : CGFloat(TableDensity.defaultFontSize)
+        }
+        applyFontSize(newSize)
+    }
+
+    func applyFontSize(_ fontSize: CGFloat) {
+        currentFontSize = fontSize
+        fontCache = TableFontCache(fontSize: fontSize)
+        currentIconSize = TableDensity.calculateIconSize(for: fontSize)
+        tableView.rowHeight = TableDensity.calculateRowHeight(for: fontSize)
+
+        if let modifiedCol = tableView.tableColumns.first(where: { $0.identifier == .columnModified }) {
+            modifiedCol.minWidth = TableDensity.calculateDateMinWidth(for: fontSize)
+        }
+        tableView.reloadData()
     }
 
     private func setupContextMenu() {
@@ -570,7 +698,6 @@ final class SearchResultsViewController: NSViewController {
     func iconForFile(at path: String) -> NSImage {
         if let cached = iconCache[path] { return cached }
         let icon = NSWorkspace.shared.icon(forFile: path)
-        icon.size = NSSize(width: 16, height: 16)
         iconCache[path] = icon
         return icon
     }
@@ -614,7 +741,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
             let str = Self.dateFormatter.string(from: date)
             return textCell(
                 string: str,
-                font: .systemFont(ofSize: 13),
+                font: fontCache.regular,
                 color: .labelColor,
                 alignment: .left,
                 identifier: colID,
@@ -624,7 +751,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
             let str = result.isDir ? "--" : Self.sizeFormatter.string(fromByteCount: Int64(result.size))
             return textCell(
                 string: str,
-                font: .monospacedDigitSystemFont(ofSize: 13, weight: .regular),
+                font: fontCache.monospacedDigit,
                 color: .secondaryLabelColor,
                 alignment: .right,
                 identifier: colID,
@@ -646,6 +773,8 @@ extension SearchResultsViewController: NSTableViewDelegate {
         let id = NSUserInterfaceItemIdentifier("NameCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
             reused.imageView?.image = iconForFile(at: result.path)
+            reused.updateIconSize(currentIconSize)
+            reused.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
             reused.configure(name: result.name, matchPositions: result.matchPositions)
             return reused
         }
@@ -662,7 +791,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
 
         let textField = NSTextField(labelWithString: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.font = .systemFont(ofSize: 13)
+        textField.font = fontCache.regular
         textField.lineBreakMode = .byTruncatingTail
         textField.maximumNumberOfLines = 1
         textField.cell?.wraps = false
@@ -673,16 +802,21 @@ extension SearchResultsViewController: NSTableViewDelegate {
         cell.addSubview(textField)
         cell.textField = textField
 
+        let widthConstraint = imageView.widthAnchor.constraint(equalToConstant: currentIconSize)
+        let heightConstraint = imageView.heightAnchor.constraint(equalToConstant: currentIconSize)
+
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
             imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            imageView.widthAnchor.constraint(equalToConstant: 16),
-            imageView.heightAnchor.constraint(equalToConstant: 16),
+            widthConstraint,
+            heightConstraint,
             textField.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 4),
             textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
             textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
 
+        cell.setIconConstraints(width: widthConstraint, height: heightConstraint)
+        cell.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
         cell.configure(name: result.name, matchPositions: result.matchPositions)
 
         return cell
@@ -691,6 +825,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
     private func pathCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier("PathCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchPathTableCellView {
+            reused.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
             reused.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
             return reused
         }
@@ -700,7 +835,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
 
         let textField = NSTextField(labelWithString: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.font = .systemFont(ofSize: 13)
+        textField.font = fontCache.regular
         textField.lineBreakMode = .byTruncatingTail
         textField.maximumNumberOfLines = 1
         textField.cell?.wraps = false
@@ -717,6 +852,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
             textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
 
+        cell.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
         cell.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
         return cell
     }
@@ -732,6 +868,9 @@ extension SearchResultsViewController: NSTableViewDelegate {
         let cellID = NSUserInterfaceItemIdentifier(identifier.rawValue + "Cell")
         if let reused = tableView.makeView(withIdentifier: cellID, owner: nil) as? NSTableCellView {
             reused.textField?.stringValue = string
+            reused.textField?.font = font
+            reused.textField?.textColor = color
+            reused.textField?.alignment = alignment
             return reused
         }
 
@@ -978,9 +1117,17 @@ class SearchHighlightCellView: NSTableCellView {
     /// 选中态下基准字色的不透明度，突出命中字符。
     var selectedAlpha: CGFloat { 1 }
 
-    /// 字号恒定，字体对象全类复用。
-    private static let regularFont = NSFont.systemFont(ofSize: 13)
-    private static let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
+    /// 字体对象随全局排版密度动态绑定，并复用外部缓存池
+    private(set) var regularFont: NSFont = NSFont.systemFont(ofSize: 13)
+    private(set) var boldFont: NSFont = NSFont.systemFont(ofSize: 13, weight: .bold)
+
+    func applyFonts(regular: NSFont, bold: NSFont) {
+        if self.regularFont != regular || self.boldFont != bold {
+            self.regularFont = regular
+            self.boldFont = bold
+            renderText()
+        }
+    }
 
     private var displayString = ""
     private var displayRanges: [NSRange] = []
@@ -1030,13 +1177,13 @@ class SearchHighlightCellView: NSTableCellView {
         let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
 
         let attributed = NSMutableAttributedString(string: displayString, attributes: [
-            .font: Self.regularFont,
+            .font: regularFont,
             .foregroundColor: defaultColor,
         ])
 
         for range in displayRanges {
             attributed.addAttributes([
-                .font: Self.boldFont,
+                .font: boldFont,
                 .foregroundColor: highlightColor,
             ], range: range)
         }
@@ -1049,6 +1196,23 @@ class SearchHighlightCellView: NSTableCellView {
 final class SearchNameTableCellView: SearchHighlightCellView {
     /// 选中态下普通字符用微透明白保持层级，命中字符用纯白加粗突出。
     override var selectedAlpha: CGFloat { 0.82 }
+
+    private(set) var iconWidthConstraint: NSLayoutConstraint?
+    private(set) var iconHeightConstraint: NSLayoutConstraint?
+
+    func setIconConstraints(width: NSLayoutConstraint, height: NSLayoutConstraint) {
+        self.iconWidthConstraint = width
+        self.iconHeightConstraint = height
+    }
+
+    func updateIconSize(_ size: CGFloat) {
+        if iconWidthConstraint?.constant != size {
+            iconWidthConstraint?.constant = size
+        }
+        if iconHeightConstraint?.constant != size {
+            iconHeightConstraint?.constant = size
+        }
+    }
 
     func configure(name: String, matchPositions: [FfiMatchRange]) {
         setDisplay(name, ranges: matchPositions.map { (Int($0.start), Int($0.end)) })

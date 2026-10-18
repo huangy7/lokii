@@ -116,10 +116,18 @@
 /* SearchWindow - search field */
 "search.placeholder" = "Search files...";
 
-/* SearchWindow - toolbar */
+/* SearchWindow - toolbar & view options */
 "search.toggleSidebar" = "Toggle Sidebar";
 "search.rebuildIndex" = "Rebuild Index";
+"window.viewOptions" = "View Options";
 "window.resetSize" = "Reset Window Size";
+"menu.zoomIn" = "Zoom In";
+"menu.zoomOut" = "Zoom Out";
+"menu.actualSize" = "Actual Size";
+"density.compact" = "Compact (11 pt)";
+"density.standard" = "Standard (13 pt)";
+"density.comfortable" = "Comfortable (15 pt)";
+"density.large" = "Large (17 pt)";
 
 /* SearchWindow - status */
 "search.indexing" = "Indexing...";

@@ -276,7 +276,7 @@ controller.delegate = mockRebuildDelegate
 controller.rebuildButton.sendAction(controller.rebuildButton.action!, to: controller.rebuildButton.target)
 assertEqual(mockRebuildDelegate.rebuildCallCount, 1, "点击重建按钮应通过代理派发 searchResultsDidRequestRebuild")
 
-print("[9/9] 测试键盘导航焦点接力与首行上移回调 (focusResults & SearchTableView.moveUp)...")
+print("[9/10] 测试键盘导航焦点接力与首行上移回调 (focusResults & SearchTableView.moveUp)...")
 let navDelegate = MockDelegate()
 controller.delegate = navDelegate
 
@@ -346,7 +346,32 @@ let shiftUpArrowEvent = NSEvent.keyEvent(
 controller.tableView.keyDown(with: shiftUpArrowEvent)
 assertEqual(navDelegate.focusSearchFieldCallCount, 1, "带有 ⇧ 修饰键的方向上键不应触发回焦代理")
 
-print("测试全部通过：9/9 项断言成功。")
+print("[10/10] 测试排版密度模型与动态字号/行高/图标/列宽联动 (applyFontSize)...")
+// 测试应用紧凑字号 11pt
+controller.applyFontSize(CGFloat(TableDensity.compact.rawValue))
+assertEqual(controller.currentFontSize, 11, "当前生效字号应为 11 pt")
+assertEqual(controller.tableView.rowHeight, 21, "紧凑模式行高应为 21 pt")
+assertEqual(controller.currentIconSize, 14, "紧凑模式图标尺寸应为 14 pt")
+
+// 测试应用舒适字号 15pt
+controller.applyFontSize(CGFloat(TableDensity.comfortable.rawValue))
+assertEqual(controller.currentFontSize, 15, "当前生效字号应为 15 pt")
+assertEqual(controller.tableView.rowHeight, 27, "舒适模式行高应为 27 pt")
+assertEqual(controller.currentIconSize, 18, "舒适模式图标尺寸应为 18 pt")
+
+// 测试应用大号字号 17pt
+controller.applyFontSize(CGFloat(TableDensity.large.rawValue))
+assertEqual(controller.currentFontSize, 17, "当前生效字号应为 17 pt")
+assertEqual(controller.tableView.rowHeight, 30, "大号模式行高应为 30 pt")
+assertEqual(controller.currentIconSize, 20, "大号模式图标尺寸应为 20 pt")
+
+// 恢复标准字号 13pt
+controller.applyFontSize(CGFloat(TableDensity.standard.rawValue))
+assertEqual(controller.currentFontSize, 13, "当前生效字号应恢复为 13 pt")
+assertEqual(controller.tableView.rowHeight, 24, "标准模式行高应为 24 pt")
+assertEqual(controller.currentIconSize, 16, "标准模式图标尺寸应为 16 pt")
+
+print("测试全部通过：10/10 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

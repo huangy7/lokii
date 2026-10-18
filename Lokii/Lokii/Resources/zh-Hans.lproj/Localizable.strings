@@ -116,10 +116,18 @@
 /* SearchWindow - search field */
 "search.placeholder" = "搜索文件...";
 
-/* SearchWindow - toolbar */
+/* SearchWindow - toolbar & view options */
 "search.toggleSidebar" = "切换侧边栏";
 "search.rebuildIndex" = "重建索引";
+"window.viewOptions" = "视图选项";
 "window.resetSize" = "恢复默认窗口大小";
+"menu.zoomIn" = "放大字号";
+"menu.zoomOut" = "缩小字号";
+"menu.actualSize" = "实际大小";
+"density.compact" = "紧凑 (11 pt)";
+"density.standard" = "标准 (13 pt)";
+"density.comfortable" = "舒适 (15 pt)";
+"density.large" = "大号 (17 pt)";
 
 /* SearchWindow - status */
 "search.indexing" = "正在索引...";

@@ -41,6 +41,15 @@ do {
         "search.matchedCount.one",
         "search.statusWithMatches",
         "window.resetSize",
+        "window.viewOptions",
+        "menu.zoomIn",
+        "menu.zoomOut",
+        "menu.actualSize",
+        "density.compact",
+        "density.standard",
+        "density.comfortable",
+        "density.large",
+        "menu.preferences",
     ]
 
     for key in requiredKeys {
@@ -51,10 +60,12 @@ do {
     assertTrue(zhContent.contains("切换侧边栏"), "zh-Hans 应包含切换侧边栏")
     assertTrue(zhContent.contains("已匹配 %@ 项"), "zh-Hans 应包含匹配项模板")
     assertTrue(zhContent.contains("恢复默认窗口大小"), "zh-Hans 应包含恢复默认窗口大小")
+    assertTrue(zhContent.contains("视图选项"), "zh-Hans 应包含视图选项")
 
     assertTrue(enContent.contains("Toggle Sidebar"), "en 应包含 Toggle Sidebar")
     assertTrue(enContent.contains("%@ matches"), "en 应包含 matches 模板")
     assertTrue(enContent.contains("Reset Window Size"), "en 应包含 Reset Window Size")
+    assertTrue(enContent.contains("View Options"), "en 应包含 View Options")
 
     assertTrue(!zhContent.contains("search.toggleInspector"), "zh-Hans 不应包含已下线的 search.toggleInspector")
     assertTrue(!enContent.contains("search.toggleInspector"), "en 不应包含已下线的 search.toggleInspector")
@@ -264,6 +275,11 @@ do {
     assertTrue(source.contains("equalToConstant: 28"), "SearchWindow.swift 中 searchField 必须设置 28 pt 固定高度约束")
     assertTrue(!source.contains("lessThanOrEqualToConstant"), "SearchWindow.swift 中 searchField 严禁设置最大宽度上限约束")
     assertTrue(!source.contains(".flexibleSpace"), "SearchWindow.swift 中顶栏项不应再包含 flexibleSpace 留白占位符")
+    assertTrue(source.contains("textformat.size"), "SearchWindow.swift 中视图选项按钮图标应为 textformat.size")
+    assertTrue(source.contains("buildViewOptionsMenu"), "SearchWindow.swift 必须实现 buildViewOptionsMenu 视图选项菜单构建方法")
+    assertTrue(source.contains("openPreferencesAction"), "SearchWindow.swift 必须包含 openPreferencesAction 偏好设置动作")
+    assertTrue(source.contains("toolbar.displayMode = .iconOnly"), "SearchWindow.swift 工具栏必须显式配置为纯图标显示模式")
+    assertTrue(source.contains("allowsDisplayModeCustomization = false"), "SearchWindow.swift 必须禁用工具栏显示模式自定义以屏蔽'图标和文本'右键选项")
 }
 
 print("测试全部通过：5/5 项断言成功。")

@@ -206,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.orderFrontStandardAboutPanel(options: options)
     }
 
-    @objc private func openPreferences() {
+    @objc func openPreferences() {
         if preferencesController == nil {
             preferencesController = PreferencesWindowController(engine: engine)
         }
