@@ -11,16 +11,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var preferencesController: PreferencesWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let config = engine.getConfig()
+
         // 在创建任何 UI 之前加载语言包
-        let lang = engine.getConfig()?.general.language ?? "zh-Hans"
-        L10n.configure(language: lang)
+        L10n.configure(language: config?.general.language ?? "zh-Hans")
 
         // 应用存储的外观主题
         ThemeManager.shared.applyCurrentTheme()
 
         // 根据配置设置应用激活策略（是否常驻 Dock）
-        let showInDock = engine.getConfig()?.general.showInDock ?? true
-        NSApp.setActivationPolicy(showInDock ? .regular : .accessory)
+        NSApp.setActivationPolicy((config?.general.showInDock ?? true) ? .regular : .accessory)
 
         setupStatusItem()
         setupMainMenu()
@@ -44,9 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        guard engine.hasFullDiskAccess else { return }
-        UserDefaults.standard.removeObject(forKey: "FDAPromptDismissed")
-        FDAGuideWindowController.closeIfOpen()
+        clearFDAPromptIfGranted()
     }
 
     func applicationDidResignActive(_ notification: Notification) {
@@ -106,14 +104,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Full Disk Access
 
     private func checkAndPromptFDA() {
-        if engine.hasFullDiskAccess {
-            UserDefaults.standard.removeObject(forKey: "FDAPromptDismissed")
-            FDAGuideWindowController.closeIfOpen()
-            return
-        }
-
-        guard !UserDefaults.standard.bool(forKey: "FDAPromptDismissed") else { return }
+        guard !clearFDAPromptIfGranted() else { return }
+        guard !UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey) else { return }
         FDAGuideWindowController.show()
+    }
+
+    /// 权限已授予时清除“不再提示”标记并收起引导窗；返回当前是否已具备完整磁盘访问权限
+    @discardableResult
+    private func clearFDAPromptIfGranted() -> Bool {
+        guard engine.hasFullDiskAccess else { return false }
+        UserDefaults.standard.removeObject(forKey: FDAGuideWindowController.promptDismissedKey)
+        FDAGuideWindowController.closeIfOpen()
+        return true
     }
 
     // MARK: - Main Menu

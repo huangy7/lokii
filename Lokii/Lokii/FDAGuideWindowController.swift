@@ -4,6 +4,9 @@ import SwiftUI
 final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
     static var current: FDAGuideWindowController?
 
+    /// “不再提示”标记的持久化键；引导窗、视图与应用代理共用同一份定义，避免字面量拼写漂移
+    static let promptDismissedKey = "FDAPromptDismissed"
+
     static func show() {
         if let existing = current, existing.window?.isVisible == true {
             existing.window?.makeKeyAndOrderFront(nil)
@@ -76,9 +79,9 @@ final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
 
     private func updateDismissedState(dontShowAgain: Bool) {
         if dontShowAgain {
-            UserDefaults.standard.set(true, forKey: "FDAPromptDismissed")
+            UserDefaults.standard.set(true, forKey: Self.promptDismissedKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: "FDAPromptDismissed")
+            UserDefaults.standard.removeObject(forKey: Self.promptDismissedKey)
         }
     }
 

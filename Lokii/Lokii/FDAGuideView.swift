@@ -213,7 +213,7 @@ struct FDAGuideView: View {
         .frame(width: 380, height: 154)
         .background(FDAVisualEffectView().ignoresSafeArea())
         .onAppear {
-            dontShowAgain = UserDefaults.standard.bool(forKey: "FDAPromptDismissed")
+            dontShowAgain = UserDefaults.standard.bool(forKey: FDAGuideWindowController.promptDismissedKey)
         }
     }
 

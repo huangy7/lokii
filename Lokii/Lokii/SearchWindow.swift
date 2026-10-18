@@ -72,12 +72,6 @@ final class SearchWindow: NSWindowController {
     private var indexingState: IndexingState = .initializing
 
     // Shared formatters
-    private static let fullDateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .long
-        f.timeStyle = .medium
-        return f
-    }()
     private static let countFormatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
@@ -116,6 +110,7 @@ final class SearchWindow: NSWindowController {
         }
 
         setupUI()
+        reloadWindowBehavior()
         applyInitialWindowFrame()
         window.delegate = self
         window.contentView?.wantsLayer = true
@@ -239,12 +234,6 @@ final class SearchWindow: NSWindowController {
         window?.toolbar = toolbar
     }
 
-    // MARK: - Panel Collapse Actions
-
-    @objc func toggleSidebar(_ sender: Any? = nil) {
-        splitViewController.toggleSidebar()
-    }
-
     // MARK: - Search Mode Menu (on the magnifying glass)
 
     private func setupSearchModeMenu() {
@@ -307,7 +296,6 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func onLanguageChanged() {
-        Self.fullDateFormatter.locale = L10n.locale
         searchField.placeholderString = L(isInlineProgressActive ? "search.indexingIncomplete" : "search.placeholder")
         if let toolbar = window?.toolbar {
             for item in toolbar.items {
@@ -365,13 +353,10 @@ final class SearchWindow: NSWindowController {
         let count = note.userInfo?["scannedFiles"] as? UInt64 ?? 0
         let formatted = formatCount(count)
 
+        statusText = .formatted("search.indexingCount", formatted)
+        // 冷启动期间额外把扫描计数同步到遮罩副标题
         if isColdStart && indexingState == .initializing {
-            // Cold start: update overlay
             overlaySubtext = .formatted("search.scannedCount", formatted)
-            statusText = .formatted("search.indexingCount", formatted)
-        } else {
-            // Hot start or rebuild: update inline status bar
-            statusText = .formatted("search.indexingCount", formatted)
         }
     }
 
@@ -379,41 +364,33 @@ final class SearchWindow: NSWindowController {
         let total = note.userInfo?["total"] as? UInt64 ?? 0
         let source = note.userInfo?["source"] as? String ?? ""
 
+        guard indexingState != .failed else { return }
+        statusText = .formatted("search.indexedCount", formatCount(total))
+
+        // 完成事件必须与当前所处阶段同源：并发触发的 initialize/rebuild 事件
+        // 到达时仅刷新计数，不得据此结束当前阶段
         switch indexingState {
-        case .failed:
-            return
-        case .initializing:
-            guard source != "rebuild" else {
-                statusText = .formatted("search.indexedCount", formatCount(total))
-                return
-            }
-            statusText = .formatted("search.indexedCount", formatCount(total))
-            if isColdStart {
-                hideLoadingOverlay()
-            } else {
-                hideInlineProgress()
-            }
-            searchResultsViewController.setRebuildEnabled(true)
-            searchResultsViewController.setRebuildSpinning(false)
-            indexingState = .idle
-            if searchField.stringValue.isEmpty {
-                loadDefaultResults()
-            }
-        case .rebuilding:
-            guard source == "rebuild" else {
-                statusText = .formatted("search.indexedCount", formatCount(total))
-                return
-            }
-            statusText = .formatted("search.indexedCount", formatCount(total))
-            hideInlineProgress()
-            searchResultsViewController.setRebuildSpinning(false)
-            searchResultsViewController.setRebuildEnabled(true)
-            indexingState = .idle
-            if searchField.stringValue.isEmpty {
-                loadDefaultResults()
-            }
         case .idle:
-            statusText = .formatted("search.indexedCount", formatCount(total))
+            return
+        case .initializing where source == "rebuild":
+            return
+        case .rebuilding where source != "rebuild":
+            return
+        default:
+            break
+        }
+
+        // 冷启动以全窗遮罩呈现进度，热启动与重建以内联指示器呈现，故收起方式不同
+        if indexingState == .initializing && isColdStart {
+            hideLoadingOverlay()
+        } else {
+            hideInlineProgress()
+        }
+        searchResultsViewController.setRebuildSpinning(false)
+        searchResultsViewController.setRebuildEnabled(true)
+        indexingState = .idle
+        if searchField.stringValue.isEmpty {
+            loadDefaultResults()
         }
     }
 
@@ -462,6 +439,7 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func onConfigReloaded(_ note: Notification) {
+        reloadWindowBehavior()
         applyWindowBehaviorFromConfig()
     }
 
@@ -490,8 +468,12 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    private var shouldRememberWindowPosition: Bool {
-        engine.getConfig()?.window.rememberPosition ?? false
+    /// 窗口位置记忆开关的本地缓存，随配置重载刷新。
+    /// 拖动与缩放回调按显示刷新率触发，若每次实时跨 FFI 解码整份配置将产生大量冗余开销。
+    private var shouldRememberWindowPosition = false
+
+    private func reloadWindowBehavior() {
+        shouldRememberWindowPosition = engine.getConfig()?.window.rememberPosition ?? false
     }
 
     private func saveWindowFrameIfNeeded() {
@@ -1053,12 +1035,9 @@ extension SearchWindow: NSToolbarDelegate {
 
 extension SearchWindow: NSMenuItemValidation {
     private var currentTableFontSize: CGFloat {
-        get {
-            let saved = UserDefaults.standard.double(forKey: TableDensity.fontSizeUserDefaultsKey)
-            return saved > 0 ? CGFloat(saved) : CGFloat(TableDensity.defaultFontSize)
-        }
+        get { TableDensity.savedFontSize }
         set {
-            UserDefaults.standard.set(Double(newValue), forKey: TableDensity.fontSizeUserDefaultsKey)
+            TableDensity.savedFontSize = newValue
             NotificationCenter.default.post(
                 name: .tableDensityDidChange,
                 object: nil,
@@ -1103,41 +1082,16 @@ extension SearchWindow: NSMenuItemValidation {
 
         menu.addItem(NSMenuItem.separator())
 
-        let compactItem = NSMenuItem(
-            title: L("density.compact"),
-            action: #selector(selectDensityAction(_:)),
-            keyEquivalent: ""
-        )
-        compactItem.tag = TableDensity.compact.rawValue
-        compactItem.target = self
-        menu.addItem(compactItem)
-
-        let standardItem = NSMenuItem(
-            title: L("density.standard"),
-            action: #selector(selectDensityAction(_:)),
-            keyEquivalent: ""
-        )
-        standardItem.tag = TableDensity.standard.rawValue
-        standardItem.target = self
-        menu.addItem(standardItem)
-
-        let comfortableItem = NSMenuItem(
-            title: L("density.comfortable"),
-            action: #selector(selectDensityAction(_:)),
-            keyEquivalent: ""
-        )
-        comfortableItem.tag = TableDensity.comfortable.rawValue
-        comfortableItem.target = self
-        menu.addItem(comfortableItem)
-
-        let largeItem = NSMenuItem(
-            title: L("density.large"),
-            action: #selector(selectDensityAction(_:)),
-            keyEquivalent: ""
-        )
-        largeItem.tag = TableDensity.large.rawValue
-        largeItem.target = self
-        menu.addItem(largeItem)
+        for density in TableDensity.allCases {
+            let item = NSMenuItem(
+                title: L(density.titleKey),
+                action: #selector(selectDensityAction(_:)),
+                keyEquivalent: ""
+            )
+            item.tag = density.rawValue
+            item.target = self
+            menu.addItem(item)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1163,20 +1117,24 @@ extension SearchWindow: NSMenuItemValidation {
         return menu
     }
 
-    @objc private func zoomInAction(_ sender: Any?) {
+    /// 按步长缩放列表字号，并钳制在可读区间内
+    private func adjustFontSize(by delta: CGFloat) {
         let current = currentTableFontSize
-        let next = min(CGFloat(TableDensity.maxFontSize), current + 2)
+        let next = min(
+            max(current + delta, CGFloat(TableDensity.minFontSize)),
+            CGFloat(TableDensity.maxFontSize)
+        )
         if next != current {
             currentTableFontSize = next
         }
     }
 
+    @objc private func zoomInAction(_ sender: Any?) {
+        adjustFontSize(by: 2)
+    }
+
     @objc private func zoomOutAction(_ sender: Any?) {
-        let current = currentTableFontSize
-        let next = max(CGFloat(TableDensity.minFontSize), current - 2)
-        if next != current {
-            currentTableFontSize = next
-        }
+        adjustFontSize(by: -2)
     }
 
     @objc private func zoomActualSizeAction(_ sender: Any?) {
@@ -1205,9 +1163,6 @@ extension SearchWindow: NSMenuItemValidation {
         }
         if menuItem.action == #selector(selectDensityAction(_:)) {
             menuItem.state = (Int(currentTableFontSize) == menuItem.tag) ? .on : .off
-            return true
-        }
-        if menuItem.action == #selector(resetToDefaultWindowFrame) || menuItem.action == #selector(openPreferencesAction(_:)) {
             return true
         }
         return true

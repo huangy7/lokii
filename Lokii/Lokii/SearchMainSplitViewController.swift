@@ -133,6 +133,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
 
     // MARK: - Notifications & Localization
 
+    /// 语言切换由本中介统一下发至各子栏，子栏不再各自订阅同一通知
     @objc func onLanguageChanged() {
         searchResultsViewController.onLanguageChanged()
     }

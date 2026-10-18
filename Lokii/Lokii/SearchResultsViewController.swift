@@ -49,61 +49,52 @@ public enum TableDensity: Int, CaseIterable {
 
     public var fontSize: CGFloat { CGFloat(rawValue) }
 
-    public var rowHeight: CGFloat {
+    /// 档位对应的本地化标题键
+    var titleKey: String {
         switch self {
-        case .compact: return 21
-        case .standard: return 24
-        case .comfortable: return 27
-        case .large: return 30
+        case .compact: return "density.compact"
+        case .standard: return "density.standard"
+        case .comfortable: return "density.comfortable"
+        case .large: return "density.large"
         }
     }
 
-    public var iconSize: CGFloat {
-        switch self {
-        case .compact: return 14
-        case .standard: return 16
-        case .comfortable: return 18
-        case .large: return 20
+    /// 生效字号，读写统一落在同一 UserDefaults 键；未持久化时回退默认档位
+    static var savedFontSize: CGFloat {
+        get {
+            let saved = UserDefaults.standard.double(forKey: fontSizeUserDefaultsKey)
+            return saved > 0 ? CGFloat(saved) : CGFloat(defaultFontSize)
+        }
+        set {
+            UserDefaults.standard.set(Double(newValue), forKey: fontSizeUserDefaultsKey)
         }
     }
 
-    public var dateColumnMinWidth: CGFloat {
-        switch self {
-        case .compact: return 130
-        case .standard: return 150
-        case .comfortable: return 170
-        case .large: return 190
+    /// 行高、图标与日期列宽随字号连续缩放，三者共享同一套分档边界，故边界只在此定义一次
+    private static func tier(for fontSize: CGFloat) -> Int {
+        switch Int(fontSize) {
+        case ...11: return 0
+        case 12...13: return 1
+        case 14...15: return 2
+        case 16...17: return 3
+        default: return 4
         }
     }
+
+    private static let rowHeights: [CGFloat] = [21, 24, 27, 30, 33]
+    private static let iconSizes: [CGFloat] = [14, 16, 18, 20, 22]
+    private static let dateColumnMinWidths: [CGFloat] = [130, 150, 170, 190, 210]
 
     public static func calculateRowHeight(for fontSize: CGFloat) -> CGFloat {
-        switch Int(fontSize) {
-        case ...11: return 21
-        case 12...13: return 24
-        case 14...15: return 27
-        case 16...17: return 30
-        default: return 33
-        }
+        rowHeights[tier(for: fontSize)]
     }
 
     public static func calculateIconSize(for fontSize: CGFloat) -> CGFloat {
-        switch Int(fontSize) {
-        case ...11: return 14
-        case 12...13: return 16
-        case 14...15: return 18
-        case 16...17: return 20
-        default: return 22
-        }
+        iconSizes[tier(for: fontSize)]
     }
 
     public static func calculateDateMinWidth(for fontSize: CGFloat) -> CGFloat {
-        switch Int(fontSize) {
-        case ...11: return 130
-        case 12...13: return 150
-        case 14...15: return 170
-        case 16...17: return 190
-        default: return 210
-        }
+        dateColumnMinWidths[tier(for: fontSize)]
     }
 }
 
@@ -171,11 +162,19 @@ final class SearchResultsViewController: NSViewController {
     let rebuildButton = NSButton()
 
     private(set) var results: [FfiSearchResult] = []
-    private var iconCache: [String: NSImage] = [:]
+    private let iconCache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 512
+        return cache
+    }()
     private var lastReportedPath: String?
     private(set) var currentFontSize: CGFloat = CGFloat(TableDensity.defaultFontSize)
     private(set) var fontCache = TableFontCache(fontSize: CGFloat(TableDensity.defaultFontSize))
-    private(set) var currentIconSize: CGFloat = CGFloat(TableDensity.standard.iconSize)
+    private(set) var currentIconSize: CGFloat = TableDensity.calculateIconSize(for: CGFloat(TableDensity.defaultFontSize))
+
+    /// 时间与体积的展示串只取决于原始数值与当前语言，按原始值缓存以规避滚动时对每个进入视口的行重复格式化
+    private var dateTextCache: [TimeInterval: String] = [:]
+    private var sizeTextCache: [UInt64: String] = [:]
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -309,12 +308,8 @@ final class SearchResultsViewController: NSViewController {
         addTableColumns()
         setupContextMenu()
 
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(onLanguageChanged),
-            name: L10n.languageChangedNotification,
-            object: nil
-        )
+        // 语言切换经主分栏中介统一转发（SearchWindow → SearchMainSplitViewController），
+        // 此处不再自行订阅，避免同一通知触发两次整表刷新
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(onTableDensityChanged(_:)),
@@ -325,8 +320,7 @@ final class SearchResultsViewController: NSViewController {
 
     private func setupTableView() {
         tableView.style = .fullWidth
-        let savedSize = UserDefaults.standard.double(forKey: TableDensity.fontSizeUserDefaultsKey)
-        let initialFontSize = savedSize > 0 ? CGFloat(savedSize) : CGFloat(TableDensity.defaultFontSize)
+        let initialFontSize = TableDensity.savedFontSize
         currentFontSize = initialFontSize
         fontCache = TableFontCache(fontSize: initialFontSize)
         currentIconSize = TableDensity.calculateIconSize(for: initialFontSize)
@@ -389,13 +383,7 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc private func onTableDensityChanged(_ notification: Notification) {
-        let newSize: CGFloat
-        if let size = notification.userInfo?["fontSize"] as? CGFloat {
-            newSize = size
-        } else {
-            let saved = UserDefaults.standard.double(forKey: TableDensity.fontSizeUserDefaultsKey)
-            newSize = saved > 0 ? CGFloat(saved) : CGFloat(TableDensity.defaultFontSize)
-        }
+        let newSize = notification.userInfo?["fontSize"] as? CGFloat ?? TableDensity.savedFontSize
         applyFontSize(newSize)
     }
 
@@ -440,7 +428,9 @@ final class SearchResultsViewController: NSViewController {
     func displayResults(_ results: [FfiSearchResult], preserveSelection: Bool) {
         let previousPath = preserveSelection ? selectedResult?.path : nil
         self.results = results
-        self.iconCache.removeAll()
+        // 图标按路径稳定复用，跨检索保留；展示串缓存随结果集更替释放，避免无限增长
+        dateTextCache.removeAll()
+        sizeTextCache.removeAll()
 
         if !preserveSelection {
             tableView.sortDescriptors = []
@@ -491,11 +481,7 @@ final class SearchResultsViewController: NSViewController {
 
     /// 更新底栏文件路径展示
     func updateBottomPath(with path: String?) {
-        if let path {
-            pathBar.url = URL(fileURLWithPath: path)
-        } else {
-            pathBar.url = nil
-        }
+        pathBar.url = path.map { URL(fileURLWithPath: $0) }
     }
 
     /// 更新底栏状态统计文本
@@ -541,6 +527,9 @@ final class SearchResultsViewController: NSViewController {
         }
         tableView.headerView?.needsDisplay = true
         tableView.menu?.refreshLocalizedTitles()
+        // 格式化结果随语言环境变化，缓存需整体失效
+        dateTextCache.removeAll()
+        sizeTextCache.removeAll()
         tableView.reloadData()
         rebuildButton.toolTip = L("search.rebuildIndex")
         rebuildButton.setAccessibilityLabel(L("search.rebuildIndex"))
@@ -687,18 +676,10 @@ final class SearchResultsViewController: NSViewController {
         }
     }
 
-    private func abbreviatePath(_ path: String) -> String {
-        let home = NSHomeDirectory()
-        if path.hasPrefix(home) {
-            return "~" + path.dropFirst(home.count)
-        }
-        return path
-    }
-
     func iconForFile(at path: String) -> NSImage {
-        if let cached = iconCache[path] { return cached }
+        if let cached = iconCache.object(forKey: path as NSString) { return cached }
         let icon = NSWorkspace.shared.icon(forFile: path)
-        iconCache[path] = icon
+        iconCache.setObject(icon, forKey: path as NSString)
         return icon
     }
 }
@@ -737,10 +718,8 @@ extension SearchResultsViewController: NSTableViewDelegate {
         case .columnPath:
             return pathCell(for: result, in: tableView)
         case .columnModified:
-            let date = Date(timeIntervalSince1970: TimeInterval(result.modified))
-            let str = Self.dateFormatter.string(from: date)
             return textCell(
-                string: str,
+                string: dateText(for: TimeInterval(result.modified)),
                 font: fontCache.regular,
                 color: .labelColor,
                 alignment: .left,
@@ -748,7 +727,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
                 in: tableView
             )
         case .columnSize:
-            let str = result.isDir ? "--" : Self.sizeFormatter.string(fromByteCount: Int64(result.size))
+            let str = result.isDir ? "--" : sizeText(for: result.size)
             return textCell(
                 string: str,
                 font: fontCache.monospacedDigit,
@@ -767,6 +746,22 @@ extension SearchResultsViewController: NSTableViewDelegate {
         if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().reloadData()
         }
+    }
+
+    /// 修改时间展示串；按原始时间戳命中缓存，避免滚动时逐行重复格式化
+    private func dateText(for modified: TimeInterval) -> String {
+        if let cached = dateTextCache[modified] { return cached }
+        let text = Self.dateFormatter.string(from: Date(timeIntervalSince1970: modified))
+        dateTextCache[modified] = text
+        return text
+    }
+
+    /// 文件体积展示串；按原始字节数命中缓存，避免滚动时逐行重复格式化
+    private func sizeText(for size: UInt64) -> String {
+        if let cached = sizeTextCache[size] { return cached }
+        let text = Self.sizeFormatter.string(fromByteCount: Int64(size))
+        sizeTextCache[size] = text
+        return text
     }
 
     private func nameCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
@@ -1206,12 +1201,8 @@ final class SearchNameTableCellView: SearchHighlightCellView {
     }
 
     func updateIconSize(_ size: CGFloat) {
-        if iconWidthConstraint?.constant != size {
-            iconWidthConstraint?.constant = size
-        }
-        if iconHeightConstraint?.constant != size {
-            iconHeightConstraint?.constant = size
-        }
+        iconWidthConstraint?.constant = size
+        iconHeightConstraint?.constant = size
     }
 
     func configure(name: String, matchPositions: [FfiMatchRange]) {

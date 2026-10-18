@@ -169,17 +169,12 @@ final class SidebarTreeViewController: NSViewController {
         // 静默恢复先前用户的文件夹展开状态
         restoreExpansion(for: tree.rootNodes)
 
-        // 恢复先前选中的目录路径；若不存在则安全回退至“全部结果”
+        // 恢复先前选中的目录路径；若该目录已不在新结果集中则安全回退至“全部结果”
         var targetRow = 0
-        if let prevPath = previousSelectedPath {
-            if let row = row(forPath: prevPath) {
-                targetRow = row
-                selectedPath = prevPath
-            } else {
-                selectedPath = nil
-            }
-        } else {
-            selectedPath = nil
+        selectedPath = nil
+        if let prevPath = previousSelectedPath, let row = row(forPath: prevPath) {
+            targetRow = row
+            selectedPath = prevPath
         }
 
         outlineView.selectRowIndexes(IndexSet(integer: targetRow), byExtendingSelection: false)

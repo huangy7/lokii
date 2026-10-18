@@ -134,14 +134,19 @@ class PreferencesViewModel: ObservableObject {
     }
     
     func restoreIndexDefaults() {
-        indexPaths = ["~"]
-        excludePatterns = ["node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn", "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__", "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp", "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata"]
+        indexPaths = Self.defaultIndexPaths
+        excludePatterns = Self.defaultExcludePatterns
         includeHidden = false
     }
-    
+
+    /// 索引配置的出厂默认值，与 Rust 侧 IndexConfig::default 保持一致。
+    /// 重置入口与“当前是否处于默认态”判定共用此定义，避免两处字面量各自漂移。
+    private static let defaultIndexPaths = ["~"]
+    private static let defaultExcludePatterns = ["node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn", "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__", "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp", "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata"]
+
     var isDefaultIndexState: Bool {
-        indexPaths == ["~"] &&
-        excludePatterns == ["node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn", "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__", "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp", "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata"] &&
+        indexPaths == Self.defaultIndexPaths &&
+        excludePatterns == Self.defaultExcludePatterns &&
         !includeHidden
     }
 }

@@ -45,11 +45,6 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         viewModel?.updateFDAStatus()
     }
 
-    func showWindow(tab: String) {
-        viewModel?.selectedTab = tab
-        showWindow(nil)
-    }
-
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if allowCloseAfterUnsavedPrompt {
             allowCloseAfterUnsavedPrompt = false

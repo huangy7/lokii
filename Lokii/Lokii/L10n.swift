@@ -8,10 +8,6 @@ enum L10n {
     private static var _bundle: Bundle?
     private static var configuredLanguage: String?
 
-    static var locale: Locale {
-        Locale(identifier: configuredLanguage ?? "zh-Hans")
-    }
-
     private static var defaultBundle: Bundle {
         Bundle.main
     }
