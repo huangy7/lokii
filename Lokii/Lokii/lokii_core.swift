@@ -902,6 +902,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     /**
      * Update configuration from a JSON string. Returns true on success.
      * Writes to TOML file first, then syncs in-memory ConfigStore.
+     *
+     * The payload is treated as a patch over the currently effective config.
+     * The frontend models only a subset of the schema, so keys it omits must
+     * keep their existing values rather than fall back to defaults — otherwise
+     * every preference toggle would silently discard hand-edited settings.
      */
     func updateConfigFromJson(json: String)  -> Bool
     
@@ -1104,6 +1109,11 @@ open func startWatcher(eventHandler: EventHandler)  {try! rustCall() {
     /**
      * Update configuration from a JSON string. Returns true on success.
      * Writes to TOML file first, then syncs in-memory ConfigStore.
+     *
+     * The payload is treated as a patch over the currently effective config.
+     * The frontend models only a subset of the schema, so keys it omits must
+     * keep their existing values rather than fall back to defaults — otherwise
+     * every preference toggle would silently discard hand-edited settings.
      */
 open func updateConfigFromJson(json: String) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1849,7 +1859,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_start_watcher() != 17814) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 17306) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 16092) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_constructor_lokiicore_new() != 44128) {

@@ -433,11 +433,17 @@ impl LokiiCore {
 
     /// Update configuration from a JSON string. Returns true on success.
     /// Writes to TOML file first, then syncs in-memory ConfigStore.
+    ///
+    /// The payload is treated as a patch over the currently effective config.
+    /// The frontend models only a subset of the schema, so keys it omits must
+    /// keep their existing values rather than fall back to defaults — otherwise
+    /// every preference toggle would silently discard hand-edited settings.
     pub fn update_config_from_json(&self, json: String) -> bool {
-        let new_config: AppConfig = match serde_json::from_str(&json) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[Lokii] Failed to parse config JSON: {e}");
+        let current = self.config_store.read().clone();
+        let new_config = match merge_config_patch(&current, &json) {
+            Some(config) => config,
+            None => {
+                eprintln!("[Lokii] Failed to parse config JSON patch: {json}");
                 return false;
             }
         };
@@ -460,6 +466,37 @@ impl LokiiCore {
         // Sync memory directly (don't wait for file watcher)
         self.config_store.update(new_config);
         true
+    }
+}
+
+/// Overlay a frontend-supplied config patch onto the currently effective config.
+///
+/// The frontend mirrors only part of the schema (it has no notion of
+/// `index.exclude_paths`, for instance). Treating its payload as a complete
+/// config and rewriting the file from it resets every unmodelled key to its
+/// default, so user-edited values vanish on the next preference toggle.
+/// Layering the patch over the current config keeps absent keys intact.
+fn merge_config_patch(base: &AppConfig, patch: &str) -> Option<AppConfig> {
+    let patch: serde_json::Value = serde_json::from_str(patch).ok()?;
+    let base = serde_json::to_value(base).ok()?;
+    serde_json::from_value(deep_merge(base, patch)).ok()
+}
+
+/// Recursively overlay `patch` onto `base`: objects merge key by key, while
+/// arrays and scalars are replaced outright so a list can still be cleared.
+fn deep_merge(base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                let merged = match base_map.remove(&key) {
+                    Some(base_value) => deep_merge(base_value, patch_value),
+                    None => patch_value,
+                };
+                base_map.insert(key, merged);
+            }
+            serde_json::Value::Object(base_map)
+        }
+        (_, patch) => patch,
     }
 }
 
@@ -547,5 +584,58 @@ mod tests {
             FfiStartupMode::ColdStart { scanned_count: 0 }
         ));
         assert_eq!(*handler.events.lock().unwrap(), ["ready:0"]);
+    }
+
+    /// 前端下发的配置只覆盖它建模过的字段，未建模字段必须原样保留，
+    /// 否则用户手改 config.toml 里的 exclude_paths 会在下次切换偏好设置时被静默重置
+    #[test]
+    fn config_patch_preserves_keys_the_frontend_does_not_model() {
+        let mut base = AppConfig::default();
+        base.index.exclude_paths = vec!["~/Library".to_string()];
+
+        let patch = r#"{
+            "general": { "language": "en", "show_in_dock": false },
+            "index": {
+                "index_paths": ["~"],
+                "exclude": ["node_modules"],
+                "include_hidden": false,
+                "max_results": 100
+            },
+            "window": { "hide_on_blur": true, "remember_position": false }
+        }"#;
+
+        let merged = merge_config_patch(&base, patch).expect("patch should merge");
+
+        assert_eq!(merged.general.language, "en");
+        assert!(!merged.general.show_in_dock);
+        assert_eq!(merged.index.max_results, 100);
+        assert_eq!(merged.index.exclude, vec!["node_modules".to_string()]);
+        assert_eq!(
+            merged.index.exclude_paths,
+            vec!["~/Library".to_string()],
+            "未建模的 exclude_paths 必须保留"
+        );
+    }
+
+    /// 显式下发的空数组表示清空，必须能覆盖基底，不能被合并逻辑吞掉
+    #[test]
+    fn config_patch_can_explicitly_clear_a_list() {
+        let base = AppConfig::default();
+
+        let merged = merge_config_patch(&base, r#"{ "index": { "exclude": [] } }"#)
+            .expect("patch should merge");
+
+        assert!(merged.index.exclude.is_empty(), "空数组应清空列表");
+        assert!(
+            !merged.index.exclude_paths.is_empty(),
+            "同一节里未被提及的字段不受影响"
+        );
+    }
+
+    /// 非法补丁必须被拒绝，而不是回退成一份默认配置覆盖用户设置
+    #[test]
+    fn malformed_config_patch_is_rejected() {
+        assert!(merge_config_patch(&AppConfig::default(), "not json").is_none());
+        assert!(merge_config_patch(&AppConfig::default(), r#"{ "index": 42 }"#).is_none());
     }
 }
