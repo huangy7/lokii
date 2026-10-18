@@ -111,6 +111,9 @@ final class SearchWindow: NSWindowController {
         window.onReturn = { [weak self] in
             self?.openSelected()
         }
+        window.onCommandF = { [weak self] in
+            self?.focusSearchField()
+        }
 
         setupUI()
         applyInitialWindowFrame()
@@ -885,6 +888,18 @@ final class SearchWindow: NSWindowController {
         }
     }
 
+    // MARK: - Focus Management
+
+    /// 聚焦搜索输入框，并将输入光标定位至文本末尾
+    func focusSearchField() {
+        guard let window = window, let searchField = searchField else { return }
+        window.makeFirstResponder(searchField)
+        if let editor = searchField.currentEditor() {
+            let length = (searchField.stringValue as NSString).length
+            editor.selectedRange = NSRange(location: length, length: 0)
+        }
+    }
+
     // MARK: - Helpers
 
     private func formatCount(_ n: UInt64) -> String {
@@ -905,6 +920,10 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
 
     func searchMainSplitViewDidRequestRebuild() {
         rebuildIndexClicked()
+    }
+
+    func searchMainSplitViewDidRequestFocusSearchField() {
+        focusSearchField()
     }
 }
 
@@ -930,6 +949,19 @@ extension SearchWindow: NSWindowDelegate {
 extension SearchWindow: NSSearchFieldDelegate {
     func controlTextDidChange(_ obj: Notification) {
         searchChanged()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // 方向下键语义命令：当光标处于文本末尾或输入为空时，将焦点交接至结果列表
+        if commandSelector == #selector(NSResponder.moveDown(_:)) {
+            let length = (textView.string as NSString).length
+            if textView.selectedRange.length == 0 && textView.selectedRange.location == length {
+                if searchResultsViewController.results.count > 0 {
+                    return searchResultsViewController.focusResults()
+                }
+            }
+        }
+        return false
     }
 }
 

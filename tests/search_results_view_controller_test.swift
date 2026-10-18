@@ -115,6 +115,12 @@ final class MockDelegate: SearchResultsViewControllerDelegate {
     func searchResultsDidRequestRebuild() {
         rebuildCallCount += 1
     }
+
+    var focusSearchFieldCallCount = 0
+
+    func searchResultsDidRequestFocusSearchField() {
+        focusSearchFieldCallCount += 1
+    }
 }
 
 print("[1/8] 测试控制器初始化与内聚底栏视图层次构建...")
@@ -266,7 +272,77 @@ controller.delegate = mockRebuildDelegate
 controller.rebuildButton.sendAction(controller.rebuildButton.action!, to: controller.rebuildButton.target)
 assertEqual(mockRebuildDelegate.rebuildCallCount, 1, "点击重建按钮应通过代理派发 searchResultsDidRequestRebuild")
 
-print("测试全部通过：8/8 项断言成功。")
+print("[9/9] 测试键盘导航焦点接力与首行上移回调 (focusResults & SearchTableView.moveUp)...")
+let navDelegate = MockDelegate()
+controller.delegate = navDelegate
+
+// 1. 测试空结果集时的守卫
+controller.displayResults([], preserveSelection: false)
+let emptyFocusResult = controller.focusResults()
+assertEqual(emptyFocusResult, false, "空结果集调用 focusResults 应安全返回 false")
+
+// 2. 恢复结果集并测试 focusResults 选行与焦点激活
+controller.displayResults(sampleItems, preserveSelection: false)
+let focusRow1Result = controller.focusResults(row: 1)
+assertEqual(focusRow1Result, true, "存在结果集时 focusResults 应返回 true")
+assertEqual(controller.tableView.selectedRow, 1, "focusResults(row: 1) 应选中第 1 行")
+
+let upArrowEvent = NSEvent.keyEvent(
+    with: .keyDown,
+    location: .zero,
+    modifierFlags: [],
+    timestamp: 0,
+    windowNumber: 0,
+    context: nil,
+    characters: "\\u{F700}",
+    charactersIgnoringModifiers: "\\u{F700}",
+    isARepeat: false,
+    keyCode: 126
+)!
+
+// 3. 测试非首行时按方向上键正常向上选行，不触发回焦
+controller.tableView.keyDown(with: upArrowEvent)
+assertEqual(controller.tableView.selectedRow, 0, "第 1 行按方向上键应自然移动到第 0 行")
+assertEqual(navDelegate.focusSearchFieldCallCount, 0, "非首行按方向上键不应触发回焦搜索框代理")
+
+// 4. 测试首行（selectedRow == 0）时按方向上键触发回焦回调
+controller.tableView.keyDown(with: upArrowEvent)
+assertEqual(controller.tableView.selectedRow, 0, "第 0 行按方向上键应保持在第 0 行")
+assertEqual(navDelegate.focusSearchFieldCallCount, 1, "第 0 行按方向上键应触发 searchResultsDidRequestFocusSearchField 代理")
+
+// 5. 测试带有 ⌘ 修饰键的方向上键（⌘↑）不触发回焦代理，保留原生滚动行为
+let cmdUpArrowEvent = NSEvent.keyEvent(
+    with: .keyDown,
+    location: .zero,
+    modifierFlags: [.command],
+    timestamp: 0,
+    windowNumber: 0,
+    context: nil,
+    characters: "\\u{F700}",
+    charactersIgnoringModifiers: "\\u{F700}",
+    isARepeat: false,
+    keyCode: 126
+)!
+controller.tableView.keyDown(with: cmdUpArrowEvent)
+assertEqual(navDelegate.focusSearchFieldCallCount, 1, "带有 ⌘ 修饰键的方向上键不应触发回焦代理")
+
+// 6. 测试带有 ⇧ 修饰键的方向上键（⇧↑）不触发回焦代理，保留原生多选行为
+let shiftUpArrowEvent = NSEvent.keyEvent(
+    with: .keyDown,
+    location: .zero,
+    modifierFlags: [.shift],
+    timestamp: 0,
+    windowNumber: 0,
+    context: nil,
+    characters: "\\u{F700}",
+    charactersIgnoringModifiers: "\\u{F700}",
+    isARepeat: false,
+    keyCode: 126
+)!
+controller.tableView.keyDown(with: shiftUpArrowEvent)
+assertEqual(navDelegate.focusSearchFieldCallCount, 1, "带有 ⇧ 修饰键的方向上键不应触发回焦代理")
+
+print("测试全部通过：9/9 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

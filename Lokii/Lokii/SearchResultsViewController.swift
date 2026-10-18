@@ -39,10 +39,13 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidDoubleClick(result: FfiSearchResult)
     /// 索引重建请求回调
     func searchResultsDidRequestRebuild()
+    /// 虚拟列表首行上移回调，用于将焦点交还搜索输入框
+    func searchResultsDidRequestFocusSearchField()
 }
 
 extension SearchResultsViewControllerDelegate {
     func searchResultsDidRequestRebuild() {}
+    func searchResultsDidRequestFocusSearchField() {}
 }
 
 // MARK: - SearchResultsViewController
@@ -236,6 +239,9 @@ final class SearchResultsViewController: NSViewController {
         tableView.delegate = self
         tableView.doubleAction = #selector(tableDoubleClicked)
         tableView.target = self
+        tableView.onMoveUpAtTop = { [weak self] in
+            self?.delegate?.searchResultsDidRequestFocusSearchField()
+        }
     }
 
     private func addTableColumns() {
@@ -332,6 +338,25 @@ final class SearchResultsViewController: NSViewController {
         tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         tableView.scrollRowToVisible(0)
         notifySelectionChanged()
+    }
+
+    /// 激活检索结果列表键盘焦点，并根据指定行号或已有选区联动可视区域与状态反馈
+    @discardableResult
+    func focusResults(row: Int? = nil) -> Bool {
+        guard !results.isEmpty else { return false }
+        let targetRow: Int
+        if let row = row, row >= 0 && row < results.count {
+            targetRow = row
+        } else if tableView.selectedRow >= 0 && tableView.selectedRow < results.count {
+            targetRow = tableView.selectedRow
+        } else {
+            targetRow = 0
+        }
+        tableView.selectRowIndexes(IndexSet(integer: targetRow), byExtendingSelection: false)
+        tableView.scrollRowToVisible(targetRow)
+        notifySelectionChanged()
+        view.window?.makeFirstResponder(tableView)
+        return true
     }
 
     // MARK: - Bottom Bar Interface
@@ -839,6 +864,9 @@ final class SearchTableView: NSTableView {
         }
     }
 
+    /// 列表焦点位于首行（或无选区）时继续向上移动的接力回调
+    var onMoveUpAtTop: (() -> Void)?
+
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 49 { // Space key
             if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
@@ -848,6 +876,17 @@ final class SearchTableView: NSTableView {
             }
             return
         }
+
+        // 方向上键（keyCode 126）：当选区停在首行或无选区时，将焦点与光标接力回搜索输入框末尾。
+        // 规避 ⇧/⌘ 组合键，确保多选与滚动至顶部行为不受影响。
+        let navigationModifiers: NSEvent.ModifierFlags = [.command, .shift, .control]
+        if event.keyCode == 126,
+           event.modifierFlags.intersection(navigationModifiers).isEmpty,
+           selectedRow <= 0 {
+            onMoveUpAtTop?()
+            return
+        }
+
         super.keyDown(with: event)
     }
     override func menu(for event: NSEvent) -> NSMenu? {

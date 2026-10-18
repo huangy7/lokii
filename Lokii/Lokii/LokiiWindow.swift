@@ -6,6 +6,7 @@ import AppKit
 final class LokiiWindow: NSWindow {
     var onEscape: (() -> Void)?
     var onReturn: (() -> Void)?
+    var onCommandF: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
         switch Int(event.keyCode) {
@@ -14,6 +15,11 @@ final class LokiiWindow: NSWindow {
         case 36: // Return
             onReturn?()
         default:
+            if event.modifierFlags.contains(.command),
+               event.charactersIgnoringModifiers?.lowercased() == "f" {
+                onCommandF?()
+                return
+            }
             super.keyDown(with: event)
         }
     }

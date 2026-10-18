@@ -10,12 +10,15 @@ protocol SearchMainSplitViewControllerDelegate: AnyObject {
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult)
     /// 索引重建请求回调
     func searchMainSplitViewDidRequestRebuild()
+    /// 虚拟列表首行上移回调，用于将焦点交还搜索输入框
+    func searchMainSplitViewDidRequestFocusSearchField()
 }
 
 extension SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidSelect(result: FfiSearchResult?) {}
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {}
     func searchMainSplitViewDidRequestRebuild() {}
+    func searchMainSplitViewDidRequestFocusSearchField() {}
 }
 
 // MARK: - SearchMainSplitViewController
@@ -159,5 +162,9 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
 
     func searchResultsDidRequestRebuild() {
         delegate?.searchMainSplitViewDidRequestRebuild()
+    }
+
+    func searchResultsDidRequestFocusSearchField() {
+        delegate?.searchMainSplitViewDidRequestFocusSearchField()
     }
 }

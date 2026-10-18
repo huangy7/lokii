@@ -94,6 +94,12 @@ final class MockSplitDelegate: SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidRequestRebuild() {
         rebuildCallCount += 1
     }
+
+    var focusSearchFieldCallCount = 0
+
+    func searchMainSplitViewDidRequestFocusSearchField() {
+        focusSearchFieldCallCount += 1
+    }
 }
 
 print("[1/5] 测试双栏容器分栏条目（NSSplitViewItem）配置参数...")
@@ -186,6 +192,10 @@ assertEqual(mockDelegate.doubleClickCallCount, 1, "双击代理方法应被调�
 // 模拟中栏列表触发索引重建请求并验证中介转发
 splitVC.searchResultsDidRequestRebuild()
 assertEqual(mockDelegate.rebuildCallCount, 1, "中介协调器应将索引重建请求转发至外部代理")
+
+// 模拟中栏列表首行上移回焦请求并验证中介转发
+splitVC.searchResultsDidRequestFocusSearchField()
+assertEqual(mockDelegate.focusSearchFieldCallCount, 1, "中介协调器应将回焦搜索框请求转发至外部代理")
 
 // 测试空结果集与重置状态清空（Empty State & Clear）
 splitVC.updateSearchResults(rawResults: [], tree: nil)

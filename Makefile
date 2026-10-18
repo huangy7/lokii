@@ -41,6 +41,7 @@ test: bindings
 	@swift tests/sidebar_tree_view_controller_test.swift
 	@swift tests/toolbar_test.swift
 	@swift tests/split_view_controller_test.swift
+	@swift tests/keyboard_navigation_test.swift
 
 
 check:
