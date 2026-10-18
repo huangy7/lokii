@@ -235,6 +235,10 @@ assertEqual(controller.numberOfPreviewItems(in: nil), 1, "存在选中条目时�
 let previewItem = controller.previewPanel(nil, previewItemAt: 0)
 assertEqual((previewItem as? NSURL)?.path, "/tmp/src/alpha.rs", "预览项路径应与当前选中条目一致")
 
+// sourceFrameOnScreenFor 视口与屏幕安全降级校验：脱离活跃视窗时应安全回退为 .zero
+let offscreenFrame = controller.previewPanel(nil, sourceFrameOnScreenFor: previewItem)
+assertEqual(offscreenFrame, NSRect.zero, "脱离屏幕视窗时 sourceFrameOnScreenFor 应安全回退为 .zero")
+
 print("[8/8] 测试底栏状态更新、进度指示与重建动作代理派发...")
 // 路径更新
 controller.updateBottomPath(with: "/tmp/src/alpha.rs")

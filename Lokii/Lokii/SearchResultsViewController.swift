@@ -777,11 +777,32 @@ extension SearchResultsViewController: QLPreviewPanelDataSource, QLPreviewPanelD
         return NSURL(fileURLWithPath: path)
     }
 
-    func previewPanel(_ panel: QLPreviewPanel!, sourceFrameOnScreenFor item: QLPreviewItem!) -> NSRect {
+    /// 当前选中项对应的文件图标视图，用作快速预览等比缩放动画的屏幕锚点与过渡位图
+    private var selectedIconImageView: NSImageView? {
         let row = tableView.selectedRow
-        guard row >= 0, row < tableView.numberOfRows else { return .zero }
-        let rect = tableView.rect(ofRow: row)
-        return tableView.window?.convertToScreen(tableView.convert(rect, to: nil)) ?? .zero
+        guard row >= 0, row < tableView.numberOfRows else { return nil }
+        let col = tableView.column(withIdentifier: .columnName)
+        guard col >= 0,
+              let cellView = tableView.view(atColumn: col, row: row, makeIfNecessary: false) as? NSTableCellView else {
+            return nil
+        }
+        return cellView.imageView
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, sourceFrameOnScreenFor item: QLPreviewItem!) -> NSRect {
+        guard let imageView = selectedIconImageView,
+              let window = imageView.window,
+              imageView.visibleRect.height > 0 else {
+            return .zero
+        }
+        let rectInWindow = imageView.convert(imageView.bounds, to: nil)
+        return window.convertToScreen(rectInWindow)
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, transitionImageFor item: QLPreviewItem!, contentRect: UnsafeMutablePointer<NSRect>!) -> Any! {
+        guard let image = selectedIconImageView?.image else { return nil }
+        contentRect?.pointee = NSRect(origin: .zero, size: image.size)
+        return image
     }
 }
 
