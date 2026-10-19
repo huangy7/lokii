@@ -138,6 +138,13 @@ let _ = controller.view // 触发 loadView 与 viewDidLoad
 assertTrue(controller.view.subviews.contains(controller.tableScrollView), "根视图应包含 tableScrollView")
 assertTrue(controller.view.subviews.contains(controller.separator), "根视图应包含分割线")
 assertTrue(controller.view.subviews.contains(controller.bottomBar), "根视图应包含 bottomBar")
+assertEqual(controller.tableScrollView.automaticallyAdjustsContentInsets, false, "tableScrollView 必须显式禁用自动边距推导")
+assertEqual(controller.tableScrollView.contentInsets.top, 0, "tableScrollView 顶部内边距应为 0")
+assertEqual(controller.tableScrollView.contentInsets.bottom, 0, "tableScrollView 底部内边距应为 0")
+let topConstraint = controller.view.constraints.first {
+    $0.firstItem as? NSScrollView == controller.tableScrollView && $0.firstAttribute == .top
+}
+assertTrue(topConstraint?.secondItem is NSLayoutGuide, "tableScrollView 顶端必须锚定至 safeAreaLayoutGuide")
 assertEqual(controller.tableView.numberOfColumns, 4, "虚拟列表应具备 4 个排版列 (名称/路径/修改时间/大小)")
 assertTrue(controller.tableView.usesAlternatingRowBackgroundColors, "虚拟列表应启用斑马纹交替背景色")
 assertEqual(controller.tableView.rowHeight, 24, "行高应为 24 pt")

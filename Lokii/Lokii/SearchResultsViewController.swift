@@ -236,6 +236,10 @@ final class SearchResultsViewController: NSViewController {
         tableScrollView.autohidesScrollers = true
         tableScrollView.borderType = .noBorder
         tableScrollView.drawsBackground = true
+        // 显式禁用自动内容边距推导，由 safeAreaLayoutGuide 约束精确控制视口边界，
+        // 彻底杜绝 AppKit 默认滚动边距机制导致数据行向上穿越表头并渗透进标题栏工具区
+        tableScrollView.automaticallyAdjustsContentInsets = false
+        tableScrollView.contentInsets = NSEdgeInsetsZero
         containerView.addSubview(tableScrollView)
 
         separator.translatesAutoresizingMaskIntoConstraints = false
@@ -249,7 +253,9 @@ final class SearchResultsViewController: NSViewController {
         setupBottomBar()
 
         NSLayoutConstraint.activate([
-            tableScrollView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            // 顶端锚定至安全区布局辅助线，使表头与滚动视口始终对齐至窗口工具栏底缘，
+            // 滚动时列表内容在表头底线处干净截断
+            tableScrollView.topAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.topAnchor),
             tableScrollView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             tableScrollView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             tableScrollView.bottomAnchor.constraint(equalTo: separator.topAnchor),
