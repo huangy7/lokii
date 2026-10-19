@@ -29,6 +29,24 @@ targets:
     dependencies:
       - package: KeyboardShortcuts
       - package: Sparkle
+    preBuildScripts:
+      - name: Build Rust Core
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          # 确保环境变量覆盖常见 cargo 与 rustup 安装路径
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+          # 自动提取 Xcode 传入的目标架构，动态映射 Rust target
+          ARCH="${CURRENT_ARCH:-${ARCHS:-$(uname -m)}}"
+          case "$ARCH" in
+            arm64*)  RUST_TARGET="aarch64-apple-darwin" ;;
+            x86_64*) RUST_TARGET="x86_64-apple-darwin" ;;
+            *)       RUST_TARGET="aarch64-apple-darwin" ;;
+          esac
+
+          cd "$SRCROOT/.."
+          cargo build -p lokii-core --lib --release --target "$RUST_TARGET"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lokii.app
@@ -38,12 +56,13 @@ targets:
         SWIFT_INCLUDE_PATHS: "$(SRCROOT)/LokiiCore/Headers"
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/../target/aarch64-apple-darwin/release"
+          - "$(SRCROOT)/../target/x86_64-apple-darwin/release"
         OTHER_LDFLAGS:
           - "-llokii_core"
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: true
-        ARCHS: arm64
+        ARCHS: "$(ARCHS_STANDARD)"
     entitlements:
       path: Lokii/Lokii.entitlements
       properties:

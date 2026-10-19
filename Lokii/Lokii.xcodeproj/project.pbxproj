@@ -175,6 +175,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 878F36BB842CE5E1A0FB27CF /* Build configuration list for PBXNativeTarget "Lokii" */;
 			buildPhases = (
+				8ED28CCFA1DDF613C72058D0 /* Build Rust Core */,
 				2AB993AA608C79977E45447B /* Sources */,
 				7600D3D49A1C4476C41D863D /* Resources */,
 				AABF71EEC99DE5F99BD0789F /* Frameworks */,
@@ -242,6 +243,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		8ED28CCFA1DDF613C72058D0 /* Build Rust Core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\n# 确保环境变量覆盖常见 cargo 与 rustup 安装路径\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 自动提取 Xcode 传入的目标架构，动态映射 Rust target\nARCH=\"${CURRENT_ARCH:-${ARCHS:-$(uname -m)}}\"\ncase \"$ARCH\" in\n  arm64*)  RUST_TARGET=\"aarch64-apple-darwin\" ;;\n  x86_64*) RUST_TARGET=\"x86_64-apple-darwin\" ;;\n  *)       RUST_TARGET=\"aarch64-apple-darwin\" ;;\nesac\n\ncd \"$SRCROOT/..\"\ncargo build -p lokii-core --lib --release --target \"$RUST_TARGET\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		2AB993AA608C79977E45447B /* Sources */ = {
@@ -361,7 +384,7 @@
 		5F736E73CBE9EC97CD42D272 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = arm64;
+				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Lokii/Lokii.entitlements;
 				CODE_SIGN_IDENTITY = "-";
@@ -375,6 +398,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(SRCROOT)/../target/aarch64-apple-darwin/release",
+					"$(SRCROOT)/../target/x86_64-apple-darwin/release",
 				);
 				OTHER_LDFLAGS = (
 					"-llokii_core",
@@ -389,7 +413,7 @@
 		9770502BB493D996BD932756 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = arm64;
+				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Lokii/Lokii.entitlements;
 				CODE_SIGN_IDENTITY = "-";
@@ -403,6 +427,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(SRCROOT)/../target/aarch64-apple-darwin/release",
+					"$(SRCROOT)/../target/x86_64-apple-darwin/release",
 				);
 				OTHER_LDFLAGS = (
 					"-llokii_core",
