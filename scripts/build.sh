@@ -146,8 +146,14 @@ build_app() {
         cp "$repo_root/Lokii/Lokii/Resources/Lokii.icns" "$icns_path"
     fi
 
-    # 编译资源束 Assets.car（包含 AppIcon 多分辨率原生图集）
+    # 编译资源束 Assets.car（包含 AppIcon 多分辨率原生图集与现代化分层图标栈）
     local partial_plist="$output_dir/partial.plist"
+    local actool_inputs=()
+    if [[ -d "$repo_root/Lokii/Lokii/AppIcon.icon" ]]; then
+        actool_inputs+=("$repo_root/Lokii/Lokii/AppIcon.icon")
+    fi
+    actool_inputs+=("$xcassets")
+
     xcrun actool \
         --compile "$output_dir" \
         --platform macosx \
@@ -155,7 +161,7 @@ build_app() {
         --app-icon AppIcon \
         --output-partial-info-plist "$partial_plist" \
         --output-format human-readable-text \
-        "$xcassets" >/dev/null 2>&1 || true
+        "${actool_inputs[@]}" >/dev/null 2>&1 || true
     rm -f "$partial_plist" "$output_dir/AppIcon.icns"
 
     # 组装 Bundle 目录结构

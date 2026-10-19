@@ -25,7 +25,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Lokii",
-            exclude: ["Info.plist", "Lokii.entitlements", "Assets.xcassets", "Resources"],
+            exclude: ["Info.plist", "Lokii.entitlements", "Assets.xcassets", "Resources", "AppIcon.icon"],
             linkerSettings: [
                 // 强制静态链接，避免运行时依赖 dylib 路径
                 .unsafeFlags(["\(rustLibPath)/liblokii_core.a"]),

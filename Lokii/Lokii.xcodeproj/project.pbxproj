@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		03C2AA4693B5C868CC54C847 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 4DA89C31BAA12806D874CFA3 /* AppIcon.icon */; };
 		0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAD6916CAB8EDC0C1974B6F /* Key.swift */; };
 		15AAEC0CDA3C27720C7F2E18 /* KeyboardShortcuts in Frameworks */ = {isa = PBXBuildFile; productRef = 484225E67DB191B3777194BF /* KeyboardShortcuts */; };
 		1B4BCC5BF4FE72D28BAEF0A4 /* Name.swift in Sources */ = {isa = PBXBuildFile; fileRef = 927DA1B3D54D6EE81E6EE89C /* Name.swift */; };
@@ -55,6 +56,7 @@
 		315BC0505768DC1262CABEDA /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		379816002C0A5D5D8096C54B /* SearchEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchEngine.swift; sourceTree = "<group>"; };
 		4945594BBD178DAC175979A5 /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
+		4DA89C31BAA12806D874CFA3 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcuts.swift; sourceTree = "<group>"; };
 		65BA160DCBC72B8377D8BDE6 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LokiiWindow.swift; sourceTree = "<group>"; };
@@ -99,6 +101,7 @@
 			isa = PBXGroup;
 			children = (
 				B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */,
+				4DA89C31BAA12806D874CFA3 /* AppIcon.icon */,
 				85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */,
 				2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */,
 				CBF42044E61241F1D42161BC /* FDAGuideView.swift */,
@@ -236,6 +239,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				03C2AA4693B5C868CC54C847 /* AppIcon.icon in Resources */,
 				D845C945605829EFD6777B02 /* Assets.xcassets in Resources */,
 				E8F36883205D0492A3F9917E /* Localizable.strings in Resources */,
 				29140F081BAFBB147E42A200 /* Lokii.icns in Resources */,
