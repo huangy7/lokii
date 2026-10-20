@@ -18,7 +18,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: verify tag matches crate version
         shell: bash
@@ -72,7 +72,7 @@ jobs:
           - arch: 'x86_64'
             target: 'x86_64-apple-darwin'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # 优先匹配最新的现代 Xcode 工具链（支持 Xcode 26+，最低满足 Swift 6）
       - name: select modern Xcode
@@ -133,7 +133,7 @@ jobs:
 
       # 上传至工作流 Artifact，便于构建日志追踪与产物留存
       - name: upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: Lokii-${{ matrix.arch }}
           path: |
@@ -155,8 +155,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           pattern: Lokii-*
           merge-multiple: true
@@ -186,7 +186,7 @@ jobs:
             gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --json body --jq .body > "output/Lokii-${GITHUB_REF_NAME#v}-$ARCH.md"
           done
           LOKII_UPDATE_PRIVATE_KEY_FILE="$KEY_FILE" bash scripts/publish-update-feed.sh "${GITHUB_REF_NAME#v}" output feeds/updates
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: verified-update-feeds
           path: feeds
@@ -200,7 +200,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: publish draft release
         shell: bash
@@ -224,8 +224,8 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           name: verified-update-feeds
           path: feeds

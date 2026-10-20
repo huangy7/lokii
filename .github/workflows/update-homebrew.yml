@@ -42,7 +42,7 @@ jobs:
           echo "intel_sha=$INTEL_SHA" >> $GITHUB_OUTPUT
 
       - name: Checkout Homebrew Tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: huangy7/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
