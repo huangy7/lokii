@@ -364,6 +364,28 @@ assertEqual(controller.pathBar.url, nil, "updateBottomPath(with: nil) 应清空�
 controller.updateStatusText("已匹配 10 项")
 assertEqual(controller.statusLabel.stringValue, "已匹配 10 项", "updateStatusText 应正确刷新状态文本")
 
+// 状态栏微反馈与权威状态隔离测试
+controller.updateStatusText("已索引 100 个文件")
+assertEqual(controller.statusLabel.stringValue, "已索引 100 个文件", "updateStatusText 正常更新持久状态")
+
+controller.notifyBackgroundIndexingActive()
+assertEqual(controller.statusLabel.stringValue, L("search.backgroundRefresh"), "触发后台刷新后状态栏展示临时刷新文案")
+assertEqual(controller.statusLabel.textColor, NSColor.controlAccentColor, "临时文案应使用 Accent 强调色")
+assertTrue(!controller.statusFeedbackCapsule.isHidden, "触发后台刷新后应显现轻量气泡")
+assertTrue(controller.statusFeedbackCapsule.isSpinning, "气泡内应持续旋转指示微动效")
+assertEqual(controller.statusFeedbackCapsule.label.stringValue, L("search.backgroundRefresh"), "气泡内文案应匹配后台刷新提示")
+
+// 在展示临时文案期间，后台进度更新不冲刷屏幕，但静默更新持久状态
+controller.updateStatusText("已索引 200 个文件")
+assertEqual(controller.statusLabel.stringValue, L("search.backgroundRefresh"), "临时文案展示期间不被后台进度通知冲掉")
+
+// 取消临时状态时，平滑恢复最新的持久状态
+controller.cancelTemporaryStatus()
+assertEqual(controller.statusLabel.stringValue, "已索引 200 个文件", "取消临时状态后应恢复最新的持久状态")
+assertEqual(controller.statusLabel.textColor, NSColor.secondaryLabelColor, "恢复后文本颜色复位为 secondaryLabelColor")
+assertTrue(controller.statusFeedbackCapsule.isHidden, "取消临时状态后气泡应隐藏")
+assertTrue(!controller.statusFeedbackCapsule.isSpinning, "取消临时状态后气泡旋转应停止")
+
 // 内联进度指示器显隐控制
 controller.setInlineProgressVisible(true)
 assertEqual(controller.inlineProgressIndicator.isHidden, false, "setInlineProgressVisible(true) 应显示指示器")

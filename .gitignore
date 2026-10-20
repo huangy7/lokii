@@ -52,3 +52,4 @@ Thumbs.db
 
 # Git 多分支工作树
 .worktrees/
+.superpowers/

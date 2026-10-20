@@ -64,7 +64,6 @@ final class SearchWindow: NSWindowController {
     private var searchMatchText: LocalizedText? = nil {
         didSet { updateStatusLabel() }
     }
-    private weak var refreshToastLabel: NSTextField?
 
     // Loading overlay
     private var loadingOverlay: NSView?
@@ -346,7 +345,6 @@ final class SearchWindow: NSWindowController {
         updateStatusLabel()
         overlayState?.headingText = L("search.buildingIndex")
         overlayState?.statusText = L("search.scanningFiles")
-        refreshToastLabel?.stringValue = L("search.backgroundRefresh")
     }
 
     private func updateStatusLabel() {
@@ -619,105 +617,13 @@ final class SearchWindow: NSWindowController {
         searchField.placeholderString = originalSearchPlaceholder
     }
 
-    // MARK: - Toast
-
-    private func showBackgroundRefreshToast() {
-        guard let contentView = window?.contentView else { return }
-
-        // Card — same material as loading overlay for visual consistency
-        let card = NSVisualEffectView()
-        card.translatesAutoresizingMaskIntoConstraints = false
-        card.material = .hudWindow
-        card.state = .active
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 12
-        card.alphaValue = 0
-        contentView.addSubview(card)
-
-        // Spinning refresh icon — wrapped in a stable container
-        let iconContainer = SearchResultsCenterSpinContainerView()
-        iconContainer.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(iconContainer)
-
-        let iconConfig = NSImage.SymbolConfiguration(pointSize: 32, weight: .light)
-        let iconView = NSImageView(image: NSImage(systemSymbolName: "arrow.triangle.2.circlepath",
-                                                   accessibilityDescription: "Refreshing")!
-            .withSymbolConfiguration(iconConfig)!)
-        iconView.frame = NSRect(x: 0, y: 0, width: 40, height: 40)
-        iconView.contentTintColor = .secondaryLabelColor
-        iconView.wantsLayer = true
-        iconContainer.addSubview(iconView)
-
-        // Heading — same font as loading overlay
-        let label = NSTextField(labelWithString: L("search.backgroundRefresh"))
-        refreshToastLabel = label
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 16, weight: .semibold)
-        label.textColor = .labelColor
-        label.alignment = .center
-        label.lineBreakMode = .byWordWrapping
-        label.maximumNumberOfLines = 2
-        card.addSubview(label)
-
-        // Layout — matches loading overlay card proportions
-        NSLayoutConstraint.activate([
-            card.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            card.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-            card.widthAnchor.constraint(equalToConstant: 200),
-
-            iconContainer.topAnchor.constraint(equalTo: card.topAnchor, constant: 24),
-            iconContainer.centerXAnchor.constraint(equalTo: card.centerXAnchor),
-            iconContainer.widthAnchor.constraint(equalToConstant: 40),
-            iconContainer.heightAnchor.constraint(equalToConstant: 40),
-
-            label.topAnchor.constraint(equalTo: iconContainer.bottomAnchor, constant: 16),
-            label.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            label.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -24),
-        ])
-
-        // Spin animation (must be linear to avoid stuttering)
-        iconView.layer?.addInfiniteSpin()
-
-        // Fade in + Spring Scale for Apple native pop effect
-        card.layer?.transform = CATransform3DMakeScale(0.8, 0.8, 1.0)
-        
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            card.animator().alphaValue = 1.0
-            
-            let spring = CASpringAnimation(keyPath: "transform")
-            spring.fromValue = CATransform3DMakeScale(0.8, 0.8, 1.0)
-            spring.toValue = CATransform3DIdentity
-            spring.damping = 15
-            spring.stiffness = 300
-            spring.duration = spring.settlingDuration
-            card.layer?.transform = CATransform3DIdentity
-            card.layer?.add(spring, forKey: "pop")
-        }
-
-        // Auto dismiss after 2 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.2
-                ctx.allowsImplicitAnimation = true
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-                card.animator().alphaValue = 0.0
-                card.layer?.transform = CATransform3DMakeScale(0.9, 0.9, 1.0)
-            }, completionHandler: {
-                card.removeFromSuperview()
-            })
-        }
-    }
-
     // MARK: - Rebuild Action
 
     @objc private func rebuildIndexClicked() {
         guard indexingState == .idle else { return }
 
         if engine.isScanning {
-            showBackgroundRefreshToast()
+            searchResultsViewController.notifyBackgroundIndexingActive()
             return
         }
 

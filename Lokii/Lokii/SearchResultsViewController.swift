@@ -23,17 +23,140 @@ private final class InteractiveHintButton: NSButton {
     }
 }
 
+/// 底部状态栏微反馈轻量气泡视图：展示后台扫描提示文案与独立旋转微动效
+final class StatusFeedbackCapsuleView: NSView {
+    let label = NSTextField(labelWithString: "")
+    let iconContainer = SearchResultsCenterSpinContainerView()
+    let iconView = NSImageView()
+    var onClick: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupView()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupView()
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        super.updateLayer()
+        guard let layer = layer else { return }
+        layer.cornerRadius = 5
+        layer.borderWidth = 1.0
+        layer.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.32).cgColor
+        layer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    private func setupView() {
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+
+        layer?.cornerRadius = 5
+        layer?.borderWidth = 1.0
+        layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.32).cgColor
+        layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.14).cgColor
+
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = .controlAccentColor
+        label.alignment = .right
+        addSubview(label)
+
+        iconContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconContainer)
+
+        iconView.translatesAutoresizingMaskIntoConstraints = true
+        iconView.frame = NSRect(x: 0, y: 0, width: 12, height: 12)
+        iconView.wantsLayer = true
+        let iconConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+        iconView.image = NSImage(
+            systemSymbolName: "arrow.triangle.2.circlepath",
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(iconConfig) ?? NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        iconView.contentTintColor = .controlAccentColor
+        iconContainer.addSubview(iconView)
+
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            iconContainer.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 5),
+            iconContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
+            iconContainer.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconContainer.widthAnchor.constraint(equalToConstant: 12),
+            iconContainer.heightAnchor.constraint(equalToConstant: 12),
+
+            heightAnchor.constraint(equalToConstant: 20),
+        ])
+    }
+
+    var isSpinning: Bool {
+        iconView.layer?.animation(forKey: "spin") != nil
+    }
+
+    func startSpin() {
+        iconView.layer?.addInfiniteSpin()
+    }
+
+    func stopSpin() {
+        iconView.layer?.removeAnimation(forKey: "spin")
+    }
+
+    func pulse() {
+        guard let layer = layer else { return }
+        layer.removeAnimation(forKey: "capsulePulse")
+        let pop = CASpringAnimation(keyPath: "transform.scale")
+        pop.fromValue = 0.92
+        pop.toValue = 1.0
+        pop.damping = 12
+        pop.stiffness = 260
+        pop.duration = pop.settlingDuration
+        layer.add(pop, forKey: "capsulePulse")
+    }
+}
+
 extension CALayer {
-    /// 追加匀速无限旋转；AppKit 图层坐标系中逆时针为正，故顺时针取负值
+    /// 追加匀速无限旋转；自适应 AppKit 默认 (0, 0) 锚点与居中 (0.5, 0.5) 锚点，确保绝对绕几何中心原位旋转规避漂移
     func addInfiniteSpin() {
-        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-        spin.fromValue = 0
-        spin.toValue = -CGFloat.pi * 2
-        spin.duration = 1.0
-        spin.repeatCount = .infinity
-        spin.timingFunction = CAMediaTimingFunction(name: .linear)
-        spin.isRemovedOnCompletion = false
-        add(spin, forKey: "spin")
+        let anim = CAKeyframeAnimation(keyPath: "transform")
+        let w = bounds.width > 0 ? bounds.width : 20.0
+        let h = bounds.height > 0 ? bounds.height : 20.0
+        let cx = w * (0.5 - anchorPoint.x)
+        let cy = h * (0.5 - anchorPoint.y)
+
+        func makeTransform(angle: CGFloat) -> CATransform3D {
+            var t = CATransform3DMakeTranslation(cx, cy, 0)
+            t = CATransform3DRotate(t, angle, 0, 0, 1)
+            t = CATransform3DTranslate(t, -cx, -cy, 0)
+            return t
+        }
+
+        anim.values = [
+            NSValue(caTransform3D: makeTransform(angle: 0)),
+            NSValue(caTransform3D: makeTransform(angle: -CGFloat.pi * 0.5)),
+            NSValue(caTransform3D: makeTransform(angle: -CGFloat.pi)),
+            NSValue(caTransform3D: makeTransform(angle: -CGFloat.pi * 1.5)),
+            NSValue(caTransform3D: makeTransform(angle: -CGFloat.pi * 2)),
+        ]
+        anim.keyTimes = [0, 0.25, 0.5, 0.75, 1.0]
+        anim.duration = 1.0
+        anim.repeatCount = .infinity
+        anim.timingFunction = CAMediaTimingFunction(name: .linear)
+        anim.isRemovedOnCompletion = false
+        add(anim, forKey: "spin")
     }
 }
 
@@ -171,10 +294,19 @@ final class SearchResultsViewController: NSViewController {
     }()
     let rebuildContainer = SearchResultsCenterSpinContainerView()
     let rebuildButton = NSButton()
+    let statusFeedbackCapsule = StatusFeedbackCapsuleView()
     let fdaHintButton: NSButton = InteractiveHintButton()
     private var hasFullDiskAccess: Bool = true
     /// 完全磁盘访问受限指引点击回调
     var onOpenFDAGuide: (() -> Void)?
+
+    // MARK: - Status Bar State & Temporary Feedback
+    /// 权威持久状态文本（由业务层或后台进度广播实时驱动）
+    private var persistedStatusText: String = ""
+    /// 当前是否处于临时状态反馈展示期
+    private var isShowingTemporaryStatus: Bool = false
+    /// 临时状态自动恢复任务
+    private var temporaryStatusWorkItem: DispatchWorkItem?
 
     private(set) var results: [FfiSearchResult] = []
     private let iconCache: NSCache<NSString, NSImage> = {
@@ -222,6 +354,8 @@ final class SearchResultsViewController: NSViewController {
     }
 
     deinit {
+        temporaryStatusWorkItem?.cancel()
+        statusFeedbackCapsule.stopSpin()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -327,6 +461,14 @@ final class SearchResultsViewController: NSViewController {
         rebuildButton.isEnabled = false
         rebuildContainer.addSubview(rebuildButton)
 
+        statusFeedbackCapsule.translatesAutoresizingMaskIntoConstraints = false
+        statusFeedbackCapsule.isHidden = true
+        statusFeedbackCapsule.alphaValue = 0.0
+        statusFeedbackCapsule.onClick = { [weak self] in
+            self?.rebuildButtonClicked()
+        }
+        bottomBar.addSubview(statusFeedbackCapsule)
+
         NSLayoutConstraint.activate([
             pathBar.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 14),
             pathBar.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
@@ -348,6 +490,9 @@ final class SearchResultsViewController: NSViewController {
             rebuildContainer.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
             rebuildContainer.widthAnchor.constraint(equalToConstant: 20),
             rebuildContainer.heightAnchor.constraint(equalToConstant: 20),
+
+            statusFeedbackCapsule.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -14),
+            statusFeedbackCapsule.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
         ])
 
         updateBottomBarVisibility()
@@ -562,9 +707,71 @@ final class SearchResultsViewController: NSViewController {
         fdaHintButton.isHidden = !showFDAHint
     }
 
-    /// 更新底栏状态统计文本
+    /// 更新底栏状态统计文本（权威持久状态驱动，若正在展示临时状态则仅静默暂存最新进度）
     func updateStatusText(_ text: String) {
-        statusLabel.stringValue = text
+        persistedStatusText = text
+        if !isShowingTemporaryStatus {
+            statusLabel.stringValue = text
+            statusLabel.textColor = .secondaryLabelColor
+        }
+    }
+
+    /// 取消临时状态展示并立即恢复最新持久状态
+    func cancelTemporaryStatus() {
+        temporaryStatusWorkItem?.cancel()
+        temporaryStatusWorkItem = nil
+        isShowingTemporaryStatus = false
+        statusFeedbackCapsule.stopSpin()
+        statusFeedbackCapsule.isHidden = true
+        statusFeedbackCapsule.alphaValue = 0.0
+        statusLabel.alphaValue = 1.0
+        rebuildContainer.alphaValue = 1.0
+        statusLabel.stringValue = persistedStatusText
+        statusLabel.textColor = .secondaryLabelColor
+    }
+
+    /// 当后台正在增量索引或扫描时，点击刷新按钮触发的状态栏微反馈
+    func notifyBackgroundIndexingActive() {
+        // 1. 同步底层无障碍与持久语义状态
+        statusLabel.stringValue = L("search.backgroundRefresh")
+        statusLabel.textColor = .controlAccentColor
+
+        // 2. 配置轻量微气泡与持续旋转微动效
+        isShowingTemporaryStatus = true
+        statusFeedbackCapsule.label.stringValue = L("search.backgroundRefresh")
+        statusFeedbackCapsule.isHidden = false
+        statusFeedbackCapsule.startSpin()
+        statusFeedbackCapsule.pulse()
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            statusLabel.animator().alphaValue = 0.0
+            rebuildContainer.animator().alphaValue = 0.0
+            statusFeedbackCapsule.animator().alphaValue = 1.0
+        }
+
+        // 3. 取消前序计时器并重新调度 2.0 秒平滑恢复
+        temporaryStatusWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.isShowingTemporaryStatus = false
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                self.statusFeedbackCapsule.animator().alphaValue = 0.0
+                self.statusLabel.animator().alphaValue = 1.0
+                self.rebuildContainer.animator().alphaValue = 1.0
+            }, completionHandler: {
+                self.statusFeedbackCapsule.isHidden = true
+                self.statusFeedbackCapsule.stopSpin()
+            })
+            self.statusLabel.stringValue = self.persistedStatusText
+            self.statusLabel.textColor = .secondaryLabelColor
+            self.temporaryStatusWorkItem = nil
+        }
+        temporaryStatusWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
 
     /// 控制底栏内联进度指示器显隐与动画
@@ -585,6 +792,7 @@ final class SearchResultsViewController: NSViewController {
     /// 控制索引重建按钮旋转微动效
     func setRebuildSpinning(_ spinning: Bool) {
         if spinning {
+            cancelTemporaryStatus()
             startRebuildButtonAnimation()
         } else {
             stopRebuildButtonAnimation()
@@ -611,6 +819,10 @@ final class SearchResultsViewController: NSViewController {
         tableView.reloadData()
         rebuildButton.toolTip = L("search.rebuildIndex")
         rebuildButton.setAccessibilityLabel(L("search.rebuildIndex"))
+        if isShowingTemporaryStatus {
+            statusLabel.stringValue = L("search.backgroundRefresh")
+            statusFeedbackCapsule.label.stringValue = L("search.backgroundRefresh")
+        }
         updateFDAButtonContent()
     }
 
@@ -661,38 +873,9 @@ final class SearchResultsViewController: NSViewController {
 
     private func stopRebuildButtonAnimation() {
         guard let layer = rebuildButton.layer else { return }
-
-        if let currentRotation = layer.presentation()?.value(forKeyPath: "transform.rotation.z") as? CGFloat {
-            layer.removeAnimation(forKey: "spin")
-
-            let fullRotation = -CGFloat.pi * 2
-            var targetMultiplier = ceil(currentRotation / fullRotation)
-            if abs((targetMultiplier * fullRotation) - currentRotation) < 0.5 {
-                targetMultiplier += 1
-            }
-            let targetRotation = targetMultiplier * fullRotation
-
-            CATransaction.begin()
-            CATransaction.setCompletionBlock {
-                layer.transform = CATransform3DIdentity
-                layer.removeAnimation(forKey: "stopSpin")
-            }
-
-            let stop = CABasicAnimation(keyPath: "transform.rotation.z")
-            stop.fromValue = currentRotation
-            stop.toValue = targetRotation
-            stop.duration = 0.4
-            stop.timingFunction = CAMediaTimingFunction(controlPoints: 0.1, 0.7, 0.3, 1.0)
-            stop.fillMode = .forwards
-            stop.isRemovedOnCompletion = false
-
-            layer.add(stop, forKey: "stopSpin")
-            CATransaction.commit()
-        } else {
-            layer.removeAnimation(forKey: "spin")
-            layer.transform = CATransform3DIdentity
-        }
-
+        layer.removeAnimation(forKey: "spin")
+        layer.removeAnimation(forKey: "stopSpin")
+        layer.transform = CATransform3DIdentity
         rebuildButton.contentTintColor = .secondaryLabelColor
     }
 
