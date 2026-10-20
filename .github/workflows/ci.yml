@@ -62,16 +62,24 @@ jobs:
       - name: test
         run: make test ARCH=${{ matrix.arch }}
 
-      # 安装 create-dmg 以生成原生拖拽布局的 DMG（若 brew 异常脚本自带 fallback 至 hdiutil）
+      # 验证 macOS AppKit 前端 release 模式编译、静态链接与 .app 组装（常规 PR/push 快速门禁）
+      - name: build release
+        if: github.event_name != 'workflow_dispatch'
+        run: make release ARCH=${{ matrix.arch }}
+
+      # 安装 create-dmg 以生成原生拖拽布局的 DMG（仅手动触发打包时执行）
       - name: install create-dmg
+        if: github.event_name == 'workflow_dispatch'
         run: brew install create-dmg || true
 
-      # 执行打包脚本产出固定资产名 Lokii-<arch>.dmg 与 zip 归档
+      # 执行打包脚本产出固定资产名 Lokii-<arch>.dmg 与 zip 归档（仅手动触发打包时执行）
       - name: package app and dmg
+        if: github.event_name == 'workflow_dispatch'
         run: make package ARCH=${{ matrix.arch }}
 
-      # 上传构建产物至工作流 Artifacts，便于测试包下载验证
+      # 上传构建产物至工作流 Artifacts，便于测试包下载验证（仅手动触发打包时执行）
       - name: upload workflow artifact
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: Lokii-${{ matrix.arch }}
