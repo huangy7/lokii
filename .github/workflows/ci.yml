@@ -6,6 +6,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   macos:
@@ -61,6 +62,20 @@ jobs:
       - name: test
         run: make test ARCH=${{ matrix.arch }}
 
-      # 验证 macOS AppKit 前端 release 模式编译、静态链接与 .app 组装
-      - name: build release
-        run: make release ARCH=${{ matrix.arch }}
+      # 安装 create-dmg 以生成原生拖拽布局的 DMG（若 brew 异常脚本自带 fallback 至 hdiutil）
+      - name: install create-dmg
+        run: brew install create-dmg || true
+
+      # 执行打包脚本产出固定资产名 Lokii-<arch>.dmg 与 zip 归档
+      - name: package app and dmg
+        run: make package ARCH=${{ matrix.arch }}
+
+      # 上传构建产物至工作流 Artifacts，便于测试包下载验证
+      - name: upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lokii-${{ matrix.arch }}
+          path: |
+            output/Lokii-*.dmg
+            output/Lokii-*.zip
+          if-no-files-found: error
