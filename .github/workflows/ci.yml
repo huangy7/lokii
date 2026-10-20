@@ -10,7 +10,7 @@ on:
 jobs:
   macos:
     name: macOS ${{ matrix.arch }}（检查/测试 + 构建）
-    runs-on: macos-15
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
@@ -22,10 +22,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 切换至 Xcode 16（Swift 6），兼容现代化依赖包工具链规范
-      - name: select Xcode 16
+      # 优先匹配最新的现代 Xcode 工具链（支持 Xcode 26+，最低满足 Swift 6）
+      - name: select modern Xcode
         run: |
-          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_2*.app" | sort -V | tail -n 1)
+          if [ -z "$XCODE_PATH" ]; then
+            XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          fi
+          if [ -z "$XCODE_PATH" ] && [ -d "/Applications/Xcode.app" ]; then
+            XCODE_PATH="/Applications/Xcode.app"
+          fi
           if [ -n "$XCODE_PATH" ]; then
             echo "Selecting $XCODE_PATH"
             sudo xcode-select -s "$XCODE_PATH"

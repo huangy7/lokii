@@ -164,19 +164,34 @@ build_app() {
         "${actool_inputs[@]}" >/dev/null 2>&1 || true
     rm -f "$partial_plist" "$output_dir/AppIcon.icns"
 
+    # 校验生成的 Assets.car 是否包含现代分层图标栈；若缺少则采用标准化 Assets.car 兜底
+    local fallback_car="$repo_root/Lokii/Lokii/Resources/Assets.car"
+    local has_layered_icon=false
+    if [[ -f "$output_dir/Assets.car" ]] && xcrun assetutil --info "$output_dir/Assets.car" 2>/dev/null | grep -q '"AssetType" : "IconImageStack"'; then
+        has_layered_icon=true
+    fi
+    if [[ "$has_layered_icon" != "true" && -f "$fallback_car" ]]; then
+        echo "==> 编译环境未生成现代化分层图标栈，使用标准预置 Assets.car 兜底..."
+        cp "$fallback_car" "$output_dir/Assets.car"
+    fi
+
     # 组装 Bundle 目录结构
     rm -rf "$bundle_dir"
     mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources"
 
     cp "$bin_dir/Lokii" "$bundle_dir/Contents/MacOS/Lokii"
-    cp "$icns_path"     "$bundle_dir/Contents/Resources/Lokii.icns"
+    chmod +x "$bundle_dir/Contents/MacOS/Lokii"
+
+    # 拷贝预置资源与多语言
+    if [[ -d "$repo_root/Lokii/Lokii/Resources" ]]; then
+        cp -R "$repo_root/Lokii/Lokii/Resources/"* "$bundle_dir/Contents/Resources/"
+    fi
+
+    # 确保应用图标与最新的 Assets.car 正确置入
+    cp "$icns_path" "$bundle_dir/Contents/Resources/Lokii.icns"
     if [[ -f "$output_dir/Assets.car" ]]; then
         cp "$output_dir/Assets.car" "$bundle_dir/Contents/Resources/Assets.car"
     fi
-    chmod +x "$bundle_dir/Contents/MacOS/Lokii"
-
-    # 拷贝多语言资源到标准 macOS Contents/Resources/
-    cp -R "$repo_root/Lokii/Lokii/Resources/"* "$bundle_dir/Contents/Resources/"
 
     # 拷贝依赖包资源束（若有）至标准 Contents/Resources/
     find "$bin_dir" -maxdepth 1 -name "*.bundle" | while read -r b; do
