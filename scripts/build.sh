@@ -25,6 +25,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
+# 全工程统一最低支持系统版本为 macOS 13.0 (Ventura)
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 version="$(grep -m1 '^version = ' "$repo_root/lokii-core/Cargo.toml" | cut -d '"' -f2)"
 build_number="$version"
