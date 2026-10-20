@@ -31,14 +31,39 @@ struct LokiiConfig: Codable {
     struct IndexConfig: Codable {
         var indexPaths: [String]
         var exclude: [String]
+        var excludePaths: [String]
         var includeHidden: Bool
         var maxResults: Int
 
         enum CodingKeys: String, CodingKey {
             case indexPaths = "index_paths"
             case exclude
+            case excludePaths = "exclude_paths"
             case includeHidden = "include_hidden"
             case maxResults = "max_results"
+        }
+
+        init(
+            indexPaths: [String] = [],
+            exclude: [String] = [],
+            excludePaths: [String] = [],
+            includeHidden: Bool = false,
+            maxResults: Int = 1000
+        ) {
+            self.indexPaths = indexPaths
+            self.exclude = exclude
+            self.excludePaths = excludePaths
+            self.includeHidden = includeHidden
+            self.maxResults = maxResults
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.indexPaths = try container.decodeIfPresent([String].self, forKey: .indexPaths) ?? []
+            self.exclude = try container.decodeIfPresent([String].self, forKey: .exclude) ?? []
+            self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? []
+            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? false
+            self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? 1000
         }
     }
 

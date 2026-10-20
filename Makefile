@@ -43,6 +43,7 @@ test: bindings
 	@swift tests/split_view_controller_test.swift
 	@swift tests/keyboard_navigation_test.swift
 	@swift tests/shortcut_recorder_test.swift
+	@swift tests/index_config_test.swift
 
 
 check:

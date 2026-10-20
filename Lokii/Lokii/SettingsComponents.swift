@@ -59,22 +59,45 @@ struct SidebarList: View {
 }
 
 // MARK: - macOS System Settings Style Group
-struct SettingsGroup<Content: View>: View {
+struct SettingsGroup<Content: View, HeaderTrailing: View>: View {
     let title: String?
+    let description: String?
+    let headerTrailing: HeaderTrailing
     @ViewBuilder var content: () -> Content
 
-    init(_ title: String? = nil, @ViewBuilder content: @escaping () -> Content) {
+    init(
+        _ title: String? = nil,
+        description: String? = nil,
+        @ViewBuilder trailing: () -> HeaderTrailing,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
         self.title = title
+        self.description = description
+        self.headerTrailing = trailing()
         self.content = content
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let title {
-                Text(title)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 12)
+            if title != nil || description != nil {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline) {
+                        if let title {
+                            Text(title)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        headerTrailing
+                    }
+                    if let description {
+                        Text(description)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary.opacity(0.85))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 12)
             }
             VStack(spacing: 0) {
                 content()
@@ -87,6 +110,16 @@ struct SettingsGroup<Content: View>: View {
                     .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
             )
         }
+    }
+}
+
+extension SettingsGroup where HeaderTrailing == EmptyView {
+    init(
+        _ title: String? = nil,
+        description: String? = nil,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.init(title, description: description, trailing: { EmptyView() }, content: content)
     }
 }
 
@@ -132,5 +165,115 @@ struct SettingsRowDivider: View {
     var body: some View {
         Divider()
             .padding(.leading, 12)
+    }
+}
+
+// MARK: - FlowLayout (Wrapping HStack)
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var lineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > width && currentX > 0 {
+                currentX = 0
+                currentY += lineHeight + spacing
+                lineHeight = 0
+            }
+            lineHeight = max(lineHeight, size.height)
+            currentX += size.width + spacing
+        }
+
+        return CGSize(width: width, height: currentY + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var currentX = bounds.minX
+        var currentY = bounds.minY
+        var lineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > bounds.maxX && currentX > bounds.minX {
+                currentX = bounds.minX
+                currentY += lineHeight + spacing
+                lineHeight = 0
+            }
+            subview.place(at: CGPoint(x: currentX, y: currentY), proposal: ProposedViewSize(size))
+            lineHeight = max(lineHeight, size.height)
+            currentX += size.width + spacing
+        }
+    }
+}
+
+// MARK: - Tag Chip View
+struct PillTagView: View {
+    let title: String
+    let onRemove: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.system(size: 11, design: .monospaced))
+                .lineLimit(1)
+            
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(isHovered ? Color.red : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("移除规则")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(isHovered ? 0.08 : 0.04))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(isHovered ? Color.primary.opacity(0.18) : Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+}
+
+// MARK: - Add Tag Chip Button
+struct AddPillButton: View {
+    let title: String
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: "plus")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(isHovered ? Color.accentColor.opacity(0.12) : Color.accentColor.opacity(0.06))
+            .foregroundStyle(Color.accentColor)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.accentColor.opacity(0.35), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
     }
 }
