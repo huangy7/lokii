@@ -8,6 +8,7 @@ pub mod wildcard;
 
 use crate::compact_index::CompactIndex;
 use crate::indexer::{FileEntry, IndexStore};
+use crate::string_pool::NameSignature;
 use serde::Serialize;
 
 use top_k::{Candidate, TopK};
@@ -29,17 +30,35 @@ pub(crate) fn find_positions<'a>(
     positions
 }
 
-/// Rank every indexed name by `score` (higher is better, `None` excludes the
-/// entry) and return the best `max_results`, ordered by score then name.
-pub(crate) fn rank_names<'a, K: Ord>(
+/// 在按名字字节序排好序的唯一名表上使用 128 位签名超集预筛后对每个唯一名只计算一次 `score`，
+/// 并将命中的唯一名通过预建的 `name_entries` CSR 反表展开为 Top-K 记录。
+pub(crate) fn rank_unique_names<'a, K: Ord + Copy>(
     index: &'a CompactIndex,
     max_results: usize,
-    mut score: impl FnMut(&'a str) -> Option<K>,
+    required_sig: NameSignature,
+    mut score: impl FnMut(&'a str, Option<&'a str>) -> Option<K>,
 ) -> Vec<Candidate<'a, K>> {
     let mut top = TopK::new(max_results);
-    for (id, name) in index.names() {
-        if let Some(score) = score(name) {
-            top.offer(id.0, score, name);
+    if max_results == 0 {
+        return Vec::new();
+    }
+    let query_index = index.query_index();
+    for name_id in 0..query_index.slot_count() as u32 {
+        let sig = query_index.signature_at(name_id);
+        if sig == crate::string_pool::NameSignature::default() && !query_index.is_ready(name_id) {
+            continue;
+        }
+        if !sig.contains(required_sig) {
+            continue;
+        }
+        let Some(name) = index.name_text(name_id) else {
+            continue;
+        };
+        if let Some(s) = score(name, query_index.folded(name_id)) {
+            let entries = query_index.entries(name_id);
+            for &ordinal in entries.iter().take(max_results) {
+                top.offer(ordinal as usize, s, name);
+            }
         }
     }
     top.finish()

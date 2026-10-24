@@ -1,4 +1,5 @@
-use crate::indexer::{score_match, IndexStore, MatchScore};
+use crate::indexer::{score_match_zero_alloc, IndexStore, MatchScore};
+use crate::string_pool::NameSignature;
 
 use super::{find_positions, AdvancedSearchResult, SearchMode};
 
@@ -24,17 +25,56 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
     let read = store.read();
     let matches = match &extension {
         Some(extension) => {
+            let mut req = NameSignature::from_substring_query(".");
+            req = req.union(NameSignature::from_substring_query(extension));
+            let ext_ascii = extension.is_ascii();
             let mut top = super::top_k::TopK::new(max_results);
-            for (id, view) in read.iter() {
-                if view.extension == extension {
-                    top.offer(id.0, MatchScore::Exact, view.name);
+            let sorted = read.sorted_names();
+            for &name_id in &sorted.ids {
+                if let Some(sig) = read.name_signature(name_id) {
+                    if !sig.contains(req) {
+                        continue;
+                    }
+                }
+                let Some((name, folded)) = read.name_entry(name_id) else {
+                    continue;
+                };
+                let matched = if let Some(f) = folded {
+                    f.rsplit_once('.').is_some_and(|(_, ext)| ext == extension)
+                } else if ext_ascii {
+                    name.rsplit_once('.')
+                        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(extension))
+                } else {
+                    false
+                };
+                if !matched {
+                    continue;
+                }
+                for &ordinal in read.entries_for_name(name_id) {
+                    let record = &read.records()[ordinal as usize];
+                    if !record.is_dir && read.extension(record.extension) == Some(extension.as_str()) {
+                        top.offer(ordinal as usize, MatchScore::Exact, name);
+                        if top.is_full() {
+                            break;
+                        }
+                    }
+                }
+                if top.is_full() {
+                    break;
                 }
             }
             top.finish()
         }
-        None => super::rank_names(&read, max_results, |name| {
-            score_match(&name.to_lowercase(), &keywords)
-        }),
+        None => {
+            let mut req = NameSignature::default();
+            for kw in &keywords {
+                req = req.union(NameSignature::from_substring_query(kw));
+            }
+            let all_ascii = keywords.iter().all(|k| k.is_ascii());
+            super::rank_unique_names(&read, max_results, req, |name, folded| {
+                score_match_zero_alloc(name, folded, &keywords, all_ascii)
+            })
+        }
     };
     matches
         .into_iter()

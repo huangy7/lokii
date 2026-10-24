@@ -976,10 +976,6 @@ struct PreferencesView: View {
         }
     }
 
-    private func addIndexPath() {
-        addIndexPathViaPanel()
-    }
-
     private func addIndexPathViaPanel() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true

@@ -58,6 +58,11 @@ impl<'a, K: Ord> TopK<'a, K> {
         }
     }
 
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.limit > 0 && self.candidates.len() >= self.limit
+    }
+
     pub fn finish(self) -> Vec<Candidate<'a, K>> {
         self.candidates.into_sorted_vec()
     }

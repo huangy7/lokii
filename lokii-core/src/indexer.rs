@@ -74,6 +74,46 @@ pub fn score_match(name_lower: &str, keywords: &[String]) -> Option<MatchScore> 
     Some(score)
 }
 
+/// 零分配打分：若名字为纯 ASCII，直接在原始字节上做大小写无关比较；
+/// 若包含非 ASCII 字符，则使用池中已预折叠的 `folded_non_ascii`。
+#[inline]
+pub(crate) fn score_match_zero_alloc(
+    name: &str,
+    folded_non_ascii: Option<&str>,
+    keywords: &[String],
+    all_keywords_ascii: bool,
+) -> Option<MatchScore> {
+    if let Some(folded) = folded_non_ascii {
+        return score_match(folded, keywords);
+    }
+    if !all_keywords_ascii {
+        // `folded_non_ascii` 只在“折叠后与原名不同”时存在；这里为 None
+        // 意味着名字已经是小写等价形式（CJK、小写重音字母等），直接按原名比较。
+        return if name.is_ascii() {
+            None
+        } else {
+            score_match(name, keywords)
+        };
+    }
+    let name_bytes = name.as_bytes();
+    for kw in keywords {
+        if !crate::string_pool::ascii_contains_ignore_case(name_bytes, kw.as_bytes()) {
+            return None;
+        }
+    }
+    let first = keywords[0].as_bytes();
+    let score = if name.eq_ignore_ascii_case(&keywords[0]) {
+        MatchScore::Exact
+    } else if name_bytes.len() >= first.len()
+        && name_bytes[..first.len()].eq_ignore_ascii_case(first)
+    {
+        MatchScore::Prefix
+    } else {
+        MatchScore::Substring
+    };
+    Some(score)
+}
+
 #[derive(Clone)]
 pub struct IndexStore {
     entries: Arc<RwLock<crate::compact_index::CompactIndex>>,
@@ -99,6 +139,11 @@ impl IndexStore {
 
     pub fn len(&self) -> usize {
         self.entries.read().len()
+    }
+
+    /// 后台预热查询索引；调用方应放在独立线程，避免阻塞 UI。
+    pub fn warm_query_index(&self) {
+        self.entries.read().warm_query_index();
     }
     pub fn is_empty(&self) -> bool {
         self.entries.read().is_empty()
@@ -145,22 +190,55 @@ impl IndexStore {
         let keywords: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let matches = match &extension {
             Some(extension) => {
+                let mut req = crate::string_pool::NameSignature::from_substring_query(".");
+                req = req.union(crate::string_pool::NameSignature::from_substring_query(
+                    extension,
+                ));
+                let ext_ascii = extension.is_ascii();
                 let mut top = crate::search::top_k::TopK::new(max_results);
-                for (id, view) in read.iter() {
-                    if view
-                        .name
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|value| value.to_lowercase() == *extension)
-                    {
-                        top.offer(id.0, MatchScore::Exact, view.name);
+                let sorted = read.sorted_names();
+                for &name_id in &sorted.ids {
+                    if let Some(sig) = read.name_signature(name_id) {
+                        if !sig.contains(req) {
+                            continue;
+                        }
+                    }
+                    let Some((name, folded)) = read.name_entry(name_id) else {
+                        continue;
+                    };
+                    let matched = if let Some(f) = folded {
+                        f.rsplit('.').next() == Some(extension.as_str())
+                    } else if ext_ascii {
+                        name.rsplit('.')
+                            .next()
+                            .is_some_and(|v| v.eq_ignore_ascii_case(extension))
+                    } else {
+                        false
+                    };
+                    if matched {
+                        for &ordinal in read.entries_for_name(name_id).iter().take(max_results) {
+                            top.offer(ordinal as usize, MatchScore::Exact, name);
+                            if top.is_full() {
+                                break;
+                            }
+                        }
+                        if top.is_full() {
+                            break;
+                        }
                     }
                 }
                 top.finish()
             }
-            None => crate::search::rank_names(&read, max_results, |name| {
-                score_match(&name.to_lowercase(), &keywords)
-            }),
+            None => {
+                let mut req = crate::string_pool::NameSignature::default();
+                for kw in &keywords {
+                    req = req.union(crate::string_pool::NameSignature::from_substring_query(kw));
+                }
+                let all_ascii = keywords.iter().all(|k| k.is_ascii());
+                crate::search::rank_unique_names(&read, max_results, req, |name, folded| {
+                    score_match_zero_alloc(name, folded, &keywords, all_ascii)
+                })
+            }
         };
         matches
             .into_iter()

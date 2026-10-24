@@ -164,8 +164,10 @@ pub fn search(
         .name_terms
         .iter()
         .any(|term| term.contains('*') || term.contains('?'));
+    let all_terms_ascii = query.name_terms.iter().all(|t| t.is_ascii());
 
     let mut top_k = TopK::new(max_results);
+    let mut ascii_buf = Vec::with_capacity(128);
 
     // 阶段 1：单趟扫描记录
     for (ordinal, record) in read.records().iter().enumerate() {
@@ -199,8 +201,15 @@ pub fn search(
             }
         }
 
-        // 3. 打分
-        let name = read.record_name(record);
+        // 3. 打分（零分配）
+        let (name, folded_opt) = if record.raw_path {
+            (read.record_name(record), None)
+        } else {
+            match read.name_entry(record.name) {
+                Some((n, f)) => (n, f),
+                None => ("", None),
+            }
+        };
         let final_score: u32 = if query.name_terms.is_empty() {
             // 纯目录模式（如 "Desktop/"）
             if is_dir_self {
@@ -212,13 +221,23 @@ pub fn search(
             }
         } else {
             // 带文件名检索（如 "src/main.rs"）
-            let name_lower = name.to_lowercase();
             let base_score: u32 = if has_wildcard {
+                let name_lower_cow: std::borrow::Cow<'_, str> = if let Some(f) = folded_opt {
+                    std::borrow::Cow::Borrowed(f)
+                } else if name.is_ascii() {
+                    ascii_buf.clear();
+                    ascii_buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+                    std::borrow::Cow::Borrowed(unsafe {
+                        std::str::from_utf8_unchecked(&ascii_buf)
+                    })
+                } else {
+                    std::borrow::Cow::Owned(name.to_lowercase())
+                };
                 let all_matched = query.name_terms.iter().all(|term| {
                     if term.contains('*') || term.contains('?') {
-                        glob_match::glob_match(term, &name_lower)
+                        glob_match::glob_match(term, &name_lower_cow)
                     } else {
-                        name_lower.contains(term.as_str())
+                        name_lower_cow.contains(term.as_str())
                     }
                 });
                 if !all_matched {
@@ -226,7 +245,17 @@ pub fn search(
                 }
                 SCORE_NAME_PREFIX
             } else {
-                let Some(score) = score_match(&name_lower, &query.name_terms) else {
+                let matched_score = if record.raw_path && !name.is_ascii() {
+                    score_match(&name.to_lowercase(), &query.name_terms)
+                } else {
+                    crate::indexer::score_match_zero_alloc(
+                        name,
+                        folded_opt,
+                        &query.name_terms,
+                        all_terms_ascii,
+                    )
+                };
+                let Some(score) = matched_score else {
                     continue;
                 };
                 match score {

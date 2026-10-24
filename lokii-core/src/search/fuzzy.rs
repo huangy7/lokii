@@ -24,9 +24,21 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
         Normalization::Smart,
         AtomKind::Fuzzy,
     );
+    // Fuzzy 匹配：当查询为纯 ASCII 时，所有 ASCII 字母/数字必须作为子序列出现在目标文件名中
+    let mut req = crate::string_pool::NameSignature::default();
+    if query.is_ascii() {
+        for b in query.bytes() {
+            let lower = b.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                req.lo |= 1u64 << (lower - b'a');
+            } else if lower.is_ascii_digit() {
+                req.lo |= 1u64 << (26 + (lower - b'0'));
+            }
+        }
+    }
     let read = store.read();
     let mut buffer = Vec::new();
-    let matches = super::rank_names(&read, max_results, |name| {
+    let matches = super::rank_unique_names(&read, max_results, req, |name, _| {
         let haystack = Utf32Str::new(name, &mut buffer);
         pattern.score(haystack, &mut matcher)
     });

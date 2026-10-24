@@ -230,7 +230,7 @@ struct PillTagView: View {
                     .foregroundStyle(isHovered ? Color.red : Color.secondary)
             }
             .buttonStyle(.plain)
-            .help("移除规则")
+            .help(L("prefs.action.remove"))
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)

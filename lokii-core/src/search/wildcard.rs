@@ -2,6 +2,21 @@ use glob_match::glob_match;
 
 use super::{AdvancedSearchResult, SearchMode};
 use crate::indexer::IndexStore;
+use crate::string_pool::NameSignature;
+
+/// 从通配符模式中提取所有不跨越 `*`/`?`/`[`/`]`/`{`/`}` 的字面量片段并生成签名超集掩码。
+fn required_signature_for_glob(pattern_lower: &str) -> NameSignature {
+    if pattern_lower.contains('[') || pattern_lower.contains('{') || pattern_lower.contains('\\') {
+        return NameSignature::default();
+    }
+    let mut sig = NameSignature::default();
+    for segment in pattern_lower.split(['*', '?']) {
+        if !segment.is_empty() {
+            sig = sig.union(NameSignature::from_substring_query(segment));
+        }
+    }
+    sig
+}
 
 /// Wildcard search using glob patterns (* and ? wildcards).
 ///
@@ -14,10 +29,62 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
         return Vec::new();
     }
     let read = store.read();
-    super::rank_names(&read, max_results, |name| {
-        glob_match(&pattern, &name.to_lowercase()).then_some(1)
-    })
-    .into_iter()
+    let req = required_signature_for_glob(&pattern);
+
+    // 针对纯 `*.ext` 模式（无其他通配符），直接跳过 `glob_match` 字符串自动机，做后缀字节比对
+    let simple_suffix = pattern.strip_prefix("*.").filter(|rest| {
+        !rest.is_empty()
+            && !rest.contains(['*', '?', '[', ']', '{', '}', '\\'])
+            && rest.is_ascii()
+    });
+
+    let mut ascii_buf = Vec::with_capacity(128);
+    let mut top = super::top_k::TopK::new(max_results);
+    let sorted = read.sorted_names();
+    for &name_id in &sorted.ids {
+        if let Some(sig) = read.name_signature(name_id) {
+            if !sig.contains(req) {
+                continue;
+            }
+        }
+        let Some((name, folded)) = read.name_entry(name_id) else {
+            continue;
+        };
+        let matched = if let Some(ext) = simple_suffix {
+            let suffix_len = ext.len() + 1;
+            if let Some(f) = folded {
+                f.len() >= suffix_len
+                    && f.as_bytes()[f.len() - suffix_len] == b'.'
+                    && &f[f.len() - ext.len()..] == ext
+            } else {
+                let bytes = name.as_bytes();
+                bytes.len() >= suffix_len
+                    && bytes[bytes.len() - suffix_len] == b'.'
+                    && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
+            }
+        } else if let Some(f) = folded {
+            glob_match(&pattern, f)
+        } else {
+            ascii_buf.clear();
+            ascii_buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+            // safety: name is guaranteed ASCII when `folded` is None
+            let lower_str = unsafe { std::str::from_utf8_unchecked(&ascii_buf) };
+            glob_match(&pattern, lower_str)
+        };
+        if matched {
+            for &ordinal in read.entries_for_name(name_id).iter().take(max_results) {
+                top.offer(ordinal as usize, 1, name);
+                if top.is_full() {
+                    break;
+                }
+            }
+            if top.is_full() {
+                break;
+            }
+        }
+    }
+    top.finish()
+        .into_iter()
     .map(|candidate| {
         let view = read
             .view(crate::compact_index::EntryId(candidate.ordinal))

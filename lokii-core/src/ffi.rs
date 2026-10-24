@@ -215,6 +215,11 @@ impl LokiiCore {
         }
         event_handler.on_index_ready(self.store.len() as u64);
 
+        // 先让首屏可用，再在后台把查询侧 CSR/签名/排序表建好；
+        // 用户第一次按键通常已经命中预热结果。
+        let warm_store = self.store.clone();
+        std::thread::spawn(move || warm_store.warm_query_index());
+
         // For hot start, spawn background verification (non-blocking)
         if matches!(mode, startup::StartupMode::HotStart { .. }) {
             self.cancel_verify.store(false, Ordering::Relaxed);
@@ -234,6 +239,7 @@ impl LokiiCore {
                 }
                 // Only update if not cancelled (rebuild took over)
                 if !cancel.load(Ordering::Relaxed) {
+                    store.warm_query_index();
                     verify_handler.on_index_updated(store.len() as u64);
                 }
             });
@@ -391,6 +397,8 @@ impl LokiiCore {
         self.store.replace_compact(fresh);
 
         drop(guard);
+        let warm_store = self.store.clone();
+        std::thread::spawn(move || warm_store.warm_query_index());
         event_handler.on_index_ready(self.store.len() as u64);
         true
     }
