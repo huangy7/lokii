@@ -140,6 +140,38 @@ pub fn scan_compact(
     Ok(index)
 }
 
+/// 剔除被更上层索引根完全覆盖、且沿途无排除剪枝阻断的冗余子扫描根
+pub(crate) fn deduplicate_scan_roots(
+    paths: &[PathBuf],
+    filter: &crate::filter::CompiledFilter,
+) -> Vec<PathBuf> {
+    let mut unique_paths: Vec<&Path> = Vec::new();
+    for p in paths {
+        if !unique_paths.iter().any(|existing| paths_equal_ci(existing, p)) {
+            unique_paths.push(p.as_path());
+        }
+    }
+
+    let mut clean_roots: Vec<PathBuf> = Vec::new();
+    for (i, candidate) in unique_paths.iter().enumerate() {
+        // 存在更上层的根覆盖 candidate，且两者之间没有任何一处被排除剪枝时，
+        // candidate 已包含在该根的遍历中，无需独立扫描
+        let is_redundant = unique_paths.iter().enumerate().any(|(j, other)| {
+            j != i
+                && path_starts_with_ci(candidate, other)
+                && candidate
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|ancestor| !paths_equal_ci(ancestor, other))
+                    .all(|ancestor| !filter.is_excluded(ancestor))
+        });
+        if !is_redundant {
+            clean_roots.push(candidate.to_path_buf());
+        }
+    }
+    clean_roots
+}
+
 fn scan_with_sink(
     paths: &[PathBuf],
     filter: Arc<crate::filter::CompiledFilter>,
@@ -154,7 +186,9 @@ fn scan_with_sink(
         protected_paths()
     };
 
-    for root in paths {
+    let scan_roots = deduplicate_scan_roots(paths, &filter);
+
+    for root in &scan_roots {
         if !root.exists() {
             continue;
         }
@@ -443,5 +477,45 @@ mod tests {
 
         let dir_entry = entries.iter().find(|e| e.name == "mydir").unwrap();
         assert_eq!(dir_entry.extension, ""); // directories have no extension
+    }
+
+    #[test]
+    fn test_deduplicate_scan_roots() {
+        let tmp = make_temp_dir();
+        let parent = tmp.path().join("parent");
+        let child = parent.join("child");
+        let blocked_parent = tmp.path().join("blocked_parent");
+        let blocked_library = blocked_parent.join("Library");
+        let pierced_sub = blocked_library.join("PiercedSub");
+
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&pierced_sub).unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.index.index_paths = vec![
+            parent.to_string_lossy().to_string(),
+            child.to_string_lossy().to_string(),
+            blocked_parent.to_string_lossy().to_string(),
+            pierced_sub.to_string_lossy().to_string(),
+        ];
+        config.index.exclude_paths = vec![blocked_library.to_string_lossy().to_string()];
+
+        let filter = crate::filter::CompiledFilter::from_config(&config);
+
+        let input_roots = vec![
+            parent.clone(),
+            child.clone(),
+            blocked_parent.clone(),
+            pierced_sub.clone(),
+        ];
+        let deduplicated = deduplicate_scan_roots(&input_roots, &filter);
+
+        // child 完全被 parent 覆盖且中间无排除阻断，应被去重
+        assert!(deduplicated.contains(&parent));
+        assert!(!deduplicated.contains(&child));
+
+        // pierced_sub 虽在 blocked_parent 下，但中间存在 blocked_library 排除剪枝，必须保留独立扫描
+        assert!(deduplicated.contains(&blocked_parent));
+        assert!(deduplicated.contains(&pierced_sub));
     }
 }

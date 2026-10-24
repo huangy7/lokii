@@ -3,7 +3,6 @@ use crate::config::AppConfig;
 use crate::filter::CompiledFilter;
 use crate::indexer::{FileEntry, IndexStore};
 use crate::metrics::WatcherMetrics;
-use crate::path_utils::path_starts_with_ci;
 use crate::permissions::has_full_disk_access;
 use crate::scanner;
 use notify::event::{ModifyKind, RenameMode};
@@ -295,16 +294,13 @@ fn collect_safe_watch_paths(
         return;
     }
 
-    if filter.is_under_excluded_prefix(path) {
+    if filter.is_excluded(path) {
         return;
     }
 
     // Check if this directory contains any protected or excluded descendants
     let has_protected = scanner::contains_protected_descendant(path, protected);
-    let has_excluded = filter
-        .excluded_prefixes()
-        .iter()
-        .any(|p| path_starts_with_ci(p, path));
+    let has_excluded = filter.has_excluded_descendant(path);
 
     if has_protected || has_excluded {
         if let Ok(entries) = std::fs::read_dir(path) {
