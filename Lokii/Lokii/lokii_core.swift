@@ -1545,6 +1545,111 @@ public func FfiConverterTypeFfiSearchResult_lower(_ value: FfiSearchResult) -> R
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiFileType {
+    
+    case all
+    case document
+    case code
+    case image
+    case media
+    case archive
+    case folder
+}
+
+
+#if compiler(>=6)
+extension FfiFileType: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFileType: FfiConverterRustBuffer {
+    typealias SwiftType = FfiFileType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFileType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .all
+        
+        case 2: return .document
+        
+        case 3: return .code
+        
+        case 4: return .image
+        
+        case 5: return .media
+        
+        case 6: return .archive
+        
+        case 7: return .folder
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiFileType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .all:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .document:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .code:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .image:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .media:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .archive:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .folder:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFileType_lift(_ buf: RustBuffer) throws -> FfiFileType {
+    return try FfiConverterTypeFfiFileType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFileType_lower(_ value: FfiFileType) -> RustBuffer {
+    return FfiConverterTypeFfiFileType.lower(value)
+}
+
+
+extension FfiFileType: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiSearchMode {
     
     case auto

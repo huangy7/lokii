@@ -94,6 +94,23 @@ fn all_modes_match_frozen_legacy() {
             "中文",
             "does-not-exist",
         ] {
+            // 独立扩展名语法（如 ".rs"）在分发层解析为扩展名预过滤。
+            // 在 Auto 与 Substring 模式下行为与旧版完全一致；显式指定非子串模式时，空检索词不再退化为字面量扫描。
+            if query == ".rs" && (mode == SearchMode::Fuzzy || mode == SearchMode::Regex) {
+                continue;
+            }
+
+            // Auto 模式已移除对模糊匹配的静默回退机制，常规文本严格执行子串匹配。
+            // 对于非子串命中的缩写查询（如 "mnrs"），Auto 模式返回空，而旧版会静默回退至模糊匹配。
+            if mode == SearchMode::Auto && query == "mnrs" {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let actual = dispatch(&current, query, mode, limit);
+                    assert_eq!(actual.1, None);
+                    assert!(actual.0.is_empty());
+                }
+                continue;
+            }
+
             for limit in [0, 1, 2, 500, usize::MAX] {
                 let actual = dispatch(&current, query, mode, limit);
                 let expected = legacy::search::dispatch(&old, query, old_mode, limit);

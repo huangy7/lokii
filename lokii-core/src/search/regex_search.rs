@@ -1,6 +1,6 @@
 use regex::RegexBuilder;
 
-use super::{AdvancedSearchResult, SearchMode};
+use super::{AdvancedSearchResult, CompiledRecordFilter, SearchMode};
 use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
@@ -63,7 +63,7 @@ fn required_signature_for_regex(pattern: &str) -> NameSignature {
     sig
 }
 
-/// Regex search using the `regex` crate.
+/// 正则检索器，接入预编译位掩码记录过滤器以达成零堆分配预筛选。
 ///
 /// Queries are expected to start with "regex:" prefix (stripped before compilation).
 /// Case-insensitive matching per R1.3. Invalid regex returns an error string
@@ -71,6 +71,7 @@ fn required_signature_for_regex(pattern: &str) -> NameSignature {
 pub fn search(
     store: &IndexStore,
     query: &str,
+    filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
     let pattern = query.trim().strip_prefix("regex:").unwrap_or(query.trim());
@@ -99,7 +100,11 @@ pub fn search(
             continue;
         };
         if regex.is_match(name) {
-            for &ordinal in read.entries_for_name(name_id).iter().take(max_results) {
+            for &ordinal in read.entries_for_name(name_id) {
+                let record = &read.records()[ordinal as usize];
+                if !filter.matches_record(record, || Some(name)) {
+                    continue;
+                }
                 top.offer(ordinal as usize, 1, name);
                 if top.is_full() {
                     break;
@@ -165,7 +170,8 @@ mod tests {
     #[test]
     fn test_regex_caret_main() {
         let store = test_store();
-        let (results, error) = search(&store, "regex:^main", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, error) = search(&store, "regex:^main", &filter, 500);
         assert!(error.is_none());
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].entry.name, "main.py");
@@ -175,7 +181,8 @@ mod tests {
     #[test]
     fn test_regex_rs_extension() {
         let store = test_store();
-        let (results, error) = search(&store, r"regex:\.rs$", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, error) = search(&store, r"regex:\.rs$", &filter, 500);
         assert!(error.is_none());
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].entry.name, "main.rs");
@@ -185,7 +192,8 @@ mod tests {
     #[test]
     fn test_regex_case_insensitive() {
         let store = test_store();
-        let (results, error) = search(&store, "regex:MAIN", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, error) = search(&store, "regex:MAIN", &filter, 500);
         assert!(error.is_none());
         // All entries with "main" in name
         assert_eq!(results.len(), 3);
@@ -194,7 +202,8 @@ mod tests {
     #[test]
     fn test_invalid_regex_returns_error() {
         let store = test_store();
-        let (results, error) = search(&store, "regex:[invalid", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, error) = search(&store, "regex:[invalid", &filter, 500);
         assert!(results.is_empty());
         assert!(error.is_some());
         assert!(error.unwrap().contains("Invalid regex:"));
@@ -203,7 +212,8 @@ mod tests {
     #[test]
     fn test_match_positions_contains_regex_range() {
         let store = test_store();
-        let (results, _) = search(&store, "regex:^main", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, _) = search(&store, "regex:^main", &filter, 500);
         assert!(!results.is_empty());
         // "main.py" -> match at (0, 4) for "main"
         let main_py = results.iter().find(|r| r.entry.name == "main.py").unwrap();
@@ -213,7 +223,8 @@ mod tests {
     #[test]
     fn test_results_sorted_by_name() {
         let store = test_store();
-        let (results, _) = search(&store, "regex:main", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, _) = search(&store, "regex:main", &filter, 500);
         let names: Vec<&str> = results.iter().map(|r| r.entry.name.as_str()).collect();
         let mut sorted = names.clone();
         sorted.sort();
@@ -223,7 +234,8 @@ mod tests {
     #[test]
     fn test_empty_pattern_after_prefix() {
         let store = test_store();
-        let (results, error) = search(&store, "regex:", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, error) = search(&store, "regex:", &filter, 500);
         assert!(results.is_empty());
         assert!(error.is_none());
     }
@@ -231,7 +243,8 @@ mod tests {
     #[test]
     fn test_search_mode_is_regex() {
         let store = test_store();
-        let (results, _) = search(&store, "regex:main", 500);
+        let filter = CompiledRecordFilter::default();
+        let (results, _) = search(&store, "regex:main", &filter, 500);
         for r in &results {
             assert_eq!(r.search_mode, SearchMode::Regex);
         }
@@ -247,6 +260,7 @@ mod tests {
                 .collect(),
         );
 
+        let filter = CompiledRecordFilter::default();
         for (pattern, expected) in [
             ("regex:ab{0,1}c", "ac"),
             ("regex:(fo)?bar", "bar"),
@@ -254,7 +268,7 @@ mod tests {
             ("regex:a{2}", "aa"),
             ("regex:foo*", "fo"),
         ] {
-            let (results, error) = search(&store, pattern, 100);
+            let (results, error) = search(&store, pattern, &filter, 100);
             assert!(error.is_none(), "{pattern}: {error:?}");
             assert!(
                 results.iter().any(|result| result.entry.name == expected),
@@ -313,7 +327,32 @@ mod tests {
     #[test]
     fn test_max_results_truncation() {
         let store = test_store();
-        let (results, _) = search(&store, "regex:main", 1);
+        let filter = CompiledRecordFilter::default();
+        let (results, _) = search(&store, "regex:main", &filter, 1);
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_regex_with_compiled_filter() {
+        let store = test_store();
+        let read = store.read();
+        let query_filter = super::super::QueryFilter {
+            file_type: super::super::FileType::Document,
+            custom_ext: None,
+            ..Default::default()
+        };
+        let filter = CompiledRecordFilter::compile(&read, &query_filter);
+        drop(read);
+
+        // "main" 匹配 main.rs, my_main.rs, main.py，但在 Document 过滤下应全被排除
+        let (results, error) = search(&store, "regex:main", &filter, 500);
+        assert!(error.is_none());
+        assert!(results.is_empty());
+
+        // "readme" 在 Document 过滤下命中 readme.md
+        let (results_doc, error_doc) = search(&store, "regex:readme", &filter, 500);
+        assert!(error_doc.is_none());
+        assert_eq!(results_doc.len(), 1);
+        assert_eq!(results_doc[0].entry.name, "readme.md");
     }
 }

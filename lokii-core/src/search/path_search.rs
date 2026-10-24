@@ -2,7 +2,7 @@ use crate::compact_index::{split_path, EntryId};
 use crate::indexer::{score_match, IndexStore, MatchScore};
 use crate::search::path_query::PathQuery;
 use crate::search::top_k::TopK;
-use crate::search::{find_positions, AdvancedSearchResult, SearchMode};
+use crate::search::{find_positions, AdvancedSearchResult, CompiledRecordFilter, SearchMode};
 
 /// 目录实体自身命中时的基准分。
 const SCORE_DIR_SELF: u32 = 500;
@@ -145,6 +145,7 @@ pub(crate) fn find_parent_highlight_range(
 pub fn search(
     store: &IndexStore,
     query: &PathQuery,
+    filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
     if max_results == 0 {
@@ -171,6 +172,10 @@ pub fn search(
 
     // 阶段 1：单趟扫描记录
     for (ordinal, record) in read.records().iter().enumerate() {
+        if !filter.matches_record(record, || Some(read.record_name(record))) {
+            continue;
+        }
+
         // 1. 查表取父路径匹配质量
         let parent_quality = if record.raw_path {
             let (parent, _) = read.split_record(record);
@@ -370,7 +375,8 @@ mod tests {
     fn test_search_relative_path() {
         let store = test_store();
         let query = PathQuery::parse("src/main.rs").unwrap();
-        let results = search(&store, &query, 10);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, &query, &filter, 10);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "main.rs");
@@ -382,7 +388,8 @@ mod tests {
     fn test_search_parent_filter_no_false_negatives() {
         let store = test_store();
         let query = PathQuery::parse("search/mod.rs").unwrap();
-        let results = search(&store, &query, 10);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, &query, &filter, 10);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.path, "/project/src/search/mod.rs");
@@ -392,7 +399,8 @@ mod tests {
     fn test_search_dir_trailing_slash() {
         let store = test_store();
         let query = PathQuery::parse("Desktop/").unwrap();
-        let results = search(&store, &query, 10);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, &query, &filter, 10);
 
         // 应命中两个同名 Desktop 目录实体本身以及 Desktop 下的所有子孙文件
         assert_eq!(results.len(), 4);
@@ -410,7 +418,8 @@ mod tests {
     fn test_search_dir_with_parent_prefix_no_false_positives() {
         let store = test_store();
         let query = PathQuery::parse("tester/Desktop/").unwrap();
-        let results = search(&store, &query, 10);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, &query, &filter, 10);
 
         // 仅匹配 /Users/tester/Desktop 及其子项，不匹配 /var/tmp/backup/Desktop
         let paths: Vec<&str> = results.iter().map(|r| r.entry.path.as_str()).collect();
@@ -422,7 +431,8 @@ mod tests {
     fn test_search_multi_word_with_extension() {
         let store = test_store();
         let query = PathQuery::parse("release/app .log").unwrap();
-        let results = search(&store, &query, 10);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, &query, &filter, 10);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.path, "/opt/release/app.log");
@@ -432,9 +442,31 @@ mod tests {
     fn test_search_scope_filter() {
         let store = test_store();
         let query = PathQuery::parse("in:/var/log/ app").unwrap();
-        let results = search(&store, &query, 10);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, &query, &filter, 10);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.path, "/var/log/app.log");
+    }
+
+    #[test]
+    fn test_path_search_with_compiled_filter() {
+        let store = test_store();
+        let read = store.read();
+        let query_filter = super::super::QueryFilter {
+            file_type: super::super::FileType::Document,
+            custom_ext: None,
+            ..Default::default()
+        };
+        let filter = CompiledRecordFilter::compile(&read, &query_filter);
+        drop(read);
+
+        // Desktop/ 下包含目录 Desktop、notes.txt、deep.txt。Document 过滤下仅保留 notes.txt 与 deep.txt
+        let query = PathQuery::parse("Desktop/").unwrap();
+        let results = search(&store, &query, &filter, 10);
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = results.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(names.contains(&"notes.txt"));
+        assert!(names.contains(&"deep.txt"));
     }
 }

@@ -361,6 +361,19 @@ impl StringPool {
         self.slots.len()
     }
 
+    pub(crate) fn find(&self, text: &str) -> Option<u32> {
+        let hash = self.hash(text);
+        let mut current = *self.lookup.get(&hash)?;
+        while current != u32::MAX {
+            let slot = self.slots.get(current as usize)?.as_ref()?;
+            if slot.text.as_ref() == text {
+                return Some(current);
+            }
+            current = slot.next;
+        }
+        None
+    }
+
     pub(crate) fn release(&mut self, id: u32) {
         let slot = self.slots[id as usize]
             .as_mut()

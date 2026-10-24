@@ -235,7 +235,8 @@ impl IndexStore {
                     req = req.union(crate::string_pool::NameSignature::from_substring_query(kw));
                 }
                 let all_ascii = keywords.iter().all(|k| k.is_ascii());
-                crate::search::rank_unique_names(&read, max_results, req, |name, folded| {
+                let filter = crate::search::CompiledRecordFilter::default();
+                crate::search::rank_unique_names(&read, &filter, max_results, req, |name, folded| {
                     score_match_zero_alloc(name, folded, &keywords, all_ascii)
                 })
             }

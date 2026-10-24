@@ -56,7 +56,11 @@ final class SearchWindow: NSWindowController {
 
     private var searchField: NSSearchField!
     private let searchContainer = NSView()
+    private let searchDivider = NSBox()
+    private let filterButton = FilterTriggerButton()
+    private let filterPopoverController = FilterPopoverController()
     private var searchWorkItem: DispatchWorkItem?
+    private static let searchModes: [FfiSearchMode] = [.auto, .substring, .wildcard, .regex, .fuzzy]
     private var currentMode: FfiSearchMode = .auto
     private var statusText: LocalizedText = .key("search.indexing") {
         didSet { updateStatusLabel() }
@@ -104,13 +108,22 @@ final class SearchWindow: NSWindowController {
         window.contentViewController = splitViewController
 
         window.onEscape = { [weak self] in
-            self?.hideWindowWithAnimation()
+            guard let self = self else { return }
+            if self.filterPopoverController.isShown {
+                self.filterPopoverController.close()
+                return
+            }
+            self.hideWindowWithAnimation()
         }
         window.onReturn = { [weak self] in
             self?.openSelected()
         }
         window.onCommandF = { [weak self] in
             self?.focusSearchField()
+        }
+        window.onOptionF = { [weak self] in
+            guard let self = self else { return }
+            self.filterPopoverController.toggle(relativeTo: self.filterButton)
         }
 
         setupUI()
@@ -187,6 +200,9 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func hideWindowWithAnimation() {
+        if filterPopoverController.isShown {
+            filterPopoverController.close()
+        }
         if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().orderOut(nil)
         }
@@ -214,23 +230,69 @@ final class SearchWindow: NSWindowController {
         searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.placeholderString = L("search.placeholder")
         searchField.font = .systemFont(ofSize: 14)
-        searchField.focusRingType = .exterior
+        // 禁用内层独立外焦点环，由外层工具栏胶囊统一承载边缘轮廓，消除双重线框嵌套
+        searchField.focusRingType = .none
         searchField.delegate = self
         searchField.sendsSearchStringImmediately = false
         searchField.sendsWholeSearchString = false
 
+        searchDivider.translatesAutoresizingMaskIntoConstraints = false
+        searchDivider.boxType = .custom
+        searchDivider.borderWidth = 0
+        searchDivider.fillColor = .separatorColor
+
+        filterButton.translatesAutoresizingMaskIntoConstraints = false
+        filterButton.isBordered = false
+        filterButton.focusRingType = .none
+        filterButton.imagePosition = .imageLeading
+        filterButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        filterButton.target = self
+        filterButton.action = #selector(filterButtonClicked(_:))
+        filterButton.setContentHuggingPriority(.required, for: .horizontal)
+        filterButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         searchContainer.addSubview(searchField)
+        searchContainer.addSubview(searchDivider)
+        searchContainer.addSubview(filterButton)
 
         NSLayoutConstraint.activate([
             searchContainer.heightAnchor.constraint(equalToConstant: 28),
-            searchContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
+            searchContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
 
             searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
             searchField.leadingAnchor.constraint(equalTo: searchContainer.leadingAnchor),
-            searchField.trailingAnchor.constraint(equalTo: searchContainer.trailingAnchor),
+            searchField.trailingAnchor.constraint(equalTo: searchDivider.leadingAnchor, constant: -4),
             searchField.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
             searchField.heightAnchor.constraint(equalToConstant: 28),
+
+            searchDivider.widthAnchor.constraint(equalToConstant: 1),
+            searchDivider.heightAnchor.constraint(equalToConstant: 14),
+            searchDivider.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            searchDivider.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor, constant: -5),
+
+            filterButton.trailingAnchor.constraint(equalTo: searchContainer.trailingAnchor, constant: -4),
+            filterButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            filterButton.widthAnchor.constraint(equalToConstant: 38),
+            filterButton.heightAnchor.constraint(equalToConstant: 22),
         ])
+
+        filterPopoverController.configure(
+            searchField: searchField,
+            onSearch: { [weak self] query in
+                guard let self = self else { return }
+                self.lastQuery = query
+                if query.isEmpty {
+                    self.searchResultsViewController.updateBottomPath(with: nil)
+                    self.loadDefaultResults()
+                } else {
+                    self.performSearch(query: query)
+                }
+            },
+            onFilterStateChanged: { [weak self] state in
+                self?.updateFilterButton(state: state)
+            }
+        )
+        updateFilterButtonState(forQuery: searchField.stringValue)
 
         let toolbar = LokiiToolbar(identifier: "LokiiMainToolbar")
         toolbar.delegate = self
@@ -257,10 +319,11 @@ final class SearchWindow: NSWindowController {
             let item = NSMenuItem(localizedKey: key, action: #selector(searchModeSelected(_:)), keyEquivalent: "")
             item.target = self
             item.tag = i
-            if i == 0 { item.state = .on }
             menu.addItem(item)
         }
+
         (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate = menu
+        syncSearchMenuState()
 
         // D-04: Optimize magnifying glass icon for visual symmetry
         if let searchButtonCell = (searchField.cell as? NSSearchFieldCell)?.searchButtonCell {
@@ -269,15 +332,34 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    @objc private func searchModeSelected(_ sender: NSMenuItem) {
-        let modes: [FfiSearchMode] = [.auto, .substring, .wildcard, .regex, .fuzzy]
-        let tag = sender.tag
-        guard tag >= 0, tag < modes.count else { return }
-        currentMode = modes[tag]
-        if let menu = sender.menu {
-            for item in menu.items { item.state = .off }
+    /// 同步搜索菜单勾选状态。
+    /// 因 `NSSearchFieldCell` 展开菜单时会对 `searchMenuTemplate` 建立深拷贝，
+    /// 状态同步必须同时写入模板菜单与当前处于激活状态的弹出菜单实例。
+    private func syncSearchMenuState(targetMenu: NSMenu? = nil) {
+        let templateMenu = (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate
+        var menusToUpdate: [NSMenu] = []
+        if let templateMenu {
+            menusToUpdate.append(templateMenu)
         }
-        sender.state = .on
+        if let targetMenu, targetMenu !== templateMenu {
+            menusToUpdate.append(targetMenu)
+        }
+
+        for menu in menusToUpdate {
+            for item in menu.items {
+                guard !item.isSeparatorItem else { continue }
+                if item.tag >= 0 && item.tag < Self.searchModes.count {
+                    item.state = (Self.searchModes[item.tag] == currentMode) ? .on : .off
+                }
+            }
+        }
+    }
+
+    @objc private func searchModeSelected(_ sender: NSMenuItem) {
+        let tag = sender.tag
+        guard tag >= 0, tag < Self.searchModes.count else { return }
+        currentMode = Self.searchModes[tag]
+        syncSearchMenuState(targetMenu: sender.menu)
         if let query = searchField?.stringValue, !query.isEmpty {
             performSearch(query: query)
         }
@@ -343,6 +425,7 @@ final class SearchWindow: NSWindowController {
             menu.refreshLocalizedTitles()
         }
         updateStatusLabel()
+        updateFilterButtonState(forQuery: searchField.stringValue)
         overlayState?.headingText = L("search.buildingIndex")
         overlayState?.statusText = L("search.scanningFiles")
     }
@@ -642,6 +725,10 @@ final class SearchWindow: NSWindowController {
     @objc private func searchChanged() {
         guard indexingState != .failed else { return }
         let query = searchField.stringValue
+        updateFilterButtonState(forQuery: query)
+        if filterPopoverController.isShown {
+            filterPopoverController.syncStateFromQuery(query)
+        }
         guard query != lastQuery else { return }
         lastQuery = query
         searchWorkItem?.cancel()
@@ -692,7 +779,15 @@ final class SearchWindow: NSWindowController {
             DispatchQueue.main.async {
                 self.isSearching = false
                 guard self.indexingState != .failed else { return }
-                guard self.searchField.stringValue.isEmpty else { return }
+                self.syncSearchMenuState()
+                self.updateFilterButtonState(forQuery: self.searchField.stringValue)
+
+                let currentText = self.searchField.stringValue
+                if !currentText.isEmpty {
+                    self.lastQuery = currentText
+                    self.performSearch(query: currentText)
+                    return
+                }
                 self.splitViewController.updateSearchResults(rawResults: items, tree: tree)
                 self.searchMatchText = nil
                 self.updateStatusLabel()
@@ -706,6 +801,7 @@ final class SearchWindow: NSWindowController {
         searchMatchText = .key("search.searching")
 
         let mode = currentMode
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.engine.search(query: query, mode: mode)
@@ -714,6 +810,8 @@ final class SearchWindow: NSWindowController {
                 self.isSearching = false
                 guard self.indexingState != .failed else { return }
                 self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
+                self.syncSearchMenuState()
+                self.updateFilterButtonState(forQuery: self.searchField.stringValue)
 
                 if let error = response.error {
                     self.searchMatchText = .verbatim(error)
@@ -726,11 +824,19 @@ final class SearchWindow: NSWindowController {
                     }
                 }
 
-                // If user typed more while searching, trigger new search
-                let current = self.searchField.stringValue
-                if current != query && !current.isEmpty {
-                    self.lastQuery = current
-                    self.performSearch(query: current)
+                // 检索期间若输入内容变动或检索模式发生切换，在此重新调度
+                let currentText = self.searchField.stringValue
+                if (currentText != query && !currentText.isEmpty) || self.currentMode != mode {
+                    if currentText.isEmpty {
+                        self.searchResultsViewController.updateBottomPath(with: nil)
+                        self.loadDefaultResults()
+                    } else {
+                        self.lastQuery = currentText
+                        self.performSearch(query: currentText)
+                    }
+                } else if currentText.isEmpty && currentText != query {
+                    self.searchResultsViewController.updateBottomPath(with: nil)
+                    self.loadDefaultResults()
                 }
             }
         }
@@ -750,12 +856,75 @@ final class SearchWindow: NSWindowController {
         }
     }
 
+    // MARK: - Filter Popover Actions & State
+
+    @objc private func filterButtonClicked(_ sender: NSButton) {
+        filterPopoverController.toggle(relativeTo: filterButton)
+    }
+
+    private func updateFilterButtonState(forQuery query: String) {
+        let (_, state) = FilterQuerySyncCoordinator.deserialize(query: query)
+        updateFilterButton(state: state)
+    }
+
+    private func updateFilterButton(state: FilterState) {
+        let count = state.activeCount
+        filterButton.activeCount = count
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        filterButton.image = NSImage(systemSymbolName: "line.3.horizontal.decrease", accessibilityDescription: L("filter.title"))?.withSymbolConfiguration(config)
+
+        if count > 0 {
+            filterButton.title = "\(count)"
+            filterButton.contentTintColor = .controlAccentColor
+            filterButton.state = .on
+            let template = L("filter.button.tooltip.active")
+            filterButton.toolTip = template == "filter.button.tooltip.active"
+                ? "\(L("filter.title")): \(count) (⌥F)"
+                : String(format: template, count)
+        } else {
+            filterButton.title = ""
+            filterButton.contentTintColor = .secondaryLabelColor
+            filterButton.state = .off
+            let tooltip = L("filter.button.tooltip")
+            filterButton.toolTip = tooltip == "filter.button.tooltip"
+                ? "\(L("filter.title")) (⌥F)"
+                : tooltip
+        }
+        filterButton.needsDisplay = true
+    }
+
+    // MARK: - Syntax Highlighting
+
+    /// 针对搜索框内限定词（type: / size: / ext:）即时应用语法胶囊高亮
+    private func applyQuerySyntaxHighlighting() {
+        guard let fieldEditor = searchField.currentEditor() as? NSTextView,
+              !fieldEditor.hasMarkedText(),
+              let storage = fieldEditor.textStorage else {
+            return
+        }
+
+        PillLayoutManager.ensureInstalled(on: fieldEditor)
+
+        let query = fieldEditor.string
+        let formatted = FilterQuerySyncCoordinator.formatQuerySyntax(
+            query,
+            baseFont: searchField.font ?? .systemFont(ofSize: 14)
+        )
+
+        let savedRange = fieldEditor.selectedRange
+        storage.beginEditing()
+        storage.setAttributedString(formatted)
+        storage.endEditing()
+        fieldEditor.selectedRange = savedRange
+    }
+
     // MARK: - Focus Management
 
     /// 聚焦搜索输入框，并将输入光标定位至文本末尾
     func focusSearchField() {
         guard let window = window, let searchField = searchField else { return }
         window.makeFirstResponder(searchField)
+        applyQuerySyntaxHighlighting()
         if let editor = searchField.currentEditor() {
             let length = (searchField.stringValue as NSString).length
             editor.selectedRange = NSRange(location: length, length: 0)
@@ -812,6 +981,7 @@ extension SearchWindow: NSWindowDelegate {
 
 extension SearchWindow: NSSearchFieldDelegate {
     func controlTextDidChange(_ obj: Notification) {
+        applyQuerySyntaxHighlighting()
         searchChanged()
     }
 
@@ -1043,4 +1213,130 @@ extension SearchWindow: NSMenuItemValidation {
         return true
     }
 }
+
+// MARK: - 内嵌过滤触发按钮
+
+/// 镶嵌于搜索框右侧的内联过滤触发按钮。
+/// 核心设计：
+/// 1. 锁定固定几何尺寸（38 x 22pt），彻底消除激活数字角标出现/消失时引发的工具栏重排与浮层定位漂移；
+/// 2. 自绘轻量级悬停与激活态圆角胶囊底衬，不产生冗余系统级双层套环。
+final class FilterTriggerButton: NSButton {
+    var activeCount: Int = 0 {
+        didSet {
+            if oldValue != activeCount {
+                needsDisplay = true
+            }
+        }
+    }
+
+    private var isHovered: Bool = false {
+        didSet {
+            if oldValue != isHovered {
+                needsDisplay = true
+            }
+        }
+    }
+
+    private var trackingAreaRef: NSTrackingArea?
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 38, height: 22)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingAreaRef {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        isHovered = false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let isActive = activeCount > 0
+        let isPressed = isHighlighted
+
+        // 绘制悬停态或激活态圆角微胶囊底衬
+        let pillRect = bounds.insetBy(dx: 1, dy: 1)
+        let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 6, yRadius: 6)
+
+        if isActive {
+            let alpha: CGFloat = isPressed ? 0.22 : (isHovered ? 0.17 : 0.12)
+            NSColor.controlAccentColor.withAlphaComponent(alpha).setFill()
+            pillPath.fill()
+        } else if isPressed {
+            NSColor.labelColor.withAlphaComponent(0.10).setFill()
+            pillPath.fill()
+        } else if isHovered {
+            NSColor.labelColor.withAlphaComponent(0.06).setFill()
+            pillPath.fill()
+        }
+
+        let fgColor: NSColor = isActive ? .controlAccentColor : (isHovered ? .labelColor : .secondaryLabelColor)
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 11.5, weight: isActive ? .semibold : .medium)
+        guard let baseIcon = NSImage(systemSymbolName: "line.3.horizontal.decrease", accessibilityDescription: nil),
+              let configuredIcon = baseIcon.withSymbolConfiguration(symbolConfig) else {
+            return
+        }
+
+        // 渲染着色图标与可选的激活计数
+        let iconSize = configuredIcon.size
+        if isActive {
+            let badgeText = "\(activeCount)" as NSString
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: fgColor
+            ]
+            let textSize = badgeText.size(withAttributes: attrs)
+            let spacing: CGFloat = 3.0
+            let totalWidth = iconSize.width + spacing + textSize.width
+            let startX = round((bounds.width - totalWidth) / 2.0)
+            let iconY = round((bounds.height - iconSize.height) / 2.0)
+
+            drawTintedImage(configuredIcon, in: NSRect(x: startX, y: iconY, width: iconSize.width, height: iconSize.height), tint: fgColor)
+
+            let textY = round((bounds.height - textSize.height) / 2.0)
+            badgeText.draw(at: NSPoint(x: startX + iconSize.width + spacing, y: textY), withAttributes: attrs)
+        } else {
+            let iconX = round((bounds.width - iconSize.width) / 2.0)
+            let iconY = round((bounds.height - iconSize.height) / 2.0)
+            drawTintedImage(configuredIcon, in: NSRect(x: iconX, y: iconY, width: iconSize.width, height: iconSize.height), tint: fgColor)
+        }
+    }
+
+    private func drawTintedImage(_ image: NSImage, in rect: NSRect, tint: NSColor) {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let ctx = NSGraphicsContext.current?.cgContext else {
+            image.draw(in: rect)
+            return
+        }
+        ctx.saveGState()
+        // AppKit 按钮视图默认 isFlipped == true，CGContext 需在局部坐标系翻转以正向绘制图标マスク
+        ctx.translateBy(x: rect.minX, y: rect.maxY)
+        ctx.scaleBy(x: 1.0, y: -1.0)
+        let localRect = CGRect(x: 0, y: 0, width: rect.width, height: rect.height)
+        ctx.clip(to: localRect, mask: cgImage)
+        tint.setFill()
+        ctx.fill(localRect)
+        ctx.restoreGState()
+    }
+}
+
 

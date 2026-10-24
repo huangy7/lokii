@@ -178,6 +178,13 @@
 "search.mode.wildcard" = "Wildcard";
 "search.mode.regex" = "Regex";
 "search.mode.fuzzy" = "Fuzzy";
+"search.filetype.all" = "All Files";
+"search.filetype.document" = "Documents";
+"search.filetype.code" = "Source Code";
+"search.filetype.image" = "Images";
+"search.filetype.media" = "Audio & Video";
+"search.filetype.archive" = "Archives";
+"search.filetype.folder" = "Folders";
 
 /* SearchWindow - kind labels */
 "kind.folder" = "Folder";
@@ -267,3 +274,25 @@
 "prefs.about.update.automatic" = "Automatically check for updates";
 "prefs.about.update.found" = "Update available";
 "prefs.about.update.manualDownload" = "Download manually if updating fails";
+
+/* Filter Popover */
+"filter.title" = "Filters";
+"filter.clearAll" = "Clear All";
+"filter.all" = "All";
+"filter.type.title" = "File Types";
+"filter.type.code" = "Code";
+"filter.type.document" = "Documents";
+"filter.type.image" = "Images";
+"filter.type.media" = "Media";
+"filter.type.archive" = "Archives";
+"filter.type.folder" = "Folders";
+"filter.size.title" = "File Size";
+"filter.size.over" = "Over";
+"filter.size.under" = "Under";
+"filter.size.invalidRange" = "Minimum size exceeds maximum size";
+"filter.behavior.title" = "Search Behaviors";
+"filter.behavior.path" = "Match Path";
+"filter.behavior.fuzzy" = "Fuzzy Matching";
+"filter.done" = "Done";
+"filter.button.tooltip" = "Filters (⌥F)";
+"filter.button.tooltip.active" = "Filters: %d active (⌥F)";

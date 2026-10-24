@@ -76,16 +76,32 @@ fn marked(mask: &[bool], ordinal: u32) -> bool {
 }
 
 #[derive(Clone, Copy, bitcode::Encode, bitcode::Decode)]
-pub(crate) struct CompactRecord {
+pub struct CompactRecord {
     pub(crate) name: u32,
     /// 父目录池槽位；原始路径记录则为路径池槽位。
     pub(crate) path: u32,
     pub(crate) extension: u32,
     pub(crate) raw_path: bool,
     pub(crate) is_dir: bool,
-    size: u64,
-    modified: u64,
-    created_at: u64,
+    pub(crate) size: u64,
+    pub(crate) modified: u64,
+    pub(crate) created_at: u64,
+}
+
+impl CompactRecord {
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(is_dir: bool, extension: u32) -> Self {
+        Self {
+            name: 0,
+            path: 0,
+            extension,
+            raw_path: false,
+            is_dir,
+            size: 0,
+            modified: 0,
+            created_at: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -754,7 +770,7 @@ impl CompactIndex {
         })
     }
 
-    pub(crate) fn records(&self) -> &[CompactRecord] {
+    pub fn records(&self) -> &[CompactRecord] {
         &self.records
     }
 
@@ -772,7 +788,7 @@ impl CompactIndex {
     }
 
     /// 仅解析文件名，省去不需要时的父目录池查表。
-    pub(crate) fn record_name(&self, record: &CompactRecord) -> &str {
+    pub fn record_name(&self, record: &CompactRecord) -> &str {
         if record.raw_path {
             self.raw_paths
                 .get(record.path)
@@ -784,6 +800,16 @@ impl CompactIndex {
 
     pub(crate) fn extension(&self, id: u32) -> Option<&str> {
         self.extensions.get(id)
+    }
+
+    /// 查找扩展名在池中的槽位编号。
+    pub fn extension_id(&self, ext: &str) -> Option<u32> {
+        self.extensions.find(ext)
+    }
+
+    /// 评估扩展名池中的每个槽位是否满足谓词条件，产出与池容量等长的布尔位图。
+    pub fn evaluate_extensions(&self, predicate: impl FnMut(&str) -> bool) -> Vec<bool> {
+        self.extensions.matching_ids(predicate)
     }
 
     pub(crate) fn evaluate_parents<T: Clone>(

@@ -52,6 +52,17 @@ pub struct FfiSearchResponse {
 
 // ── UniFFI Enums ────────────────────────────────────────────────────────
 
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiFileType {
+    All,
+    Document,
+    Code,
+    Image,
+    Media,
+    Archive,
+    Folder,
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiSearchMode {
     Auto,
