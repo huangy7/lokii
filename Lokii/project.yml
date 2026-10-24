@@ -61,8 +61,10 @@ targets:
         LIBRARY_SEARCH_PATHS:
           - "$(SRCROOT)/../target/aarch64-apple-darwin/release"
           - "$(SRCROOT)/../target/x86_64-apple-darwin/release"
-        OTHER_LDFLAGS:
-          - "-llokii_core"
+        "OTHER_LDFLAGS[arch=arm64]":
+          - "$(SRCROOT)/../target/aarch64-apple-darwin/release/liblokii_core.a"
+        "OTHER_LDFLAGS[arch=x86_64]":
+          - "$(SRCROOT)/../target/x86_64-apple-darwin/release/liblokii_core.a"
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: true

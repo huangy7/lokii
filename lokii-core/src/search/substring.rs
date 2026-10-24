@@ -1,7 +1,7 @@
 use crate::indexer::{score_match_zero_alloc, IndexStore, MatchScore};
 use crate::string_pool::NameSignature;
 
-use super::{find_positions, AdvancedSearchResult, SearchMode};
+use super::{find_positions, AdvancedSearchResult, CompiledRecordFilter, SearchMode};
 
 /// Convert MatchScore to normalized f64 per research recommendation.
 fn score_to_f64(score: MatchScore) -> f64 {
@@ -12,11 +12,16 @@ fn score_to_f64(score: MatchScore) -> f64 {
     }
 }
 
-/// Substring search wrapping existing IndexStore logic.
-/// Preserves v1.0 behavior: extension filter, multi-keyword AND, Exact > Prefix > Substring ranking.
-pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<AdvancedSearchResult> {
+/// 子串检索器，接入预编译位掩码记录过滤器以达成零堆分配预筛选。
+/// 保持原有语义：扩展名过滤、多关键词 AND 匹配、Exact > Prefix > Substring 排序。
+pub fn search(
+    store: &IndexStore,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> Vec<AdvancedSearchResult> {
     let query = query.trim();
-    if query.is_empty() || max_results == 0 {
+    if max_results == 0 {
         return Vec::new();
     }
     let extension =
@@ -53,6 +58,9 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
                 for &ordinal in read.entries_for_name(name_id) {
                     let record = &read.records()[ordinal as usize];
                     if !record.is_dir && read.extension(record.extension) == Some(extension.as_str()) {
+                        if !filter.matches_record(record, || Some(name)) {
+                            continue;
+                        }
                         top.offer(ordinal as usize, MatchScore::Exact, name);
                         if top.is_full() {
                             break;
@@ -66,14 +74,32 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
             top.finish()
         }
         None => {
-            let mut req = NameSignature::default();
-            for kw in &keywords {
-                req = req.union(NameSignature::from_substring_query(kw));
+            if query.is_empty() {
+                if filter.is_passthrough() {
+                    Vec::new()
+                } else {
+                    let mut top = super::top_k::TopK::new(max_results);
+                    let records = read.records();
+                    for (id, name) in read.names() {
+                        if let Some(record) = records.get(id.0) {
+                            if !filter.matches_record(record, || Some(name)) {
+                                continue;
+                            }
+                        }
+                        top.offer(id.0, MatchScore::Exact, name);
+                    }
+                    top.finish()
+                }
+            } else {
+                let mut req = NameSignature::default();
+                for kw in &keywords {
+                    req = req.union(NameSignature::from_substring_query(kw));
+                }
+                let all_ascii = keywords.iter().all(|k| k.is_ascii());
+                super::rank_unique_names(&read, filter, max_results, req, |name, folded| {
+                    score_match_zero_alloc(name, folded, &keywords, all_ascii)
+                })
             }
-            let all_ascii = keywords.iter().all(|k| k.is_ascii());
-            super::rank_unique_names(&read, max_results, req, |name, folded| {
-                score_match_zero_alloc(name, folded, &keywords, all_ascii)
-            })
         }
     };
     matches
@@ -85,7 +111,7 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
             AdvancedSearchResult {
                 entry: view.materialize(),
                 score: score_to_f64(candidate.score),
-                match_positions: if extension.is_some() {
+                match_positions: if extension.is_some() || query.is_empty() {
                     Vec::new()
                 } else {
                     find_positions(
@@ -132,7 +158,8 @@ mod tests {
             make_entry("main.rs", "/src/main.rs", false),
             make_entry("readme.md", "/readme.md", false),
         ]);
-        let results = search(&store, "main", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "main", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "main.rs");
         assert_eq!(results[0].search_mode, SearchMode::Substring);
@@ -143,7 +170,8 @@ mod tests {
     fn test_substring_match_positions() {
         let store = IndexStore::new();
         store.replace(vec![make_entry("main.rs", "/main.rs", false)]);
-        let results = search(&store, "main", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "main", &filter, 500);
         assert!(!results[0].match_positions.is_empty());
         assert_eq!(results[0].match_positions[0], (0, 4));
     }
@@ -155,7 +183,8 @@ mod tests {
             make_entry("report.pdf", "/report.pdf", false),
             make_entry("data.csv", "/data.csv", false),
         ]);
-        let results = search(&store, ".pdf", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, ".pdf", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "report.pdf");
     }
@@ -164,22 +193,45 @@ mod tests {
     fn test_empty_query_returns_empty() {
         let store = IndexStore::new();
         store.replace(vec![make_entry("file.txt", "/file.txt", false)]);
-        let results = search(&store, "", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "", &filter, 500);
         assert!(results.is_empty());
     }
 
     #[test]
-    fn test_score_normalization() {
+    fn test_ranking_prefers_prefix_over_substring() {
         let store = IndexStore::new();
         store.replace(vec![
             make_entry("main.rs", "/main.rs", false), // prefix match for "main"
             make_entry("my_main.rs", "/my_main.rs", false), // substring match
         ]);
-        let results = search(&store, "main", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "main", &filter, 500);
         assert_eq!(results.len(), 2);
         // Prefix should score higher than substring
         assert!(results[0].score > results[1].score);
         assert_eq!(results[0].score, 0.75); // prefix
         assert_eq!(results[1].score, 0.5); // substring
+    }
+
+    #[test]
+    fn test_substring_with_compiled_filter() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("main.rs", "/src/main.rs", false),
+            make_entry("main.md", "/main.md", false),
+        ]);
+        let read = store.read();
+        let query_filter = crate::search::QueryFilter {
+            file_type: crate::search::FileType::Code,
+            custom_ext: None,
+            ..Default::default()
+        };
+        let filter = CompiledRecordFilter::compile(&read, &query_filter);
+        drop(read);
+
+        let results = search(&store, "main", &filter, 500);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.name, "main.rs");
     }
 }

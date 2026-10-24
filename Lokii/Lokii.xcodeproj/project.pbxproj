@@ -33,12 +33,15 @@
 		936E3DE734BD1E2769EEE65C /* SearchResultsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13D34F183E4D57DC9DB688CD /* SearchResultsViewController.swift */; };
 		9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD267E77C749892BFB3B6BFA /* SearchWindow.swift */; };
 		AEA8B664BE46D819FA9CEC5E /* ResultDirectoryTree.swift in Sources */ = {isa = PBXBuildFile; fileRef = 029F8156A3FE4133E39F1024 /* ResultDirectoryTree.swift */; };
+		CCFEB9A2297EF1A1BA18AA6B /* FilterQuerySyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3373E36AED0BB84FF41FBE05 /* FilterQuerySyncCoordinator.swift */; };
 		CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = E44E26FAF1C1762428B98CEB /* Utilities.swift */; };
+		CFC1A9DD189A03E00F8F2FF3 /* FilterPopoverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F2785E445C9283940228F3D /* FilterPopoverView.swift */; };
 		D845C945605829EFD6777B02 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */; };
 		DB72F207E9C6F823A2970A05 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 732101997548517319E501C8 /* Sparkle */; };
 		E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8727ED2D2029A80C7739E625 /* ViewModifiers.swift */; };
 		E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */; };
 		E8F36883205D0492A3F9917E /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 32DCF9A42DF27EEDA3F2ED92 /* Localizable.strings */; };
+		ECE64A8C9247F97E4B382BBD /* FilterPopoverController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 813464940F363EDC00821512 /* FilterPopoverController.swift */; };
 		F25F859C77AB2A06F57CC09F /* Shortcut.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E72A2DABCA6C6F23E1053A /* Shortcut.swift */; };
 		F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */; };
 		FE8E1519D288E897B2E0A137 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */; };
@@ -54,6 +57,7 @@
 		245A938DDC4CD962CF827FD1 /* Lokii.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Lokii.entitlements; sourceTree = "<group>"; };
 		2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		315BC0505768DC1262CABEDA /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		3373E36AED0BB84FF41FBE05 /* FilterQuerySyncCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterQuerySyncCoordinator.swift; sourceTree = "<group>"; };
 		379816002C0A5D5D8096C54B /* SearchEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchEngine.swift; sourceTree = "<group>"; };
 		4945594BBD178DAC175979A5 /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
 		4DA89C31BAA12806D874CFA3 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = AppIcon.icon; sourceTree = "<group>"; };
@@ -62,11 +66,13 @@
 		6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LokiiWindow.swift; sourceTree = "<group>"; };
 		71E72A2DABCA6C6F23E1053A /* Shortcut.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shortcut.swift; sourceTree = "<group>"; };
 		76AE17B289006D96A51F7B4B /* RecorderCocoa.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderCocoa.swift; sourceTree = "<group>"; };
+		813464940F363EDC00821512 /* FilterPopoverController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterPopoverController.swift; sourceTree = "<group>"; };
 		85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
 		8727ED2D2029A80C7739E625 /* ViewModifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModifiers.swift; sourceTree = "<group>"; };
 		8B947458DDBFC6998183062C /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		8D0F2BCF8E46E2EBC3770B95 /* SidebarTreeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarTreeViewController.swift; sourceTree = "<group>"; };
 		8D4C9FAED6C7E08E9EE9C482 /* SearchMainSplitViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchMainSplitViewController.swift; sourceTree = "<group>"; };
+		8F2785E445C9283940228F3D /* FilterPopoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterPopoverView.swift; sourceTree = "<group>"; };
 		927DA1B3D54D6EE81E6EE89C /* Name.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Name.swift; sourceTree = "<group>"; };
 		947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSMenuItem++.swift"; sourceTree = "<group>"; };
 		A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizedMenu.swift; sourceTree = "<group>"; };
@@ -106,6 +112,9 @@
 				2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */,
 				CBF42044E61241F1D42161BC /* FDAGuideView.swift */,
 				C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */,
+				813464940F363EDC00821512 /* FilterPopoverController.swift */,
+				8F2785E445C9283940228F3D /* FilterPopoverView.swift */,
+				3373E36AED0BB84FF41FBE05 /* FilterQuerySyncCoordinator.swift */,
 				8B947458DDBFC6998183062C /* Info.plist */,
 				4945594BBD178DAC175979A5 /* L10n.swift */,
 				A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */,
@@ -280,6 +289,9 @@
 				857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */,
 				6C65440D3707233BEDDD2F59 /* FDAGuideView.swift in Sources */,
 				F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */,
+				ECE64A8C9247F97E4B382BBD /* FilterPopoverController.swift in Sources */,
+				CFC1A9DD189A03E00F8F2FF3 /* FilterPopoverView.swift in Sources */,
+				CCFEB9A2297EF1A1BA18AA6B /* FilterQuerySyncCoordinator.swift in Sources */,
 				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
 				3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */,
 				55670C6273A3B5887190D820 /* L10n.swift in Sources */,
@@ -404,8 +416,11 @@
 					"$(SRCROOT)/../target/aarch64-apple-darwin/release",
 					"$(SRCROOT)/../target/x86_64-apple-darwin/release",
 				);
-				OTHER_LDFLAGS = (
-					"-llokii_core",
+				"OTHER_LDFLAGS[arch=arm64]" = (
+					"$(SRCROOT)/../target/aarch64-apple-darwin/release/liblokii_core.a",
+				);
+				"OTHER_LDFLAGS[arch=x86_64]" = (
+					"$(SRCROOT)/../target/x86_64-apple-darwin/release/liblokii_core.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.lokii.app;
 				PRODUCT_NAME = Lokii;
@@ -433,8 +448,11 @@
 					"$(SRCROOT)/../target/aarch64-apple-darwin/release",
 					"$(SRCROOT)/../target/x86_64-apple-darwin/release",
 				);
-				OTHER_LDFLAGS = (
-					"-llokii_core",
+				"OTHER_LDFLAGS[arch=arm64]" = (
+					"$(SRCROOT)/../target/aarch64-apple-darwin/release/liblokii_core.a",
+				);
+				"OTHER_LDFLAGS[arch=x86_64]" = (
+					"$(SRCROOT)/../target/x86_64-apple-darwin/release/liblokii_core.a",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.lokii.app;
 				PRODUCT_NAME = Lokii;

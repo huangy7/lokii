@@ -44,6 +44,9 @@ test: bindings
 	@swift tests/keyboard_navigation_test.swift
 	@swift tests/shortcut_recorder_test.swift
 	@swift tests/index_config_test.swift
+	@swift tests/filter_query_sync_coordinator_test.swift
+	@swift tests/filter_popover_view_test.swift
+	@swift tests/filter_popover_controller_test.swift
 
 
 check:

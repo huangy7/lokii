@@ -1,6 +1,6 @@
 use glob_match::glob_match;
 
-use super::{AdvancedSearchResult, SearchMode};
+use super::{AdvancedSearchResult, CompiledRecordFilter, SearchMode};
 use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
@@ -18,12 +18,17 @@ fn required_signature_for_glob(pattern_lower: &str) -> NameSignature {
     sig
 }
 
-/// Wildcard search using glob patterns (* and ? wildcards).
+/// 通配符检索器，接入预编译位掩码记录过滤器以达成零堆分配预筛选。
 ///
 /// Case-insensitive matching per R1.2. Both the pattern and filenames
 /// are lowercased before comparison. Matching entries get score 1.0
 /// (wildcard is binary match) and match_positions covering the full name.
-pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<AdvancedSearchResult> {
+pub fn search(
+    store: &IndexStore,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> Vec<AdvancedSearchResult> {
     let pattern = query.trim().to_lowercase();
     if pattern.is_empty() || max_results == 0 {
         return Vec::new();
@@ -38,6 +43,7 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
             && rest.is_ascii()
     });
 
+    let is_match_all = pattern == "*";
     let mut ascii_buf = Vec::with_capacity(128);
     let mut top = super::top_k::TopK::new(max_results);
     let sorted = read.sorted_names();
@@ -50,7 +56,9 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
         let Some((name, folded)) = read.name_entry(name_id) else {
             continue;
         };
-        let matched = if let Some(ext) = simple_suffix {
+        let matched = if is_match_all {
+            true
+        } else if let Some(ext) = simple_suffix {
             let suffix_len = ext.len() + 1;
             if let Some(f) = folded {
                 f.len() >= suffix_len
@@ -72,7 +80,11 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
             glob_match(&pattern, lower_str)
         };
         if matched {
-            for &ordinal in read.entries_for_name(name_id).iter().take(max_results) {
+            for &ordinal in read.entries_for_name(name_id) {
+                let record = &read.records()[ordinal as usize];
+                if !filter.matches_record(record, || Some(name)) {
+                    continue;
+                }
                 top.offer(ordinal as usize, 1, name);
                 if top.is_full() {
                     break;
@@ -85,19 +97,19 @@ pub fn search(store: &IndexStore, query: &str, max_results: usize) -> Vec<Advanc
     }
     top.finish()
         .into_iter()
-    .map(|candidate| {
-        let view = read
-            .view(crate::compact_index::EntryId(candidate.ordinal))
-            .unwrap();
-        AdvancedSearchResult {
-            entry: view.materialize(),
-            score: 1.0,
-            match_positions: vec![(0, view.name.len())],
-            parent_match_positions: Vec::new(),
-            search_mode: SearchMode::Wildcard,
-        }
-    })
-    .collect()
+        .map(|candidate| {
+            let view = read
+                .view(crate::compact_index::EntryId(candidate.ordinal))
+                .unwrap();
+            AdvancedSearchResult {
+                entry: view.materialize(),
+                score: 1.0,
+                match_positions: vec![(0, view.name.len())],
+                parent_match_positions: Vec::new(),
+                search_mode: SearchMode::Wildcard,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -137,7 +149,8 @@ mod tests {
     #[test]
     fn test_star_pdf_matches_pdf_not_txt() {
         let store = test_store();
-        let results = search(&store, "*.pdf", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*.pdf", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "report.pdf");
     }
@@ -145,7 +158,8 @@ mod tests {
     #[test]
     fn test_question_mark_two_chars() {
         let store = test_store();
-        let results = search(&store, "test_??.rs", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "test_??.rs", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "test_01.rs");
     }
@@ -153,7 +167,8 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         let store = test_store();
-        let results = search(&store, "*.PDF", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*.PDF", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "report.pdf");
     }
@@ -161,7 +176,8 @@ mod tests {
     #[test]
     fn test_star_main_star() {
         let store = test_store();
-        let results = search(&store, "*main*", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*main*", &filter, 500);
         assert_eq!(results.len(), 2);
         // Alphabetical: main.rs, my_main.rs
         assert_eq!(results[0].entry.name, "main.rs");
@@ -171,7 +187,8 @@ mod tests {
     #[test]
     fn test_match_positions_full_name() {
         let store = test_store();
-        let results = search(&store, "*.pdf", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*.pdf", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].match_positions, vec![(0, "report.pdf".len())]);
     }
@@ -184,7 +201,8 @@ mod tests {
             make_entry("a_file.rs", "/a_file.rs"),
             make_entry("b_file.rs", "/b_file.rs"),
         ]);
-        let results = search(&store, "*.rs", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*.rs", &filter, 500);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].entry.name, "a_file.rs");
         assert_eq!(results[1].entry.name, "b_file.rs");
@@ -194,21 +212,24 @@ mod tests {
     #[test]
     fn test_empty_query_returns_empty() {
         let store = test_store();
-        let results = search(&store, "", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "", &filter, 500);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_whitespace_query_returns_empty() {
         let store = test_store();
-        let results = search(&store, "   ", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "   ", &filter, 500);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_mode_is_wildcard() {
         let store = test_store();
-        let results = search(&store, "*.rs", 500);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*.rs", &filter, 500);
         assert!(!results.is_empty());
         for r in &results {
             assert_eq!(r.search_mode, SearchMode::Wildcard);
@@ -218,7 +239,29 @@ mod tests {
     #[test]
     fn test_max_results_truncation() {
         let store = test_store();
-        let results = search(&store, "*.rs", 2);
+        let filter = CompiledRecordFilter::default();
+        let results = search(&store, "*.rs", &filter, 2);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_wildcard_with_compiled_filter() {
+        let store = test_store();
+        let read = store.read();
+        let query_filter = super::super::QueryFilter {
+            file_type: super::super::FileType::Code,
+            custom_ext: None,
+            ..Default::default()
+        };
+        let filter = CompiledRecordFilter::compile(&read, &query_filter);
+        drop(read);
+
+        // "report.*" 匹配 report.pdf 和 report.txt，但在 Code 过滤下应全被排除
+        let results = search(&store, "report.*", &filter, 500);
+        assert!(results.is_empty());
+
+        // "*test*" 在 Code 过滤下命中 test_01.rs 与 test_1.rs
+        let results_code = search(&store, "*test*", &filter, 500);
+        assert_eq!(results_code.len(), 2);
     }
 }

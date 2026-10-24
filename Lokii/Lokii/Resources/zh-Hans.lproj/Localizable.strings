@@ -178,6 +178,13 @@
 "search.mode.wildcard" = "通配符";
 "search.mode.regex" = "正则表达式";
 "search.mode.fuzzy" = "模糊";
+"search.filetype.all" = "全部文件";
+"search.filetype.document" = "文本文档";
+"search.filetype.code" = "源代码";
+"search.filetype.image" = "图像视觉";
+"search.filetype.media" = "媒体影音";
+"search.filetype.archive" = "压缩封包";
+"search.filetype.folder" = "文件夹";
 
 /* SearchWindow - kind labels */
 "kind.folder" = "文件夹";
@@ -267,3 +274,25 @@
 "prefs.about.update.automatic" = "自动检查更新";
 "prefs.about.update.found" = "有可用更新";
 "prefs.about.update.manualDownload" = "更新失败时手动下载";
+
+/* Filter Popover */
+"filter.title" = "过滤条件";
+"filter.clearAll" = "全部清除";
+"filter.all" = "全部";
+"filter.type.title" = "文件类型";
+"filter.type.code" = "代码";
+"filter.type.document" = "文档";
+"filter.type.image" = "图片";
+"filter.type.media" = "多媒体";
+"filter.type.archive" = "压缩包";
+"filter.type.folder" = "文件夹";
+"filter.size.title" = "文件大小";
+"filter.size.over" = "大于";
+"filter.size.under" = "小于";
+"filter.size.invalidRange" = "大小下限大于上限，区间互斥";
+"filter.behavior.title" = "检索行为";
+"filter.behavior.path" = "匹配完整路径";
+"filter.behavior.fuzzy" = "模糊跳字匹配";
+"filter.done" = "完成";
+"filter.button.tooltip" = "过滤条件 (⌥F)";
+"filter.button.tooltip.active" = "过滤条件: %d 项已激活 (⌥F)";
