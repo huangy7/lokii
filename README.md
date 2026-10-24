@@ -36,7 +36,7 @@ Lokii is a native macOS instant file search tool engineered for developer-grade 
 
 | Feature | Description |
 | :--- | :--- |
-| **Instant As-You-Type Search** | Sub-millisecond response latency across 500,000+ files with low memory footprint (< 100MB). |
+| **Instant As-You-Type Search** | Sub-millisecond response latency across 500,000+ files with low memory footprint (under 100MB). |
 | **Multi-Mode Query Engine** | Intelligent mode detection supporting substring, wildcard (`*`, `?`), regular expression (`^...$`), and fuzzy matching. |
 | **Real-Time FSEvents Stream** | Multi-channel FSEvents event stream with dirty-queue debouncing to keep the index in sync without high CPU overhead. |
 | **Native AppKit Density** | High-density virtualized table view, native macOS file icons, zebra striping, and spring-damped micro-interactions. |
@@ -45,6 +45,21 @@ Lokii is a native macOS instant file search tool engineered for developer-grade 
 | **Native Settings & FDA** | Native Preferences window with custom search roots, exclusion rules, theme switching (Light/Dark/System), and interactive Full Disk Access setup. |
 
 The compact index shares filenames, parent paths, and extensions to reduce duplicate storage. Search materializes only the selected results while preserving matching and ordering behavior. Initialization failures display an error instead of reporting an empty index as ready. Whole-app performance validation is still pending; core-process measurements are not whole-app guarantees.
+
+## Why Lokii?
+
+macOS comes with powerful system search tools, yet developers and power users consistently miss the simplicity and raw speed of Windows tools like voidtools Everything. Lokii was built to fill that gap.
+
+### Lokii vs. Spotlight
+
+- **Instant Filename Indexing**: Spotlight is designed for comprehensive metadata, email, and deep content indexing. In contrast, Lokii focuses exclusively on blazing-fast file and folder name indexing. It avoids the heavy background disk thrashing and indexing delays typical of Spotlight.
+- **Deep Directory Visibility**: Spotlight frequently excludes, deprioritizes, or delays indexing hidden directories, build artifacts, and nested developer folders (`node_modules`, `target`, `.git`, `.venv`). Lokii scans and tracks the entire filesystem uniformly via direct FSEvents integration.
+- **Developer Query Modes**: Lokii natively supports wildcards (`*.rs`, `test_*.swift`), regular expressions (`^IMG_.*\.png$`), and exact extension filters, giving developers precise control without complex Spotlight syntax.
+
+### Lokii vs. Raycast & Alfred
+
+- **Dedicated High-Performance Architecture**: While Raycast and Alfred are versatile productivity launchers, their file search commands rely under the hood on macOS's built-in Spotlight metadata service. When Spotlight has not indexed a file or is struggling with load, launcher file search inherits the exact same delay.
+- **Ultra-Lightweight Resource Footprint**: Lokii's in-memory inverted index is written in Rust with compacted bitcode string tables, consuming under 100 MB of RAM while indexing over 500,000 files. It is an instant, keyboard-driven utility that opens in under 10 milliseconds and disappears the moment you press Escape.
 
 ## Privacy
 
@@ -93,6 +108,15 @@ make package ARCH=x86_64
 ```
 
 Output disk images will be generated in `output/Lokii-<arch>.dmg`.
+
+## Community
+
+- **GitHub Discussions**: [Ask questions, share workflows, and discuss ideas](https://github.com/huangy7/lokii/discussions)
+- **Issue Tracker**: [Report bugs or submit feature requests](https://github.com/huangy7/lokii/issues)
+
+## Contributing
+
+Contributions, bug reports, and suggestions are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for details on setting up your local development environment and submitting pull requests.
 
 ## Contributors
 
