@@ -1,6 +1,7 @@
 use glob_match::glob_match;
 
 use super::{AdvancedSearchResult, CompiledRecordFilter, SearchMode};
+use crate::compact_index::CompactIndex;
 use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
@@ -29,11 +30,21 @@ pub fn search(
     filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
+    let read = store.read();
+    search_index(&read, query, filter, max_results)
+}
+
+/// 接收统一快照读锁的通配符检索实现，杜绝锁重入与快照位掩码漂移。
+pub fn search_index(
+    read: &CompactIndex,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> Vec<AdvancedSearchResult> {
     let pattern = query.trim().to_lowercase();
     if pattern.is_empty() || max_results == 0 {
         return Vec::new();
     }
-    let read = store.read();
     let req = required_signature_for_glob(&pattern);
 
     // 针对纯 `*.ext` 模式（无其他通配符），直接跳过 `glob_match` 字符串自动机，做后缀字节比对

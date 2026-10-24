@@ -724,6 +724,12 @@ final class SearchWindow: NSWindowController {
 
     @objc private func searchChanged() {
         guard indexingState != .failed else { return }
+
+        // 优先检查并释放因输入法组字而暂存的过滤变更，避免后续陈旧短词覆盖已应用过滤的即时检索
+        if filterPopoverController.flushPendingStateIfNeeded() {
+            return
+        }
+
         let query = searchField.stringValue
         updateFilterButtonState(forQuery: query)
         if filterPopoverController.isShown {

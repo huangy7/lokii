@@ -189,6 +189,10 @@ do {
     assertEqual(capturedState?.minSizeBytes, 1_000_000, "1MB 下限应被同步识别")
     assertEqual(capturedState?.maxSizeBytes, 50_000_000, "50MB 上限应被同步识别")
     assertEqual(capturedState?.activeCount, 2, "激活过滤维度数量应准确计算为 2 (类型、大小)")
+
+    // 测试未有暂存状态时，flushPendingStateIfNeeded 应返回 false
+    let flushedWithoutPending = controller.flushPendingStateIfNeeded()
+    assertEqual(flushedWithoutPending, false, "无暂存状态时 flushPendingStateIfNeeded 应返回 false")
 }
 
 print("[4/5] 测试 LokiiWindow 键盘事件路由与 ⌥F (Option+F) 快捷键拦截...")

@@ -74,6 +74,9 @@ public final class FilterQuerySyncCoordinator {
     /// 同步守卫锁，防止双向联动中的递归重入
     private var isSynchronizing = false
 
+    /// 当输入法正在组字时，暂存用户在浮层中触发的待应用过滤状态
+    public private(set) var pendingState: FilterState?
+
     public init() {}
 
     // MARK: - 静态语法序列化与反序列化
@@ -450,9 +453,11 @@ public final class FilterQuerySyncCoordinator {
         // 检查当前输入框活跃的字段编辑器
         let fieldEditor = searchField.currentEditor() as? NSTextView
         if fieldEditor?.hasMarkedText() == true {
-            // 输入法正在进行多字节（如中文拼音）组字，暂缓覆写，避免破坏未提交的拼音流
+            // 输入法正在进行多字节（如中文拼音）组字，暂存待应用的过滤状态，避免破坏未提交的拼音流
+            pendingState = state
             return
         }
+        pendingState = nil
 
         let currentQuery = searchField.stringValue
         let (keyword, _) = Self.deserialize(query: currentQuery)
@@ -473,6 +478,22 @@ public final class FilterQuerySyncCoordinator {
         }
 
         performSearch(newQuery)
+    }
+
+    /// 检查并应用之前因输入法组字而暂存的未提交过滤状态
+    @discardableResult
+    public func flushPendingStateIfNeeded(
+        searchField: NSSearchField,
+        performSearch: (String) -> Void
+    ) -> Bool {
+        guard let state = pendingState else { return false }
+        let fieldEditor = searchField.currentEditor() as? NSTextView
+        if fieldEditor?.hasMarkedText() == true {
+            return false
+        }
+        pendingState = nil
+        updateQueryFromUI(state: state, searchField: searchField, performSearch: performSearch)
+        return true
     }
 
     /// 搜索框键盘键入变动逆向驱动浮层 UI 状态回填

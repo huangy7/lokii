@@ -1,7 +1,10 @@
+use crate::compact_index::CompactIndex;
 use crate::indexer::{score_match_zero_alloc, IndexStore, MatchScore};
 use crate::string_pool::NameSignature;
 
-use super::{find_positions, AdvancedSearchResult, CompiledRecordFilter, SearchMode};
+use super::{
+    find_positions, is_dotfile_query, AdvancedSearchResult, CompiledRecordFilter, SearchMode,
+};
 
 /// Convert MatchScore to normalized f64 per research recommendation.
 fn score_to_f64(score: MatchScore) -> f64 {
@@ -20,14 +23,26 @@ pub fn search(
     filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
+    let read = store.read();
+    search_index(&read, query, filter, max_results)
+}
+
+/// 接收统一快照读锁的子串检索实现，杜绝锁重入与快照位掩码漂移。
+pub fn search_index(
+    read: &CompactIndex,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> Vec<AdvancedSearchResult> {
     let query = query.trim();
     if max_results == 0 {
         return Vec::new();
     }
-    let extension =
-        (query.starts_with('.') && !query.contains(' ')).then(|| query[1..].to_lowercase());
+    let extension = (!is_dotfile_query(query)
+        && query.starts_with('.')
+        && !query.contains(' '))
+    .then(|| query[1..].to_lowercase());
     let keywords: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let read = store.read();
     let matches = match &extension {
         Some(extension) => {
             let Some(ext_id) = read.extension_id(extension) else {
@@ -87,7 +102,7 @@ pub fn search(
         }
         None => {
             if query.is_empty() {
-                if filter.is_passthrough() {
+                if filter.is_passthrough() && !filter.has_explicit_type_all() {
                     Vec::new()
                 } else {
                     let mut top = super::top_k::TopK::new(max_results);
@@ -290,5 +305,76 @@ mod tests {
             .map(|r| r.entry.name)
             .collect();
         assert_eq!(store_doc, ["u.文档"]);
+    }
+
+    #[test]
+    fn test_dotfiles_searchable_in_auto_and_substring() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry(".env", "/project/.env", false),
+            make_entry(".env.local", "/project/.env.local", false),
+            make_entry(".gitignore", "/project/.gitignore", false),
+            make_entry(".zshrc", "/Users/me/.zshrc", false),
+            make_entry(".bashrc", "/Users/me/.bashrc", false),
+            make_entry(".npmrc", "/project/.npmrc", false),
+            make_entry(".dockerignore", "/project/.dockerignore", false),
+            make_entry("regular.rs", "/project/regular.rs", false),
+        ]);
+        let filter = CompiledRecordFilter::default();
+
+        // 1. .env
+        let env_res = search(&store, ".env", &filter, 500);
+        let env_names: Vec<_> = env_res.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(env_names.contains(&".env"));
+        assert!(env_names.contains(&".env.local"));
+
+        // 2. .gitignore
+        let gitignore_res = search(&store, ".gitignore", &filter, 500);
+        assert_eq!(gitignore_res.len(), 1);
+        assert_eq!(gitignore_res[0].entry.name, ".gitignore");
+
+        // 3. .zshrc
+        let zshrc_res = search(&store, ".zshrc", &filter, 500);
+        assert_eq!(zshrc_res.len(), 1);
+        assert_eq!(zshrc_res[0].entry.name, ".zshrc");
+
+        // 4. .bashrc
+        let bashrc_res = search(&store, ".bashrc", &filter, 500);
+        assert_eq!(bashrc_res.len(), 1);
+        assert_eq!(bashrc_res[0].entry.name, ".bashrc");
+
+        // 5. .npmrc
+        let npmrc_res = search(&store, ".npmrc", &filter, 500);
+        assert_eq!(npmrc_res.len(), 1);
+        assert_eq!(npmrc_res[0].entry.name, ".npmrc");
+
+        // 6. .dockerignore
+        let dockerignore_res = search(&store, ".dockerignore", &filter, 500);
+        assert_eq!(dockerignore_res.len(), 1);
+        assert_eq!(dockerignore_res[0].entry.name, ".dockerignore");
+
+        // 7. 常规扩展名 .rs 依然走扩展名检索
+        let rs_res = search(&store, ".rs", &filter, 500);
+        assert_eq!(rs_res.len(), 1);
+        assert_eq!(rs_res[0].entry.name, "regular.rs");
+    }
+
+    #[test]
+    fn test_type_all_returns_top_k() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("file1.txt", "/file1.txt", false),
+            make_entry("file2.rs", "/file2.rs", false),
+        ]);
+
+        let (results_empty, _) = crate::search::dispatch(&store, "", SearchMode::Auto, 500);
+        assert!(results_empty.is_empty(), "纯空搜索框应当返回空列表");
+
+        let (results_type_all, _) = crate::search::dispatch(&store, "type:all", SearchMode::Auto, 500);
+        assert_eq!(results_type_all.len(), 2, "显式 type:all 应当返回前 Top-K 结果");
+
+        let (results_type_all_query, _) = crate::search::dispatch(&store, "type:all file1", SearchMode::Auto, 500);
+        assert_eq!(results_type_all_query.len(), 1);
+        assert_eq!(results_type_all_query[0].entry.name, "file1.txt");
     }
 }

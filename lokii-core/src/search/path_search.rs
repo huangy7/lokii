@@ -1,4 +1,4 @@
-use crate::compact_index::{split_path, EntryId};
+use crate::compact_index::{split_path, CompactIndex, EntryId};
 use crate::indexer::{score_match, IndexStore, MatchScore};
 use crate::search::path_query::PathQuery;
 use crate::search::top_k::TopK;
@@ -151,8 +151,20 @@ pub fn search(
     if max_results == 0 {
         return Vec::new();
     }
-
     let read = store.read();
+    search_index(&read, query, filter, max_results)
+}
+
+/// 接收统一快照读锁的路径检索实现，杜绝锁重入与快照位掩码漂移。
+pub fn search_index(
+    read: &CompactIndex,
+    query: &PathQuery,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> Vec<AdvancedSearchResult> {
+    if max_results == 0 {
+        return Vec::new();
+    }
 
     // 阶段 0：父目录池预判
     // 每个父目录只判定一次，状态表约 30KB，常驻 L1 缓存。

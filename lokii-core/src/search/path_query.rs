@@ -49,9 +49,13 @@ impl PathQuery {
                 continue;
             }
 
-            // 2. 独立扩展名: .rs, .toml
+            // 2. 独立扩展名: .rs, .toml（排除隐藏点文件，如 .env、.gitignore）
             if word.starts_with('.') && !word.contains('/') && word.len() > 1 {
-                extension = Some(word[1..].to_lowercase());
+                if crate::search::filter::is_dotfile_query(word) {
+                    name_terms.push(word.to_string());
+                } else {
+                    extension = Some(word[1..].to_lowercase());
+                }
                 continue;
             }
 

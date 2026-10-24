@@ -1,6 +1,7 @@
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use crate::compact_index::CompactIndex;
 use crate::indexer::IndexStore;
 
 use super::{AdvancedSearchResult, CompiledRecordFilter, SearchMode};
@@ -18,6 +19,17 @@ pub fn search(
     filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
+    let read = store.read();
+    search_index(&read, query, filter, max_results)
+}
+
+/// 接收统一快照读锁的模糊检索实现，杜绝锁重入与快照位掩码漂移。
+pub fn search_index(
+    read: &CompactIndex,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> Vec<AdvancedSearchResult> {
     let query = query.trim();
     if query.is_empty() || max_results == 0 {
         return Vec::new();
@@ -31,9 +43,8 @@ pub fn search(
     );
     // Fuzzy 匹配：由 NameSignature 内部统一封装查询串特征位构造
     let req = crate::string_pool::NameSignature::from_fuzzy_query(query);
-    let read = store.read();
     let mut buffer = Vec::new();
-    let matches = super::rank_unique_names(&read, filter, max_results, req, |name, _| {
+    let matches = super::rank_unique_names(read, filter, max_results, req, |name, _| {
         let haystack = Utf32Str::new(name, &mut buffer);
         pattern.score(haystack, &mut matcher)
     });
