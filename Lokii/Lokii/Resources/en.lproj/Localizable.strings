@@ -178,13 +178,6 @@
 "search.mode.wildcard" = "Wildcard";
 "search.mode.regex" = "Regex";
 "search.mode.fuzzy" = "Fuzzy";
-"search.filetype.all" = "All Files";
-"search.filetype.document" = "Documents";
-"search.filetype.code" = "Source Code";
-"search.filetype.image" = "Images";
-"search.filetype.media" = "Audio & Video";
-"search.filetype.archive" = "Archives";
-"search.filetype.folder" = "Folders";
 
 /* SearchWindow - kind labels */
 "kind.folder" = "Folder";
@@ -290,9 +283,7 @@
 "filter.size.over" = "Over";
 "filter.size.under" = "Under";
 "filter.size.invalidRange" = "Minimum size exceeds maximum size";
-"filter.behavior.title" = "Search Behaviors";
-"filter.behavior.path" = "Match Path";
-"filter.behavior.fuzzy" = "Fuzzy Matching";
+"filter.size.folderMetadataNote" = "Folders are filtered by directory metadata size, not recursive total size";
 "filter.done" = "Done";
 "filter.button.tooltip" = "Filters (⌥F)";
 "filter.button.tooltip.active" = "Filters: %d active (⌥F)";

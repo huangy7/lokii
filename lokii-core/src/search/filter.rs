@@ -138,6 +138,8 @@ pub struct QueryFilter {
     pub custom_exts: Vec<String>,
     /// 文件大小区间过滤条件。
     pub size_filter: SizeFilter,
+    /// 是否显式指定了 `type:all` 过滤词元。
+    pub has_explicit_type_all: bool,
 }
 
 /// 解析单项带单位的大小字符串（如 "10m"、"500k"、"1.5g"、"1024b"），遵循 macOS 原生十进制规范（1KB = 10^3, 1MB = 10^6 等）。
@@ -280,6 +282,71 @@ pub(crate) fn parse_size_token(payload: &str) -> Option<SizeFilter> {
     None
 }
 
+/// 判断给定的词元或查询串是否为点文件（隐藏配置/工程文件）而非扩展名过滤。
+///
+/// 判定规则：
+/// 1. 必须以 `.` 开头，且长度大于 1；
+/// 2. 包含后续点号（如 `.env.local`、`.config.json` 等多段点文件）；
+/// 3. 包含连字符或下划线（如 `.clang-format`、`.bash_profile`、`.ds_store` 等典型文件名）；
+/// 4. 结尾为典型配置后缀（如以 `rc` 结尾且长度 >= 4 的 `.*rc`，或以 `ignore` 结尾的 `.*ignore`）；
+/// 5. 命中知名隐藏点文件白名单（如 `.env`、`.git`、`.zshrc`、`.bashrc`、`.npmrc`、`.idea`、`.vscode` 等）。
+pub fn is_dotfile_query(query: &str) -> bool {
+    let s = query.trim();
+    if !s.starts_with('.') || s.len() <= 1 || s.contains(' ') || s.contains('/') {
+        return false;
+    }
+
+    let rest = &s[1..];
+    // 多段点号（如 .env.local, .foo.bar）
+    if rest.contains('.') {
+        return true;
+    }
+
+    // 包含常见点文件名分隔符（如 .clang-format, .bash_profile, .ds_store）
+    if rest.contains('-') || rest.contains('_') {
+        return true;
+    }
+
+    let lower = s.to_ascii_lowercase();
+
+    // 典型配置尾缀：.*rc（长度 >= 4，避免匹配 .rc 资源脚本扩展名，覆盖 .zshrc, .bashrc, .npmrc, .vimrc 等）
+    if lower.len() >= 4 && lower.ends_with("rc") {
+        return true;
+    }
+
+    // 典型排除尾缀：.*ignore（如 .gitignore, .dockerignore, .npmignore）
+    if lower.len() >= 7 && lower.ends_with("ignore") {
+        return true;
+    }
+
+    // 知名单段点文件与隐藏目录
+    matches!(
+        lower.as_str(),
+        ".env"
+            | ".git"
+            | ".idea"
+            | ".vscode"
+            | ".cargo"
+            | ".cache"
+            | ".config"
+            | ".local"
+            | ".ssh"
+            | ".gnupg"
+            | ".profile"
+            | ".zprofile"
+            | ".zshenv"
+            | ".zlogin"
+            | ".editorconfig"
+            | ".mailmap"
+            | ".rubocop"
+            | ".flake8"
+            | ".pylintrc"
+            | ".gitkeep"
+            | ".localized"
+            | ".trash"
+    )
+}
+
 /// 解析检索输入中的类型、扩展名与文件大小过滤指令，提取清理后的纯检索词与对应的 `QueryFilter`。
 ///
 /// 支持语法规则：
@@ -297,6 +364,7 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
     let mut file_types = Vec::new();
     let mut custom_exts = Vec::new();
     let mut size_filter = SizeFilter::default();
+    let mut has_explicit_type_all = false;
 
     for term in trimmed.split_whitespace() {
         // 1. type:<category>（支持以逗号切分的复合分类，如 type:code,doc）
@@ -318,6 +386,7 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
                     for ft in parsed_parts.into_iter().flatten() {
                         if ft == FileType::All {
                             file_types.clear();
+                            has_explicit_type_all = true;
                         } else if !file_types.contains(&ft) {
                             file_types.push(ft);
                         }
@@ -362,34 +431,20 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             continue;
         }
 
-        // 4. 独立 .ext（非隐藏文件与相对路径守卫）
+        // 4. 独立 .ext（非隐藏点文件与相对路径守卫）
         if term.starts_with('.') && term.len() > 1 && term.len() <= 6 && !term.contains('/') {
+            if is_dotfile_query(term) {
+                remaining_terms.push(term);
+                continue;
+            }
             let candidate = &term[1..];
             // 边界守卫：后缀候选必须全为字母或数字，防止 `..` 或 `...` 等相对路径/省略词元被误识别为扩展名过滤
             if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
-                // 排除常见隐藏点文件与目录，避免把点文件误判为扩展名过滤
-                let is_hidden_ignore = [
-                    ".git",
-                    ".env",
-                    ".zshrc",
-                    ".bashrc",
-                    ".gitignore",
-                    ".dockerignore",
-                    ".npmrc",
-                    ".idea",
-                    ".cargo",
-                    ".cache",
-                ]
-                .iter()
-                .any(|&p| term.eq_ignore_ascii_case(p));
-
-                if !is_hidden_ignore {
-                    let lower = candidate.to_ascii_lowercase();
-                    if !custom_exts.contains(&lower) {
-                        custom_exts.push(lower);
-                    }
-                    continue;
+                let lower = candidate.to_ascii_lowercase();
+                if !custom_exts.contains(&lower) {
+                    custom_exts.push(lower);
                 }
+                continue;
             }
         }
 
@@ -407,6 +462,7 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             file_types,
             custom_exts,
             size_filter,
+            has_explicit_type_all,
         },
     )
 }
@@ -449,6 +505,7 @@ pub struct CompiledRecordFilter {
     min_size_bytes: u64,
     max_size_bytes: u64,
     has_size_filter: bool,
+    has_explicit_type_all: bool,
 }
 
 impl Default for CompiledRecordFilter {
@@ -467,6 +524,7 @@ impl Default for CompiledRecordFilter {
             min_size_bytes: 0,
             max_size_bytes: u64::MAX,
             has_size_filter: false,
+            has_explicit_type_all: false,
         }
     }
 }
@@ -476,6 +534,12 @@ impl CompiledRecordFilter {
     #[inline]
     pub fn is_passthrough(&self) -> bool {
         !self.has_type_filter && !self.has_custom_ext && !self.has_size_filter
+    }
+
+    /// 是否显式指定了 `type:all`。
+    #[inline]
+    pub fn has_explicit_type_all(&self) -> bool {
+        self.has_explicit_type_all
     }
 
     /// 是否指定了自定义扩展名。
@@ -591,6 +655,7 @@ impl CompiledRecordFilter {
             min_size_bytes,
             max_size_bytes,
             has_size_filter,
+            has_explicit_type_all: filter.has_explicit_type_all,
         }
     }
 
@@ -600,7 +665,13 @@ impl CompiledRecordFilter {
             return true;
         }
         if view.is_dir {
-            return self.allow_dirs && !self.has_size_filter;
+            if !self.allow_dirs {
+                return false;
+            }
+            if self.dirs_only {
+                return view.size >= self.min_size_bytes && view.size <= self.max_size_bytes;
+            }
+            return !self.has_size_filter;
         }
         if self.dirs_only {
             return false;
@@ -640,9 +711,15 @@ impl CompiledRecordFilter {
         if self.is_passthrough() {
             return true;
         }
-        // 1. 目录守卫：目录不参与大小比较
+        // 1. 目录守卫：纯目录检索时按目录项自身大小比对，混排检索时目录不参与大小比较
         if record.is_dir {
-            return self.allow_dirs && !self.has_size_filter;
+            if !self.allow_dirs {
+                return false;
+            }
+            if self.dirs_only {
+                return record.size >= self.min_size_bytes && record.size <= self.max_size_bytes;
+            }
+            return !self.has_size_filter;
         }
         if self.dirs_only {
             return false;
@@ -1582,5 +1659,110 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "large.rs");
+    }
+
+    #[test]
+    fn test_is_dotfile_query_rules() {
+        // 典型点文件与配置项应当识别为 dotfile 而非扩展名
+        assert!(is_dotfile_query(".env"));
+        assert!(is_dotfile_query(".env.local"));
+        assert!(is_dotfile_query(".gitignore"));
+        assert!(is_dotfile_query(".dockerignore"));
+        assert!(is_dotfile_query(".npmignore"));
+        assert!(is_dotfile_query(".zshrc"));
+        assert!(is_dotfile_query(".bashrc"));
+        assert!(is_dotfile_query(".npmrc"));
+        assert!(is_dotfile_query(".vimrc"));
+        assert!(is_dotfile_query(".editorconfig"));
+        assert!(is_dotfile_query(".clang-format"));
+        assert!(is_dotfile_query(".bash_profile"));
+        assert!(is_dotfile_query(".ds_store"));
+        assert!(is_dotfile_query(".git"));
+        assert!(is_dotfile_query(".idea"));
+        assert!(is_dotfile_query(".vscode"));
+
+        // 普通扩展名与裸点号不应误判为 dotfile
+        assert!(!is_dotfile_query(".rs"));
+        assert!(!is_dotfile_query(".pdf"));
+        assert!(!is_dotfile_query(".png"));
+        assert!(!is_dotfile_query(".swift"));
+        assert!(!is_dotfile_query(".c"));
+        assert!(!is_dotfile_query(".rc"));
+        assert!(!is_dotfile_query("."));
+        assert!(!is_dotfile_query(""));
+    }
+
+    #[test]
+    fn test_parse_query_filter_dotfiles_and_explicit_type_all() {
+        let (clean, filter) = parse_query_filter(".env");
+        assert_eq!(clean, ".env");
+        assert!(filter.custom_exts.is_empty());
+        assert!(!filter.has_explicit_type_all);
+
+        let (clean2, filter2) = parse_query_filter(".gitignore");
+        assert_eq!(clean2, ".gitignore");
+        assert!(filter2.custom_exts.is_empty());
+
+        let (clean3, filter3) = parse_query_filter("type:all");
+        assert_eq!(clean3, "");
+        assert!(filter3.has_explicit_type_all);
+
+        let (clean4, filter4) = parse_query_filter("type:all foo");
+        assert_eq!(clean4, "foo");
+        assert!(filter4.has_explicit_type_all);
+    }
+
+    #[test]
+    fn test_compiled_filter_folder_with_size_unlocks_deadlock() {
+        let store = crate::indexer::IndexStore::new();
+        store.replace(vec![
+            crate::indexer::FileEntry {
+                name: "dir_small".to_string(),
+                path: "/dir_small".to_string(),
+                is_dir: true,
+                size: 64,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "dir_large".to_string(),
+                path: "/dir_large".to_string(),
+                is_dir: true,
+                size: 20_000_000,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "file_small.txt".to_string(),
+                path: "/file_small.txt".to_string(),
+                is_dir: false,
+                size: 64,
+                modified: 0,
+                created_at: 0,
+                extension: "txt".to_string(),
+            },
+        ]);
+
+        // 纯文件夹检索 + 大小约束：目录参与大小比较，普通文件被拒绝，解除历史恒空死锁
+        let (results, _) = crate::search::dispatch(
+            &store,
+            "type:folder size:<10m",
+            crate::search::SearchMode::Auto,
+            10,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.name, "dir_small");
+
+        // 仅匹配超大目录
+        let (results_large, _) = crate::search::dispatch(
+            &store,
+            "type:folder size:>10m",
+            crate::search::SearchMode::Auto,
+            10,
+        );
+        assert_eq!(results_large.len(), 1);
+        assert_eq!(results_large[0].entry.name, "dir_large");
     }
 }

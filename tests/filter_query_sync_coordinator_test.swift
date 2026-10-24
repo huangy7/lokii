@@ -233,17 +233,35 @@ do {
 
     assertEqual(markedSearchTriggered, false, "输入法组字中（hasMarkedText() == true）时不应触发检索")
     assertEqual(markedSearchField.stringValue, "拼音输入zhong", "输入法组字中时不应覆写输入框文本")
+    assertEqual(coordinator.pendingState, newState, "输入法组字中应暂存 pendingState 供后续重试应用")
+
+    // 4.1 组字中再次调用 flushPendingStateIfNeeded 应被拦截且 pendingState 保持原值
+    let prematureFlushed = coordinator.flushPendingStateIfNeeded(searchField: markedSearchField) { _ in }
+    assertEqual(prematureFlushed, false, "仍在组字态时 flushPendingStateIfNeeded 应返回 false")
+    assertEqual(coordinator.pendingState, newState, "未上屏时 pendingState 严禁被提前清空")
+
+    // 4.2 组字期间多次更新过滤条件，应始终以最新 state 覆盖 pendingState
+    var newerState = FilterState()
+    newerState.selectedTypes = [.code, .document]
+    coordinator.updateQueryFromUI(state: newerState, searchField: markedSearchField) { _ in }
+    assertEqual(coordinator.pendingState, newerState, "组字期间多次变更过滤条件应暂存最新状态")
 
     // 模拟组字完成提交后允许更新，且光标自动推进至末尾空格后，同时挂载 PillLayoutManager
     markedSearchField.mockEditor.mockMarked = false
-    coordinator.updateQueryFromUI(state: newState, searchField: markedSearchField) { _ in
+    let flushed = coordinator.flushPendingStateIfNeeded(searchField: markedSearchField) { _ in
         markedSearchTriggered = true
     }
+    assertTrue(flushed, "组字完成后 flushPendingStateIfNeeded 应成功生效并返回 true")
+    assertEqual(coordinator.pendingState, nil, "flush 后 pendingState 应清空")
     assertEqual(markedSearchTriggered, true, "输入法组字完成后应允许更新并触发检索")
-    assertEqual(markedSearchField.stringValue, "拼音输入zhong type:doc ", "组字完成后应成功同步语法并追加尾随空格")
-    assertEqual(markedSearchField.mockEditor.selectedRange.location, ("拼音输入zhong type:doc " as NSString).length, "勾选后光标必须自动推进至文本末尾空格后")
+    assertEqual(markedSearchField.stringValue, "拼音输入zhong type:code,doc ", "组字完成后应成功同步语法并追加尾随空格")
+    assertEqual(markedSearchField.mockEditor.selectedRange.location, ("拼音输入zhong type:code,doc " as NSString).length, "勾选后光标必须自动推进至文本末尾空格后")
     assertEqual(markedSearchField.mockEditor.selectedRange.length, 0, "光标不应处于选中状态")
     assertTrue(markedSearchField.mockEditor.layoutManager is PillLayoutManager, "字段编辑器应自动挂载 PillLayoutManager 以绘制圆角胶囊背景")
+
+    // 4.3 pendingState 为 nil 时再次 flush 应幂等返回 false
+    let emptyFlushed = coordinator.flushPendingStateIfNeeded(searchField: markedSearchField) { _ in }
+    assertEqual(emptyFlushed, false, "pendingState 为 nil 时 flush 应返回 false 且无副作用")
 }
 
 print("[6/6] 测试 formatQuerySyntax 语法高亮与限定词胶囊格式化...")

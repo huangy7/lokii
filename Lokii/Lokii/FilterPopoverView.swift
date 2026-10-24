@@ -35,7 +35,7 @@ public struct FileTypeItem: Identifiable, Sendable {
 
 // MARK: - 本地编辑状态协同容器
 
-final class FilterPopoverLocalState {
+final class FilterPopoverLocalState: ObservableObject {
     var isMinEnabled: Bool? = nil
     var minText: String? = nil
     var minUnit: SizeUnit? = nil
@@ -51,24 +51,47 @@ final class FilterPopoverLocalState {
     var isInternalUpdate: Bool = false
     var lastSyncedMinBytes: UInt64? = nil
     var lastSyncedMaxBytes: UInt64? = nil
+
+    init(filterState: FilterState? = nil) {
+        if let state = filterState {
+            if let minBytes = state.minSizeBytes {
+                let (t, u) = FilterPopoverView.decomposeBytes(minBytes)
+                self.isMinEnabled = true
+                self.minText = t
+                self.minUnit = u
+                self.lastSyncedMinBytes = minBytes
+            }
+            if let maxBytes = state.maxSizeBytes {
+                let (t, u) = FilterPopoverView.decomposeBytes(maxBytes)
+                self.isMaxEnabled = true
+                self.maxSizeText = t
+                self.maxSizeUnit = u
+                self.lastSyncedMaxBytes = maxBytes
+            }
+        }
+    }
+
+    deinit {
+        minDebounceTask?.cancel()
+        maxDebounceTask?.cancel()
+    }
 }
 
 // MARK: - 声明式过滤气泡浮层视图
 
-/// 高信息密度、键盘优先的原生搜索过滤气泡浮层视图。
-/// 核心特性：
-/// 1. 与 `FilterState` 及主搜索栏保持双向实时绑定；
-/// 2. 支持多文件类型并集复选与“全部”总控联动；
-/// 3. 支持大小阈值与区间约束的安全数值输入与单位换算；
-/// 4. 隔离本地编辑态与防抖提交，防止击键中间态意外失焦；
-/// 5. 补齐无障碍 VoiceOver 辅助功能标签与区间倒置弱提示。
+/// 原生 AppKit 搜索视窗的 SwiftUI 过滤气泡浮层。
+/// 采用独立状态箱（FilterPopoverLocalState）以 @State 托管引用类型生命周期，
+/// 其业务背景与设计考量如下：
+/// 1. 编辑态隔离：在文本输入过程中提供 250ms 防抖，避免高频击键中间态向主搜索栏与倒排索引触发无意义重搜；
+/// 2. 状态生命周期守卫：通过 @State 保证引用类型状态箱在 SwiftUI 视图树重绘中维持持久单例，防止防抖 Task 句柄丢失泄漏，并兼容无头自动化测试环境；
+/// 3. 极速响应权衡：复选框与单位下拉菜单采用零延迟即时同步，而文本框中间态（如临时清空或多位输入）允许暂存，保障键入流畅度。
 public struct FilterPopoverView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Binding public var state: FilterState
     public var onStateChanged: ((FilterState) -> Void)?
     public var onDismiss: (() -> Void)?
 
-    private let localBox = FilterPopoverLocalState()
+    @State private var localBox: FilterPopoverLocalState
 
     private var isDark: Bool {
         colorScheme == .dark
@@ -167,26 +190,19 @@ public struct FilterPopoverView: View {
         self._state = state
         self.onStateChanged = onStateChanged
         self.onDismiss = onDismiss
+        self._localBox = State(initialValue: FilterPopoverLocalState(filterState: state.wrappedValue))
 
         if let minBytes = state.wrappedValue.minSizeBytes {
             let (t, u) = Self.decomposeBytes(minBytes)
             _isMinEnabledState = State(initialValue: true)
             _minTextState = State(initialValue: t)
             _minUnitState = State(initialValue: u)
-            localBox.isMinEnabled = true
-            localBox.minText = t
-            localBox.minUnit = u
-            localBox.lastSyncedMinBytes = minBytes
         }
         if let maxBytes = state.wrappedValue.maxSizeBytes {
             let (t, u) = Self.decomposeBytes(maxBytes)
             _isMaxEnabledState = State(initialValue: true)
             _maxSizeTextState = State(initialValue: t)
             _maxSizeUnitState = State(initialValue: u)
-            localBox.isMaxEnabled = true
-            localBox.maxSizeText = t
-            localBox.maxSizeUnit = u
-            localBox.lastSyncedMaxBytes = maxBytes
         }
     }
 
@@ -418,6 +434,20 @@ public struct FilterPopoverView: View {
                 }
                 .padding(.top, 2)
             }
+
+            // 纯文件夹且启用大小时的元数据大小弱提示
+            if isFolderOnlyWithSizeConstraint {
+                HStack(spacing: 4) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(L("filter.size.folderMetadataNote"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.top, 2)
+            }
         }
     }
 
@@ -557,6 +587,11 @@ public struct FilterPopoverView: View {
             return minB > maxB
         }
         return false
+    }
+
+    /// 是否处于仅选中文件夹类型且启用了大小限制的状态
+    public var isFolderOnlyWithSizeConstraint: Bool {
+        state.selectedTypes == [.folder] && (isMinEnabled || isMaxEnabled)
     }
 
     /// 处理下限大小文本输入变化，启动 250ms 防抖

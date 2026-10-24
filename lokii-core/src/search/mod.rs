@@ -8,7 +8,7 @@ pub mod top_k;
 pub mod wildcard;
 
 pub use filter::{
-    parse_query_filter, CompiledRecordFilter, FileType, QueryFilter, SizeFilter,
+    is_dotfile_query, parse_query_filter, CompiledRecordFilter, FileType, QueryFilter, SizeFilter,
 };
 
 use crate::compact_index::CompactIndex;
@@ -65,14 +65,17 @@ pub(crate) fn rank_unique_names<'a, K: Ord + Copy>(
             let entries = query_index.entries(name_id);
             if passthrough {
                 for &ordinal in entries.iter().take(max_results) {
-                    top.offer(ordinal as usize, s, name);
+                    if (ordinal as usize) < index.records().len() {
+                        top.offer(ordinal as usize, s, name);
+                    }
                 }
             } else {
                 for &ordinal in entries.iter() {
-                    if let Some(record) = index.records().get(ordinal as usize) {
-                        if !filter.matches_record(record, || Some(name)) {
-                            continue;
-                        }
+                    let Some(record) = index.records().get(ordinal as usize) else {
+                        continue;
+                    };
+                    if !filter.matches_record(record, || Some(name)) {
+                        continue;
                     }
                     top.offer(ordinal as usize, s, name);
                 }
@@ -182,6 +185,9 @@ pub fn dispatch_with_filter(
         file_types: effective_file_types,
         custom_exts: effective_custom_exts,
         size_filter: effective_size_filter,
+        has_explicit_type_all: has_explicit_type_all
+            || inline_filter.has_explicit_type_all
+            || filter.has_explicit_type_all,
     };
 
     let effective_mode = match mode {
@@ -189,15 +195,13 @@ pub fn dispatch_with_filter(
         other => other,
     };
 
-    let compiled_filter = {
-        let read = store.read();
-        CompiledRecordFilter::compile(&read, &effective_filter)
-    };
+    let read = store.read();
+    let compiled_filter = CompiledRecordFilter::compile(&read, &effective_filter);
 
     // 含路径语法（'/' 或 'in:'）时交由路径检索器。
     if effective_mode != SearchMode::Regex {
         if let Some(path_query) = path_query::PathQuery::parse(&clean_query) {
-            let results = path_search::search(store, &path_query, &compiled_filter, max_results);
+            let results = path_search::search_index(&read, &path_query, &compiled_filter, max_results);
             return (results, None);
         }
     }
@@ -206,18 +210,18 @@ pub fn dispatch_with_filter(
     // 保持高确定性与精准度：普通文本输入严格按连续子串匹配，搜不到即返回空列表，避免无脑降级为模糊跳字匹配。
     let (results, error) = match effective_mode {
         SearchMode::Auto | SearchMode::Substring => {
-            let results = substring::search(store, &clean_query, &compiled_filter, max_results);
+            let results = substring::search_index(&read, &clean_query, &compiled_filter, max_results);
             (results, None)
         }
         SearchMode::Wildcard => {
-            let results = wildcard::search(store, &clean_query, &compiled_filter, max_results);
+            let results = wildcard::search_index(&read, &clean_query, &compiled_filter, max_results);
             (results, None)
         }
         SearchMode::Regex => {
-            regex_search::search(store, &clean_query, &compiled_filter, max_results)
+            regex_search::search_index(&read, &clean_query, &compiled_filter, max_results)
         }
         SearchMode::Fuzzy => {
-            let results = fuzzy::search(store, &clean_query, &compiled_filter, max_results);
+            let results = fuzzy::search_index(&read, &clean_query, &compiled_filter, max_results);
             (results, None)
         }
     };

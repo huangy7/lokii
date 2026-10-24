@@ -1,6 +1,7 @@
 use regex::RegexBuilder;
 
 use super::{AdvancedSearchResult, CompiledRecordFilter, SearchMode};
+use crate::compact_index::CompactIndex;
 use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
@@ -73,6 +74,17 @@ pub fn search(
     filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
+    let read = store.read();
+    search_index(&read, query, filter, max_results)
+}
+
+/// 接收统一快照读锁的正则检索实现，杜绝锁重入与快照位掩码漂移。
+pub fn search_index(
+    read: &CompactIndex,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+) -> (Vec<AdvancedSearchResult>, Option<String>) {
     let pattern = query.trim().strip_prefix("regex:").unwrap_or(query.trim());
     if pattern.is_empty() {
         return (Vec::new(), None);
@@ -86,7 +98,6 @@ pub fn search(
         Err(error) => return (Vec::new(), Some(format!("Invalid regex: {error}"))),
     };
     let req = required_signature_for_regex(pattern);
-    let read = store.read();
     let mut top = super::top_k::TopK::new(max_results);
     let sorted = read.sorted_names();
     for &name_id in &sorted.ids {

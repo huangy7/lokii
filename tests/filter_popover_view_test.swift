@@ -256,9 +256,6 @@ do {
         "filter.size.over",
         "filter.size.under",
         "filter.size.invalidRange",
-        "filter.behavior.title",
-        "filter.behavior.path",
-        "filter.behavior.fuzzy",
         "filter.done"
     ]
 

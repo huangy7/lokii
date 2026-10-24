@@ -140,10 +140,11 @@ pub fn scan_compact(
     Ok(index)
 }
 
-/// 剔除被更上层索引根完全覆盖、且沿途无排除剪枝阻断的冗余子扫描根
+/// 剔除被更上层索引根完全覆盖、且沿途无排除或隐藏剪枝阻断的冗余子扫描根。
 pub(crate) fn deduplicate_scan_roots(
     paths: &[PathBuf],
     filter: &crate::filter::CompiledFilter,
+    include_hidden: bool,
 ) -> Vec<PathBuf> {
     let mut unique_paths: Vec<&Path> = Vec::new();
     for p in paths {
@@ -154,16 +155,30 @@ pub(crate) fn deduplicate_scan_roots(
 
     let mut clean_roots: Vec<PathBuf> = Vec::new();
     for (i, candidate) in unique_paths.iter().enumerate() {
-        // 存在更上层的根覆盖 candidate，且两者之间没有任何一处被排除剪枝时，
-        // candidate 已包含在该根的遍历中，无需独立扫描
+        // 存在更上层的根覆盖 candidate，且两者之间没有任何一处被排除或隐藏剪枝阻断时，
+        // candidate 才能被视为已包含在该根的遍历中。
         let is_redundant = unique_paths.iter().enumerate().any(|(j, other)| {
             j != i
                 && path_starts_with_ci(candidate, other)
                 && candidate
                     .ancestors()
-                    .skip(1)
                     .take_while(|ancestor| !paths_equal_ci(ancestor, other))
-                    .all(|ancestor| !filter.is_excluded(ancestor))
+                    .all(|ancestor| {
+                        // 1. 若沿途节点被排除规则阻断，上层扫描无法深入
+                        if filter.is_excluded(ancestor) {
+                            return false;
+                        }
+                        // 2. 若未开启索引隐藏文件且沿途节点为隐藏目录，上层扫描器会在读取子项时剪枝跳过
+                        if !include_hidden
+                            && ancestor
+                                .file_name()
+                                .map(|n| n.to_string_lossy().starts_with('.'))
+                                .unwrap_or(false)
+                        {
+                            return false;
+                        }
+                        true
+                    })
         });
         if !is_redundant {
             clean_roots.push(candidate.to_path_buf());
@@ -186,7 +201,7 @@ fn scan_with_sink(
         protected_paths()
     };
 
-    let scan_roots = deduplicate_scan_roots(paths, &filter);
+    let scan_roots = deduplicate_scan_roots(paths, &filter, include_hidden);
 
     for root in &scan_roots {
         if !root.exists() {
@@ -508,7 +523,7 @@ mod tests {
             blocked_parent.clone(),
             pierced_sub.clone(),
         ];
-        let deduplicated = deduplicate_scan_roots(&input_roots, &filter);
+        let deduplicated = deduplicate_scan_roots(&input_roots, &filter, false);
 
         // child 完全被 parent 覆盖且中间无排除阻断，应被去重
         assert!(deduplicated.contains(&parent));
@@ -517,5 +532,42 @@ mod tests {
         // pierced_sub 虽在 blocked_parent 下，但中间存在 blocked_library 排除剪枝，必须保留独立扫描
         assert!(deduplicated.contains(&blocked_parent));
         assert!(deduplicated.contains(&pierced_sub));
+    }
+
+    #[test]
+    fn test_deduplicate_scan_roots_preserves_explicit_hidden_roots_when_hidden_excluded() {
+        let tmp = make_temp_dir();
+        let home = tmp.path().join("home");
+        let dot_config = home.join(".config");
+        let nvim = dot_config.join("nvim");
+
+        fs::create_dir_all(&nvim).unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.index.index_paths = vec![
+            home.to_string_lossy().to_string(),
+            nvim.to_string_lossy().to_string(),
+        ];
+
+        let filter = crate::filter::CompiledFilter::from_config(&config);
+        let input_roots = vec![home.clone(), nvim.clone()];
+
+        // 当 include_hidden = false 时，上层 home 扫描会剪枝跳过 .config，
+        // 故显式配置的 nvim 绝不可被去重丢弃，必须保留独立扫描
+        let roots_no_hidden = deduplicate_scan_roots(&input_roots, &filter, false);
+        assert!(roots_no_hidden.contains(&home));
+        assert!(roots_no_hidden.contains(&nvim));
+
+        // 验证子根自身直接为隐藏目录（如 home 与 home/.config）的边界情况
+        let direct_hidden_roots = vec![home.clone(), dot_config.clone()];
+        let direct_res = deduplicate_scan_roots(&direct_hidden_roots, &filter, false);
+        assert!(direct_res.contains(&home));
+        assert!(direct_res.contains(&dot_config));
+
+        // 当 include_hidden = true 时，上层 home 扫描会自然遍历进入 .config/nvim，
+        // 此时子根作为冗余项正常去重
+        let roots_with_hidden = deduplicate_scan_roots(&input_roots, &filter, true);
+        assert!(roots_with_hidden.contains(&home));
+        assert!(!roots_with_hidden.contains(&nvim));
     }
 }

@@ -185,8 +185,10 @@ impl IndexStore {
             return Vec::new();
         }
         let read = self.read();
-        let extension =
-            (query.starts_with('.') && !query.contains(' ')).then(|| query[1..].to_lowercase());
+        let extension = (!crate::search::filter::is_dotfile_query(query)
+            && query.starts_with('.')
+            && !query.contains(' '))
+        .then(|| query[1..].to_lowercase());
         let keywords: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let matches = match &extension {
             Some(extension) => {

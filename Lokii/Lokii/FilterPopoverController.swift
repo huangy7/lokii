@@ -168,8 +168,29 @@ public final class FilterPopoverController: NSObject, NSPopoverDelegate {
         }
     }
 
+    /// 检查并应用之前因输入法组字而暂存的未提交过滤状态
+    @discardableResult
+    public func flushPendingStateIfNeeded() -> Bool {
+        guard let field = searchField else { return false }
+        guard let state = coordinator.pendingState else { return false }
+        let fieldEditor = field.currentEditor() as? NSTextView
+        if fieldEditor?.hasMarkedText() == true {
+            return false
+        }
+        return coordinator.flushPendingStateIfNeeded(searchField: field) { [weak self] newQuery in
+            self?.viewModel.state = state
+            self?.onFilterStateChanged?(state)
+            self?.onSearch?(newQuery)
+        }
+    }
+
     /// 外部输入框按键变动时，实时同步更新浮层内部选定状态
     public func syncStateFromQuery(_ query: String) {
+        let fieldEditor = searchField?.currentEditor() as? NSTextView
+        // 输入法正在组字或存在未上屏暂存状态时，严禁使用未完成拼音覆盖浮层内部已选状态
+        if fieldEditor?.hasMarkedText() == true || coordinator.pendingState != nil {
+            return
+        }
         coordinator.updateUIFromQuery(query: query) { [weak self] newState in
             self?.viewModel.state = newState
             self?.onFilterStateChanged?(newState)
