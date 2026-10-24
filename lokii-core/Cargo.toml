@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "lokii_core"
-crate-type = ["staticlib", "cdylib", "lib"]
+crate-type = ["staticlib", "lib"]
 
 [dependencies]
 uniffi = { version = "0.29", features = ["cli"] }

@@ -26,6 +26,9 @@ targets:
       - path: Lokii
         excludes:
           - "*.xcassets/*/.*"
+          # Assets.car 是 actool 的编译产物，仅作 CI 兜底由 scripts/build.sh 直接读取；
+          # 若作为资源参与拷贝会与 LinkAssetCatalog 争抢同一输出路径
+          - "Resources/Assets.car"
     dependencies:
       - package: KeyboardShortcuts
       - package: Sparkle
@@ -47,6 +50,7 @@ targets:
 
           cd "$SRCROOT/.."
           cargo build -p lokii-core --lib --release --target "$RUST_TARGET"
+          rm -f "target/$RUST_TARGET/release/liblokii_core.dylib"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lokii.app

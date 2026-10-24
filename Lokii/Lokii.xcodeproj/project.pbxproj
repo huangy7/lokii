@@ -266,7 +266,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\n# 确保环境变量覆盖常见 cargo 与 rustup 安装路径\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 自动提取 Xcode 传入的目标架构，动态映射 Rust target\nARCH=\"${CURRENT_ARCH:-${ARCHS:-$(uname -m)}}\"\ncase \"$ARCH\" in\n  arm64*)  RUST_TARGET=\"aarch64-apple-darwin\" ;;\n  x86_64*) RUST_TARGET=\"x86_64-apple-darwin\" ;;\n  *)       RUST_TARGET=\"aarch64-apple-darwin\" ;;\nesac\n\ncd \"$SRCROOT/..\"\ncargo build -p lokii-core --lib --release --target \"$RUST_TARGET\"\n";
+			shellScript = "set -e\n# 确保环境变量覆盖常见 cargo 与 rustup 安装路径\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 自动提取 Xcode 传入的目标架构，动态映射 Rust target\nARCH=\"${CURRENT_ARCH:-${ARCHS:-$(uname -m)}}\"\ncase \"$ARCH\" in\n  arm64*)  RUST_TARGET=\"aarch64-apple-darwin\" ;;\n  x86_64*) RUST_TARGET=\"x86_64-apple-darwin\" ;;\n  *)       RUST_TARGET=\"aarch64-apple-darwin\" ;;\nesac\n\ncd \"$SRCROOT/..\"\ncargo build -p lokii-core --lib --release --target \"$RUST_TARGET\"\nrm -f \"target/$RUST_TARGET/release/liblokii_core.dylib\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

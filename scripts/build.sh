@@ -105,7 +105,7 @@ generate_bindings() {
     out_dir="$(mktemp -d)"
 
     cargo run -p lokii-core --bin uniffi-bindgen --manifest-path "$repo_root/Cargo.toml" -- generate \
-        --library "$repo_root/target/$rust_target/release/liblokii_core.dylib" \
+        --library "$repo_root/target/$rust_target/release/liblokii_core.a" \
         --language swift \
         --out-dir "$out_dir"
 
