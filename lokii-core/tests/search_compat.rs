@@ -19,6 +19,13 @@ fn fixture() -> Vec<FileEntry> {
         ("folder.rs", "/folder.rs"),
         ("empty", ""),
         ("relative", "relative"),
+        ("u.文档", "/u.文档"),
+        ("x.café", "/x.café"),
+        ("Makefile", "/Makefile"),
+        ("foo.", "/foo."),
+        ("noext", "/noext"),
+        ("naïve.md", "/naïve.md"),
+        ("ab", "/ab"),
     ]
     .into_iter()
     .enumerate()
@@ -61,7 +68,7 @@ fn all_modes_match_frozen_legacy() {
             })
             .collect(),
     );
-    for query in ["main", ".rs", ".txt", "中文", "", "missing"] {
+    for query in ["main", ".rs", ".txt", ".文档", ".café", ".", "中文", "", "missing"] {
         for limit in [0, 1, 2, 500, usize::MAX] {
             assert_eq!(
                 serde_json::to_value(current.search(query, limit)).unwrap(),
@@ -83,11 +90,17 @@ fn all_modes_match_frozen_legacy() {
             "main rs",
             "MAIN",
             ".rs",
+            ".文档",
+            ".café",
+            ".",
             "*.rs",
             "main?",
             "mnrs",
+            "cafe",
+            "naive",
             "regex:[",
             "regex:^main",
+            "regex:a\\.?b",
             "İ",
             "café",
             "cafe\u{301}",
@@ -101,8 +114,8 @@ fn all_modes_match_frozen_legacy() {
             }
 
             // Auto 模式已移除对模糊匹配的静默回退机制，常规文本严格执行子串匹配。
-            // 对于非子串命中的缩写查询（如 "mnrs"），Auto 模式返回空，而旧版会静默回退至模糊匹配。
-            if mode == SearchMode::Auto && query == "mnrs" {
+            // 对于非子串命中的缩写或去重音查询（如 "mnrs"、"naive"），Auto 模式返回空，而旧版会静默回退至模糊匹配。
+            if mode == SearchMode::Auto && (query == "mnrs" || query == "naive") {
                 for limit in [0, 1, 2, 500, usize::MAX] {
                     let actual = dispatch(&current, query, mode, limit);
                     assert_eq!(actual.1, None);

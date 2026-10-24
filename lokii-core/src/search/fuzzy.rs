@@ -29,18 +29,8 @@ pub fn search(
         Normalization::Smart,
         AtomKind::Fuzzy,
     );
-    // Fuzzy 匹配：当查询为纯 ASCII 时，所有 ASCII 字母/数字必须作为子序列出现在目标文件名中
-    let mut req = crate::string_pool::NameSignature::default();
-    if query.is_ascii() {
-        for b in query.bytes() {
-            let lower = b.to_ascii_lowercase();
-            if lower.is_ascii_lowercase() {
-                req.lo |= 1u64 << (lower - b'a');
-            } else if lower.is_ascii_digit() {
-                req.lo |= 1u64 << (26 + (lower - b'0'));
-            }
-        }
-    }
+    // Fuzzy 匹配：由 NameSignature 内部统一封装查询串特征位构造
+    let req = crate::string_pool::NameSignature::from_fuzzy_query(query);
     let read = store.read();
     let mut buffer = Vec::new();
     let matches = super::rank_unique_names(&read, filter, max_results, req, |name, _| {
@@ -171,5 +161,28 @@ mod tests {
         let results = search(&store, "mn", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "main.md");
+    }
+
+    #[test]
+    fn test_fuzzy_matches_accented_filenames() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("café.txt"),
+            make_entry("naïve.md"),
+            make_entry("中文文档.txt"),
+        ]);
+        let filter = CompiledRecordFilter::default();
+
+        let cafe_results: Vec<_> = search(&store, "cafe", &filter, 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(cafe_results, ["café.txt"]);
+
+        let naive_results: Vec<_> = search(&store, "naive", &filter, 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(naive_results, ["naïve.md"]);
     }
 }

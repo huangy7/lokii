@@ -16,8 +16,8 @@ use crate::compact_index::IndexError;
 /// - `hi` bits 26..63 (38b): 相邻 ASCII 字母数字 2-gram 哈希桶高 38 位（共 46 个 2-gram 桶）
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct NameSignature {
-    pub lo: u64,
-    pub hi: u64,
+    lo: u64,
+    hi: u64,
 }
 
 impl NameSignature {
@@ -87,11 +87,43 @@ impl NameSignature {
                     lo |= 1u64 << 53;
                 } else if (0xAC00..=0xD7AF).contains(&u) {
                     lo |= 1u64 << 54;
+                } else if u >= 0x80 {
+                    // 将带重音/变音符的拉丁扩展字符折叠映射至对应的 ASCII 基础字母/数字签名位，
+                    // 确保模糊匹配器的智能变音归一化（如 cafe 命中 café.txt、naive 命中 naïve.md）不被签名预筛误剪枝。
+                    let norm = nucleo_matcher::chars::normalize(ch);
+                    if norm.is_ascii() {
+                        let folded = (norm as u8).to_ascii_lowercase();
+                        if folded.is_ascii_lowercase() {
+                            lo |= 1u64 << (folded - b'a');
+                        } else if folded.is_ascii_digit() {
+                            lo |= 1u64 << (26 + (folded - b'0'));
+                        }
+                    }
                 }
             }
         }
 
         Self { lo, hi }
+    }
+
+    /// 根据模糊查询串生成必需签名位（超集过滤掩码）。
+    ///
+    /// 当查询为纯 ASCII 时，所有 ASCII 字母与数字（含拉丁变音归一化等价字符）必须出现在目标文件名中。
+    #[inline]
+    pub fn from_fuzzy_query(query: &str) -> Self {
+        if !query.is_ascii() {
+            return Self::default();
+        }
+        let mut lo = 0u64;
+        for b in query.bytes() {
+            let lower = b.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                lo |= 1u64 << (lower - b'a');
+            } else if lower.is_ascii_digit() {
+                lo |= 1u64 << (26 + (lower - b'0'));
+            }
+        }
+        Self { lo, hi: 0 }
     }
 
     /// 根据已经转小写的查询子串片段生成必需签名位（超集过滤掩码）。

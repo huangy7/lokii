@@ -33,6 +33,7 @@ fn required_signature_for_regex(pattern: &str) -> NameSignature {
             }
             // 转义：只有“转义标点”仍是固定字面量（\.、\+ 等）；
             // \d、\w、\xNN、\p{..} 这类字符类/编码转义必须整体放弃预筛。
+            // 将转义标点推入当前 run 而非立即并入 sig，以便后续紧跟 * / + / ? 量词时可由 run.pop() 正确撤销。
             b'\\' => {
                 let Some(&next) = bytes.get(i + 1) else {
                     return NameSignature::default();
@@ -40,9 +41,7 @@ fn required_signature_for_regex(pattern: &str) -> NameSignature {
                 if next.is_ascii_alphanumeric() || !next.is_ascii() {
                     return NameSignature::default();
                 }
-                flush(&mut run, &mut sig);
-                let literal = (next as char).to_string();
-                sig = sig.union(NameSignature::from_substring_query(&literal));
+                run.push(next as char);
                 i += 1;
             }
             // 量词：前一个字符不是必然出现（* / ?），或与前一字符的相邻关系不成立（+）。
@@ -299,6 +298,9 @@ mod tests {
             "foo|bar",
             "a.b",
             r"a\+b",
+            r"a\.?b",
+            r"a\.*b",
+            r"a\.+b",
             r"\d+",
             r"[\]]",
             "f.o",
@@ -354,5 +356,20 @@ mod tests {
         assert!(error_doc.is_none());
         assert_eq!(results_doc.len(), 1);
         assert_eq!(results_doc[0].entry.name, "readme.md");
+    }
+
+    #[test]
+    fn test_regex_escaped_literal_with_quantifier() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("ab", "/ab"),
+            make_entry("a.b", "/a.b"),
+            make_entry("axb", "/axb"),
+        ]);
+        let filter = CompiledRecordFilter::default();
+        let (results, error) = search(&store, r"regex:^a\.?b$", &filter, 500);
+        assert!(error.is_none());
+        let names: Vec<_> = results.into_iter().map(|r| r.entry.name).collect();
+        assert_eq!(names, ["a.b", "ab"]);
     }
 }
