@@ -30,34 +30,46 @@ pub fn search(
     let read = store.read();
     let matches = match &extension {
         Some(extension) => {
-            let mut req = NameSignature::from_substring_query(".");
-            req = req.union(NameSignature::from_substring_query(extension));
+            let Some(ext_id) = read.extension_id(extension) else {
+                return Vec::new();
+            };
+            let req = if extension.is_empty() {
+                NameSignature::default()
+            } else {
+                NameSignature::from_substring_query(".")
+                    .union(NameSignature::from_substring_query(extension))
+            };
             let ext_ascii = extension.is_ascii();
             let mut top = super::top_k::TopK::new(max_results);
             let sorted = read.sorted_names();
             for &name_id in &sorted.ids {
-                if let Some(sig) = read.name_signature(name_id) {
-                    if !sig.contains(req) {
-                        continue;
+                if !extension.is_empty() {
+                    if let Some(sig) = read.name_signature(name_id) {
+                        if !sig.contains(req) {
+                            continue;
+                        }
                     }
                 }
                 let Some((name, folded)) = read.name_entry(name_id) else {
                     continue;
                 };
-                let matched = if let Some(f) = folded {
+                let matched = if extension.is_empty() {
+                    true
+                } else if let Some(f) = folded {
                     f.rsplit_once('.').is_some_and(|(_, ext)| ext == extension)
                 } else if ext_ascii {
                     name.rsplit_once('.')
                         .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(extension))
                 } else {
-                    false
+                    // `folded` 为 None 意味着该名字小写折叠后与原串一致（如中文或已小写的重音扩展名）
+                    name.rsplit_once('.').is_some_and(|(_, ext)| ext == extension)
                 };
                 if !matched {
                     continue;
                 }
                 for &ordinal in read.entries_for_name(name_id) {
                     let record = &read.records()[ordinal as usize];
-                    if !record.is_dir && read.extension(record.extension) == Some(extension.as_str()) {
+                    if record.extension == ext_id {
                         if !filter.matches_record(record, || Some(name)) {
                             continue;
                         }
@@ -233,5 +245,50 @@ mod tests {
         let results = search(&store, "main", &filter, 500);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "main.rs");
+    }
+
+    #[test]
+    fn test_non_ascii_extensions_and_bare_dot() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("u.文档", "/u.文档", false),
+            make_entry("x.café", "/x.café", false),
+            make_entry("Makefile", "/Makefile", false),
+            make_entry("foo.", "/foo.", false),
+            make_entry("noext", "/noext", false),
+            make_entry("main.rs", "/main.rs", false),
+        ]);
+        let filter = CompiledRecordFilter::default();
+
+        let doc_names: Vec<_> = search(&store, ".文档", &filter, 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(doc_names, ["u.文档"]);
+
+        let cafe_names: Vec<_> = search(&store, ".café", &filter, 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(cafe_names, ["x.café"]);
+
+        let bare_dot_names: Vec<_> = search(&store, ".", &filter, 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(bare_dot_names, ["Makefile", "foo.", "noext"]);
+
+        let rs_names: Vec<_> = search(&store, ".rs", &filter, 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(rs_names, ["main.rs"]);
+
+        let store_doc: Vec<_> = store
+            .search(".文档", 500)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(store_doc, ["u.文档"]);
     }
 }

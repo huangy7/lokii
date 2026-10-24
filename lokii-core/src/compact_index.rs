@@ -170,11 +170,149 @@ pub(crate) struct SortedNames {
     membership: Vec<u64>,
 }
 
-pub(crate) struct QueryIndex {
+#[derive(Default)]
+struct CsrTable {
+    /// Base CSR 构建时覆盖的 `records` 前缀长度（`0..base_records_len`）。
+    base_records_len: usize,
+    /// 是否存在发生在 `0..base_records_len` 范围内的原地改名操作。
+    has_base_renames: bool,
     /// 每个名字池槽位对应的记录下标列表（CSR 扁平存储）。
     name_entries_off: Vec<u32>,
     name_entries: Vec<u32>,
-    /// 按名字池槽位索引的签名；槽位复用时会清空，下次刷新按需重算。
+    /// 增量追加或原地改名后覆盖的 `name_id -> ordinals` 升序列表；
+    /// 命中此表的 `name_id` 直接返回切片，避免增量写入时重建全量 Base CSR。
+    overflow_entries: std::collections::HashMap<u32, Vec<u32>>,
+}
+
+impl CsrTable {
+    #[inline]
+    fn base_slice(&self, name_id: u32) -> &[u32] {
+        let slot = name_id as usize;
+        let (Some(&start), Some(&end)) = (
+            self.name_entries_off.get(slot),
+            self.name_entries_off.get(slot + 1),
+        ) else {
+            return &[];
+        };
+        &self.name_entries[start as usize..end as usize]
+    }
+
+    #[inline]
+    fn entries(&self, name_id: u32) -> &[u32] {
+        if !self.overflow_entries.is_empty() {
+            if let Some(list) = self.overflow_entries.get(&name_id) {
+                return list.as_slice();
+            }
+        }
+        self.base_slice(name_id)
+    }
+
+    /// 原地复用 `name_entries_off` 完成计数、前缀和与游标写入，零临时 buffer 分配。
+    fn rebuild(&mut self, records: &[CompactRecord], slots: usize) {
+        self.overflow_entries.clear();
+        self.has_base_renames = false;
+        self.base_records_len = records.len();
+
+        self.name_entries_off.clear();
+        self.name_entries_off.resize(slots + 2, 0);
+        for record in records {
+            if let Some(slot) = self.name_entries_off.get_mut(record.name as usize + 2) {
+                *slot += 1;
+            }
+        }
+
+        let mut total = 0u32;
+        for slot in &mut self.name_entries_off[1..=slots + 1] {
+            total += *slot;
+            *slot = total;
+        }
+
+        self.name_entries.clear();
+        if self.name_entries.capacity() < records.len() {
+            self.name_entries
+                .reserve_exact(records.len() - self.name_entries.capacity());
+        }
+        self.name_entries.resize(records.len(), 0);
+        for (ordinal, record) in records.iter().enumerate() {
+            if let Some(cursor) = self.name_entries_off.get_mut(record.name as usize + 1) {
+                self.name_entries[*cursor as usize] = ordinal as u32;
+                *cursor += 1;
+            }
+        }
+        self.name_entries_off.truncate(slots + 1);
+    }
+
+    fn append_record(&mut self, name_id: u32, ordinal: u32) {
+        if let Some(list) = self.overflow_entries.get_mut(&name_id) {
+            list.push(ordinal);
+            return;
+        }
+        let base = self.base_slice(name_id);
+        let mut list = Vec::with_capacity(base.len() + 1);
+        list.extend_from_slice(base);
+        list.push(ordinal);
+        self.overflow_entries.insert(name_id, list);
+    }
+
+    fn replace_record_name(&mut self, ordinal: u32, old_name: u32, new_name: u32) {
+        if old_name == new_name {
+            return;
+        }
+        if (ordinal as usize) < self.base_records_len {
+            self.has_base_renames = true;
+        }
+        if !self.overflow_entries.contains_key(&old_name) {
+            let base = self.base_slice(old_name).to_vec();
+            self.overflow_entries.insert(old_name, base);
+        }
+        if let Some(old_list) = self.overflow_entries.get_mut(&old_name) {
+            if let Ok(pos) = old_list.binary_search(&ordinal) {
+                old_list.remove(pos);
+            }
+        }
+        if !self.overflow_entries.contains_key(&new_name) {
+            let base = self.base_slice(new_name).to_vec();
+            self.overflow_entries.insert(new_name, base);
+        }
+        if let Some(new_list) = self.overflow_entries.get_mut(&new_name) {
+            if let Err(pos) = new_list.binary_search(&ordinal) {
+                new_list.insert(pos, ordinal);
+            }
+        }
+    }
+
+    fn rebuild_overflow(&mut self, records: &[CompactRecord]) {
+        self.overflow_entries.clear();
+        for (offset, record) in records[self.base_records_len..].iter().enumerate() {
+            let ordinal = (self.base_records_len + offset) as u32;
+            self.append_record(record.name, ordinal);
+        }
+    }
+
+    fn clear_name(&mut self, name_id: u32) {
+        if self.base_slice(name_id).is_empty() {
+            self.overflow_entries.remove(&name_id);
+        } else {
+            self.overflow_entries.insert(name_id, Vec::new());
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let overflow_bytes: usize = self
+            .overflow_entries
+            .values()
+            .map(|list| list.capacity() * 4 + std::mem::size_of::<Vec<u32>>() + 8)
+            .sum();
+        self.name_entries_off.capacity() * 4 + self.name_entries.capacity() * 4 + overflow_bytes
+    }
+}
+
+pub(crate) struct QueryIndex {
+    /// 按需构建并支持增量溢出的 CSR 反表。
+    csr: std::sync::OnceLock<CsrTable>,
+    /// 当发生中间记录删除使 CSR 失效时，回收 `CsrTable` 以在下一次查询时零分配复用容量。
+    csr_scratch: std::sync::Mutex<Option<CsrTable>>,
+    /// 按名字池槽位索引的签名；槽位复用时会清空，下次新增按需重算。
     signatures: Vec<crate::string_pool::NameSignature>,
     /// `signatures` 的有效位；签名本身可能全零，不能拿零值当“未计算”。
     signature_ready: Vec<u64>,
@@ -187,8 +325,8 @@ pub(crate) struct QueryIndex {
 impl Default for QueryIndex {
     fn default() -> Self {
         Self {
-            name_entries_off: Vec::new(),
-            name_entries: Vec::new(),
+            csr: std::sync::OnceLock::new(),
+            csr_scratch: std::sync::Mutex::new(None),
             signatures: Vec::new(),
             signature_ready: Vec::new(),
             sorted: std::sync::Mutex::new(None),
@@ -200,23 +338,51 @@ impl Default for QueryIndex {
 impl QueryIndex {
     fn build(records: &[CompactRecord], names: &crate::string_pool::StringPool) -> Self {
         let mut index = Self::default();
-        index.refresh(records, names);
+        let slots = names.slot_len();
         index
+            .signatures
+            .resize(slots, crate::string_pool::NameSignature::default());
+        index.signature_ready.resize(slots.div_ceil(64), 0);
+
+        for name_id in 0..slots as u32 {
+            if let Some(name) = names.get(name_id) {
+                index.set_name(name_id, name);
+            }
+        }
+
+        let mut table = CsrTable::default();
+        table.rebuild(records, slots);
+        let _ = index.csr.set(table);
+        index
+    }
+
+    #[inline]
+    fn ensure_csr(&self, records: &[CompactRecord], slots: usize) -> &CsrTable {
+        self.csr.get_or_init(|| {
+            let mut table = self
+                .csr_scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default();
+            table.rebuild(records, slots);
+            table
+        })
+    }
+
+    fn invalidate_csr(&mut self) {
+        if let Some(mut table) = self.csr.take() {
+            table.overflow_entries.clear();
+            table.has_base_renames = false;
+            *self
+                .csr_scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(table);
+        }
     }
 
     pub(crate) fn slot_count(&self) -> usize {
         self.signatures.len()
-    }
-
-    fn has_entries(&self, name_id: u32) -> bool {
-        let slot = name_id as usize;
-        match (
-            self.name_entries_off.get(slot),
-            self.name_entries_off.get(slot + 1),
-        ) {
-            (Some(start), Some(end)) => start < end,
-            _ => false,
-        }
     }
 
     fn set_ready(&mut self, name_id: u32) {
@@ -256,15 +422,9 @@ impl QueryIndex {
             .is_some_and(|word| word & (1u64 << (slot % 64)) != 0)
     }
 
+    #[inline]
     pub(crate) fn entries(&self, name_id: u32) -> &[u32] {
-        let slot = name_id as usize;
-        let (Some(start), Some(end)) = (
-            self.name_entries_off.get(slot),
-            self.name_entries_off.get(slot + 1),
-        ) else {
-            return &[];
-        };
-        &self.name_entries[*start as usize..*end as usize]
+        self.csr.get().map_or(&[], |table| table.entries(name_id))
     }
 
     fn set_name(&mut self, name_id: u32, name: &str) {
@@ -274,7 +434,12 @@ impl QueryIndex {
             let lower = name.to_lowercase();
             (lower != name).then(|| lower.into_boxed_str())
         };
-        self.signatures[name_id as usize] =
+        let slot = name_id as usize;
+        if slot >= self.signatures.len() {
+            self.signatures
+                .resize(slot + 1, crate::string_pool::NameSignature::default());
+        }
+        self.signatures[slot] =
             crate::string_pool::NameSignature::from_name(name, folded.as_deref());
         self.set_ready(name_id);
         match folded {
@@ -297,6 +462,9 @@ impl QueryIndex {
             *word &= !(1u64 << (slot % 64));
         }
         self.folded_non_ascii.remove(&name_id);
+        if let Some(csr) = self.csr.get_mut() {
+            csr.clear_name(name_id);
+        }
         self.invalidate_sorted();
     }
 
@@ -308,9 +476,46 @@ impl QueryIndex {
         *sorted = None;
     }
 
+    /// 仅为本批次新注册的 `candidate_ids` 补算签名并增量归并到字典序名字表，
+    /// 耗时严格正比于本次新增记录数 `O(batch)`，不再遍历全池槽位。
+    fn register_records(
+        &mut self,
+        records: &[CompactRecord],
+        names: &crate::string_pool::StringPool,
+    ) {
+        let slots = names.slot_len();
+        if self.signatures.len() < slots {
+            self.signatures
+                .resize(slots, crate::string_pool::NameSignature::default());
+        }
+        let words = slots.div_ceil(64);
+        if self.signature_ready.len() < words {
+            self.signature_ready.resize(words, 0);
+        }
+
+        let mut new_ids = Vec::new();
+        for record in records {
+            let name_id = record.name;
+            if !self.is_ready(name_id) {
+                if let Some(name) = names.get(name_id) {
+                    self.set_name(name_id, name);
+                    new_ids.push(name_id);
+                }
+            }
+        }
+
+        if !new_ids.is_empty() {
+            self.merge_new_sorted_names(new_ids, names);
+        }
+    }
+
     /// 纯新增时把新名字并进已排序表，避免为一次写入重排全部唯一名。
     /// 删除/改名/槽位复用会让排序表失效（`clear_name`），此时直接跳过，等下一次等分查询重建。
-    fn merge_new_sorted_names(&mut self, names: &crate::string_pool::StringPool) {
+    fn merge_new_sorted_names(
+        &mut self,
+        mut new_ids: Vec<u32>,
+        names: &crate::string_pool::StringPool,
+    ) {
         let mut sorted = self
             .sorted
             .lock()
@@ -319,16 +524,13 @@ impl QueryIndex {
             return;
         };
 
-        let mut new_ids: Vec<u32> = (0..self.slot_count() as u32)
-            .filter(|name_id| {
-                let slot = *name_id as usize;
-                self.has_entries(*name_id)
-                    && existing
-                        .membership
-                        .get(slot / 64)
-                        .is_none_or(|word| word & (1u64 << (slot % 64)) == 0)
-            })
-            .collect();
+        new_ids.retain(|&name_id| {
+            let slot = name_id as usize;
+            existing
+                .membership
+                .get(slot / 64)
+                .is_none_or(|word| word & (1u64 << (slot % 64)) == 0)
+        });
         if new_ids.is_empty() {
             *sorted = Some(existing);
             return;
@@ -339,6 +541,7 @@ impl QueryIndex {
             let right_name = names.get(right).unwrap_or("");
             left_name.cmp(right_name).then(left.cmp(&right))
         });
+        new_ids.dedup();
 
         let mut ids = Vec::with_capacity(existing.ids.len() + new_ids.len());
         let (mut old, mut new) = (0usize, 0usize);
@@ -370,57 +573,6 @@ impl QueryIndex {
         *sorted = Some(std::sync::Arc::new(SortedNames { ids, membership }));
     }
 
-    /// 只重建 O(records) 的 CSR，并补算新增名字的签名；不再每次变更都排序全部唯一名。
-    fn refresh(&mut self, records: &[CompactRecord], names: &crate::string_pool::StringPool) {
-        let slots = names.slot_len();
-        let mut counts = vec![0u32; slots];
-        for record in records {
-            if let Some(count) = counts.get_mut(record.name as usize) {
-                *count += 1;
-            }
-        }
-
-        self.name_entries_off.clear();
-        self.name_entries_off.reserve(slots + 1);
-        self.name_entries_off.push(0);
-        let mut total = 0u32;
-        for &count in &counts {
-            total += count;
-            self.name_entries_off.push(total);
-        }
-
-        self.name_entries.clear();
-        if self.name_entries.capacity() < records.len() {
-            self.name_entries.reserve_exact(records.len());
-        }
-        self.name_entries.resize(records.len(), 0);
-        let mut cursors = self.name_entries_off[..slots].to_vec();
-        for (ordinal, record) in records.iter().enumerate() {
-            if let Some(cursor) = cursors.get_mut(record.name as usize) {
-                self.name_entries[*cursor as usize] = ordinal as u32;
-                *cursor += 1;
-            }
-        }
-
-        self.signatures
-            .resize(slots, crate::string_pool::NameSignature::default());
-        self.signature_ready.resize(slots.div_ceil(64), 0);
-
-        for name_id in 0..slots {
-            let name_id = name_id as u32;
-            if !self.has_entries(name_id) || self.is_ready(name_id) {
-                continue;
-            }
-            if let Some(name) = names.get(name_id) {
-                self.set_name(name_id, name);
-            }
-        }
-
-        // 槽位释放时已经清掉折叠串；这里不再每次刷新遍历整张表，
-        // 否则中文名字占比高时会把一次增量更新拖成 O(非 ASCII 名字数)。
-        self.merge_new_sorted_names(names);
-    }
-
     fn estimated_bytes(&self) -> usize {
         let folded_bytes: usize = self
             .folded_non_ascii
@@ -437,8 +589,17 @@ impl QueryIndex {
                 })
             })
             .unwrap_or(0);
-        self.name_entries_off.capacity() * 4
-            + self.name_entries.capacity() * 4
+        let csr_bytes = self.csr.get().map_or_else(
+            || {
+                self.csr_scratch
+                    .lock()
+                    .ok()
+                    .and_then(|scratch| scratch.as_ref().map(CsrTable::estimated_bytes))
+                    .unwrap_or(0)
+            },
+            CsrTable::estimated_bytes,
+        );
+        csr_bytes
             + self.signatures.capacity() * std::mem::size_of::<crate::string_pool::NameSignature>()
             + self.signature_ready.capacity() * 8
             + folded_bytes
@@ -631,21 +792,49 @@ impl CompactIndex {
         }
     }
 
-    fn refresh_query_index(&mut self) {
+    fn on_records_appended(&mut self, base_ordinal: usize, added: &[CompactRecord]) {
+        if added.is_empty() {
+            return;
+        }
+        let Self {
+            query_index, names, ..
+        } = self;
+        if let Some(index) = query_index.get_mut() {
+            index.register_records(added, names);
+            if let Some(csr) = index.csr.get_mut() {
+                for (offset, record) in added.iter().enumerate() {
+                    csr.append_record(record.name, (base_ordinal + offset) as u32);
+                }
+                if csr.overflow_entries.len() > 8192 {
+                    index.invalidate_csr();
+                }
+            }
+        }
+    }
+
+    fn on_records_removed(&mut self, first_removed: usize) {
         let Self {
             query_index,
             records,
-            names,
             ..
         } = self;
         if let Some(index) = query_index.get_mut() {
-            index.refresh(records, names);
+            if let Some(csr) = index.csr.get_mut() {
+                if !csr.has_base_renames && first_removed >= csr.base_records_len {
+                    csr.rebuild_overflow(records);
+                } else {
+                    index.invalidate_csr();
+                }
+            }
         }
     }
 
     fn ensure_query_index(&self) -> &QueryIndex {
-        self.query_index
-            .get_or_init(|| QueryIndex::build(&self.records, &self.names))
+        let index = self
+            .query_index
+            .get_or_init(|| QueryIndex::build(&self.records, &self.names));
+        index.ensure_csr(&self.records, self.names.slot_len());
+        index
     }
 
     #[inline]
@@ -659,7 +848,7 @@ impl CompactIndex {
             return std::sync::Arc::clone(names);
         }
         let mut ids: Vec<u32> = (0..index.slot_count() as u32)
-            .filter(|name_id| index.has_entries(*name_id))
+            .filter(|&name_id| self.names.get(name_id).is_some())
             .collect();
         ids.sort_unstable_by(|&left, &right| {
             let left_name = self.names.get(left).unwrap_or("");
@@ -718,8 +907,9 @@ impl CompactIndex {
 
     pub fn push(&mut self, entry: FileEntry) -> Result<(), IndexError> {
         let record = self.acquire(&entry)?;
+        let base_ordinal = self.records.len();
         self.records.push(record);
-        self.refresh_query_index();
+        self.on_records_appended(base_ordinal, std::slice::from_ref(&record));
         Ok(())
     }
 
@@ -835,27 +1025,33 @@ impl CompactIndex {
     }
 
     pub fn remove_matching(&mut self, predicate: impl FnMut(EntryView<'_>) -> bool) -> usize {
-        let removed = self.remove_without_refresh(predicate);
-        self.refresh_query_index();
+        let (removed, first_removed) = self.remove_without_refresh(predicate);
+        if let Some(first_removed) = first_removed {
+            self.on_records_removed(first_removed);
+        }
         removed
     }
 
     fn remove_without_refresh(
         &mut self,
         mut predicate: impl FnMut(EntryView<'_>) -> bool,
-    ) -> usize {
+    ) -> (usize, Option<usize>) {
         self.remove_records_matching(|index, record| predicate(index.record_view(record).unwrap()))
     }
 
     fn remove_records_matching(
         &mut self,
         mut predicate: impl FnMut(&Self, &CompactRecord) -> bool,
-    ) -> usize {
+    ) -> (usize, Option<usize>) {
         let mut retained = 0;
+        let mut first_removed = None;
         let count = self.records.len();
         for ordinal in 0..count {
             let record = self.records[ordinal];
             if predicate(self, &record) {
+                if first_removed.is_none() {
+                    first_removed = Some(ordinal);
+                }
                 self.release(record);
             } else {
                 self.records[retained] = record;
@@ -863,7 +1059,7 @@ impl CompactIndex {
             }
         }
         self.records.truncate(retained);
-        count - retained
+        (count - retained, first_removed)
     }
 
     pub fn add_entries(&mut self, entries: Vec<FileEntry>) -> Result<(), IndexError> {
@@ -878,8 +1074,9 @@ impl CompactIndex {
                 }
             }
         }
+        let base_ordinal = self.records.len();
+        self.on_records_appended(base_ordinal, &staged);
         self.records.extend(staged);
-        self.refresh_query_index();
         Ok(())
     }
 
@@ -898,10 +1095,14 @@ impl CompactIndex {
                 }
             }
         }
-        let removed = self.remove_without_refresh(predicate);
+        let (removed, first_removed) = self.remove_without_refresh(predicate);
+        if let Some(first_removed) = first_removed {
+            self.on_records_removed(first_removed);
+        }
+        let base_ordinal = self.records.len();
+        self.on_records_appended(base_ordinal, &staged);
         self.records.reserve_exact(staged.len());
         self.records.extend(staged);
-        self.refresh_query_index();
         Ok(removed)
     }
 
@@ -947,9 +1148,23 @@ impl CompactIndex {
         let count = staged.len();
         for (ordinal, record) in staged {
             let previous = std::mem::replace(&mut self.records[ordinal], record);
+            if previous.name != record.name {
+                if let Some(index) = self.query_index.get_mut() {
+                    if let Some(csr) = index.csr.get_mut() {
+                        csr.replace_record_name(ordinal as u32, previous.name, record.name);
+                    }
+                }
+            }
             self.release(previous);
+            if previous.name != record.name {
+                let Self {
+                    query_index, names, ..
+                } = self;
+                if let Some(index) = query_index.get_mut() {
+                    index.register_records(std::slice::from_ref(&record), names);
+                }
+            }
         }
-        self.refresh_query_index();
         Ok(count)
     }
 
@@ -1045,14 +1260,30 @@ impl CompactIndex {
         }
         for (ordinal, replacement) in replacements {
             let previous = std::mem::replace(&mut self.records[ordinal], replacement);
+            if previous.name != replacement.name {
+                if let Some(index) = self.query_index.get_mut() {
+                    if let Some(csr) = index.csr.get_mut() {
+                        csr.replace_record_name(ordinal as u32, previous.name, replacement.name);
+                    }
+                }
+            }
             self.release(previous);
+            if previous.name != replacement.name {
+                let Self {
+                    query_index, names, ..
+                } = self;
+                if let Some(index) = query_index.get_mut() {
+                    index.register_records(std::slice::from_ref(&replacement), names);
+                }
+            }
         }
+        let mut first_removed: Option<usize> = None;
         if !excluded.is_empty() {
             let excluded_prefixes: Vec<_> =
                 excluded.iter().map(|path| format!("{path}/")).collect();
             let excluded_paths: Vec<&str> = excluded.iter().map(String::as_str).collect();
             let (affected_parents, affected_raw_paths) = self.affected_masks(&excluded_paths);
-            self.remove_records_matching(|index, record| {
+            let (_, excluded_first) = self.remove_records_matching(|index, record| {
                 let affected = if record.raw_path {
                     marked(&affected_raw_paths, record.path)
                 } else {
@@ -1067,6 +1298,7 @@ impl CompactIndex {
                         .iter()
                         .any(|prefix| view.path_starts_with(prefix))
             });
+            first_removed = excluded_first;
         }
         let prefixes: Vec<_> = removes.iter().map(|path| format!("{path}/")).collect();
         // 统计本批次 additions 对每个 parent 槽位的引用数；只有当池中总引用数大于本批次引用数时，
@@ -1132,7 +1364,7 @@ impl CompactIndex {
         {
             0
         } else {
-            self.remove_records_matching(|index, record| {
+            let (removed_count, removed_first) = self.remove_records_matching(|index, record| {
                 if !record.raw_path
                     && marked(&upsert_parents, record.path)
                     && upsert_ids.contains(&(record.path, record.name))
@@ -1167,12 +1399,20 @@ impl CompactIndex {
                             expected_parent == parent && expected_name == name
                         })
                     }
-            })
+            });
+            if let Some(rf) = removed_first {
+                first_removed = Some(first_removed.map_or(rf, |prev| prev.min(rf)));
+            }
+            removed_count
         };
+        if let Some(first_removed) = first_removed {
+            self.on_records_removed(first_removed);
+        }
         let added = additions.len();
+        let base_ordinal = self.records.len();
+        self.on_records_appended(base_ordinal, &additions);
         self.records.reserve_exact(added);
         self.records.extend(additions);
-        self.refresh_query_index();
         Ok((added, removed))
     }
 
@@ -1195,10 +1435,14 @@ impl CompactIndex {
             }
         }
         let current: HashSet<_> = fresh.iter().map(|(_, view)| view.path_key()).collect();
+        let (_, first_removed) = self.remove_without_refresh(|view| !current.contains(&view.path_key()));
+        if let Some(first_removed) = first_removed {
+            self.on_records_removed(first_removed);
+        }
+        let base_ordinal = self.records.len();
+        self.on_records_appended(base_ordinal, &staged);
         self.records.reserve_exact(staged.len());
         self.records.extend(staged);
-        self.remove_without_refresh(|view| !current.contains(&view.path_key()));
-        self.refresh_query_index();
         Ok(())
     }
 

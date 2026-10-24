@@ -190,17 +190,23 @@ impl IndexStore {
         let keywords: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let matches = match &extension {
             Some(extension) => {
-                let mut req = crate::string_pool::NameSignature::from_substring_query(".");
-                req = req.union(crate::string_pool::NameSignature::from_substring_query(
-                    extension,
-                ));
+                let req = if extension.is_empty() {
+                    crate::string_pool::NameSignature::default()
+                } else {
+                    crate::string_pool::NameSignature::from_substring_query(".")
+                        .union(crate::string_pool::NameSignature::from_substring_query(
+                            extension,
+                        ))
+                };
                 let ext_ascii = extension.is_ascii();
                 let mut top = crate::search::top_k::TopK::new(max_results);
                 let sorted = read.sorted_names();
                 for &name_id in &sorted.ids {
-                    if let Some(sig) = read.name_signature(name_id) {
-                        if !sig.contains(req) {
-                            continue;
+                    if !extension.is_empty() {
+                        if let Some(sig) = read.name_signature(name_id) {
+                            if !sig.contains(req) {
+                                continue;
+                            }
                         }
                     }
                     let Some((name, folded)) = read.name_entry(name_id) else {
@@ -213,7 +219,7 @@ impl IndexStore {
                             .next()
                             .is_some_and(|v| v.eq_ignore_ascii_case(extension))
                     } else {
-                        false
+                        name.rsplit('.').next() == Some(extension.as_str())
                     };
                     if matched {
                         for &ordinal in read.entries_for_name(name_id).iter().take(max_results) {

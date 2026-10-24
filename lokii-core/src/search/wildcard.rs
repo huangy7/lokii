@@ -72,11 +72,15 @@ pub fn search(
             }
         } else if let Some(f) = folded {
             glob_match(&pattern, f)
+        } else if !name.bytes().any(|b| b.is_ascii_uppercase()) {
+            // 当 `folded` 为 None 且不含 ASCII 大写字节时（包括纯小写 ASCII 名，以及所有
+            // 小写恒等的非 ASCII 文件名如中文文档、已小写的重音名），原串本身即为全小写等价态，
+            // 直接传入 glob_match，零拷贝且无需 unsafe。
+            glob_match(&pattern, name)
         } else {
             ascii_buf.clear();
             ascii_buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
-            // safety: name is guaranteed ASCII when `folded` is None
-            let lower_str = unsafe { std::str::from_utf8_unchecked(&ascii_buf) };
+            let lower_str = std::str::from_utf8(&ascii_buf).unwrap_or(name);
             glob_match(&pattern, lower_str)
         };
         if matched {

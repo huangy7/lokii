@@ -80,3 +80,31 @@ fn non_ascii_names_remain_searchable_after_updates() {
         ["Éclair.md"]
     );
 }
+
+#[test]
+fn incremental_event_batches_and_renames_preserve_search_consistency() {
+    let store = IndexStore::new();
+    store.replace(vec![
+        entry("base.rs", "/proj/src/base.rs"),
+        entry("old_name.rs", "/proj/src/old_name.rs"),
+    ]);
+    store.warm_query_index();
+
+    // 增量新增与尾部删除批次
+    assert_eq!(
+        names(&store, "old_name", SearchMode::Substring),
+        ["old_name.rs"]
+    );
+    store.add_entries(vec![entry("tail.rs", "/churn/tail.rs")]);
+    assert_eq!(
+        names(&store, "*.rs", SearchMode::Wildcard),
+        ["base.rs", "old_name.rs", "tail.rs"]
+    );
+
+    // 删除尾部新增记录（不触发 Base CSR 重建）
+    store.remove_paths(&HashSet::from(["/churn/tail.rs".to_string()]));
+    assert_eq!(
+        names(&store, "*.rs", SearchMode::Wildcard),
+        ["base.rs", "old_name.rs"]
+    );
+}
