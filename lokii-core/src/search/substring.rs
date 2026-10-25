@@ -38,10 +38,21 @@ pub fn search_index(
     if max_results == 0 {
         return Vec::new();
     }
-    let extension = (!is_dotfile_query(query)
+    let mut extension = (!is_dotfile_query(query)
         && query.starts_with('.')
         && !query.contains(' '))
     .then(|| query[1..].to_lowercase());
+
+    // 扩展名回退机制（Fallback Guard）：
+    // 若查询形式形似单扩展名（以单点开头），但在当前索引库中查无该扩展名记录
+    // （例如用户正在键入的隐藏点文件前缀 .giti、.myse 等），
+    // 绝不可直接返回空列表，而应将 extension 撤销为 None，
+    // 顺畅回退至常规子串匹配流程，避免静默漏搜。
+    if let Some(ref ext) = extension {
+        if read.extension_id(ext).is_none() {
+            extension = None;
+        }
+    }
     let keywords: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let matches = match &extension {
         Some(extension) => {
@@ -314,10 +325,12 @@ mod tests {
             make_entry(".env", "/project/.env", false),
             make_entry(".env.local", "/project/.env.local", false),
             make_entry(".gitignore", "/project/.gitignore", false),
+            make_entry("test.gitignore", "/project/test.gitignore", false),
             make_entry(".zshrc", "/Users/me/.zshrc", false),
             make_entry(".bashrc", "/Users/me/.bashrc", false),
             make_entry(".npmrc", "/project/.npmrc", false),
             make_entry(".dockerignore", "/project/.dockerignore", false),
+            make_entry(".mysecret", "/project/.mysecret", false),
             make_entry("regular.rs", "/project/regular.rs", false),
         ]);
         let filter = CompiledRecordFilter::default();
@@ -328,10 +341,21 @@ mod tests {
         assert!(env_names.contains(&".env"));
         assert!(env_names.contains(&".env.local"));
 
-        // 2. .gitignore
+        // 2. .gitignore 完整匹配与前缀匹配（如用户键入 .giti / .gitig 时）
         let gitignore_res = search(&store, ".gitignore", &filter, 500);
-        assert_eq!(gitignore_res.len(), 1);
-        assert_eq!(gitignore_res[0].entry.name, ".gitignore");
+        let gitignore_names: Vec<_> = gitignore_res.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(gitignore_names.contains(&".gitignore"));
+        assert!(gitignore_names.contains(&"test.gitignore"));
+
+        let giti_res = search(&store, ".giti", &filter, 500);
+        let giti_names: Vec<_> = giti_res.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(giti_names.contains(&".gitignore"));
+        assert!(giti_names.contains(&"test.gitignore"));
+
+        // 3. 未知点文件前缀（如 .myse 查找 .mysecret，数据库中无 myse 扩展名，无缝回退子串匹配）
+        let myse_res = search(&store, ".myse", &filter, 500);
+        assert_eq!(myse_res.len(), 1);
+        assert_eq!(myse_res[0].entry.name, ".mysecret");
 
         // 3. .zshrc
         let zshrc_res = search(&store, ".zshrc", &filter, 500);

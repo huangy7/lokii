@@ -285,11 +285,12 @@ pub(crate) fn parse_size_token(payload: &str) -> Option<SizeFilter> {
 /// 判断给定的词元或查询串是否为点文件（隐藏配置/工程文件）而非扩展名过滤。
 ///
 /// 判定规则：
-/// 1. 必须以 `.` 开头，且长度大于 1；
-/// 2. 包含后续点号（如 `.env.local`、`.config.json` 等多段点文件）；
-/// 3. 包含连字符或下划线（如 `.clang-format`、`.bash_profile`、`.ds_store` 等典型文件名）；
-/// 4. 结尾为典型配置后缀（如以 `rc` 结尾且长度 >= 4 的 `.*rc`，或以 `ignore` 结尾的 `.*ignore`）；
-/// 5. 命中知名隐藏点文件白名单（如 `.env`、`.git`、`.zshrc`、`.bashrc`、`.npmrc`、`.idea`、`.vscode` 等）。
+/// 1. 基础守卫：必须以 `.` 开头，且长度大于 1，不包含空格与路径分隔符；
+/// 2. 结构特征：包含后续点号（如 `.env.local`、`.config.json` 等多段点文件）；
+/// 3. 分隔符特征：包含连字符或下划线（如 `.clang-format`、`.bash_profile`、`.ds_store` 等典型文件名）；
+/// 4. 常见配置尾缀：以 `rc` 结尾且长度 >= 4（如 `.zshrc`、`.bashrc`、`.npmrc`），或以 `ignore` 结尾（如 `.gitignore`、`.dockerignore`）；
+/// 5. 常见点文件族前缀（长度 >= 4，覆盖键入过程中的中间态与衍生文件，如 `.git*`、`.env*`、`.docker*`、`.zsh*`、`.bash*`、`.cargo*` 等）；
+/// 6. 知名单段点文件与隐藏目录白名单（如 `.vscode`、`.idea`、`.profile`、`.local` 等）。
 pub fn is_dotfile_query(query: &str) -> bool {
     let s = query.trim();
     if !s.starts_with('.') || s.len() <= 1 || s.contains(' ') || s.contains('/') {
@@ -319,29 +320,45 @@ pub fn is_dotfile_query(query: &str) -> bool {
         return true;
     }
 
+    // 常见点文件/配置族前缀（覆盖输入过程中的中间态与派生文件，如 .giti、.dock、.zsh 等）
+    const DOTFILE_FAMILY_PREFIXES: &[&str] = &[
+        ".git",
+        ".env",
+        ".docker",
+        ".editor",
+        ".eslint",
+        ".prett",
+        ".config",
+        ".cargo",
+        ".vscode",
+        ".idea",
+        ".clang",
+        ".rustf",
+        ".pylint",
+        ".ruboc",
+        ".flake",
+        ".gnupg",
+        ".mailm",
+        ".zsh",
+        ".bash",
+        ".npm",
+        ".yarn",
+    ];
+
+    if DOTFILE_FAMILY_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+
     // 知名单段点文件与隐藏目录
     matches!(
         lower.as_str(),
-        ".env"
-            | ".git"
-            | ".idea"
-            | ".vscode"
-            | ".cargo"
-            | ".cache"
-            | ".config"
-            | ".local"
+        ".local"
             | ".ssh"
-            | ".gnupg"
             | ".profile"
             | ".zprofile"
             | ".zshenv"
             | ".zlogin"
-            | ".editorconfig"
-            | ".mailmap"
-            | ".rubocop"
-            | ".flake8"
-            | ".pylintrc"
-            | ".gitkeep"
+            | ".cache"
             | ".localized"
             | ".trash"
     )
@@ -360,13 +377,16 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
         return (String::new(), QueryFilter::default());
     }
 
+    let raw_terms: Vec<&str> = trimmed.split_whitespace().collect();
+    let term_count = raw_terms.len();
+
     let mut remaining_terms = Vec::new();
     let mut file_types = Vec::new();
     let mut custom_exts = Vec::new();
     let mut size_filter = SizeFilter::default();
     let mut has_explicit_type_all = false;
 
-    for term in trimmed.split_whitespace() {
+    for term in raw_terms {
         // 1. type:<category>（支持以逗号切分的复合分类，如 type:code,doc）
         if term.len() >= 5 && term.is_char_boundary(5) && term[..5].eq_ignore_ascii_case("type:") {
             let cat_str = &term[5..];
@@ -432,7 +452,16 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
         }
 
         // 4. 独立 .ext（非隐藏点文件与相对路径守卫）
-        if term.starts_with('.') && term.len() > 1 && term.len() <= 6 && !term.contains('/') {
+        // 关键语义约束：仅当查询包含多个词元时（例如存在前置主检索词时，如 "config .json" 或 "main .rs"），
+        // 独立的 .ext 词元才作为隐式扩展名修饰符；
+        // 若整条查询仅由单个词元构成（如 ".rs"、".giti"、".secret"），则保留在 remaining_terms 中为主检索词，
+        // 避免在无其他检索词时误吞输入导致检索词变空，或使未列入白名单的点文件/隐藏目录前缀被误杀漏搜。
+        if term_count > 1
+            && term.starts_with('.')
+            && term.len() > 1
+            && term.len() <= 6
+            && !term.contains('/')
+        {
             if is_dotfile_query(term) {
                 remaining_terms.push(term);
                 continue;
@@ -1681,6 +1710,16 @@ mod tests {
         assert!(is_dotfile_query(".idea"));
         assert!(is_dotfile_query(".vscode"));
 
+        // 点文件家族常见前缀（键入过程与派生词元）亦应当识别为 dotfile
+        assert!(is_dotfile_query(".giti"));
+        assert!(is_dotfile_query(".gitig"));
+        assert!(is_dotfile_query(".gitign"));
+        assert!(is_dotfile_query(".docker"));
+        assert!(is_dotfile_query(".zsh"));
+        assert!(is_dotfile_query(".bash"));
+        assert!(is_dotfile_query(".npm"));
+        assert!(is_dotfile_query(".cargo"));
+
         // 普通扩展名与裸点号不应误判为 dotfile
         assert!(!is_dotfile_query(".rs"));
         assert!(!is_dotfile_query(".pdf"));
@@ -1702,6 +1741,21 @@ mod tests {
         let (clean2, filter2) = parse_query_filter(".gitignore");
         assert_eq!(clean2, ".gitignore");
         assert!(filter2.custom_exts.is_empty());
+
+        // 点文件前缀在单词元输入下保留为检索词，不被误吞为扩展名
+        let (clean_giti, filter_giti) = parse_query_filter(".giti");
+        assert_eq!(clean_giti, ".giti");
+        assert!(filter_giti.custom_exts.is_empty());
+
+        // 单词元纯扩展名格式保留在 clean 中由底层索引做扩展名匹配或子串回退
+        let (clean_rs, filter_rs) = parse_query_filter(".rs");
+        assert_eq!(clean_rs, ".rs");
+        assert!(filter_rs.custom_exts.is_empty());
+
+        // 多词元输入下，后置独立扩展名正常识别为过滤条件
+        let (clean_multi, filter_multi) = parse_query_filter("main .rs");
+        assert_eq!(clean_multi, "main");
+        assert_eq!(filter_multi.custom_ext.as_deref(), Some("rs"));
 
         let (clean3, filter3) = parse_query_filter("type:all");
         assert_eq!(clean3, "");

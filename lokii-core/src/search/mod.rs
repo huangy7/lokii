@@ -308,6 +308,36 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_auto_mode_dotfile_prefix() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            crate::indexer::FileEntry {
+                name: ".gitignore".to_string(),
+                path: "/project/.gitignore".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 1700000000,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "test.gitignore".to_string(),
+                path: "/project/test.gitignore".to_string(),
+                is_dir: false,
+                size: 200,
+                modified: 1700000000,
+                created_at: 0,
+                extension: "gitignore".to_string(),
+            },
+        ]);
+        let (results, error) = dispatch(&store, ".giti", SearchMode::Auto, 500);
+        assert!(error.is_none());
+        let names: Vec<_> = results.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(names.contains(&".gitignore"));
+        assert!(names.contains(&"test.gitignore"));
+    }
+
+    #[test]
     fn test_dispatch_wildcard_mode() {
         let store = IndexStore::new();
         store.replace(vec![crate::indexer::FileEntry {
