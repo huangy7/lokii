@@ -18,7 +18,6 @@
 "menu.minimize" = "Minimize";
 
 /* AppDelegate - about panel */
-"about.appName" = "Lokii";
 "about.tagline" = "Instant file search for macOS";
 
 /* PreferencesWindowController - window */
@@ -31,7 +30,6 @@
 
 /* PreferencesWindowController - General */
 "prefs.section.behavior" = "Behavior";
-"prefs.section.behavior.description" = "Choose how the main window should behave during everyday use.";
 "prefs.showInDock" = "Show in Dock";
 "prefs.showInDock.description" = "Keep the app icon in the Dock for quick access by clicking (takes effect after restart).";
 "prefs.hideOnBlur" = "Hide on focus lost";
@@ -40,39 +38,27 @@
 "prefs.rememberPosition.description" = "Restore the last size and position when Lokii opens again.";
 
 "prefs.section.search" = "Search";
-"prefs.section.search.description" = "Tune how many matches Lokii returns in each query.";
 "prefs.maxResults" = "Maximum search results";
 "prefs.maxResults.description" = "Higher values show more matches, but the default is usually enough.";
 
-"prefs.section.shortcuts" = "Shortcuts";
-"prefs.section.shortcuts.description" = "Set the global shortcut used to summon Lokii from anywhere.";
 "prefs.globalShortcut" = "Global shortcut";
 "prefs.globalShortcut.description" = "Use this shortcut to open or hide Lokii even when another app is active.";
 
 "prefs.section.language" = "Language";
-"prefs.section.language.description" = "Pick the language used across the app.";
 "prefs.language" = "Language";
 "prefs.language.zh-Hans" = "中文";
 "prefs.language.en" = "English";
 
 /* PreferencesWindowController - Index */
-"prefs.indexPaths" = "Index Paths";
-"prefs.indexPaths.description" = "Lokii scans these folders to build its filename index.";
 "prefs.indexPaths.empty" = "No index paths";
-"prefs.excludePatterns" = "Exclude Patterns";
 "prefs.excludePatterns.description" = "Exclude directory names you never want to scan to reduce noise and indexing time.";
-"prefs.excludePatterns.empty" = "No exclude rules";
 "prefs.excludePatterns.editor.addTitle" = "Add Exclude Rule";
-"prefs.excludePatterns.editor.editTitle" = "Edit Exclude Rule";
 "prefs.excludePatterns.editor.message" = "Enter a directory name to exclude from scanning, such as `node_modules` or `.git`.";
 "prefs.excludePatterns.editor.placeholder" = "Example: node_modules";
 "prefs.excludePatterns.editor.confirm" = "Save";
 "prefs.excludePatterns.editor.cancel" = "Cancel";
-"prefs.indexOptions" = "Index Options";
-"prefs.indexOptions.description" = "These options change scan coverage and usually require a rebuild afterwards.";
 "prefs.includeHidden" = "Index hidden files";
 "prefs.includeHidden.description" = "Include dotfiles and hidden folders such as `.ssh` and `.config`.";
-"prefs.includeHidden.hint" = "Include files starting with a dot (e.g. .config, .ssh).\nRequires index rebuild to take effect.";
 "prefs.index.unsaved" = "Unsaved changes";
 "prefs.resetToDefaults" = "Restore Defaults";
 "prefs.save" = "Save";
@@ -81,37 +67,19 @@
 "prefs.unsavedChanges.save" = "Save";
 "prefs.unsavedChanges.discard" = "Don't Save";
 "prefs.unsavedChanges.cancel" = "Keep Editing";
-"prefs.action.add" = "Add";
-"prefs.action.edit" = "Edit";
 "prefs.action.remove" = "Remove";
 
 /* PreferencesWindowController - Privacy */
-"prefs.section.privacy" = "Privacy & Permissions";
-"prefs.section.privacy.description" = "Manage the system permission Lokii needs to search protected folders.";
-"prefs.section.privacy.actions" = "Quick Actions";
-"prefs.section.privacy.actions.description" = "Jump to System Settings directly or open the step-by-step guide when access is needed.";
 "prefs.privacy.fullDiskAccess" = "Full Disk Access";
 "prefs.privacy.badge.granted" = "Granted";
 "prefs.privacy.badge.missing" = "Recommended";
 "prefs.privacy.status.granted" = "Full Disk Access is enabled";
 "prefs.privacy.status.granted.description" = "Lokii can now cover protected locations such as Desktop, Documents, and Downloads.";
-"prefs.privacy.status.granted.footnote" = "If results still look incomplete, rebuild the index once from the main window.";
 "prefs.privacy.status.missing" = "Full Disk Access is not enabled yet";
 "prefs.privacy.status.missing.description" = "Without this permission, Lokii cannot fully index protected locations such as Desktop, Documents, and Downloads.";
-"prefs.privacy.status.missing.footnote" = "After granting access, return to Lokii and rebuild the index to unlock full coverage.";
 "prefs.privacy.openSettings" = "Open System Settings";
-"prefs.privacy.openSettings.description" = "Go to Privacy & Security > Full Disk Access and allow Lokii.";
 "prefs.privacy.viewGuide" = "View Step-by-Step Guide";
-"prefs.privacy.viewGuide.description" = "Open the guided window with instructions and finish the permission flow there.";
 "prefs.privacy.rebuildHint" = "If you just granted access, it is a good idea to rebuild the index once from the main window.";
-
-/* PreferencesWindowController - FDA banner */
-"fda.bannerTitle" = "Unlock full search coverage";
-"fda.bannerDescription" = "Lokii needs Full Disk Access to index protected folders such as Desktop, Documents, and Downloads.";
-"fda.bannerFootnote" = "After granting access, come back to Lokii and rebuild the index to see complete results.";
-"fda.viewGuide" = "View Steps";
-"fda.bannerText" = "Full Disk Access is required to index all files.";
-"fda.setupNow" = "Set Up Now";
 
 /* SearchWindow - search field */
 "search.placeholder" = "Search files...";
@@ -179,11 +147,6 @@
 "search.mode.regex" = "Regex";
 "search.mode.fuzzy" = "Fuzzy";
 
-/* SearchWindow - kind labels */
-"kind.folder" = "Folder";
-"kind.document" = "Document";
-"kind.file" = "File";
-
 /* FDAGuideWindowController */
 "fda.windowTitle" = "Add Lokii to Full Disk Access";
 "fda.title" = "Add Lokii to Full Disk Access";
@@ -215,7 +178,6 @@
 "prefs.index.pathConfirm.cancel" = "Cancel";
 "prefs.index.pathNotFound" = "Not Found";
 "prefs.index.pathNotFound.help" = "This path was not found on disk or is currently offline.";
-"prefs.index.addExclude" = "Add Exclude Pattern…";
 "prefs.index.addExcludePath" = "Add Exclusion";
 "prefs.index.excludePaths.empty" = "No custom excluded paths";
 "prefs.index.excludePaths.inputTitle" = "Add Excluded Path Prefix";
@@ -224,7 +186,6 @@
 "prefs.index.excludePaths.chooseFolder" = "Choose Folder...";
 "prefs.index.excludePaths.manualInput" = "Enter Path Manually...";
 "prefs.index.excludePatterns.add" = "Add Rule";
-"prefs.about.version" = "Version";
 "prefs.about.architecture" = "Core Architecture";
 "prefs.about.architecture.value" = "Rust (lokii-core) + FSEvents Engine";
 "prefs.about.license" = "License";
@@ -246,7 +207,6 @@
 "prefs.about.update.checkNow" = "Check for Updates";
 "prefs.about.update.checking" = "Checking…";
 "prefs.about.update.latest" = "Up to date";
-"prefs.about.update.available" = "New version available: %@";
 "prefs.about.update.download" = "Download";
 "menu.checkUpdates" = "Check for Updates…";
 
@@ -256,10 +216,7 @@
 "shortcut.clear" = "Clear shortcut";
 "shortcut.modifierRequired" = "Must include a modifier key (⌘ / ⌥ / ⌃)";
 "keyboard_shortcut_used_by_menu_item" = "This keyboard shortcut cannot be used as it’s already used by the “%@” menu item.";
-"keyboard_shortcut_used_by_system" = "This keyboard shortcut cannot be used as it’s already a system-wide keyboard shortcut.";
-"keyboard_shortcuts_can_be_changed" = "Most system-wide keyboard shortcuts can be changed in “System Settings › Keyboard › Keyboard Shortcuts”.";
 "keyboard_shortcut_disallowed" = "Option modifier must be combined with Command or Control.";
-"force_use_shortcut" = "Use Anyway";
 "ok" = "OK";
 "space_key" = "Space";
 "search.initializationFailed" = "Index initialization failed";
