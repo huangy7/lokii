@@ -179,6 +179,32 @@ pub fn dispatch_with_filter(
         filter.size_filter
     };
 
+    let read = store.read();
+
+    let mut clean_query = clean_query;
+    let mut effective_custom_exts = effective_custom_exts;
+    let mut effective_custom_ext = effective_custom_ext;
+
+    // 针对多词元中隐式推断的独立 `.ext` 词元，校验只读索引库中是否存在该扩展名：
+    // 若当前索引中查无此扩展名，说明该词元并非合法扩展名修饰符，而是用户输入的中间态词条或未知点文件前缀；
+    // 此时将该候选扩展名从过滤器中移除，并将原词元归还至 clean_query，避免误将搜索结果归零。
+    if !inline_filter.inferred_exts.is_empty() {
+        for (inferred_ext, raw_token) in &inline_filter.inferred_exts {
+            if read.extension_id(inferred_ext).is_none() {
+                effective_custom_exts.retain(|e| e != inferred_ext);
+                if effective_custom_ext.as_deref() == Some(inferred_ext.as_str()) {
+                    effective_custom_ext = effective_custom_exts.first().cloned();
+                }
+                if clean_query.is_empty() {
+                    clean_query = raw_token.clone();
+                } else {
+                    clean_query.push(' ');
+                    clean_query.push_str(raw_token);
+                }
+            }
+        }
+    }
+
     let effective_filter = QueryFilter {
         file_type: effective_file_type,
         custom_ext: effective_custom_ext,
@@ -188,6 +214,7 @@ pub fn dispatch_with_filter(
         has_explicit_type_all: has_explicit_type_all
             || inline_filter.has_explicit_type_all
             || filter.has_explicit_type_all,
+        inferred_exts: inline_filter.inferred_exts,
     };
 
     let effective_mode = match mode {
@@ -195,7 +222,6 @@ pub fn dispatch_with_filter(
         other => other,
     };
 
-    let read = store.read();
     let compiled_filter = CompiledRecordFilter::compile(&read, &effective_filter);
 
     // 含路径语法（'/' 或 'in:'）时交由路径检索器。
@@ -335,6 +361,48 @@ mod tests {
         let names: Vec<_> = results.iter().map(|r| r.entry.name.as_str()).collect();
         assert!(names.contains(&".gitignore"));
         assert!(names.contains(&"test.gitignore"));
+    }
+
+    #[test]
+    fn test_multi_term_inferred_ext_fallback_to_query() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            crate::indexer::FileEntry {
+                name: "main.rs".to_string(),
+                path: "/project/main.rs".to_string(),
+                is_dir: false,
+                size: 1000,
+                modified: 1700000000,
+                created_at: 0,
+                extension: "rs".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "myproject.custom_hidden".to_string(),
+                path: "/project/myproject.custom_hidden".to_string(),
+                is_dir: false,
+                size: 500,
+                modified: 1700000000,
+                created_at: 0,
+                extension: "custom_hidden".to_string(),
+            },
+        ]);
+
+        // 1. 已知合法扩展名：正常作为过滤修饰符
+        let (results_known, err_known) = dispatch(&store, "main .rs", SearchMode::Auto, 500);
+        assert!(err_known.is_none());
+        assert_eq!(results_known.len(), 1);
+        assert_eq!(results_known[0].entry.name, "main.rs");
+
+        // 2. 独立推断的生僻/未知扩展名前缀（索引中查无此扩展名）：安全归还为普通检索词，避免误将搜索结果清空
+        let (results_unknown, err_unknown) = dispatch(&store, "myproject .custom", SearchMode::Auto, 500);
+        assert!(err_unknown.is_none());
+        assert_eq!(results_unknown.len(), 1);
+        assert_eq!(results_unknown[0].entry.name, "myproject.custom_hidden");
+
+        // 3. 显式 ext: 语法：严格遵循显式强约束，查无该扩展名则正常返回空列表
+        let (results_explicit, err_explicit) = dispatch(&store, "myproject ext:custom", SearchMode::Auto, 500);
+        assert!(err_explicit.is_none());
+        assert!(results_explicit.is_empty());
     }
 
     #[test]

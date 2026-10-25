@@ -140,6 +140,8 @@ pub struct QueryFilter {
     pub size_filter: SizeFilter,
     /// 是否显式指定了 `type:all` 过滤词元。
     pub has_explicit_type_all: bool,
+    /// 由独立 `.ext` 语法隐式推断出的候选扩展名与原始词元 (extension, raw_token)
+    pub inferred_exts: Vec<(String, String)>,
 }
 
 /// 解析单项带单位的大小字符串（如 "10m"、"500k"、"1.5g"、"1024b"），遵循 macOS 原生十进制规范（1KB = 10^3, 1MB = 10^6 等）。
@@ -383,6 +385,7 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
     let mut remaining_terms = Vec::new();
     let mut file_types = Vec::new();
     let mut custom_exts = Vec::new();
+    let mut inferred_exts = Vec::new();
     let mut size_filter = SizeFilter::default();
     let mut has_explicit_type_all = false;
 
@@ -471,8 +474,9 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
                 let lower = candidate.to_ascii_lowercase();
                 if !custom_exts.contains(&lower) {
-                    custom_exts.push(lower);
+                    custom_exts.push(lower.clone());
                 }
+                inferred_exts.push((lower, term.to_string()));
                 continue;
             }
         }
@@ -492,14 +496,77 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             custom_exts,
             size_filter,
             has_explicit_type_all,
+            inferred_exts,
         },
     )
 }
 
-/// 判断无扩展名的特殊文件名是否归类于代码工程文件（如 Makefile、Dockerfile 等）。
+/// 判断无后缀的隐藏点文件是否属于代码工程或环境配置文件（用于 `type:code` 分类判定）。
+///
+/// 将实体文件分类逻辑与用户查询意图探测彻底解耦：
+/// 1. 严格排斥系统级描述文件、缓存与临时目录（如 `.localized`、`.DS_Store`、`.Trash` 等）；
+/// 2. 覆盖常见配置尾缀（如 `.*ignore`、`.*rc`）；
+/// 3. 精确匹配核心代码与开发环境配置资产（如 `.editorconfig`、`.clang-format`、`.env*` 等）。
+#[inline]
+pub(crate) fn is_code_dotfile(name: &str) -> bool {
+    if !name.starts_with('.') || name.len() <= 1 {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+
+    // 系统级描述、临时、缓存与历史文件防御拦截
+    if matches!(
+        lower.as_str(),
+        ".trash"
+            | ".localized"
+            | ".ds_store"
+            | ".cache"
+            | ".spotlight-v100"
+            | ".fseventsd"
+            | ".temporaryitems"
+            | ".cfusertextencoding"
+    ) || lower.ends_with("history")
+    {
+        return false;
+    }
+
+    // 1. 典型配置尾缀：.*ignore（如 .gitignore, .dockerignore, .npmignore）
+    if lower.len() >= 7 && lower.ends_with("ignore") {
+        return true;
+    }
+
+    // 2. 典型配置尾缀：.*rc（长度 >= 4，如 .zshrc, .bashrc, .npmrc, .prettierrc, .eslintrc）
+    if lower.len() >= 4 && lower.ends_with("rc") {
+        return true;
+    }
+
+    // 3. 常见核心开发环境与工程代码配置文件
+    if lower.starts_with(".env") {
+        return true;
+    }
+
+    matches!(
+        lower.as_str(),
+        ".editorconfig"
+            | ".clang-format"
+            | ".clang-tidy"
+            | ".flake8"
+            | ".mailmap"
+            | ".gitattributes"
+            | ".gitmodules"
+            | ".gitconfig"
+            | ".gitkeep"
+            | ".bash_profile"
+            | ".zprofile"
+            | ".zshenv"
+            | ".zlogin"
+    )
+}
+
+/// 判断无扩展名的特殊文件名是否归类于代码工程文件（如 Makefile、Dockerfile 以及常见工程点配置文件等）。
 #[inline]
 pub(crate) fn is_code_special_filename(name: &str) -> bool {
-    matches!(
+    if matches!(
         name,
         "Makefile"
             | "makefile"
@@ -512,7 +579,11 @@ pub(crate) fn is_code_special_filename(name: &str) -> bool {
             | "LICENSE"
             | "Gemfile"
             | "Rakefile"
-    )
+            | "CMakeLists.txt"
+    ) {
+        return true;
+    }
+    is_code_dotfile(name)
 }
 
 /// 针对当前紧凑索引完成编译的记录过滤器。
@@ -712,6 +783,16 @@ impl CompiledRecordFilter {
             return true;
         }
         if self.has_custom_ext {
+            if view.extension.is_empty() && view.name.starts_with('.') && view.name.len() > 1 {
+                let dotfile_candidate = &view.name[1..];
+                if self
+                    .custom_exts
+                    .iter()
+                    .any(|target| dotfile_candidate.eq_ignore_ascii_case(target))
+                {
+                    return true;
+                }
+            }
             return self
                 .custom_exts
                 .iter()
@@ -764,8 +845,24 @@ impl CompiledRecordFilter {
             return true;
         }
 
-        // 4. 扩展名位掩码初筛与特殊代码文件名兜底
-        if self.has_code_type && !self.has_custom_ext {
+        // 4. 扩展名位掩码初筛与特殊代码文件名 / 根点文件兜底
+        if self.has_custom_ext {
+            let is_empty = self.empty_ext_id == Some(record.extension);
+            if is_empty {
+                if let Some(name) = get_name() {
+                    if name.starts_with('.') && name.len() > 1 {
+                        let dotfile_candidate = &name[1..];
+                        if self
+                            .custom_exts
+                            .iter()
+                            .any(|target| dotfile_candidate.eq_ignore_ascii_case(target))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        } else if self.has_code_type {
             let is_empty = self.empty_ext_id == Some(record.extension);
             if is_empty {
                 if let Some(name) = get_name() {
@@ -1818,5 +1915,153 @@ mod tests {
         );
         assert_eq!(results_large.len(), 1);
         assert_eq!(results_large[0].entry.name, "dir_large");
+    }
+
+    #[test]
+    fn test_root_dotfiles_matched_by_custom_ext() {
+        let store = crate::indexer::IndexStore::new();
+        store.replace(vec![
+            crate::indexer::FileEntry {
+                name: ".gitignore".to_string(),
+                path: "/project/.gitignore".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "test.gitignore".to_string(),
+                path: "/project/test.gitignore".to_string(),
+                is_dir: false,
+                size: 200,
+                modified: 0,
+                created_at: 0,
+                extension: "gitignore".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: ".zshrc".to_string(),
+                path: "/Users/me/.zshrc".to_string(),
+                is_dir: false,
+                size: 300,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+        ]);
+
+        let (results_git, _) = crate::search::dispatch(
+            &store,
+            "ext:gitignore",
+            crate::search::SearchMode::Auto,
+            10,
+        );
+        let names_git: Vec<_> = results_git.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(names_git.contains(&".gitignore"));
+        assert!(names_git.contains(&"test.gitignore"));
+
+        let (results_zsh, _) = crate::search::dispatch(
+            &store,
+            "ext:zshrc",
+            crate::search::SearchMode::Auto,
+            10,
+        );
+        assert_eq!(results_zsh.len(), 1);
+        assert_eq!(results_zsh[0].entry.name, ".zshrc");
+    }
+
+    #[test]
+    fn test_type_code_matches_engineering_dotfiles() {
+        let store = crate::indexer::IndexStore::new();
+        store.replace(vec![
+            crate::indexer::FileEntry {
+                name: ".gitignore".to_string(),
+                path: "/project/.gitignore".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: ".editorconfig".to_string(),
+                path: "/project/.editorconfig".to_string(),
+                is_dir: false,
+                size: 150,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: ".Trash".to_string(),
+                path: "/Users/me/.Trash".to_string(),
+                is_dir: true,
+                size: 0,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "normal.txt".to_string(),
+                path: "/project/normal.txt".to_string(),
+                is_dir: false,
+                size: 500,
+                modified: 0,
+                created_at: 0,
+                extension: "txt".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: ".localized".to_string(),
+                path: "/Users/me/.localized".to_string(),
+                is_dir: false,
+                size: 0,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: ".DS_Store".to_string(),
+                path: "/project/.DS_Store".to_string(),
+                is_dir: false,
+                size: 6148,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: ".zsh_history".to_string(),
+                path: "/Users/me/.zsh_history".to_string(),
+                is_dir: false,
+                size: 1024,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "Makefile".to_string(),
+                path: "/project/Makefile".to_string(),
+                is_dir: false,
+                size: 1000,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+        ]);
+
+        let (results, _) = crate::search::dispatch(
+            &store,
+            "type:code",
+            crate::search::SearchMode::Auto,
+            10,
+        );
+        let names: Vec<_> = results.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(names.contains(&".gitignore"));
+        assert!(names.contains(&".editorconfig"));
+        assert!(names.contains(&"Makefile"));
+        assert!(!names.contains(&".Trash"));
+        assert!(!names.contains(&".localized"));
+        assert!(!names.contains(&".DS_Store"));
+        assert!(!names.contains(&".zsh_history"));
+        assert!(!names.contains(&"normal.txt"));
     }
 }
