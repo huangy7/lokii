@@ -842,6 +842,7 @@ final class SearchResultsViewController: NSViewController {
     /// 更新底栏文件路径展示并协同控制与权限提示的互斥显隐
     func updateBottomPath(with path: String?) {
         pathBar.url = path.map { URL(fileURLWithPath: $0) }
+        pathBar.toolTip = path
         updateBottomBarVisibility()
     }
 
@@ -2004,6 +2005,8 @@ final class SearchNameTableCellView: SearchHighlightCellView {
 
     func configure(name: String, matchPositions: [FfiMatchRange]) {
         setDisplay(name, ranges: matchPositions.map { (Int($0.start), Int($0.end)) })
+        toolTip = name
+        textField?.toolTip = name
     }
 }
 
@@ -2018,12 +2021,16 @@ final class SearchPathTableCellView: SearchHighlightCellView {
         let parent = (fullPath as NSString).deletingLastPathComponent
         guard !parent.isEmpty else {
             setDisplay("", ranges: [])
+            toolTip = nil
+            textField?.toolTip = nil
             return
         }
 
         let abbreviated = abbreviateHomePrefix(parent)
         setDisplay(abbreviated.display,
                    ranges: parentMatchPositions.compactMap { abbreviated.displayRange(for: $0) })
+        toolTip = fullPath
+        textField?.toolTip = fullPath
     }
 }
 
