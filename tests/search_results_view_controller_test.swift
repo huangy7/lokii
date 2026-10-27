@@ -182,13 +182,18 @@ let sizeCol = controller.tableView.tableColumns.first { $0.identifier == .column
 
 let nameCellView = controller.tableView(controller.tableView, viewFor: nameCol, row: 0)
 assertTrue(nameCellView is SearchNameTableCellView, "名称列应返回定制高亮单元格 SearchNameTableCellView")
+assertEqual(nameCellView?.toolTip, "alpha.rs", "名称列单元格 toolTip 应为完整文件名")
+assertEqual((nameCellView as? SearchNameTableCellView)?.textField?.toolTip, "alpha.rs", "名称列文本框 toolTip 应为完整文件名")
 
 let nameCellViewNoMatch = controller.tableView(controller.tableView, viewFor: nameCol, row: 1) as? SearchNameTableCellView
 assertTrue(nameCellViewNoMatch != nil, "名称列无匹配范围时应能正常渲染")
 assertEqual(nameCellViewNoMatch?.textField?.attributedStringValue.string, "beta.md", "未高亮单元格文本内容应与文件名一致")
+assertEqual(nameCellViewNoMatch?.toolTip, "beta.md", "未高亮单元格 toolTip 应为完整文件名")
 
 let pathCellView = controller.tableView(controller.tableView, viewFor: pathCol, row: 0) as? NSTableCellView
 assertEqual(pathCellView?.textField?.stringValue, "/tmp/src", "路径列应显示父目录路径")
+assertEqual(pathCellView?.toolTip, "/tmp/src/alpha.rs", "路径列单元格 toolTip 应为完整绝对路径")
+assertEqual(pathCellView?.textField?.toolTip, "/tmp/src/alpha.rs", "路径列文本框 toolTip 应为完整绝对路径")
 
 let sizeCellView = controller.tableView(controller.tableView, viewFor: sizeCol, row: 2) as? NSTableCellView
 assertEqual(sizeCellView?.textField?.stringValue, "--", "目录行大小应显示为 --")
@@ -408,8 +413,10 @@ print("[8/8] 测试底栏状态更新、进度指示与重建动作代理派发.
 // 路径更新
 controller.updateBottomPath(with: "/tmp/src/alpha.rs")
 assertEqual(controller.pathBar.url?.path, "/tmp/src/alpha.rs", "updateBottomPath 应正确设置路径")
+assertEqual(controller.pathBar.toolTip, "/tmp/src/alpha.rs", "updateBottomPath 应同步设置底栏 toolTip 为完整路径")
 controller.updateBottomPath(with: nil)
 assertEqual(controller.pathBar.url, nil, "updateBottomPath(with: nil) 应清空路径")
+assertEqual(controller.pathBar.toolTip, nil, "updateBottomPath(with: nil) 应同步清空底栏 toolTip")
 
 // 状态文本更新
 controller.updateStatusText("已匹配 10 项")

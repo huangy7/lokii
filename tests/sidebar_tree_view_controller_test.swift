@@ -170,10 +170,13 @@ let allResultsCell = controller.outlineView(controller.outlineView, viewFor: col
 assertTrue(allResultsCell != nil, "应当返回 SidebarTreeCellView")
 assertEqual(allResultsCell?.textField?.stringValue, L("search.sidebar.allResults"), "全部结果单元格标题应为本地化全部结果")
 assertEqual(allResultsCell?.countBadgeLabel.stringValue, "7", "全部结果单元格徽标应为 7")
+assertEqual(allResultsCell?.toolTip, nil, "全部结果单元格无需 toolTip")
 
 let srcCell = controller.outlineView(controller.outlineView, viewFor: column, item: srcNode) as? SidebarTreeCellView
 assertEqual(srcCell?.textField?.stringValue, "src", "src 单元格标题应为 src")
 assertEqual(srcCell?.countBadgeLabel.stringValue, "5", "src 单元格徽标应为 5")
+assertEqual(srcCell?.toolTip, srcNode.fullPath, "目录单元格 toolTip 应为完整路径")
+assertEqual(srcCell?.textField?.toolTip, srcNode.fullPath, "目录文本框 toolTip 应为完整路径")
 
 print("[4/6] 测试单选切换与代理回调机制...")
 let mockDelegate = MockSidebarDelegate()

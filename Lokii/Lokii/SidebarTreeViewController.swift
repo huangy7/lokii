@@ -321,6 +321,8 @@ extension SidebarTreeViewController: NSOutlineViewDelegate {
                 count: allResults.count,
                 icon: Self.allResultsIcon
             )
+            cell.toolTip = nil
+            cell.textField?.toolTip = nil
             return cell
         }
 
@@ -330,6 +332,8 @@ extension SidebarTreeViewController: NSOutlineViewDelegate {
                 count: node.recursiveMatchCount,
                 icon: Self.folderIcon
             )
+            cell.toolTip = node.fullPath
+            cell.textField?.toolTip = node.fullPath
             return cell
         }
 
