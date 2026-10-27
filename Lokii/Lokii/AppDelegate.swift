@@ -22,6 +22,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 根据配置设置应用激活策略（是否常驻 Dock）
         NSApp.setActivationPolicy((config?.general.showInDock ?? true) ? .regular : .accessory)
 
+        // 注册应用支持向系统“服务（Services）”导出的数据类型
+        NSApp.registerServicesMenuSendTypes([
+            .fileURL,
+            NSPasteboard.PasteboardType("NSFilenamesPboardType"),
+            .string,
+            NSPasteboard.PasteboardType("public.plain-text"),
+            NSPasteboard.PasteboardType("public.directory"),
+            NSPasteboard.PasteboardType("public.folder"),
+            NSPasteboard.PasteboardType("public.item"),
+            NSPasteboard.PasteboardType("public.data"),
+            NSPasteboard.PasteboardType("com.apple.resolvable"),
+        ], returnTypes: [])
+
         setupStatusItem()
         setupMainMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(onLanguageChanged),
@@ -157,6 +170,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let prefsItem = NSMenuItem(localizedKey: "menu.preferences", action: #selector(openPreferences), keyEquivalent: ",")
         prefsItem.target = self
         appMenu.addItem(prefsItem)
+
+        appMenu.addItem(NSMenuItem.separator())
+
+        // Services menu
+        let servicesMenuItem = NSMenuItem(localizedKey: "menu.services", action: nil, keyEquivalent: "")
+        let servicesMenu = NSMenu(title: L("menu.services"))
+        servicesMenuItem.submenu = servicesMenu
+        appMenu.addItem(servicesMenuItem)
+        NSApp.servicesMenu = servicesMenu
 
         appMenu.addItem(NSMenuItem.separator())
 

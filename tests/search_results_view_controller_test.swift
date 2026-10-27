@@ -270,11 +270,39 @@ assertTrue(menu.items[8].isSeparatorItem, "第 8 项应为分隔线")
 assertEqual(menu.items[9].action, #selector(controller.moveToTrashSelected), "第 9 项应绑定 moveToTrashSelected")
 assertEqual(menu.items[9].keyEquivalent, String(format: "%c", NSDeleteCharacter), "moveToTrashSelected 快捷键应为 Delete")
 assertEqual(menu.items[9].keyEquivalentModifierMask, [.command], "moveToTrashSelected 修饰键应为 Command")
+assertTrue(menu.allowsContextMenuPlugIns, "tableView.menu 必须开启 allowsContextMenuPlugIns 以由 AppKit 原生托管系统服务")
 
 // 校验菜单项可用性验证逻辑 (validateMenuItem)
 for item in menu.items where !item.isSeparatorItem {
     assertTrue(controller.validateMenuItem(item), "有选中项时上下文菜单项 \\(item.title) 应通过校验")
 }
+
+// 校验 revealSelected 单选与多选条目在访达中高亮定位行为，以及底栏点击与面包屑定位联动
+var interceptedRevealURLs: [URL] = []
+controller.revealFilesHandler = { urls in
+    interceptedRevealURLs = urls
+}
+
+// 1. 单选条目触发 revealSelected：应精准传递该条目 URL，严禁误触发文件打开或进入目录
+controller.selectFirstRow()
+interceptedRevealURLs.removeAll()
+controller.revealSelected()
+assertEqual(interceptedRevealURLs.map { $0.path }, ["/tmp/src/alpha.rs"], "单选条目时 revealSelected 应通过 revealFilesHandler 定位所选项路径")
+
+// 2. 多选条目触发 revealSelected：应批量传递全部选中条目的 URL
+controller.tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+interceptedRevealURLs.removeAll()
+controller.revealSelected()
+assertEqual(interceptedRevealURLs.map { $0.path }, ["/tmp/src/alpha.rs", "/tmp/docs/beta.md"], "多选条目时 revealSelected 应批量定位全部选中项路径")
+
+// 3. 点击底栏路径项触发 pathBarClicked：应通过 revealFilesHandler 定位该节点路径
+controller.selectFirstRow()
+controller.updateBottomPath(with: "/tmp/src/alpha.rs")
+interceptedRevealURLs.removeAll()
+if let pathBarAction = controller.pathBar.action {
+    _ = controller.pathBar.target?.perform(pathBarAction, with: controller.pathBar)
+}
+assertEqual(interceptedRevealURLs.map { $0.path }, ["/tmp/src/alpha.rs"], "点击底栏路径栏项应通过 revealFilesHandler 定位节点路径")
 
 // 校验 SearchTableView 键盘事件分发与 ⌘⌫ 按键等效处理
 let deleteEvent = NSEvent.keyEvent(

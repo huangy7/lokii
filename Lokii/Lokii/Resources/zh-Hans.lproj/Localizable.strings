@@ -122,6 +122,10 @@
 "search.ctx.copyPath" = "拷贝路径";
 "search.ctx.copyName" = "拷贝名称";
 "search.ctx.moveToTrash" = "移到废纸篓";
+"search.ctx.openInTerminal" = "在终端中打开";
+"search.ctx.filterByDirectory" = "以此目录为过滤范围";
+"search.ctx.services" = "服务";
+"menu.services" = "服务";
 "search.trash.confirmTitle" = "将选中的 %d 项移到废纸篓？";
 "search.trash.confirmMessage" = "移到废纸篓的项目可以在访达中放回原处。";
 "search.trash.confirmButton" = "移到废纸篓";
