@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 let sourceFiles = [
     "Lokii/Lokii/L10n.swift",
     "Lokii/Lokii/LocalizedMenu.swift",
+    "Lokii/Lokii/TerminalLauncher.swift",
     "Lokii/Lokii/ResultDirectoryTree.swift",
     "Lokii/Lokii/SidebarTreeViewController.swift",
     "Lokii/Lokii/SearchResultsViewController.swift",
@@ -300,6 +301,20 @@ if let revealItem = revealMenuItem {
     _ = searchVC.perform(revealItem.action, with: revealItem)
 }
 assertEqual(breadcrumbRevealedURLs.map { $0.path }, ["/workspace/src"], "触发面包屑菜单在访达中显示应调用 revealFilesHandler 定位该目录")
+
+// 验证在终端中打开动作路由至 openInTerminalHandler
+var breadcrumbTerminalURLs: [URL] = []
+searchVC.openInTerminalHandler = { urls in
+    breadcrumbTerminalURLs = urls
+}
+let terminalMenuItem = breadcrumbMenu?.items.first {
+    $0.action == NSSelectorFromString("breadcrumbOpenInTerminal:")
+}
+assertTrue(terminalMenuItem != nil, "面包屑菜单必须包含在终端中打开动作项")
+if let terminalItem = terminalMenuItem {
+    _ = searchVC.perform(terminalItem.action, with: terminalItem)
+}
+assertEqual(breadcrumbTerminalURLs.map { $0.path }, ["/workspace/src"], "触发面包屑菜单在终端中打开应调用 openInTerminalHandler 派发该目录")
 
 // 验证在目录租约下，validRequestor 正确响应 public.directory
 let leaseReqDir = searchVC.validRequestor(forSendType: directoryType, returnType: nil)

@@ -25,6 +25,11 @@ guard let localizedMenuSource = try? String(contentsOfFile: "Lokii/Lokii/Localiz
     exit(1)
 }
 
+guard let terminalLauncherSource = try? String(contentsOfFile: "Lokii/Lokii/TerminalLauncher.swift", encoding: .utf8) else {
+    fputs("tests/search_results_view_controller_test.swift: error: 无法读取 TerminalLauncher.swift\n", stderr)
+    exit(1)
+}
+
 // Mock FfiSearchResult
 let mockFfiSource = """
 public struct FfiMatchRange: Equatable, Hashable {
@@ -79,6 +84,7 @@ import Quartz
 \(mockFfiSource)
 \(l10nSource)
 \(localizedMenuSource)
+\(terminalLauncherSource)
 \(searchResultsSource)
 
 func assertEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String, file: StaticString = #file, line: UInt = #line) {
@@ -253,29 +259,46 @@ guard let menu = controller.tableView.menu else {
     fputs("断言失败: tableView.menu 不能为空\\n", stderr)
     exit(1)
 }
-assertEqual(menu.items.count, 10, "右键上下文菜单应包含 8 个功能项加 2 个分隔线")
+assertEqual(menu.items.count, 11, "右键上下文菜单应包含 9 个功能项加 2 个分隔线")
 assertEqual(menu.items[0].action, #selector(controller.openSelected), "第 0 项应绑定 openSelected")
 assertEqual(menu.items[1].action, #selector(controller.quickLookSelected), "第 1 项应绑定 quickLookSelected")
 assertEqual(menu.items[1].keyEquivalent, " ", "quickLookSelected 快捷键应为 Space")
 assertTrue(menu.items[1].keyEquivalentModifierMask.isEmpty, "quickLookSelected 修饰键掩码应为空")
 assertEqual(menu.items[2].action, #selector(controller.revealSelected), "第 2 项应绑定 revealSelected")
-assertEqual(menu.items[3].action, #selector(controller.showInfoSelected), "第 3 项应绑定 showInfoSelected")
-assertEqual(menu.items[3].keyEquivalent, "i", "showInfoSelected 快捷键应为 i")
-assertTrue(menu.items[4].isSeparatorItem, "第 4 项应为分隔线")
-assertEqual(menu.items[5].action, #selector(controller.copyFile), "第 5 项应绑定 copyFile")
-assertEqual(menu.items[5].keyEquivalent, "c", "copyFile 快捷键应为 c")
-assertEqual(menu.items[6].action, #selector(controller.copyPath), "第 6 项应绑定 copyPath")
-assertEqual(menu.items[7].action, #selector(controller.copyName), "第 7 项应绑定 copyName")
-assertTrue(menu.items[8].isSeparatorItem, "第 8 项应为分隔线")
-assertEqual(menu.items[9].action, #selector(controller.moveToTrashSelected), "第 9 项应绑定 moveToTrashSelected")
-assertEqual(menu.items[9].keyEquivalent, String(format: "%c", NSDeleteCharacter), "moveToTrashSelected 快捷键应为 Delete")
-assertEqual(menu.items[9].keyEquivalentModifierMask, [.command], "moveToTrashSelected 修饰键应为 Command")
+assertEqual(menu.items[3].action, #selector(controller.openInTerminalSelected), "第 3 项应绑定 openInTerminalSelected")
+assertEqual(menu.items[4].action, #selector(controller.showInfoSelected), "第 4 项应绑定 showInfoSelected")
+assertEqual(menu.items[4].keyEquivalent, "i", "showInfoSelected 快捷键应为 i")
+assertTrue(menu.items[5].isSeparatorItem, "第 5 项应为分隔线")
+assertEqual(menu.items[6].action, #selector(controller.copyFile), "第 6 项应绑定 copyFile")
+assertEqual(menu.items[6].keyEquivalent, "c", "copyFile 快捷键应为 c")
+assertEqual(menu.items[7].action, #selector(controller.copyPath), "第 7 项应绑定 copyPath")
+assertEqual(menu.items[8].action, #selector(controller.copyName), "第 8 项应绑定 copyName")
+assertTrue(menu.items[9].isSeparatorItem, "第 9 项应为分隔线")
+assertEqual(menu.items[10].action, #selector(controller.moveToTrashSelected), "第 10 项应绑定 moveToTrashSelected")
+assertEqual(menu.items[10].keyEquivalent, String(format: "%c", NSDeleteCharacter), "moveToTrashSelected 快捷键应为 Delete")
+assertEqual(menu.items[10].keyEquivalentModifierMask, [.command], "moveToTrashSelected 修饰键应为 Command")
 assertTrue(menu.allowsContextMenuPlugIns, "tableView.menu 必须开启 allowsContextMenuPlugIns 以由 AppKit 原生托管系统服务")
 
 // 校验菜单项可用性验证逻辑 (validateMenuItem)
 for item in menu.items where !item.isSeparatorItem {
     assertTrue(controller.validateMenuItem(item), "有选中项时上下文菜单项 \\(item.title) 应通过校验")
 }
+
+// 校验 openInTerminalSelected 单选与多选条目在终端中打开行为
+var interceptedTerminalURLs: [URL] = []
+controller.openInTerminalHandler = { urls in
+    interceptedTerminalURLs = urls
+}
+
+controller.selectFirstRow()
+interceptedTerminalURLs.removeAll()
+controller.openInTerminalSelected()
+assertEqual(interceptedTerminalURLs.map { $0.path }, ["/tmp/src/alpha.rs"], "单选条目时 openInTerminalSelected 应派发所选项路径")
+
+controller.tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+interceptedTerminalURLs.removeAll()
+controller.openInTerminalSelected()
+assertEqual(interceptedTerminalURLs.map { $0.path }, ["/tmp/src/alpha.rs", "/tmp/docs/beta.md"], "多选条目时 openInTerminalSelected 应批量派发全部选中项路径")
 
 // 校验 revealSelected 单选与多选条目在访达中高亮定位行为，以及底栏点击与面包屑定位联动
 var interceptedRevealURLs: [URL] = []

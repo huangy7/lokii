@@ -14,6 +14,9 @@ pub struct GeneralConfig {
     pub language: String,
     /// Whether to show the application icon in the macOS Dock.
     pub show_in_dock: bool,
+    /// Preferred terminal application bundle identifier (e.g. "com.googlecode.iterm2")
+    /// or absolute application bundle path. Defaults to "com.apple.Terminal".
+    pub terminal_bundle_id: String,
 }
 
 impl Default for GeneralConfig {
@@ -21,6 +24,7 @@ impl Default for GeneralConfig {
         Self {
             language: "zh-Hans".to_string(),
             show_in_dock: true,
+            terminal_bundle_id: "com.apple.Terminal".to_string(),
         }
     }
 }
@@ -502,6 +506,21 @@ toggle_window = "Cmd+Alt+F"
         let config = GeneralConfig::default();
         assert_eq!(config.language, "zh-Hans");
         assert!(config.show_in_dock);
+        assert_eq!(config.terminal_bundle_id, "com.apple.Terminal");
+    }
+
+    #[test]
+    fn test_general_config_backward_compatibility() {
+        // 边界守卫与向后兼容：验证缺失 terminal_bundle_id 键的历史配置能优雅回退至默认系统终端
+        let json_legacy = r#"{"language":"en","show_in_dock":false}"#;
+        let config_json: GeneralConfig = serde_json::from_str(json_legacy).expect("反序列化遗留 JSON 失败");
+        assert_eq!(config_json.language, "en");
+        assert!(!config_json.show_in_dock);
+        assert_eq!(config_json.terminal_bundle_id, "com.apple.Terminal");
+
+        let toml_legacy = "language = \"zh-Hans\"\nshow_in_dock = true\n";
+        let config_toml: GeneralConfig = toml::from_str(toml_legacy).expect("反序列化遗留 TOML 失败");
+        assert_eq!(config_toml.terminal_bundle_id, "com.apple.Terminal");
     }
 
     #[test]

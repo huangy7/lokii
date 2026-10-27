@@ -627,6 +627,7 @@ mod tests {
 
         assert_eq!(merged.general.language, "en");
         assert!(!merged.general.show_in_dock);
+        assert_eq!(merged.general.terminal_bundle_id, "com.apple.Terminal");
         assert_eq!(merged.index.max_results, 100);
         assert_eq!(merged.index.exclude, vec!["node_modules".to_string()]);
         assert_eq!(
@@ -634,6 +635,13 @@ mod tests {
             vec!["~/Library".to_string()],
             "未建模的 exclude_paths 必须保留"
         );
+
+        let patch_terminal = r#"{
+            "general": { "terminal_bundle_id": "com.googlecode.iterm2" }
+        }"#;
+        let merged_terminal = merge_config_patch(&base, patch_terminal).expect("patch should merge");
+        assert_eq!(merged_terminal.general.terminal_bundle_id, "com.googlecode.iterm2");
+        assert_eq!(merged_terminal.general.language, "zh-Hans");
     }
 
     /// 显式下发的空数组表示清空，必须能覆盖基底，不能被合并逻辑吞掉

@@ -45,10 +45,12 @@
 		F25F859C77AB2A06F57CC09F /* Shortcut.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E72A2DABCA6C6F23E1053A /* Shortcut.swift */; };
 		F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */; };
 		FE8E1519D288E897B2E0A137 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */; };
+		86190642C9C084AB656B26E3 /* TerminalLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37D1DCE1C1F72A5CDF32D7AC /* TerminalLauncher.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		029F8156A3FE4133E39F1024 /* ResultDirectoryTree.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultDirectoryTree.swift; sourceTree = "<group>"; };
+		37D1DCE1C1F72A5CDF32D7AC /* TerminalLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalLauncher.swift; sourceTree = "<group>"; };
 		04B808522771C196E501D47E /* ThemeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeManager.swift; sourceTree = "<group>"; };
 		0EEF1864B7BFEBFEB32B4C84 /* Lokii.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Lokii.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13527D399236306E42D34EB3 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
@@ -131,6 +133,7 @@
 				CD267E77C749892BFB3B6BFA /* SearchWindow.swift */,
 				BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */,
 				8D0F2BCF8E46E2EBC3770B95 /* SidebarTreeViewController.swift */,
+				37D1DCE1C1F72A5CDF32D7AC /* TerminalLauncher.swift */,
 				04B808522771C196E501D47E /* ThemeManager.swift */,
 				260F6214BF9ED6B99CC06647 /* KeyboardShortcuts */,
 				AC5F4C27F9F94A645F5F7458 /* Resources */,
@@ -311,6 +314,7 @@
 				FE8E1519D288E897B2E0A137 /* SettingsComponents.swift in Sources */,
 				F25F859C77AB2A06F57CC09F /* Shortcut.swift in Sources */,
 				87860C9B63B288E5747D5F5E /* SidebarTreeViewController.swift in Sources */,
+				86190642C9C084AB656B26E3 /* TerminalLauncher.swift in Sources */,
 				43E1EA3946E3F6FDE146A8EB /* ThemeManager.swift in Sources */,
 				CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */,
 				E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */,

@@ -43,6 +43,21 @@ class PreferencesViewModel: ObservableObject {
         }
     }
     
+    @Published var terminalBundleId: String = TerminalLauncher.systemTerminalBundleId {
+        didSet {
+            guard terminalBundleId != oldValue, !isLoading else { return }
+            saveGeneralConfig()
+            refreshAvailableTerminals()
+        }
+    }
+
+    @Published var availableTerminals: [TerminalAppItem] = []
+
+    /// 当前生效的终端项，供菜单标签与图标统一取值
+    var selectedTerminal: TerminalAppItem? {
+        availableTerminals.first { $0.id == terminalBundleId }
+    }
+    
     // Draft states for index configurations
     @Published var indexPaths: [String] = []
     @Published var excludePatterns: [String] = []
@@ -69,6 +84,17 @@ class PreferencesViewModel: ObservableObject {
     func updateFDAStatus() {
         self.hasFullDiskAccess = engine.hasFullDiskAccess
     }
+
+    func refreshAvailableTerminals() {
+        self.availableTerminals = TerminalLauncher.installedTerminals(selectedId: terminalBundleId)
+    }
+
+    func chooseCustomTerminal(window: NSWindow? = nil) {
+        TerminalLauncher.chooseCustomTerminal(window: window) { [weak self] item in
+            guard let self = self, let item = item else { return }
+            self.terminalBundleId = item.id
+        }
+    }
     
     func loadConfig() {
         guard let config = engine.getConfig() else { return }
@@ -79,6 +105,7 @@ class PreferencesViewModel: ObservableObject {
         self.showInDock = config.general.showInDock
         self.maxResults = config.index.maxResults
         self.language = config.general.language
+        self.terminalBundleId = config.general.terminalBundleId
         self.theme = ThemeManager.shared.currentTheme
         
         self.indexPaths = config.index.indexPaths
@@ -91,12 +118,13 @@ class PreferencesViewModel: ObservableObject {
         self.savedExcludePaths = config.index.excludePaths
         self.savedIncludeHidden = config.index.includeHidden
         isLoading = false
+        refreshAvailableTerminals()
     }
     
     private func saveGeneralConfig() {
         guard !isLoading else { return }
         _ = engine.updateConfig(LokiiConfig(
-            general: .init(language: language, showInDock: showInDock),
+            general: .init(language: language, showInDock: showInDock, terminalBundleId: terminalBundleId),
             index: .init(
                 indexPaths: savedIndexPaths,
                 exclude: savedExcludePatterns,
@@ -354,6 +382,43 @@ struct PreferencesView: View {
                 Toggle("", isOn: $viewModel.rememberPosition)
                     .toggleStyle(.switch)
                     .labelsHidden()
+            }
+            SettingsRowDivider()
+            SettingsRow(L("prefs.defaultTerminal"), description: L("prefs.defaultTerminal.description")) {
+                Menu {
+                    ForEach(viewModel.availableTerminals) { item in
+                        Button(action: {
+                            viewModel.terminalBundleId = item.id
+                        }) {
+                            HStack {
+                                Text(item.name)
+                                if viewModel.terminalBundleId == item.id {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button(action: {
+                        viewModel.chooseCustomTerminal(window: NSApp.keyWindow)
+                    }) {
+                        Text(L("prefs.defaultTerminal.chooseOther"))
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        if let selected = viewModel.selectedTerminal {
+                            Image(nsImage: selected.icon)
+                                .resizable()
+                                .frame(width: 16, height: 16)
+                            Text(selected.name)
+                        } else {
+                            Text(L("prefs.defaultTerminal"))
+                        }
+                    }
+                    .font(.system(size: 12))
+                }
+                .menuStyle(.borderedButton)
+                .fixedSize()
             }
         }
         

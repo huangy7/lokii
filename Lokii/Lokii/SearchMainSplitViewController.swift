@@ -126,11 +126,14 @@ final class SearchMainSplitViewController: NSSplitViewController {
         // 1. 同步更新左侧目录聚合树（内部会静默恢复用户先前的展开与选中路径）
         sidebarTreeViewController.updateTree(tree)
 
-        // 2. 基于左侧当前选中的目录作用域过滤全量结果集
+        // 2. 基于左侧当前选中的目录作用域过滤全量结果集，并推入中间虚拟列表渲染
         let activePrefix = sidebarTreeViewController.selectedPath
-        let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: activePrefix)
+        displayResults(byDirectoryPrefix: activePrefix)
+    }
 
-        // 3. 推入中间虚拟列表渲染，重置选区
+    /// 按目录作用域裁剪全量结果并刷新主列表，供首轮渲染、侧边栏选择与面包屑过滤共用
+    private func displayResults(byDirectoryPrefix path: String?) {
+        let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
         searchResultsViewController.displayResults(filtered, preserveSelection: false)
     }
 
@@ -147,8 +150,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
         sidebarTreeViewController.selectDirectory(path: path)
 
         // 3. 核心兜底过滤：无论该路径是否在单链压缩折叠段中，强制执行全量结果集前缀裁剪
-        let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
-        searchResultsViewController.displayResults(filtered, preserveSelection: false)
+        displayResults(byDirectoryPrefix: path)
     }
 
     // MARK: - Notifications & Localization
@@ -164,8 +166,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
 extension SearchMainSplitViewController: SidebarTreeViewControllerDelegate {
     func sidebarDidSelectDirectory(path: String?) {
         guard !isUpdatingSearchResults else { return }
-        let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
-        searchResultsViewController.displayResults(filtered, preserveSelection: false)
+        displayResults(byDirectoryPrefix: path)
     }
 }
 

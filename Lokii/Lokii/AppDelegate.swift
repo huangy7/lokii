@@ -23,17 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy((config?.general.showInDock ?? true) ? .regular : .accessory)
 
         // 注册应用支持向系统“服务（Services）”导出的数据类型
-        NSApp.registerServicesMenuSendTypes([
-            .fileURL,
-            NSPasteboard.PasteboardType("NSFilenamesPboardType"),
-            .string,
-            NSPasteboard.PasteboardType("public.plain-text"),
-            NSPasteboard.PasteboardType("public.directory"),
-            NSPasteboard.PasteboardType("public.folder"),
-            NSPasteboard.PasteboardType("public.item"),
-            NSPasteboard.PasteboardType("public.data"),
-            NSPasteboard.PasteboardType("com.apple.resolvable"),
-        ], returnTypes: [])
+        NSApp.registerServicesMenuSendTypes(Array(ServicesPasteboard.allTypes), returnTypes: [])
 
         setupStatusItem()
         setupMainMenu()
