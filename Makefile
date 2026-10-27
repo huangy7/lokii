@@ -47,6 +47,7 @@ test: bindings
 	@swift tests/filter_query_sync_coordinator_test.swift
 	@swift tests/filter_popover_view_test.swift
 	@swift tests/filter_popover_controller_test.swift
+	@swift tests/breadcrumb_and_services_test.swift
 
 
 check:

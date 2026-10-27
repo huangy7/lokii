@@ -256,12 +256,141 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidRequestFocusSearchField()
     /// 检索结果条目成功移入废纸篓回调（用于联动上层容器与目录聚合树同步）
     func searchResultsDidTrashItems(paths: Set<String>)
+    /// 请求设置作用域目录过滤回调
+    func searchResultsDidRequestScopeFilter(path: String)
 }
 
 extension SearchResultsViewControllerDelegate {
     func searchResultsDidRequestRebuild() {}
     func searchResultsDidRequestFocusSearchField() {}
     func searchResultsDidTrashItems(paths: Set<String>) {}
+    func searchResultsDidRequestScopeFilter(path: String) {}
+}
+
+// MARK: - Breadcrumb Navigation & Delegation
+
+private var servicesMenuKey: UInt8 = 0
+
+extension NSApplication {
+    /// 确保 NSApp.servicesMenu 支持上下文菜单临时租约动态路由与成对恢复
+    static let swizzleServicesMenuOnce: Void = {
+        guard let originalGetter = class_getInstanceMethod(NSApplication.self, #selector(getter: NSApplication.servicesMenu)),
+              let originalSetter = class_getInstanceMethod(NSApplication.self, #selector(setter: NSApplication.servicesMenu)),
+              let swizzledGetter = class_getInstanceMethod(NSApplication.self, #selector(NSApplication.lokii_servicesMenu)),
+              let swizzledSetter = class_getInstanceMethod(NSApplication.self, #selector(NSApplication.lokii_setServicesMenu(_:))) else {
+            return
+        }
+        method_exchangeImplementations(originalGetter, swizzledGetter)
+        method_exchangeImplementations(originalSetter, swizzledSetter)
+    }()
+
+    @objc func lokii_servicesMenu() -> NSMenu? {
+        if let menu = objc_getAssociatedObject(self, &servicesMenuKey) as? NSMenu {
+            return menu
+        }
+        return self.lokii_servicesMenu()
+    }
+
+    @objc func lokii_setServicesMenu(_ menu: NSMenu?) {
+        objc_setAssociatedObject(self, &servicesMenuKey, menu, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        self.lokii_setServicesMenu(menu)
+    }
+}
+
+/// 面包屑路径导航交互代理协议
+protocol BreadcrumbPathControlDelegate: AnyObject {
+    /// 请求指定路径节点对应的上下文菜单
+    func breadcrumbPathControl(_ control: BreadcrumbPathControl, menuFor url: URL) -> NSMenu?
+}
+
+/// 面包屑上下文菜单生命周期代理：成对管理高亮节点与系统服务菜单路由
+final class BreadcrumbMenuDelegate: NSObject, NSMenuDelegate {
+    private weak var previousServicesMenu: NSMenu?
+    weak var activeComponentCell: NSPathComponentCell?
+    var onClose: (() -> Void)?
+
+    override init() {
+        super.init()
+        _ = NSApplication.swizzleServicesMenuOnce
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        previousServicesMenu = NSApp.servicesMenu
+        if let servicesItem = menu.items.first(where: {
+            $0.submenu?.title == L("search.ctx.services") ||
+            $0.representedObject as? String == "search.ctx.services"
+        }), let submenu = servicesItem.submenu {
+            NSApp.servicesMenu = submenu
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        NSApp.servicesMenu = previousServicesMenu
+        previousServicesMenu = nil
+        activeComponentCell?.isHighlighted = false
+        activeComponentCell = nil
+        let handler = onClose
+        onClose = nil
+        handler?()
+    }
+}
+
+/// 主结果列表上下文菜单生命周期代理：成对管理系统服务菜单路由
+final class ContextServicesMenuDelegate: NSObject, NSMenuDelegate {
+    private weak var previousServicesMenu: NSMenu?
+
+    override init() {
+        super.init()
+        _ = NSApplication.swizzleServicesMenuOnce
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        previousServicesMenu = NSApp.servicesMenu
+        if let servicesItem = menu.items.first(where: {
+            $0.submenu?.title == L("search.ctx.services") ||
+            $0.representedObject as? String == "search.ctx.services"
+        }), let submenu = servicesItem.submenu {
+            NSApp.servicesMenu = submenu
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        NSApp.servicesMenu = previousServicesMenu
+        previousServicesMenu = nil
+    }
+}
+
+/// 原生面包屑路径导航控件：支持组件单元格坐标精确几何命中与空白区域防穿透
+final class BreadcrumbPathControl: NSPathControl {
+    weak var actionDelegate: BreadcrumbPathControlDelegate?
+    let menuDelegate = BreadcrumbMenuDelegate()
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let location = convert(event.locationInWindow, from: nil)
+        guard let pathCell = cell as? NSPathCell else { return nil }
+
+        for componentCell in pathCell.pathComponentCells {
+            let rect = pathCell.rect(of: componentCell, withFrame: bounds, in: self)
+            if rect.contains(location), let url = componentCell.url {
+                componentCell.isHighlighted = true
+                menuDelegate.activeComponentCell = componentCell
+                guard let menu = actionDelegate?.breadcrumbPathControl(self, menuFor: url) else {
+                    componentCell.isHighlighted = false
+                    menuDelegate.activeComponentCell = nil
+                    return nil
+                }
+                menu.delegate = menuDelegate
+                return menu
+            }
+        }
+
+        // 边界守卫：点击控件内部右侧空白无组件区域时阻断默认菜单，防止事件逃逸穿透
+        return nil
+    }
 }
 
 // MARK: - SearchResultsViewController
@@ -279,7 +408,7 @@ final class SearchResultsViewController: NSViewController {
     // ── 内聚底栏核心组件 ──
     let separator = NSBox()
     let bottomBar = NSView()
-    let pathBar = NSPathControl()
+    let pathBar = BreadcrumbPathControl()
     let statusLabel = NSTextField(labelWithString: "")
     let inlineProgressIndicator: NSProgressIndicator = {
         let pi = NSProgressIndicator()
@@ -326,8 +455,19 @@ final class SearchResultsViewController: NSViewController {
         return (resultingURL as URL?) ?? url
     }
 
+    /// 注入式访达定位操作闭包，默认调用系统 NSWorkspace 接口在父级视窗选中高亮目标条目
+    var revealFilesHandler: ([URL]) -> Void = { urls in
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
     /// 注入式确认弹窗闭包，默认通过主视窗弹出原生确认 Sheet，返回用户是否确认执行
     var confirmTrashHandler: ((Int, @escaping (Bool) -> Void) -> Void)?
+
+    /// 上下文作用域租约：当面包屑弹出右键菜单时临时接管有效载荷，规避与主列表选区发生交叉错位
+    var activeContextMenuPayload: [URL]?
+
+    /// 主检索列表右键上下文菜单代理：成对维护 NSApp.servicesMenu 状态机
+    private let tableMenuDelegate = ContextServicesMenuDelegate()
 
     /// 时间与体积的展示串只取决于原始数值与当前语言，按原始值缓存以规避滚动时对每个进入视口的行重复格式化
     private var dateTextCache: [TimeInterval: String] = [:]
@@ -411,6 +551,7 @@ final class SearchResultsViewController: NSViewController {
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.pathStyle = .standard
         pathBar.isEditable = false
+        pathBar.actionDelegate = self
         pathBar.font = .systemFont(ofSize: 12)
         pathBar.backgroundColor = .clear
         pathBar.focusRingType = .none
@@ -613,6 +754,8 @@ final class SearchResultsViewController: NSViewController {
             keyEquivalent: String(format: "%c", NSDeleteCharacter)
         )
         trashItem.keyEquivalentModifierMask = [.command]
+        menu.allowsContextMenuPlugIns = true
+        menu.delegate = tableMenuDelegate
         tableView.menu = menu
     }
 
@@ -859,7 +1002,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc private func pathBarClicked() {
         if let url = pathBar.clickedPathItem?.url ?? pathBar.url {
-            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: url.path)
+            revealFilesHandler([url])
         }
     }
 
@@ -926,15 +1069,16 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc func showInfoSelected(_ sender: Any? = nil) {
-        let selected = selectedResults
-        guard !selected.isEmpty else { return }
-        // 限制并发打开的最大窗口数，避免多选场景下瞬时弹出过多视窗造成系统卡顿
-        let targets = selected.prefix(10).filter { FileManager.default.fileExists(atPath: $0.path) }
+        openFinderInfoWindow(for: selectedResults.map(\.path))
+    }
+
+    private func openFinderInfoWindow(for paths: [String]) {
+        let targets = paths.prefix(10).filter { FileManager.default.fileExists(atPath: $0) }
         guard !targets.isEmpty else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let statements = targets.map { item -> String in
-                let escaped = item.path
+            let statements = targets.map { path -> String in
+                let escaped = path
                     .replacingOccurrences(of: "\\", with: "\\\\")
                     .replacingOccurrences(of: "\"", with: "\\\"")
                 return "open information window of (POSIX file \"\(escaped)\" as alias)"
@@ -981,12 +1125,10 @@ final class SearchResultsViewController: NSViewController {
     @objc func revealSelected(_ sender: Any? = nil) {
         let selected = selectedResults
         guard !selected.isEmpty else { return }
-        if selected.count == 1 {
-            NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: selected[0].path)
-        } else {
-            let urls = selected.map { URL(fileURLWithPath: $0.path) }
-            NSWorkspace.shared.activateFileViewerSelecting(urls)
-        }
+        // 统一调用 activateFileViewerSelecting 接口，无论单选或多选、文件或文件夹，
+        // 均在父级视窗中精准定位并高亮目标项，规避 selectFile(nil, ...) 导致的直接打开文档或穿透进入文件夹缺陷
+        let urls = selected.map { URL(fileURLWithPath: $0.path) }
+        revealFilesHandler(urls)
     }
 
     @objc func moveToTrashSelected(_ sender: Any? = nil) {
@@ -1133,6 +1275,119 @@ final class SearchResultsViewController: NSViewController {
         let icon = NSWorkspace.shared.icon(forFile: path)
         iconCache.setObject(icon, forKey: path as NSString)
         return icon
+    }
+
+    // MARK: - NSServicesRequests
+
+    override func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? {
+        guard returnType == nil else {
+            return super.validRequestor(forSendType: sendType, returnType: returnType)
+        }
+        guard let sendType = sendType else {
+            return super.validRequestor(forSendType: sendType, returnType: returnType)
+        }
+
+        let directoryTypes: Set<NSPasteboard.PasteboardType> = [
+            NSPasteboard.PasteboardType("public.directory"),
+            NSPasteboard.PasteboardType("public.folder"),
+        ]
+
+        let generalSupportedTypes: Set<NSPasteboard.PasteboardType> = [
+            .fileURL,
+            NSPasteboard.PasteboardType("NSFilenamesPboardType"),
+            .string,
+            NSPasteboard.PasteboardType("public.plain-text"),
+            NSPasteboard.PasteboardType("public.item"),
+            NSPasteboard.PasteboardType("public.data"),
+            NSPasteboard.PasteboardType("com.apple.resolvable"),
+        ]
+
+        let allSupportedTypes = directoryTypes.union(generalSupportedTypes)
+        guard allSupportedTypes.contains(sendType) else {
+            return super.validRequestor(forSendType: sendType, returnType: returnType)
+        }
+
+        let hasPayload = !(activeContextMenuPayload?.isEmpty ?? true)
+        let hasSelection = !selectedResults.isEmpty
+        guard hasPayload || hasSelection else {
+            return super.validRequestor(forSendType: sendType, returnType: returnType)
+        }
+
+        // 若服务请求特定于目录容器类型，精准校验目标载荷是否包含实际目录实体
+        if directoryTypes.contains(sendType) {
+            let isTargetDirectory: Bool
+            if let payload = activeContextMenuPayload, !payload.isEmpty {
+                isTargetDirectory = payload.contains { url in
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
+                        return isDir.boolValue
+                    }
+                    return url.hasDirectoryPath || url.pathExtension.isEmpty
+                }
+            } else {
+                isTargetDirectory = selectedResults.contains { $0.isDir }
+            }
+            guard isTargetDirectory else {
+                return super.validRequestor(forSendType: sendType, returnType: returnType)
+            }
+        }
+
+        return self
+    }
+}
+
+// MARK: - NSServicesMenuRequestor
+
+extension SearchResultsViewController: NSServicesMenuRequestor {
+    @objc(writeSelectionToPasteboard:types:)
+    func writeSelection(to pboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
+        let targetURLs: [URL]
+        if let payload = activeContextMenuPayload, !payload.isEmpty {
+            targetURLs = payload
+        } else {
+            targetURLs = selectedResults.map { URL(fileURLWithPath: $0.path) }
+        }
+
+        guard !targetURLs.isEmpty else { return false }
+
+        var didWrite = false
+        pboard.clearContents()
+
+        let paths = targetURLs.map(\.path)
+        let pathString = paths.joined(separator: "\n")
+
+        let fileTypes: Set<NSPasteboard.PasteboardType> = [
+            .fileURL,
+            NSPasteboard.PasteboardType("public.directory"),
+            NSPasteboard.PasteboardType("public.folder"),
+            NSPasteboard.PasteboardType("public.item"),
+            NSPasteboard.PasteboardType("public.data"),
+            NSPasteboard.PasteboardType("com.apple.resolvable"),
+        ]
+
+        if types.contains(where: { fileTypes.contains($0) }) {
+            pboard.writeObjects(targetURLs as [NSURL])
+            didWrite = true
+        }
+
+        let filenamesType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+        if types.contains(filenamesType) {
+            pboard.setPropertyList(paths, forType: filenamesType)
+            didWrite = true
+        }
+
+        if types.contains(.string) {
+            pboard.setString(pathString, forType: .string)
+            didWrite = true
+        }
+
+        let plainTextType = NSPasteboard.PasteboardType("public.plain-text")
+        if types.contains(plainTextType) {
+            pboard.setString(pathString, forType: plainTextType)
+            didWrite = true
+        }
+
+        return didWrite
     }
 }
 
@@ -1350,6 +1605,10 @@ extension SearchResultsViewController: NSTableViewDelegate {
 
 extension SearchResultsViewController: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.representedObject as? String == "search.ctx.services" {
+            let hasPayload = !(activeContextMenuPayload?.isEmpty ?? true)
+            return hasPayload || !selectedResults.isEmpty
+        }
         switch menuItem.action {
         case #selector(openSelected),
              #selector(quickLookSelected),
@@ -1360,6 +1619,19 @@ extension SearchResultsViewController: NSMenuItemValidation {
              #selector(copyName),
              #selector(moveToTrashSelected):
             return !selectedResults.isEmpty
+        case #selector(breadcrumbRevealInFinder(_:)),
+             #selector(breadcrumbOpenItem(_:)),
+             #selector(breadcrumbOpenInTerminal(_:)),
+             #selector(breadcrumbShowInfo(_:)):
+            guard let url = menuItem.representedObject as? URL else { return false }
+            return FileManager.default.fileExists(atPath: url.path)
+        case #selector(breadcrumbFilterByDirectory(_:)):
+            guard let url = menuItem.representedObject as? URL else { return false }
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+        case #selector(breadcrumbCopyPath(_:)),
+             #selector(breadcrumbCopyName(_:)):
+            return menuItem.representedObject is URL
         default:
             return true
         }
@@ -1418,6 +1690,93 @@ extension SearchResultsViewController: QLPreviewPanelDataSource, QLPreviewPanelD
         guard let image = selectedIconImageView?.image else { return nil }
         contentRect?.pointee = NSRect(origin: .zero, size: image.size)
         return image
+    }
+}
+
+// MARK: - BreadcrumbPathControlDelegate
+
+extension SearchResultsViewController: BreadcrumbPathControlDelegate {
+    func breadcrumbPathControl(_ control: BreadcrumbPathControl, menuFor url: URL) -> NSMenu? {
+        activeContextMenuPayload = [url]
+        control.menuDelegate.onClose = { [weak self] in
+            self?.activeContextMenuPayload = nil
+        }
+
+        let menu = NSMenu()
+        menu.addLocalizedItem("search.ctx.open", action: #selector(breadcrumbOpenItem(_:)), keyEquivalent: "")
+        menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(breadcrumbRevealInFinder(_:)), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        menu.addLocalizedItem("search.ctx.copyPath", action: #selector(breadcrumbCopyPath(_:)), keyEquivalent: "")
+        menu.addLocalizedItem("search.ctx.copyName", action: #selector(breadcrumbCopyName(_:)), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        menu.addLocalizedItem("search.ctx.openInTerminal", action: #selector(breadcrumbOpenInTerminal(_:)), keyEquivalent: "")
+        menu.addLocalizedItem("search.ctx.filterByDirectory", action: #selector(breadcrumbFilterByDirectory(_:)), keyEquivalent: "")
+        menu.addLocalizedItem("search.ctx.getInfo", action: #selector(breadcrumbShowInfo(_:)), keyEquivalent: "")
+
+        for item in menu.items where !item.isSeparatorItem {
+            item.target = self
+            item.representedObject = url
+        }
+
+        menu.allowsContextMenuPlugIns = true
+        return menu
+    }
+
+    // MARK: - Breadcrumb Actions
+
+    @objc private func breadcrumbRevealInFinder(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        revealFilesHandler([url])
+    }
+
+    @objc private func breadcrumbOpenItem(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func breadcrumbCopyPath(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+    }
+
+    @objc private func breadcrumbCopyName(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.lastPathComponent, forType: .string)
+    }
+
+    @objc private func breadcrumbOpenInTerminal(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        var isDir: ObjCBool = false
+        let targetDirURL: URL
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            targetDirURL = url
+        } else {
+            targetDirURL = url.deletingLastPathComponent()
+        }
+
+        if let terminalAppURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.open([targetDirURL], withApplicationAt: terminalAppURL, configuration: configuration) { _, error in
+                if let error = error {
+                    NSLog("Failed to open Terminal: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    @objc private func breadcrumbFilterByDirectory(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        delegate?.searchResultsDidRequestScopeFilter(path: url.path)
+    }
+
+    @objc private func breadcrumbShowInfo(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        openFinderInfoWindow(for: [url.path])
     }
 }
 

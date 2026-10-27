@@ -134,6 +134,23 @@ final class SearchMainSplitViewController: NSSplitViewController {
         searchResultsViewController.displayResults(filtered, preserveSelection: false)
     }
 
+    /// 基于指定目录路径过滤检索结果，并联动更新侧边栏选中状态
+    ///
+    /// - Parameter path: 目标过滤目录路径
+    func filterByDirectory(path: String) {
+        // 1. 若侧边栏当前处于收起状态，展开以提供视觉上下文
+        if isSidebarCollapsed {
+            isSidebarCollapsed = false
+        }
+
+        // 2. 尝试在左侧目录树中高亮匹配行（若存在独立对应节点）
+        sidebarTreeViewController.selectDirectory(path: path)
+
+        // 3. 核心兜底过滤：无论该路径是否在单链压缩折叠段中，强制执行全量结果集前缀裁剪
+        let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
+        searchResultsViewController.displayResults(filtered, preserveSelection: false)
+    }
+
     // MARK: - Notifications & Localization
 
     /// 语言切换由本中介统一下发至各子栏，子栏不再各自订阅同一通知
@@ -177,5 +194,9 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
         let tree = ResultDirectoryTree.build(from: rawResults)
         sidebarTreeViewController.updateTree(tree)
         delegate?.searchMainSplitViewDidTrashItems(paths: paths, remainingCount: rawResults.count)
+    }
+
+    func searchResultsDidRequestScopeFilter(path: String) {
+        filterByDirectory(path: path)
     }
 }

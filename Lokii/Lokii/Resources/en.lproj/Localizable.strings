@@ -122,6 +122,10 @@
 "search.ctx.copyPath" = "Copy Path";
 "search.ctx.copyName" = "Copy Name";
 "search.ctx.moveToTrash" = "Move to Trash";
+"search.ctx.openInTerminal" = "Open in Terminal";
+"search.ctx.filterByDirectory" = "Filter by This Directory";
+"search.ctx.services" = "Services";
+"menu.services" = "Services";
 "search.trash.confirmTitle" = "Move %d items to Trash?";
 "search.trash.confirmMessage" = "Items moved to Trash can be restored from Finder.";
 "search.trash.confirmButton" = "Move to Trash";
