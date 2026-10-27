@@ -9,10 +9,6 @@ struct TerminalAppItem: Identifiable {
     let name: String
     /// 应用程序包物理路径 URL
     let appURL: URL
-
-    var icon: NSImage {
-        NSWorkspace.shared.icon(forFile: appURL.path)
-    }
 }
 
 /// 终端应用调度与探活中介者

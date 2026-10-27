@@ -405,17 +405,8 @@ struct PreferencesView: View {
                         Text(L("prefs.defaultTerminal.chooseOther"))
                     }
                 } label: {
-                    HStack(spacing: 6) {
-                        if let selected = viewModel.selectedTerminal {
-                            Image(nsImage: selected.icon)
-                                .resizable()
-                                .frame(width: 16, height: 16)
-                            Text(selected.name)
-                        } else {
-                            Text(L("prefs.defaultTerminal"))
-                        }
-                    }
-                    .font(.system(size: 12))
+                    Text(viewModel.selectedTerminal?.name ?? L("prefs.defaultTerminal"))
+                        .font(.system(size: 12))
                 }
                 .menuStyle(.borderedButton)
                 .fixedSize()
