@@ -10,21 +10,25 @@ struct LokiiConfig: Codable {
     struct GeneralConfig: Codable {
         var language: String
         var showInDock: Bool
+        var terminalBundleId: String
 
         enum CodingKeys: String, CodingKey {
             case language
             case showInDock = "show_in_dock"
+            case terminalBundleId = "terminal_bundle_id"
         }
 
-        init(language: String = "zh-Hans", showInDock: Bool = true) {
+        init(language: String = "zh-Hans", showInDock: Bool = true, terminalBundleId: String = "com.apple.Terminal") {
             self.language = language
             self.showInDock = showInDock
+            self.terminalBundleId = terminalBundleId
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? "zh-Hans"
             self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? true
+            self.terminalBundleId = try container.decodeIfPresent(String.self, forKey: .terminalBundleId) ?? "com.apple.Terminal"
         }
     }
 

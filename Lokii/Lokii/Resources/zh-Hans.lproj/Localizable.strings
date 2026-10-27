@@ -36,6 +36,9 @@
 "prefs.hideOnBlur.description" = "切换到其他应用后自动收起窗口，保持桌面更清爽。";
 "prefs.rememberPosition" = "记住窗口位置";
 "prefs.rememberPosition.description" = "重新打开 Lokii 时恢复到你上次摆放的位置和大小。";
+"prefs.defaultTerminal" = "默认终端";
+"prefs.defaultTerminal.description" = "指定在终端中打开目录时优先唤起的应用程序。";
+"prefs.defaultTerminal.chooseOther" = "选取其他应用...";
 
 "prefs.section.search" = "搜索";
 "prefs.maxResults" = "最大搜索结果数";

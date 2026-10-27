@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 let sourceFiles = [
     "Lokii/Lokii/L10n.swift",
     "Lokii/Lokii/LocalizedMenu.swift",
+    "Lokii/Lokii/TerminalLauncher.swift",
     "Lokii/Lokii/ResultDirectoryTree.swift",
     "Lokii/Lokii/SidebarTreeViewController.swift",
     "Lokii/Lokii/SearchResultsViewController.swift",

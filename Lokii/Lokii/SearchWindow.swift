@@ -138,6 +138,13 @@ final class SearchWindow: NSWindowController {
         searchResultsViewController.onOpenFDAGuide = {
             FDAGuideWindowController.show()
         }
+        // 终端唤起按当前配置派发，闭包在装配点注入而非依赖进程级全局状态
+        searchResultsViewController.openInTerminalHandler = { [weak engine] urls in
+            TerminalLauncher.openBatch(
+                at: urls,
+                preferredIdentifier: engine?.getConfig()?.general.terminalBundleId
+            )
+        }
         searchResultsViewController.updateFDAStatus(hasFDA: engine.hasFullDiskAccess)
         if engine.stats.isReady {
             loadDefaultResults()

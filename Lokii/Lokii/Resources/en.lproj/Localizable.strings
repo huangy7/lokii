@@ -36,6 +36,9 @@
 "prefs.hideOnBlur.description" = "Automatically hide the window when you switch to another app.";
 "prefs.rememberPosition" = "Remember window position";
 "prefs.rememberPosition.description" = "Restore the last size and position when Lokii opens again.";
+"prefs.defaultTerminal" = "Default Terminal";
+"prefs.defaultTerminal.description" = "Choose the preferred application when opening a directory in terminal.";
+"prefs.defaultTerminal.chooseOther" = "Choose Other Application...";
 
 "prefs.section.search" = "Search";
 "prefs.maxResults" = "Maximum search results";
