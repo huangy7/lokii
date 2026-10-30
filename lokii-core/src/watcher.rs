@@ -60,6 +60,8 @@ pub fn file_entry_from_path(path: &Path) -> Option<FileEntry> {
 pub struct EventBatch {
     pub creates: Vec<PathBuf>,
     pub removes: Vec<PathBuf>,
+    /// 本批次中带显式创建语义的新目录，处理时需要回扫其内容。
+    pub dir_creates: Vec<PathBuf>,
 }
 
 /// Classify raw notify events into creates and removes.
@@ -98,19 +100,26 @@ pub fn classify_events(raw: HashMap<PathBuf, Vec<EventKind>>) -> EventBatch {
         let has_create = kinds.iter().any(|k| matches!(k, EventKind::Create(_)));
         let has_remove = kinds.iter().any(|k| matches!(k, EventKind::Remove(_)));
 
-        if has_rename_from {
-            batch.removes.push(path);
+        let classified_create = if has_rename_from {
+            false
         } else if has_remove || has_rename_other || !(has_rename_to || has_create) {
             // A file still on disk was recreated within the debounce window (upsert);
             // otherwise the path is genuinely gone.
-            if path.exists() {
-                batch.creates.push(path);
-            } else {
-                batch.removes.push(path);
-            }
+            path.exists()
         } else {
-            batch.creates.push(path);
+            true
+        };
+
+        if !classified_create {
+            batch.removes.push(path);
+            continue;
         }
+        // 只有带显式创建语义的目录才是"新目录"；仅元数据变化的既有目录不触发回扫，
+        // 否则大目录上一次属性变化就会引发整棵子树的重复扫描。
+        if (has_create || has_rename_to) && path.is_dir() {
+            batch.dir_creates.push(path.clone());
+        }
+        batch.creates.push(path);
     }
     batch
 }
@@ -193,14 +202,35 @@ fn try_process_event_batch(
     for (old, new) in &renames {
         batch.removes.retain(|path| path.to_string_lossy() != *old);
         batch.creates.retain(|path| path.to_string_lossy() != *new);
+        batch
+            .dir_creates
+            .retain(|path| path.to_string_lossy() != *new);
     }
-    let creates: Vec<_> = batch
+    // DirtyQueue 会把新建目录的子项事件合并掉，目录内容只能在此处回扫补齐，
+    // 否则新建目录下的文件要等下一次全量对账才进入索引。
+    let dir_roots: Vec<PathBuf> = batch
+        .dir_creates
+        .iter()
+        .filter(|path| !filter.is_excluded(path))
+        .filter(|path| include_hidden || !is_hidden(path))
+        .cloned()
+        .collect();
+    let mut creates: Vec<_> = batch
         .creates
         .iter()
         .filter(|path| !filter.is_excluded(path))
         .filter(|path| include_hidden || !is_hidden(path))
+        .filter(|path| !dir_roots.iter().any(|root| root == *path))
         .filter_map(|path| file_entry_from_path(path))
         .collect();
+    if !dir_roots.is_empty() {
+        creates.extend(scanner::scan_directories(
+            &dir_roots,
+            Arc::new(filter.clone()),
+            include_hidden,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ));
+    }
     let remove_roots: Vec<String> = batch
         .removes
         .iter()
@@ -696,6 +726,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![file_path],
             removes: vec![],
+            dir_creates: vec![],
         };
         let (added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
         assert_eq!(added, 1);
@@ -715,6 +746,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![file_path],
             removes: vec![],
+            dir_creates: vec![],
         };
 
         let (added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
@@ -740,6 +772,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![],
             removes: vec![PathBuf::from("/tmp/old.txt")],
+            dir_creates: vec![],
         };
 
         let (added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
@@ -760,6 +793,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![file_path],
             removes: vec![],
+            dir_creates: vec![],
         };
 
         let (added, _removed) = process_event_batch(batch, &store, &dummy_filter(), true);
@@ -777,6 +811,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![file_path],
             removes: vec![],
+            dir_creates: vec![],
         };
 
         // include_hidden = false should filter out hidden files
@@ -795,6 +830,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![file_path],
             removes: vec![],
+            dir_creates: vec![],
         };
 
         // include_hidden = true should keep hidden files
@@ -854,6 +890,7 @@ mod tests {
         let batch = EventBatch {
             removes: vec![old_dir],
             creates: vec![new_dir],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -900,6 +937,7 @@ mod tests {
         let batch = EventBatch {
             removes: vec![old_dir],
             creates: vec![new_dir],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -936,6 +974,7 @@ mod tests {
         let batch = EventBatch {
             removes: vec![old_dir],
             creates: vec![new_dir],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -973,6 +1012,7 @@ mod tests {
         let batch = EventBatch {
             removes: vec![old_dir],
             creates: vec![new_dir],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -1007,6 +1047,7 @@ mod tests {
         let batch = EventBatch {
             removes: vec![old_dir],
             creates: vec![new_dir],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -1045,6 +1086,7 @@ mod tests {
         let batch = EventBatch {
             removes: vec![PathBuf::from("/tmp/old.txt")],
             creates: vec![new_file.clone()],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -1080,6 +1122,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![],
             removes: vec![PathBuf::from("/tmp/mydir")],
+            dir_creates: vec![],
         };
 
         let (_added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
@@ -1181,6 +1224,7 @@ mod tests {
         let batch = EventBatch {
             creates: vec![],
             removes: vec![PathBuf::from("/tmp/bar")],
+            dir_creates: vec![],
         };
 
         process_event_batch(batch, &store, &dummy_filter(), true);
@@ -1424,5 +1468,30 @@ mod tests {
         let (_added, removed) = process_event_batch(batch, &store, &dummy_filter(), true);
         assert_eq!(removed, 1);
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_dir_create_batch_indexes_children() {
+        // 新建目录与其子文件走同一条防抖队列时，目录事件会合并掉子项事件，
+        // 批次处理必须回扫目录内容，否则子文件要等下一次全量对账才可见。
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("bugs");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("report.md");
+        fs::write(&file, "# bug").unwrap();
+
+        let mut queue = DirtyQueue::new();
+        queue.insert(dir, EventKind::Create(CreateKind::Folder));
+        queue.insert(file.clone(), EventKind::Create(CreateKind::File));
+
+        let store = IndexStore::new();
+        let batch = classify_events(queue.take());
+        process_event_batch(batch, &store, &dummy_filter(), true);
+
+        let file_path = file.to_string_lossy().into_owned();
+        assert!(
+            store.entries().iter().any(|entry| entry.path == file_path),
+            "directory create batch must index the directory's children"
+        );
     }
 }

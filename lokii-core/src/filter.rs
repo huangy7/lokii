@@ -81,6 +81,7 @@ fn deepest_matching_depth(prefixes: &[NormalizedPrefix], path_str: &str) -> Opti
 ///
 /// All paths are normalized (tilde expanded, absolute) at construction time
 /// so the hot path does zero allocation and no canonicalization.
+#[derive(Clone)]
 pub struct CompiledFilter {
     /// Normalized include root paths from config `index_paths`.
     include_roots: Vec<NormalizedPrefix>,
