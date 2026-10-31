@@ -45,6 +45,36 @@ pub fn search_index(
     if pattern.is_empty() || max_results == 0 {
         return Vec::new();
     }
+    // 当查询为全匹配通配符 "*" 时，全局遍历所有记录并按修改时间倒序（最近活跃优先）保留 Top-K 结果，
+    // 规避首屏按文件名自然字母截断导致的最近修改文件漏显问题。
+    if pattern == "*" {
+        let mut top = super::top_k::TopK::new(max_results);
+        let records = read.records();
+        for (ordinal, record) in records.iter().enumerate() {
+            let name = read.record_name(record);
+            if !filter.matches_record(record, || Some(name)) {
+                continue;
+            }
+            top.offer(ordinal, record.modified, name);
+        }
+        return top
+            .finish()
+            .into_iter()
+            .map(|candidate| {
+                let view = read
+                    .view(crate::compact_index::EntryId(candidate.ordinal))
+                    .unwrap();
+                AdvancedSearchResult {
+                    entry: view.materialize(),
+                    score: 1.0,
+                    match_positions: Vec::new(),
+                    parent_match_positions: Vec::new(),
+                    search_mode: SearchMode::Wildcard,
+                }
+            })
+            .collect();
+    }
+
     let req = required_signature_for_glob(&pattern);
 
     // 针对纯 `*.ext` 模式（无其他通配符），直接跳过 `glob_match` 字符串自动机，做后缀字节比对
@@ -54,7 +84,6 @@ pub fn search_index(
             && rest.is_ascii()
     });
 
-    let is_match_all = pattern == "*";
     let mut ascii_buf = Vec::with_capacity(128);
     let mut top = super::top_k::TopK::new(max_results);
     let sorted = read.sorted_names();
@@ -67,9 +96,7 @@ pub fn search_index(
         let Some((name, folded)) = read.name_entry(name_id) else {
             continue;
         };
-        let matched = if is_match_all {
-            true
-        } else if let Some(ext) = simple_suffix {
+        let matched = if let Some(ext) = simple_suffix {
             let suffix_len = ext.len() + 1;
             if let Some(f) = folded {
                 f.len() >= suffix_len

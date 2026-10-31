@@ -96,22 +96,35 @@ pub(crate) fn score_match_zero_alloc(
         };
     }
     let name_bytes = name.as_bytes();
+    let mut all_match = true;
     for kw in keywords {
         if !crate::string_pool::ascii_contains_ignore_case(name_bytes, kw.as_bytes()) {
-            return None;
+            all_match = false;
+            break;
         }
     }
-    let first = keywords[0].as_bytes();
-    let score = if name.eq_ignore_ascii_case(&keywords[0]) {
-        MatchScore::Exact
-    } else if name_bytes.len() >= first.len()
-        && name_bytes[..first.len()].eq_ignore_ascii_case(first)
-    {
-        MatchScore::Prefix
-    } else {
-        MatchScore::Substring
-    };
-    Some(score)
+    if all_match {
+        let first = keywords[0].as_bytes();
+        let score = if name.eq_ignore_ascii_case(&keywords[0]) {
+            MatchScore::Exact
+        } else if name_bytes.len() >= first.len()
+            && name_bytes[..first.len()].eq_ignore_ascii_case(first)
+        {
+            MatchScore::Prefix
+        } else {
+            MatchScore::Substring
+        };
+        return Some(score);
+    }
+
+    // 若直接 ASCII 匹配失败且名字中含有非 ASCII 字符，尝试拼音全拼与首字母匹配
+    if name_bytes.iter().any(|&b| b >= 0x80) {
+        if let Some(pinyin_score) = crate::pinyin::score_pinyin_match(name, keywords) {
+            return Some(pinyin_score);
+        }
+    }
+
+    None
 }
 
 #[derive(Clone)]
@@ -177,6 +190,15 @@ impl IndexStore {
         self.entries
             .write()
             .remove_matching(|view| paths.iter().any(|path| view.path_equals(path)));
+    }
+
+    /// 批量从紧凑倒排索引中立即剔除指定排除目录树（含自身及所有子条目），并就地重整查询索引
+    pub fn exclude_paths(&self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut write = self.entries.write();
+        let _ = write.apply_event_batch(&[], paths, &[], Vec::new());
     }
 
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
@@ -623,5 +645,20 @@ mod tests {
 
         let entries = store.entries();
         assert_eq!(entries[0].name, "b.txt");
+    }
+
+    #[test]
+    fn test_exclude_paths_immediately_drops_records() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("keep.rs", "/Projects/keep.rs", false),
+            make_entry("drop1.rs", "/Downloads/sub/drop1.rs", false),
+            make_entry("drop2.rs", "/Downloads/drop2.rs", false),
+        ]);
+        assert_eq!(store.len(), 3);
+        store.exclude_paths(&["/Downloads".to_string()]);
+        assert_eq!(store.len(), 1);
+        let entries = store.entries();
+        assert_eq!(entries[0].name, "keep.rs");
     }
 }

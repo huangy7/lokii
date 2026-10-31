@@ -315,12 +315,12 @@ pub fn search_index(
                 match query.path_pattern.as_deref() {
                     Some(pat) => {
                         let target_name = split_path(pat.trim_end_matches('/')).1;
-                        find_positions(&name_lower, [target_name])
+                        find_positions(&view.name, &name_lower, [target_name])
                     }
                     None => Vec::new(),
                 }
             } else {
-                find_positions(&name_lower, query.name_terms.iter().map(String::as_str))
+                find_positions(&view.name, &name_lower, query.name_terms.iter().map(String::as_str))
             };
 
             AdvancedSearchResult {
