@@ -6,6 +6,8 @@ pub mod indexer;
 pub mod metrics;
 pub mod path_utils;
 pub mod permissions;
+pub mod pinyin;
+pub mod pinyin_data;
 pub mod scanner;
 pub mod search;
 pub mod startup;

@@ -331,6 +331,7 @@ final class BreadcrumbMenuDelegate: NSObject, NSMenuDelegate {
     private weak var previousServicesMenu: NSMenu?
     weak var activeComponentCell: NSPathComponentCell?
     var onClose: (() -> Void)?
+    var onMenuWillOpen: ((NSMenu) -> Void)?
 
     override init() {
         super.init()
@@ -338,6 +339,7 @@ final class BreadcrumbMenuDelegate: NSObject, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        onMenuWillOpen?(menu)
         previousServicesMenu = NSApp.servicesMenu
         if let servicesItem = menu.items.first(where: {
             $0.submenu?.title == L("search.ctx.services") ||
@@ -463,11 +465,20 @@ final class SearchResultsViewController: NSViewController {
         TerminalLauncher.openBatch(at: urls)
     }
 
+    /// 注入式将目录加入排除配置操作闭包
+    var onExcludeDirectory: ((String) -> Void)?
+
     /// 注入式确认弹窗闭包，默认通过主视窗弹出原生确认 Sheet，返回用户是否确认执行
     var confirmTrashHandler: ((Int, @escaping (Bool) -> Void) -> Void)?
 
     /// 上下文作用域租约：当面包屑弹出右键菜单时临时接管有效载荷，规避与主列表选区发生交叉错位
     var activeContextMenuPayload: [URL]?
+
+    // MARK: - Empty State View
+    var hasActiveSearchQuery: Bool = false
+    let emptyStateContainer = NSView()
+    let emptyIconImageView = NSImageView()
+    let emptyTitleLabel = NSTextField(labelWithString: "")
 
     /// 主检索列表右键上下文菜单代理：成对维护 NSApp.servicesMenu 状态机
     private let tableMenuDelegate = BreadcrumbMenuDelegate()
@@ -529,6 +540,28 @@ final class SearchResultsViewController: NSViewController {
 
         setupBottomBar()
 
+        emptyStateContainer.translatesAutoresizingMaskIntoConstraints = false
+        emptyStateContainer.isHidden = true
+        containerView.addSubview(emptyStateContainer)
+
+        emptyIconImageView.translatesAutoresizingMaskIntoConstraints = false
+        let iconConfig = NSImage.SymbolConfiguration(pointSize: 36, weight: .light)
+        emptyIconImageView.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
+            .withSymbolConfiguration(iconConfig)
+        emptyIconImageView.contentTintColor = .tertiaryLabelColor
+        emptyStateContainer.addSubview(emptyIconImageView)
+
+        emptyTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyTitleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        emptyTitleLabel.textColor = .secondaryLabelColor
+        emptyTitleLabel.alignment = .center
+        emptyTitleLabel.isEditable = false
+        emptyTitleLabel.isSelectable = false
+        emptyTitleLabel.drawsBackground = false
+        emptyTitleLabel.isBezeled = false
+        emptyTitleLabel.stringValue = L("search.empty.title")
+        emptyStateContainer.addSubview(emptyTitleLabel)
+
         NSLayoutConstraint.activate([
             // 顶端锚定至安全区布局辅助线，使表头与滚动视口始终对齐至窗口工具栏底缘，
             // 滚动时列表内容在表头底线处干净截断
@@ -545,6 +578,20 @@ final class SearchResultsViewController: NSViewController {
             bottomBar.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             bottomBar.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
             bottomBar.heightAnchor.constraint(equalToConstant: 28),
+
+            emptyStateContainer.centerXAnchor.constraint(equalTo: tableScrollView.centerXAnchor),
+            emptyStateContainer.centerYAnchor.constraint(equalTo: tableScrollView.centerYAnchor, constant: -16),
+            emptyStateContainer.widthAnchor.constraint(lessThanOrEqualTo: tableScrollView.widthAnchor, constant: -48),
+
+            emptyIconImageView.topAnchor.constraint(equalTo: emptyStateContainer.topAnchor),
+            emptyIconImageView.centerXAnchor.constraint(equalTo: emptyStateContainer.centerXAnchor),
+            emptyIconImageView.widthAnchor.constraint(equalToConstant: 40),
+            emptyIconImageView.heightAnchor.constraint(equalToConstant: 40),
+
+            emptyTitleLabel.topAnchor.constraint(equalTo: emptyIconImageView.bottomAnchor, constant: 12),
+            emptyTitleLabel.leadingAnchor.constraint(equalTo: emptyStateContainer.leadingAnchor),
+            emptyTitleLabel.trailingAnchor.constraint(equalTo: emptyStateContainer.trailingAnchor),
+            emptyTitleLabel.bottomAnchor.constraint(equalTo: emptyStateContainer.bottomAnchor),
         ])
 
         self.view = containerView
@@ -674,6 +721,7 @@ final class SearchResultsViewController: NSViewController {
         tableView.gridStyleMask = []
         tableView.selectionHighlightStyle = .regular
         tableView.usesAlternatingRowBackgroundColors = true
+        tableView.setDraggingSourceOperationMask([.copy, .link], forLocal: false)
         tableView.dataSource = self
         tableView.delegate = self
         tableView.doubleAction = #selector(tableDoubleClicked)
@@ -742,15 +790,26 @@ final class SearchResultsViewController: NSViewController {
     private func setupContextMenu() {
         let menu = NSMenu()
         menu.addLocalizedItem("search.ctx.open", action: #selector(openSelected), keyEquivalent: "\r")
+
+        let openWithItem = NSMenuItem(title: L("search.ctx.openWith"), action: nil, keyEquivalent: "")
+        let openWithSubmenu = NSMenu(title: L("search.ctx.openWith"))
+        openWithItem.submenu = openWithSubmenu
+        menu.addItem(openWithItem)
+
         let qlItem = menu.addLocalizedItem("search.ctx.quickLook", action: #selector(quickLookSelected), keyEquivalent: " ")
         qlItem.keyEquivalentModifierMask = []
-        menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(revealSelected), keyEquivalent: "")
+        let revealItem = menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(revealSelected), keyEquivalent: "r")
+        revealItem.keyEquivalentModifierMask = [.command]
         menu.addLocalizedItem("search.ctx.openInTerminal", action: #selector(openInTerminalSelected), keyEquivalent: "")
         menu.addLocalizedItem("search.ctx.getInfo", action: #selector(showInfoSelected), keyEquivalent: "i")
         menu.addItem(NSMenuItem.separator())
         menu.addLocalizedItem("search.ctx.copyFile", action: #selector(copyFile), keyEquivalent: "c")
-        menu.addLocalizedItem("search.ctx.copyPath", action: #selector(copyPath), keyEquivalent: "")
-        menu.addLocalizedItem("search.ctx.copyName", action: #selector(copyName), keyEquivalent: "")
+        let copyPathItem = menu.addLocalizedItem("search.ctx.copyPath", action: #selector(copyPath), keyEquivalent: "C")
+        copyPathItem.keyEquivalentModifierMask = [.command, .option]
+        let copyNameItem = menu.addLocalizedItem("search.ctx.copyName", action: #selector(copyName), keyEquivalent: "C")
+        copyNameItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(NSMenuItem.separator())
+        menu.addLocalizedItem("search.ctx.excludeDirectory", action: #selector(excludeDirectorySelected), keyEquivalent: "")
         menu.addItem(NSMenuItem.separator())
         let trashItem = menu.addLocalizedItem(
             "search.ctx.moveToTrash",
@@ -760,6 +819,9 @@ final class SearchResultsViewController: NSViewController {
         trashItem.keyEquivalentModifierMask = [.command]
         menu.allowsContextMenuPlugIns = true
         menu.delegate = tableMenuDelegate
+        tableMenuDelegate.onMenuWillOpen = { [weak self] m in
+            self?.updateOpenWithMenu(in: m)
+        }
         tableView.menu = menu
     }
 
@@ -807,6 +869,7 @@ final class SearchResultsViewController: NSViewController {
         } else {
             tableView.deselectAll(nil)
         }
+        emptyStateContainer.isHidden = !(results.isEmpty && hasActiveSearchQuery)
         notifySelectionChanged()
     }
 
@@ -977,6 +1040,7 @@ final class SearchResultsViewController: NSViewController {
             statusLabel.stringValue = L("search.backgroundRefresh")
             statusFeedbackCapsule.label.stringValue = L("search.backgroundRefresh")
         }
+        emptyTitleLabel.stringValue = L("search.empty.title")
         updateFDAButtonContent()
     }
 
@@ -1073,7 +1137,7 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc func quickLookSelected(_ sender: Any? = nil) {
-        guard selectedResult != nil else { return }
+        guard !selectedResults.isEmpty else { return }
         let panel = QLPreviewPanel.shared()
         panel?.reloadData()
         panel?.makeKeyAndOrderFront(nil)
@@ -1149,6 +1213,78 @@ final class SearchResultsViewController: NSViewController {
         guard !selected.isEmpty else { return }
         let urls = selected.map { URL(fileURLWithPath: $0.path) }
         openInTerminalHandler(urls)
+    }
+
+    /// 动态构建“打开方式”子菜单项列表
+    private func updateOpenWithMenu(in menu: NSMenu) {
+        guard let openWithItem = menu.items.first(where: {
+            $0.submenu?.title == L("search.ctx.openWith") || $0.title == L("search.ctx.openWith")
+        }), let submenu = openWithItem.submenu else { return }
+        submenu.removeAllItems()
+
+        let urls = contextualURLs
+        guard let firstURL = urls.first else {
+            openWithItem.isEnabled = false
+            return
+        }
+        openWithItem.isEnabled = true
+
+        let appURLs = NSWorkspace.shared.urlsForApplications(toOpen: firstURL)
+        let defaultAppURL = NSWorkspace.shared.urlForApplication(toOpen: firstURL)
+
+        for appURL in appURLs {
+            let appName = FileManager.default.displayName(atPath: appURL.path)
+            let item = NSMenuItem(title: appName, action: #selector(openWithApp(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = appURL
+            let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+            icon.size = NSSize(width: 16, height: 16)
+            item.image = icon
+            if let defaultURL = defaultAppURL, defaultURL.path == appURL.path {
+                item.state = .on
+            }
+            submenu.addItem(item)
+        }
+
+        if !appURLs.isEmpty {
+            submenu.addItem(NSMenuItem.separator())
+        }
+
+        let otherItem = NSMenuItem(title: L("search.ctx.openWith.other"), action: #selector(chooseOtherAppToOpen(_:)), keyEquivalent: "")
+        otherItem.target = self
+        submenu.addItem(otherItem)
+    }
+
+    @objc func openWithApp(_ sender: NSMenuItem) {
+        guard let appURL = sender.representedObject as? URL else { return }
+        let urls = contextualURLs
+        guard !urls.isEmpty else { return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.open(urls, withApplicationAt: appURL, configuration: config, completionHandler: nil)
+    }
+
+    @objc func chooseOtherAppToOpen(_ sender: Any? = nil) {
+        let urls = contextualURLs
+        guard !urls.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [UTType.application, UTType.applicationBundle]
+        panel.begin { response in
+            guard response == .OK, let appURL = panel.url else { return }
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = true
+            NSWorkspace.shared.open(urls, withApplicationAt: appURL, configuration: config, completionHandler: nil)
+        }
+    }
+
+    @objc func excludeDirectorySelected(_ sender: Any? = nil) {
+        guard let url = contextualURLs.first else { return }
+        let dirURL = TerminalLauncher.directoryURL(for: url)
+        onExcludeDirectory?(dirURL.path)
     }
 
     @objc func moveToTrashSelected(_ sender: Any? = nil) {
@@ -1385,6 +1521,11 @@ extension SearchResultsViewController: NSTableViewDataSource {
         results.count
     }
 
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard row >= 0, row < results.count else { return nil }
+        return NSURL(fileURLWithPath: results[row].path)
+    }
+
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard let descriptor = tableView.sortDescriptors.first,
               let key = descriptor.key else { return }
@@ -1525,7 +1666,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         let textField = NSTextField(labelWithString: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.font = fontCache.regular
-        textField.lineBreakMode = .byTruncatingTail
+        textField.lineBreakMode = .byTruncatingMiddle
         textField.maximumNumberOfLines = 1
         textField.cell?.wraps = false
         textField.cell?.isScrollable = false
@@ -1592,7 +1733,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
 
 extension SearchResultsViewController: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.representedObject as? String == "search.ctx.services" {
+        if menuItem.representedObject as? String == "search.ctx.services" || menuItem.hasSubmenu {
             return !contextualURLs.isEmpty
         }
         switch menuItem.action {
@@ -1604,8 +1745,11 @@ extension SearchResultsViewController: NSMenuItemValidation {
              #selector(copyFile),
              #selector(copyPath),
              #selector(copyName),
-             #selector(moveToTrashSelected):
-            return !selectedResults.isEmpty
+             #selector(moveToTrashSelected),
+             #selector(openWithApp(_:)),
+             #selector(chooseOtherAppToOpen(_:)),
+             #selector(excludeDirectorySelected(_:)):
+            return !contextualURLs.isEmpty
         case #selector(breadcrumbRevealInFinder(_:)),
              #selector(breadcrumbOpenItem(_:)),
              #selector(breadcrumbOpenInTerminal(_:)),
@@ -1629,7 +1773,7 @@ extension SearchResultsViewController: NSMenuItemValidation {
 
 extension SearchResultsViewController: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
-        selectedResult != nil
+        !selectedResults.isEmpty
     }
 
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
@@ -1643,12 +1787,13 @@ extension SearchResultsViewController: QLPreviewPanelDataSource, QLPreviewPanelD
     }
 
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        selectedResult != nil ? 1 : 0
+        selectedResults.count
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        guard let path = selectedResult?.path else { return nil }
-        return NSURL(fileURLWithPath: path)
+        let items = selectedResults
+        guard index >= 0, index < items.count else { return nil }
+        return NSURL(fileURLWithPath: items[index].path)
     }
 
     /// 当前选中项对应的文件图标视图，用作快速预览等比缩放动画的屏幕锚点与过渡位图
@@ -1805,6 +1950,12 @@ final class SearchTableView: NSTableView {
     var onMoveUpAtTop: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
+        // Escape (keyCode 53)：当焦点处于结果列表时，触发统一 Escape 分层响应
+        if event.keyCode == 53 {
+            window?.cancelOperation(nil)
+            return
+        }
+
         if event.keyCode == 49 { // Space key
             if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
                 QLPreviewPanel.shared().orderOut(nil)
@@ -1909,6 +2060,8 @@ class SearchHighlightCellView: NSTableCellView {
     var baseColor: NSColor { .labelColor }
     /// 选中态下基准字色的不透明度，突出命中字符。
     var selectedAlpha: CGFloat { 1 }
+    /// 自定段落排版样式（如截断规则），默认为空由系统按文本框设定推导
+    var paragraphStyle: NSParagraphStyle? { nil }
 
     /// 字体对象随全局排版密度动态绑定，并复用外部缓存池
     private(set) var regularFont: NSFont = NSFont.systemFont(ofSize: 13)
@@ -1969,10 +2122,15 @@ class SearchHighlightCellView: NSTableCellView {
         let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(selectedAlpha) : baseColor
         let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
 
-        let attributed = NSMutableAttributedString(string: displayString, attributes: [
+        var baseAttributes: [NSAttributedString.Key: Any] = [
             .font: regularFont,
             .foregroundColor: defaultColor,
-        ])
+        ]
+        if let style = paragraphStyle {
+            baseAttributes[.paragraphStyle] = style
+        }
+
+        let attributed = NSMutableAttributedString(string: displayString, attributes: baseAttributes)
 
         for range in displayRanges {
             attributed.addAttributes([
@@ -2016,6 +2174,16 @@ final class SearchNameTableCellView: SearchHighlightCellView {
 final class SearchPathTableCellView: SearchHighlightCellView {
     override var baseColor: NSColor { .secondaryLabelColor }
     override var selectedAlpha: CGFloat { 0.75 }
+
+    private static let middleTruncateStyle: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingMiddle
+        return style
+    }()
+
+    override var paragraphStyle: NSParagraphStyle? {
+        Self.middleTruncateStyle
+    }
 
     func configure(fullPath: String, parentMatchPositions: [FfiMatchRange]) {
         let parent = (fullPath as NSString).deletingLastPathComponent

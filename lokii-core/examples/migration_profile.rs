@@ -1,3 +1,5 @@
+use lokii_core::pinyin;
+
 #[allow(dead_code)]
 mod compact_index {
     include!("../src/compact_index.rs");

@@ -482,6 +482,23 @@ impl LokiiCore {
             return false;
         }
 
+        // 识别新增的排除目录，就地从当前内存倒排索引中立即剔除条目
+        let current_resolved: std::collections::HashSet<String> = current
+            .resolve_exclude_paths()
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let new_resolved: Vec<String> = new_config
+            .resolve_exclude_paths()
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| !current_resolved.contains(p))
+            .collect();
+
+        if !new_resolved.is_empty() {
+            self.store.exclude_paths(&new_resolved);
+        }
+
         // Sync memory directly (don't wait for file watcher)
         self.config_store.update(new_config);
         true
