@@ -18,8 +18,9 @@ output/
 *.dmg.tmp
 *.iconset/
 
-docs/*
-!docs/superpowers/
+docs/
+CLAUDE.md
+AGENTS.md
 
 # Xcode 用户状态与工作空间缓存
 xcuserdata/
