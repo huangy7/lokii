@@ -83,6 +83,18 @@ impl NameSignature {
                 let u = ch as u32;
                 if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
                     lo |= 1u64 << 52;
+                    if let Some((syllable, initial)) = crate::pinyin::char_pinyin(ch) {
+                        for b in syllable.bytes() {
+                            if b.is_ascii_lowercase() {
+                                lo |= 1u64 << (b - b'a');
+                            }
+                        }
+                        if initial.is_ascii_lowercase() {
+                            let bit = (initial as u8 - b'a') as u32;
+                            lo |= 1u64 << bit;
+                            hi |= 1u64 << bit;
+                        }
+                    }
                 } else if (0x3040..=0x30FF).contains(&u) {
                     lo |= 1u64 << 53;
                 } else if (0xAC00..=0xD7AF).contains(&u) {
@@ -177,6 +189,18 @@ impl NameSignature {
                 let u = ch as u32;
                 if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
                     lo |= 1u64 << 52;
+                    if let Some((syllable, initial)) = crate::pinyin::char_pinyin(ch) {
+                        for b in syllable.bytes() {
+                            if b.is_ascii_lowercase() {
+                                lo |= 1u64 << (b - b'a');
+                            }
+                        }
+                        if initial.is_ascii_lowercase() {
+                            let bit = (initial as u8 - b'a') as u32;
+                            lo |= 1u64 << bit;
+                            hi |= 1u64 << bit;
+                        }
+                    }
                 } else if (0x3040..=0x30FF).contains(&u) {
                     lo |= 1u64 << 53;
                 } else if (0xAC00..=0xD7AF).contains(&u) {
@@ -198,7 +222,23 @@ impl NameSignature {
 
     #[inline]
     pub fn contains(self, required: Self) -> bool {
-        (self.lo & required.lo) == required.lo && (self.hi & required.hi) == required.hi
+        if (self.lo & required.lo) == required.lo && (self.hi & required.hi) == required.hi {
+            return true;
+        }
+        // 若目标包含 CJK 文字且查询包含拉丁字母，放宽二元组与连字强约束，
+        // 校验基础字符（字母、数字、符号及脚本标记位）是否完备存在。
+        if (self.lo & (1u64 << 52)) != 0 {
+            const LETTERS_MASK: u64 = 0x3FFFFFFu64; // bits 0..25 (a..z)
+            const CHARS_MASK: u64 = (1u64 << 55) - 1; // bits 0..54 (基础字符与脚本位)
+            let req_letters = required.lo & LETTERS_MASK;
+            if req_letters != 0 {
+                let req_chars = required.lo & CHARS_MASK;
+                if (self.lo & req_chars) == req_chars {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

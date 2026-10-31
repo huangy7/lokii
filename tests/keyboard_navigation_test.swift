@@ -34,7 +34,7 @@ func assertTrue(_ condition: Bool, _ message: String = "", file: StaticString = 
     }
 }
 
-print("[1/4] 测试 LokiiWindow 核心快捷键分发 (Escape / Return / ⌘F)...")
+print("[1/5] 测试 LokiiWindow 核心快捷键分发 (Escape / Return / ⌘F / cancelOperation)...")
 let window = LokiiWindow(
     contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
     styleMask: [.titled, .closable, .resizable],
@@ -64,6 +64,11 @@ let escapeEvent = NSEvent.keyEvent(
 )!
 window.keyDown(with: escapeEvent)
 assertTrue(escapeCalled, "按下 Escape 应触发 onEscape 回调")
+
+// 验证响应者链 cancelOperation: 分发
+escapeCalled = false
+window.cancelOperation(nil)
+assertTrue(escapeCalled, "触发 cancelOperation: 应调用 onEscape 回调")
 
 let returnEvent = NSEvent.keyEvent(
     with: .keyDown,
@@ -112,13 +117,31 @@ let bareFEvent = NSEvent.keyEvent(
 window.keyDown(with: bareFEvent)
 assertTrue(!commandFCalled, "无修饰键按下 'f' 不应触发 onCommandF 回调")
 
-print("[2/4] 测试搜索框 Field Editor 语义命令解析 (moveDown: 触发时机与边界守卫)...")
+print("[2/5] 测试搜索框 Field Editor 语义命令解析 (moveDown 与 cancelOperation 触发时机与边界守卫)...")
 
 class MockSearchFieldDelegate: NSObject, NSSearchFieldDelegate {
     var hasResults = true
     var didFocusResults = false
+    var didHandleEscape = false
+    var didClearQuery = false
+    weak var mockSearchField: NSSearchField?
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            if textView.hasMarkedText() {
+                return false
+            }
+            let length = (textView.string as NSString).length
+            if length == 0 {
+                didHandleEscape = true
+                return true
+            } else {
+                didClearQuery = true
+                mockSearchField?.stringValue = ""
+                textView.string = ""
+                return true
+            }
+        }
         if commandSelector == #selector(NSResponder.moveDown(_:)) {
             let length = (textView.string as NSString).length
             if textView.selectedRange.length == 0 && textView.selectedRange.location == length {
@@ -134,6 +157,7 @@ class MockSearchFieldDelegate: NSObject, NSSearchFieldDelegate {
 
 let delegate = MockSearchFieldDelegate()
 let searchField = NSSearchField()
+delegate.mockSearchField = searchField
 searchField.delegate = delegate
 let dummyWindow = NSWindow()
 dummyWindow.contentView?.addSubview(searchField)
@@ -185,11 +209,31 @@ delegate.didFocusResults = false
 let handledNoResults = delegate.control(searchField, textView: editor, doCommandBy: #selector(NSResponder.moveDown(_:)))
 assertTrue(!handledNoResults, "结果集为空时不应拦截 ↓ 动作")
 
-// 场景 F: 其他语义命令 (如 moveUp: 或 insertNewline:) -> 预期不拦截 (返回 false)
+// 场景 F: 输入框有内容时按下 Escape (cancelOperation) -> 应清空文本并消费动作
+editor.string = "lokii search"
+searchField.stringValue = "lokii search"
+delegate.didClearQuery = false
+delegate.didHandleEscape = false
+let handledCancelWithText = delegate.control(searchField, textView: editor, doCommandBy: #selector(NSResponder.cancelOperation(_:)))
+assertTrue(handledCancelWithText, "输入框有内容时按下 Escape 应拦截并消费")
+assertTrue(delegate.didClearQuery, "输入框有内容时按下 Escape 应清空检索输入")
+assertTrue(!delegate.didHandleEscape, "输入框有内容时按下 Escape 不应立即触发窗口退出")
+assertEqual(searchField.stringValue, "", "输入框 stringValue 应被重置为空")
+
+// 场景 G: 输入框为空时按下 Escape (cancelOperation) -> 应触发窗口关闭回调
+editor.string = ""
+searchField.stringValue = ""
+delegate.didClearQuery = false
+delegate.didHandleEscape = false
+let handledCancelEmpty = delegate.control(searchField, textView: editor, doCommandBy: #selector(NSResponder.cancelOperation(_:)))
+assertTrue(handledCancelEmpty, "输入框为空时按下 Escape 应拦截并消费")
+assertTrue(delegate.didHandleEscape, "输入框为空时按下 Escape 应触发窗口退出回调")
+
+// 场景 H: 其他语义命令 (如 moveUp: 或 insertNewline:) -> 预期不拦截 (返回 false)
 let handledMoveUp = delegate.control(searchField, textView: editor, doCommandBy: #selector(NSResponder.moveUp(_:)))
 assertTrue(!handledMoveUp, "moveUp: 命令不应被搜索框拦截处理")
 
-print("[3/4] 测试搜索框回焦与光标末尾定位机制 (focusSearchField)...")
+print("[3/5] 测试搜索框回焦与光标末尾定位机制 (focusSearchField)...")
 func testFocusSearchField(in window: NSWindow, searchField: NSSearchField) {
     window.makeFirstResponder(searchField)
     if let fieldEditor = searchField.currentEditor() {
@@ -204,7 +248,7 @@ assertEqual(dummyWindow.firstResponder === editor, true, "搜索框应成为第�
 assertEqual(editor.selectedRange.location, 10, "光标位置应严格定位于字符串末尾 (location = 10)")
 assertEqual(editor.selectedRange.length, 0, "光标选区长度应为 0")
 
-print("[4/4] 测试端到端键盘上下移动双向焦点闭环联动...")
+print("[4/5] 测试端到端键盘上下移动双向焦点闭环联动...")
 var currentFocus: String = "searchField"
 var tableSelectedRow: Int = 0
 
@@ -221,7 +265,55 @@ if currentFocus == "tableView" && tableSelectedRow <= 0 {
 }
 assertEqual(currentFocus, "searchField", "首行上移应将焦点交还搜索输入框")
 
-print("测试全部通过：4/4 组断言成功。")
+print("[5/5] 测试统一 Esc 快捷键分层响应契约 (handleEscape)...")
+var mockPopoverOpen = false
+var mockPreviewOpen = false
+var mockQuery = ""
+var mockWindowHidden = false
+
+func testHandleEscape() {
+    if mockPreviewOpen {
+        mockPreviewOpen = false
+        return
+    }
+    if mockPopoverOpen {
+        mockPopoverOpen = false
+        return
+    }
+    if !mockQuery.isEmpty {
+        mockQuery = ""
+        return
+    }
+    mockWindowHidden = true
+}
+
+// 场景 1：预览面板展开时按下 Escape -> 优先关闭预览面板
+mockPreviewOpen = true
+mockPopoverOpen = true
+mockQuery = "test"
+mockWindowHidden = false
+testHandleEscape()
+assertTrue(!mockPreviewOpen, "应优先关闭预览面板")
+assertTrue(mockPopoverOpen, "浮层仍应保持展开")
+assertEqual(mockQuery, "test", "查询词不应被修改")
+assertTrue(!mockWindowHidden, "视窗不应隐藏")
+
+// 场景 2：过滤浮层展开时按下 Escape -> 优先关闭过滤浮层
+testHandleEscape()
+assertTrue(!mockPopoverOpen, "应优先关闭过滤浮层")
+assertEqual(mockQuery, "test", "查询词不应被修改")
+assertTrue(!mockWindowHidden, "视窗不应隐藏")
+
+// 场景 3：输入框有内容时按下 Escape -> 清空输入框
+testHandleEscape()
+assertEqual(mockQuery, "", "查询词应被清空")
+assertTrue(!mockWindowHidden, "视窗不应隐藏")
+
+// 场景 4：输入框已为空时按下 Escape -> 隐藏视窗
+testHandleEscape()
+assertTrue(mockWindowHidden, "输入框为空时按下 Escape 应隐藏视窗")
+
+print("测试全部通过：5/5 组断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

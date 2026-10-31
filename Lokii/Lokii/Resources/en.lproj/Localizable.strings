@@ -115,9 +115,19 @@
 "search.matchedCount.one" = "1 match";
 "search.statusWithMatches" = "%1$@ | %2$@";
 "search.indexReady" = "Index ready";
+"search.empty.title" = "No Matching Files";
+"search.empty.subtitle" = "Check spelling, try fuzzy matching, or press ⌥F to adjust filters";
+"search.toolbar.pin" = "Pin Window";
+"search.history.title" = "Recent Searches";
+"search.history.clear" = "Clear Search History";
+"prefs.launchAtLogin" = "Launch at Login";
+"prefs.launchAtLogin.description" = "Automatically start Lokii silently when logging in to macOS";
 
 /* SearchWindow - context menu */
 "search.ctx.open" = "Open";
+"search.ctx.openWith" = "Open With";
+"search.ctx.openWith.other" = "Other...";
+"search.ctx.excludeDirectory" = "Exclude Directory";
 "search.ctx.quickLook" = "Quick Look";
 "search.ctx.revealInFinder" = "Reveal in Finder";
 "search.ctx.getInfo" = "Get Info";

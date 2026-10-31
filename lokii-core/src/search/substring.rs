@@ -153,6 +153,7 @@ pub fn search_index(
                     Vec::new()
                 } else {
                     find_positions(
+                        &view.name,
                         &view.name.to_lowercase(),
                         keywords.iter().map(String::as_str),
                     )

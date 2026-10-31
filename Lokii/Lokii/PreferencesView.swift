@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
 // MARK: - Preferences ViewModel
 class PreferencesViewModel: ObservableObject {
@@ -72,6 +73,12 @@ class PreferencesViewModel: ObservableObject {
     
     @Published var hasFullDiskAccess: Bool = false
     @Published var selectedTab: String = "general"
+    @Published var launchAtLogin: Bool = false {
+        didSet {
+            guard !isLoading, launchAtLogin != oldValue else { return }
+            setLaunchAtLogin(enabled: launchAtLogin)
+        }
+    }
     
     private var isLoading = false
     
@@ -79,6 +86,33 @@ class PreferencesViewModel: ObservableObject {
         self.engine = engine
         loadConfig()
         updateFDAStatus()
+        refreshLaunchAtLoginStatus()
+    }
+    
+    func refreshLaunchAtLoginStatus() {
+        if #available(macOS 13.0, *) {
+            let wasLoading = isLoading
+            isLoading = true
+            defer { isLoading = wasLoading }
+            self.launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
+    }
+
+    private func setLaunchAtLogin(enabled: Bool) {
+        if #available(macOS 13.0, *) {
+            do {
+                if enabled {
+                    if SMAppService.mainApp.status == .enabled { return }
+                    try SMAppService.mainApp.register()
+                } else {
+                    if SMAppService.mainApp.status == .notFound { return }
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                NSLog("Failed to update SMAppService launch at login: \(error.localizedDescription)")
+                refreshLaunchAtLoginStatus()
+            }
+        }
     }
     
     func updateFDAStatus() {
@@ -148,6 +182,15 @@ class PreferencesViewModel: ObservableObject {
     
     func saveIndexChanges() -> Bool {
         guard var config = engine.getConfig() else { return false }
+        // 判定是否需要触发后台重建索引：
+        // 当仅向 excludePaths 追加新排除目录时，内核可就地毫秒级直接剔除记录，无需全量重扫；
+        // 其余任何变更（取消排除目录、变更索引根路径、切换隐藏文件开关、变更排除通配模式）均需触发后台重建以重新录入文件。
+        let onlyAddedExcludePaths = (indexPaths == savedIndexPaths) &&
+                                    (includeHidden == savedIncludeHidden) &&
+                                    (excludePatterns == savedExcludePatterns) &&
+                                    (savedExcludePaths.allSatisfy { excludePaths.contains($0) })
+        let needsRebuild = isIndexDirty && !onlyAddedExcludePaths
+
         config.index.indexPaths = indexPaths
         config.index.exclude = excludePatterns
         config.index.excludePaths = excludePaths
@@ -159,6 +202,9 @@ class PreferencesViewModel: ObservableObject {
             savedExcludePatterns = excludePatterns
             savedExcludePaths = excludePaths
             savedIncludeHidden = includeHidden
+            if needsRebuild {
+                engine.rebuildIndex()
+            }
         }
         return success
     }
@@ -343,6 +389,7 @@ struct PreferencesView: View {
             .frame(minWidth: 580, idealWidth: 620, minHeight: 480, idealHeight: 520)
             .onAppear {
                 viewModel.updateFDAStatus()
+                viewModel.refreshLaunchAtLoginStatus()
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 viewModel.updateFDAStatus()
@@ -380,6 +427,12 @@ struct PreferencesView: View {
             SettingsRowDivider()
             SettingsRow(L("prefs.rememberPosition"), description: L("prefs.rememberPosition.description")) {
                 Toggle("", isOn: $viewModel.rememberPosition)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            SettingsRowDivider()
+            SettingsRow(L("prefs.launchAtLogin"), description: L("prefs.launchAtLogin.description")) {
+                Toggle("", isOn: $viewModel.launchAtLogin)
                     .toggleStyle(.switch)
                     .labelsHidden()
             }

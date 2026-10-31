@@ -201,7 +201,13 @@ final class SearchEngine: @unchecked Sendable {
     func updateConfig(_ config: LokiiConfig) -> Bool {
         guard let data = try? JSONEncoder().encode(config),
               let json = String(data: data, encoding: .utf8) else { return false }
-        return core.updateConfigFromJson(json: json)
+        let success = core.updateConfigFromJson(json: json)
+        if success {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: Self.configReloadedNotification, object: nil)
+            }
+        }
+        return success
     }
 }
 

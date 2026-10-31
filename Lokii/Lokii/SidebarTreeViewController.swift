@@ -375,6 +375,14 @@ final class SidebarOutlineView: NSOutlineView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         return true
     }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            window?.cancelOperation(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
 }
 
 // MARK: - SidebarTreeCellView

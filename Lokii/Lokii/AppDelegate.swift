@@ -57,6 +57,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if FDAGuideWindowController.isPresenting {
             return
         }
+        if mainWindow?.isPinned == true {
+            return
+        }
         guard engine.getConfig()?.window.hideOnBlur ?? true else { return }
         mainWindow?.window?.orderOut(nil)
     }

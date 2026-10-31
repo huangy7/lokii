@@ -18,20 +18,33 @@ use serde::Serialize;
 
 use top_k::{Candidate, TopK};
 
-/// 计算各关键词在 `name_lower` 中的字节区间，供前端高亮。
+/// 计算各关键词在 `name` 或拼音转写中的字节区间，供前端高亮。
+/// 支持混合查询（如部分关键词直接命中，另一部分关键词通过拼音匹配命中）。
 pub(crate) fn find_positions<'a>(
+    name: &str,
     name_lower: &str,
     keywords: impl IntoIterator<Item = &'a str>,
 ) -> Vec<(usize, usize)> {
     let mut positions = Vec::new();
-    for keyword in keywords {
-        if keyword.is_empty() {
-            continue;
-        }
+    let kw_list: Vec<&'a str> = keywords.into_iter().filter(|k| !k.is_empty()).collect();
+    let mut unmatched_keywords = Vec::new();
+
+    for &keyword in &kw_list {
         if let Some(start) = name_lower.find(keyword) {
             positions.push((start, start + keyword.len()));
+        } else {
+            unmatched_keywords.push(keyword);
         }
     }
+
+    if !unmatched_keywords.is_empty() && name.as_bytes().iter().any(|&b| b >= 0x80) {
+        let kw_strings: Vec<String> = unmatched_keywords.iter().map(|s| s.to_string()).collect();
+        let pinyin_pos = crate::pinyin::find_pinyin_positions(name, &kw_strings);
+        positions.extend(pinyin_pos);
+    }
+
+    positions.sort_by_key(|&(s, e)| (s, e));
+    positions.dedup();
     positions
 }
 

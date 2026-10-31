@@ -115,9 +115,19 @@
 "search.matchedCount.one" = "已匹配 1 项";
 "search.statusWithMatches" = "%1$@ | %2$@";
 "search.indexReady" = "索引已就绪";
+"search.empty.title" = "未找到匹配项";
+"search.empty.subtitle" = "请检查拼写、尝试使用模糊匹配模式，或按 ⌥F 调整过滤条件";
+"search.toolbar.pin" = "置顶视窗";
+"search.history.title" = "最近搜索";
+"search.history.clear" = "清除搜索历史";
+"prefs.launchAtLogin" = "登录时自动启动";
+"prefs.launchAtLogin.description" = "开机或登录 macOS 时在后台静默启动 Lokii";
 
 /* SearchWindow - context menu */
 "search.ctx.open" = "打开";
+"search.ctx.openWith" = "打开方式";
+"search.ctx.openWith.other" = "其他...";
+"search.ctx.excludeDirectory" = "忽略此目录";
 "search.ctx.quickLook" = "快速查看";
 "search.ctx.revealInFinder" = "在访达中显示";
 "search.ctx.getInfo" = "显示简介";

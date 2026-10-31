@@ -32,27 +32,50 @@ final class SearchWindow: NSWindowController {
         Self.calculateDefaultWindowFrame()
     }
 
-    /// 基于当前主屏幕可用工作区几何尺寸，按黄金视觉比例自适应计算默认尺寸与居中位置
-    static func calculateDefaultWindowFrame() -> NSRect {
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+    /// 基于指定或当前主屏幕可用工作区几何尺寸，按黄金视觉比例自适应计算默认尺寸与居中位置
+    static func calculateDefaultWindowFrame(on targetScreen: NSScreen? = nil) -> NSRect {
+        guard let screen = targetScreen ?? NSScreen.main ?? NSScreen.screens.first else {
             return NSRect(x: 0, y: 0, width: 960, height: 640)
         }
         let visible = screen.visibleFrame
-        // 宽度取可见屏幕宽度的 60%，钳制在 [960, 1280] pt
-        let width = min(max(visible.width * 0.60, 960), 1280)
-        // 高度取可见屏幕高度的 62%，钳制在 [600, 860] pt
-        let height = min(max(visible.height * 0.62, 600), 860)
+        // 宽度取可见屏幕宽度的 60%，钳制在 [960, 1280] pt（不超过可用屏幕宽度）
+        let rawWidth = min(max(visible.width * 0.60, 960), 1280)
+        let finalWidth = min(rawWidth, visible.width)
+        // 高度取可见屏幕高度的 62%，钳制在 [600, 860] pt（不超过可用屏幕高度）
+        let rawHeight = min(max(visible.height * 0.62, 600), 860)
+        let finalHeight = min(rawHeight, visible.height)
 
-        // 水平居中，垂直方向位于视窗黄金中心（屏幕中心微偏上 5% 屏幕高度）
-        let x = visible.origin.x + (visible.width - width) / 2
-        let y = visible.origin.y + (visible.height - height) / 2 + (visible.height * 0.05)
-        return NSRect(x: round(x), y: round(y), width: round(width), height: round(height))
+        // 水平居中，垂直方向位于视窗黄金中心（屏幕中心微偏上 5% 屏幕高度）并钳制在工作区内
+        let x = visible.origin.x + (visible.width - finalWidth) / 2
+        let targetY = visible.origin.y + (visible.height - finalHeight) / 2 + (visible.height * 0.05)
+        let y = min(max(targetY, visible.origin.y), visible.maxY - finalHeight)
+        return NSRect(x: round(x), y: round(y), width: round(finalWidth), height: round(finalHeight))
     }
 
     private let savedWindowFrameKey = "LokiiMainWindowFrame"
     let splitViewController = SearchMainSplitViewController()
     var searchResultsViewController: SearchResultsViewController { splitViewController.searchResultsViewController }
     var sidebarTreeViewController: SidebarTreeViewController { splitViewController.sidebarTreeViewController }
+
+    // MARK: - Pin State & Window Level
+    private(set) var isPinned: Bool = false
+    private let pinButton = NSButton()
+
+    @objc func togglePin() {
+        isPinned.toggle()
+        guard let window = window else { return }
+        window.level = isPinned ? .floating : .normal
+        updatePinButtonState()
+    }
+
+    private func updatePinButtonState() {
+        let symbolName = isPinned ? "pin.fill" : "pin"
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: isPinned ? .semibold : .regular)
+        pinButton.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: L("search.toolbar.pin"))?
+            .withSymbolConfiguration(config)
+        pinButton.contentTintColor = isPinned ? .controlAccentColor : .secondaryLabelColor
+        pinButton.toolTip = L("search.toolbar.pin")
+    }
 
     private var searchField: NSSearchField!
     private let searchContainer = NSView()
@@ -108,12 +131,7 @@ final class SearchWindow: NSWindowController {
         window.contentViewController = splitViewController
 
         window.onEscape = { [weak self] in
-            guard let self = self else { return }
-            if self.filterPopoverController.isShown {
-                self.filterPopoverController.close()
-                return
-            }
-            self.hideWindowWithAnimation()
+            self?.handleEscape()
         }
         window.onReturn = { [weak self] in
             self?.openSelected()
@@ -124,6 +142,9 @@ final class SearchWindow: NSWindowController {
         window.onOptionF = { [weak self] in
             guard let self = self else { return }
             self.filterPopoverController.toggle(relativeTo: self.filterButton)
+        }
+        window.onCommandP = { [weak self] in
+            self?.togglePin()
         }
 
         setupUI()
@@ -137,6 +158,20 @@ final class SearchWindow: NSWindowController {
 
         searchResultsViewController.onOpenFDAGuide = {
             FDAGuideWindowController.show()
+        }
+        searchResultsViewController.onExcludeDirectory = { [weak self, weak engine] dirPath in
+            guard let self = self, let engine = engine else { return }
+            guard var config = engine.getConfig() else { return }
+            if !config.index.excludePaths.contains(dirPath) {
+                config.index.excludePaths.append(dirPath)
+                _ = engine.updateConfig(config)
+                let currentQuery = self.searchField.stringValue
+                if currentQuery.isEmpty {
+                    self.loadDefaultResults()
+                } else {
+                    self.performSearch(query: currentQuery)
+                }
+            }
         }
         // 终端唤起按当前配置派发，闭包在装配点注入而非依赖进程级全局状态
         searchResultsViewController.openInTerminalHandler = { [weak engine] urls in
@@ -168,6 +203,13 @@ final class SearchWindow: NSWindowController {
         
         let isFirstAppear = !window.isVisible
         if isFirstAppear {
+            let mouseLoc = NSEvent.mouseLocation
+            let mouseScreen = NSScreen.screens.first { NSMouseInRect(mouseLoc, $0.frame, false) }
+            if let targetScreen = mouseScreen, targetScreen != window.screen {
+                let newFrame = Self.calculateDefaultWindowFrame(on: targetScreen)
+                window.setFrame(newFrame, display: false)
+            }
+
             window.alphaValue = 0.0
             if let layer = window.contentView?.layer {
                 let center = CGPoint(x: layer.bounds.midX, y: layer.bounds.midY)
@@ -183,6 +225,9 @@ final class SearchWindow: NSWindowController {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeFirstResponder(searchField)
+        if let editor = searchField.currentEditor() {
+            editor.selectAll(nil)
+        }
         
         if isFirstAppear {
             // Quick fade in
@@ -311,7 +356,42 @@ final class SearchWindow: NSWindowController {
         window?.toolbar = toolbar
     }
 
-    // MARK: - Search Mode Menu (on the magnifying glass)
+    // MARK: - Search Mode Menu & Recent Searches (on the magnifying glass)
+
+    private let recentSearchesKey = "LokiiRecentSearches"
+    private var recentSearches: [String] {
+        get { Array((UserDefaults.standard.stringArray(forKey: recentSearchesKey) ?? []).prefix(5)) }
+        set { UserDefaults.standard.set(Array(newValue.prefix(5)), forKey: recentSearchesKey) }
+    }
+
+    private func recordSearchQuery(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return }
+        var current = recentSearches
+        current.removeAll { item in
+            item.caseInsensitiveCompare(trimmed) == .orderedSame ||
+            trimmed.hasPrefix(item) ||
+            item.hasPrefix(trimmed)
+        }
+        current.insert(trimmed, at: 0)
+        if current.count > 5 {
+            current = Array(current.prefix(5))
+        }
+        recentSearches = current
+        setupSearchModeMenu()
+    }
+
+    @objc private func recentSearchSelected(_ sender: NSMenuItem) {
+        guard let query = sender.representedObject as? String else { return }
+        searchField.stringValue = query
+        focusSearchField()
+        performSearch(query: query)
+    }
+
+    @objc private func clearRecentSearches() {
+        recentSearches = []
+        setupSearchModeMenu()
+    }
 
     private func setupSearchModeMenu() {
         let menu = NSMenu(title: L("search.mode.title"))
@@ -327,6 +407,29 @@ final class SearchWindow: NSWindowController {
             item.target = self
             item.tag = i
             menu.addItem(item)
+        }
+
+        let history = recentSearches
+        if !history.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+            let headerItem = NSMenuItem(title: L("search.history.title"), action: nil, keyEquivalent: "")
+            headerItem.isEnabled = false
+            headerItem.tag = -1
+            menu.addItem(headerItem)
+
+            for query in history {
+                let item = NSMenuItem(title: query, action: #selector(recentSearchSelected(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = query
+                item.tag = -1
+                menu.addItem(item)
+            }
+
+            menu.addItem(NSMenuItem.separator())
+            let clearItem = NSMenuItem(title: L("search.history.clear"), action: #selector(clearRecentSearches), keyEquivalent: "")
+            clearItem.target = self
+            clearItem.tag = -1
+            menu.addItem(clearItem)
         }
 
         (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate = menu
@@ -415,6 +518,11 @@ final class SearchWindow: NSWindowController {
                 } else if item.itemIdentifier == .searchField {
                     item.label = L("search.placeholder")
                     item.paletteLabel = L("search.placeholder")
+                } else if item.itemIdentifier == .pinWindow {
+                    item.label = L("search.toolbar.pin")
+                    item.paletteLabel = L("search.toolbar.pin")
+                    item.toolTip = L("search.toolbar.pin")
+                    updatePinButtonState()
                 } else if item.itemIdentifier == .resetWindowSize {
                     item.label = L("window.viewOptions")
                     item.paletteLabel = L("window.viewOptions")
@@ -499,8 +607,11 @@ final class SearchWindow: NSWindowController {
         searchResultsViewController.setRebuildEnabled(true)
         searchResultsViewController.updateFDAStatus(hasFDA: engine.hasFullDiskAccess)
         indexingState = .idle
-        if searchField.stringValue.isEmpty {
+        let currentText = searchField.stringValue
+        if currentText.isEmpty {
             loadDefaultResults()
+        } else {
+            performSearch(query: currentText)
         }
     }
 
@@ -549,6 +660,12 @@ final class SearchWindow: NSWindowController {
     @objc private func onConfigReloaded(_ note: Notification) {
         reloadWindowBehavior()
         applyWindowBehaviorFromConfig()
+        let currentQuery = searchField.stringValue
+        if currentQuery.isEmpty {
+            loadDefaultResults()
+        } else {
+            performSearch(query: currentQuery)
+        }
     }
 
     // MARK: - Window Behavior
@@ -769,9 +886,14 @@ final class SearchWindow: NSWindowController {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.engine.search(query: "*", mode: .wildcard)
-            // 按文件名自然字母顺序（A-Z）排列，并清除匹配范围（默认未检索状态下不施加高亮）
+            // 默认未检索状态下按修改时间倒序排列（最近活跃优先），时间相同时按文件名自然字母顺序排列
             let items: [FfiSearchResult] = response.results
-                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                .sorted {
+                    if $0.modified != $1.modified {
+                        return $0.modified > $1.modified
+                    }
+                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                }
                 .map { item in
                     FfiSearchResult(
                         name: item.name,
@@ -801,6 +923,7 @@ final class SearchWindow: NSWindowController {
                     self.performSearch(query: currentText)
                     return
                 }
+                self.searchResultsViewController.hasActiveSearchQuery = false
                 self.splitViewController.updateSearchResults(rawResults: items, tree: tree)
                 self.searchMatchText = nil
                 self.updateStatusLabel()
@@ -822,6 +945,7 @@ final class SearchWindow: NSWindowController {
             DispatchQueue.main.async {
                 self.isSearching = false
                 guard self.indexingState != .failed else { return }
+                self.searchResultsViewController.hasActiveSearchQuery = !query.isEmpty
                 self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
                 self.syncSearchMenuState()
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
@@ -862,6 +986,10 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func openSelected() {
+        let currentQuery = searchField.stringValue
+        if !currentQuery.isEmpty {
+            recordSearchQuery(currentQuery)
+        }
         let selected = selectedResults
         guard !selected.isEmpty else { return }
         for item in selected {
@@ -933,6 +1061,30 @@ final class SearchWindow: NSWindowController {
 
     // MARK: - Focus Management
 
+    /// 统一 Esc (Escape) 键分层响应机制：
+    /// 1. 若当前开启了快速预览（Quick Look），优先关闭预览面板；
+    /// 2. 若展开了过滤气泡浮层，优先关闭气泡浮层；
+    /// 3. 若搜索输入框存在文本，清空输入框并重置回默认排序结果集，同时聚焦输入框；
+    /// 4. 若搜索输入框为空，触发窗口退出微动效并隐藏视窗。
+    func handleEscape() {
+        if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
+            QLPreviewPanel.shared().orderOut(nil)
+            return
+        }
+        if self.filterPopoverController.isShown {
+            self.filterPopoverController.close()
+            return
+        }
+        if !searchField.stringValue.isEmpty {
+            searchField.stringValue = ""
+            applyQuerySyntaxHighlighting()
+            searchChanged()
+            focusSearchField()
+            return
+        }
+        hideWindowWithAnimation()
+    }
+
     /// 聚焦搜索输入框，并将输入光标定位至文本末尾
     func focusSearchField() {
         guard let window = window, let searchField = searchField else { return }
@@ -953,6 +1105,10 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
     }
 
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {
+        let currentQuery = searchField.stringValue
+        if !currentQuery.isEmpty {
+            recordSearchQuery(currentQuery)
+        }
         engine.openFile(path: result.path)
     }
 
@@ -999,6 +1155,38 @@ extension SearchWindow: NSSearchFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // 回车确认命令：记录搜索历史并打开当前选定条目
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            let currentQuery = searchField.stringValue
+            if !currentQuery.isEmpty {
+                recordSearchQuery(currentQuery)
+            }
+            openSelected()
+            return true
+        }
+
+        // 取消命令 (Escape)：
+        // 1. 若处于输入法组字/候选态（markedText），放行交由输入法取消候选；
+        // 2. 其余场景统一由 handleEscape 分层响应（关闭浮层/清空输入/退出窗口）。
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            if textView.hasMarkedText() {
+                return false
+            }
+            handleEscape()
+            return true
+        }
+
+        // 方向上键语义命令：当输入为空时，按向上键回填上一次搜索词
+        if commandSelector == #selector(NSResponder.moveUp(_:)) {
+            let length = (textView.string as NSString).length
+            if length == 0, let lastQuery = recentSearches.first {
+                searchField.stringValue = lastQuery
+                focusSearchField()
+                performSearch(query: lastQuery)
+                return true
+            }
+        }
+
         // 方向下键语义命令：当光标处于文本末尾或输入为空时，将焦点交接至结果列表
         if commandSelector == #selector(NSResponder.moveDown(_:)) {
             let length = (textView.string as NSString).length
@@ -1016,6 +1204,7 @@ extension SearchWindow: NSSearchFieldDelegate {
 
 extension NSToolbarItem.Identifier {
     static let searchField = NSToolbarItem.Identifier("lokii.toolbar.searchField")
+    static let pinWindow = NSToolbarItem.Identifier("lokii.toolbar.pinWindow")
     static let resetWindowSize = NSToolbarItem.Identifier("lokii.toolbar.resetWindowSize")
 }
 
@@ -1058,6 +1247,20 @@ extension SearchWindow: NSToolbarDelegate {
             item.isNavigational = true
             return item
 
+        case .pinWindow:
+            pinButton.bezelStyle = .toolbar
+            pinButton.isBordered = false
+            pinButton.target = self
+            pinButton.action = #selector(togglePin)
+            updatePinButtonState()
+
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.view = pinButton
+            item.label = L("search.toolbar.pin")
+            item.paletteLabel = L("search.toolbar.pin")
+            item.toolTip = L("search.toolbar.pin")
+            return item
+
         case .resetWindowSize:
             let button = NSButton()
             button.image = NSImage(systemSymbolName: "textformat.size", accessibilityDescription: L("window.viewOptions"))
@@ -1081,11 +1284,11 @@ extension SearchWindow: NSToolbarDelegate {
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .resetWindowSize]
+        [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .pinWindow, .resetWindowSize]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .resetWindowSize]
+        [.toggleSidebar, .sidebarTrackingSeparator, .searchField, .pinWindow, .resetWindowSize]
     }
 }
 
