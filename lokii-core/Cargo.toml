@@ -25,6 +25,10 @@ nucleo-matcher = "0.3"
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[[bin]]
+name = "lokii"
+path = "src/bin/lokii.rs"
+
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"

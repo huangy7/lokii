@@ -2,6 +2,14 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 
+// MARK: - CLI Tool Install State
+enum CliInstallState: Equatable {
+    case notInstalled
+    case installing
+    case installed
+    case failed(message: String, detail: String)
+}
+
 // MARK: - Preferences ViewModel
 class PreferencesViewModel: ObservableObject {
     let engine: SearchEngine
@@ -54,6 +62,30 @@ class PreferencesViewModel: ObservableObject {
 
     @Published var availableTerminals: [TerminalAppItem] = []
 
+    /// 命令行工具安装状态（未安装 / 安装中 / 已安装 / 安装失败）
+    @Published var cliState: CliInstallState = .notInstalled
+
+    let cliTarget = "/usr/local/bin/lokii"
+    var cliSource: String {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/lokii").path
+    }
+
+    /// 软链接目标是否属于 Lokii；刷新、安装、卸载共用，避免误碰用户自己的软链接
+    private func isOurCliLink(_ dest: String) -> Bool {
+        dest == cliSource || dest.hasSuffix("/Contents/Helpers/lokii")
+    }
+
+    /// 失败后的"重试"要重做刚才失败的那个动作，而不是一律安装
+    private var lastCliActionWasUninstall = false
+
+    func retryCommandLineTool() {
+        if lastCliActionWasUninstall {
+            uninstallCommandLineTool()
+        } else {
+            installCommandLineTool()
+        }
+    }
+
     /// 当前生效的终端项，供菜单标签与图标统一取值
     var selectedTerminal: TerminalAppItem? {
         availableTerminals.first { $0.id == terminalBundleId }
@@ -87,6 +119,7 @@ class PreferencesViewModel: ObservableObject {
         loadConfig()
         updateFDAStatus()
         refreshLaunchAtLoginStatus()
+        refreshCliStatus()
     }
     
     func refreshLaunchAtLoginStatus() {
@@ -127,6 +160,188 @@ class PreferencesViewModel: ObservableObject {
         TerminalLauncher.chooseCustomTerminal(window: window) { [weak self] item in
             guard let self = self, let item = item else { return }
             self.terminalBundleId = item.id
+        }
+    }
+
+    /// 校验并刷新 /usr/local/bin/lokii 软链接状态
+    func refreshCliStatus() {
+        let fm = FileManager.default
+        var isInstalled = false
+        if let attrs = try? fm.attributesOfItem(atPath: cliTarget),
+           attrs[.type] as? FileAttributeType == .typeSymbolicLink,
+           let dest = try? fm.destinationOfSymbolicLink(atPath: cliTarget) {
+            isInstalled = isOurCliLink(dest) && fm.fileExists(atPath: cliTarget)
+        }
+
+        // 如果当前处于安装中，不被外部被动轮询覆盖
+        if case .installing = cliState {
+            return
+        }
+
+        if isInstalled {
+            self.cliState = .installed
+        } else {
+            // 如果已处于失败态，保持失败原因以便用户重试或查看日志；否则为未安装
+            if case .failed = cliState {
+                // keep failed state
+            } else {
+                self.cliState = .notInstalled
+            }
+        }
+    }
+
+    /// 安装 App 内置的 `lokii` CLI 软链接到 /usr/local/bin
+    func installCommandLineTool() {
+        guard cliState != .installing else { return }
+        lastCliActionWasUninstall = false
+        cliState = .installing
+
+        let source = cliSource
+        let target = cliTarget
+        let fm = FileManager.default
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            guard fm.isExecutableFile(atPath: source) else {
+                DispatchQueue.main.async {
+                    self.cliState = .failed(
+                        message: L("prefs.cli.error.notFound"),
+                        detail: String(format: L("prefs.cli.missing"), source)
+                    )
+                }
+                return
+            }
+
+            // 不覆盖用户自己放在同名位置的真实文件，或指向别处的软链接（只替换指向 Lokii 的旧链接）
+            if let attrs = try? fm.attributesOfItem(atPath: target) {
+                let dest = try? fm.destinationOfSymbolicLink(atPath: target)
+                let isOurs = attrs[.type] as? FileAttributeType == .typeSymbolicLink
+                    && dest.map(self.isOurCliLink) == true
+                if !isOurs {
+                    DispatchQueue.main.async {
+                        self.cliState = .failed(
+                            message: L("prefs.cli.error.conflict"),
+                            detail: String(format: L("prefs.cli.conflict"), target)
+                        )
+                    }
+                    return
+                }
+            }
+
+            do {
+                try fm.createDirectory(atPath: "/usr/local/bin", withIntermediateDirectories: true)
+                try? fm.removeItem(atPath: target)
+                try fm.createSymbolicLink(atPath: target, withDestinationPath: source)
+                DispatchQueue.main.async {
+                    self.cliState = .installed
+                }
+            } catch {
+                let escaped = source.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                let script = "do shell script \"mkdir -p /usr/local/bin && ln -sfh \" & quoted form of \"\(escaped)\" & \" \(target)\" with administrator privileges"
+                var errorInfo: NSDictionary?
+                NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
+
+                DispatchQueue.main.async {
+                    if let errorInfo = errorInfo {
+                        let errNum = errorInfo[NSAppleScript.errorNumber] as? Int
+                        if errNum == -128 {
+                            // 用户主动取消授权弹窗，恢复为未安装
+                            self.cliState = .notInstalled
+                        } else {
+                            let errDetail = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown error"
+                            self.cliState = .failed(
+                                message: L("prefs.cli.error.permission"),
+                                detail: errDetail
+                            )
+                        }
+                    } else {
+                        self.cliState = .installed
+                    }
+                }
+            }
+        }
+    }
+
+    /// 移除 /usr/local/bin/lokii 软链接；严格校验目标确实指向当前应用的 Helpers/lokii，避免误删用户文件
+    func uninstallCommandLineTool() {
+        guard cliState != .installing else { return }
+        lastCliActionWasUninstall = true
+        cliState = .installing
+        let target = cliTarget
+        let fm = FileManager.default
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            guard let attrs = try? fm.attributesOfItem(atPath: target) else {
+                DispatchQueue.main.async { self.cliState = .notInstalled }
+                return
+            }
+
+            // 1. 严格校验必须是软链接
+            guard attrs[.type] as? FileAttributeType == .typeSymbolicLink else {
+                DispatchQueue.main.async {
+                    self.cliState = .failed(
+                        message: L("prefs.cli.error.conflict"),
+                        detail: String(format: L("prefs.cli.conflict"), target)
+                    )
+                }
+                return
+            }
+
+            // 2. 严格校验软链接指向目标是否属于 Lokii
+            guard let dest = try? fm.destinationOfSymbolicLink(atPath: target) else {
+                DispatchQueue.main.async {
+                    self.cliState = .failed(
+                        message: L("prefs.cli.error.uninstallFailed"),
+                        detail: String(format: L("prefs.cli.readLinkFailed"), target)
+                    )
+                }
+                return
+            }
+
+            guard self.isOurCliLink(dest) else {
+                DispatchQueue.main.async {
+                    self.cliState = .failed(
+                        message: L("prefs.cli.error.notOurSymlink"),
+                        detail: String(format: L("prefs.cli.notOurSymlink"), dest)
+                    )
+                }
+                return
+            }
+
+            // 3. 优先使用 FileManager.removeItem
+            do {
+                try fm.removeItem(atPath: target)
+                DispatchQueue.main.async {
+                    self.cliState = .notInstalled
+                }
+            } catch {
+                // 4. 若无写权限，通过 AppleScript 请求管理员提权移除
+                let script = "do shell script \"rm -f \(target)\" with administrator privileges"
+                var errorInfo: NSDictionary?
+                NSAppleScript(source: script)?.executeAndReturnError(&errorInfo)
+
+                DispatchQueue.main.async {
+                    if let errorInfo = errorInfo {
+                        let errNum = errorInfo[NSAppleScript.errorNumber] as? Int
+                        if errNum == -128 {
+                            // 用户取消授权，链接仍在；refreshCliStatus 在 .installing 下会直接返回，需先复位
+                            self.cliState = .installed
+                        } else {
+                            let errDetail = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown error"
+                            self.cliState = .failed(
+                                message: L("prefs.cli.error.uninstallFailed"),
+                                detail: errDetail
+                            )
+                        }
+                    } else {
+                        self.cliState = .notInstalled
+                    }
+                }
+            }
         }
     }
     
@@ -317,7 +532,7 @@ private struct SettingsPathRow: View {
             .opacity(isHovered ? 1.0 : 0.25)
             .animation(.easeInOut(duration: 0.15), value: isHovered)
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 14)
         .padding(.vertical, 7)
         .background(isHovered ? Color.primary.opacity(0.035) : Color.clear)
         .contentShape(Rectangle())
@@ -390,9 +605,11 @@ struct PreferencesView: View {
             .onAppear {
                 viewModel.updateFDAStatus()
                 viewModel.refreshLaunchAtLoginStatus()
+                viewModel.refreshCliStatus()
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 viewModel.updateFDAStatus()
+                viewModel.refreshCliStatus()
             }
     }
     
@@ -412,6 +629,7 @@ struct PreferencesView: View {
     // MARK: - General Pane
     @ViewBuilder
     private var generalPane: some View {
+        // Group 1: 行为
         SettingsGroup(L("prefs.section.behavior")) {
             SettingsRow(L("prefs.showInDock"), description: L("prefs.showInDock.description")) {
                 Toggle("", isOn: $viewModel.showInDock)
@@ -436,7 +654,10 @@ struct PreferencesView: View {
                     .toggleStyle(.switch)
                     .labelsHidden()
             }
-            SettingsRowDivider()
+        }
+
+        // Group 2: 终端与集成
+        SettingsGroup(L("prefs.section.terminalAndIntegration")) {
             SettingsRow(L("prefs.defaultTerminal"), description: L("prefs.defaultTerminal.description")) {
                 Menu {
                     ForEach(viewModel.availableTerminals) { item in
@@ -464,8 +685,11 @@ struct PreferencesView: View {
                 .menuStyle(.borderedButton)
                 .fixedSize()
             }
+            SettingsRowDivider()
+            CliSettingRow(viewModel: viewModel)
         }
         
+        // Group 3: 搜索
         SettingsGroup(L("prefs.section.search")) {
             SettingsRow(L("prefs.maxResults"), description: L("prefs.maxResults.description")) {
                 HStack(spacing: 8) {
@@ -1171,5 +1395,224 @@ struct PreferencesView: View {
         } else {
             completion(nil)
         }
+    }
+}
+
+// MARK: - Command Line Tool Setting Row
+struct CliSettingRow: View {
+    @ObservedObject var viewModel: PreferencesViewModel
+    @State private var showingErrorSheet = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(L("prefs.cli"))
+                        .font(.system(size: 13, weight: .semibold))
+
+                    statusBadge
+                }
+
+                Text(L("prefs.cli.description"))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if case .failed(let message, let detail) = viewModel.cliState {
+                    HStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.red)
+                        Text(message)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.red.opacity(0.9))
+                            .lineLimit(1)
+                        Text("•")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary.opacity(0.5))
+                        Button(L("prefs.cli.viewLog")) {
+                            showingErrorSheet = true
+                        }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                    }
+                    .padding(.top, 2)
+                    .sheet(isPresented: $showingErrorSheet) {
+                        CliErrorDetailSheet(message: message, detail: detail, isPresented: $showingErrorSheet)
+                    }
+                }
+            }
+
+            Spacer(minLength: 16)
+
+            actionButton
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(minHeight: 52)
+    }
+
+    // MARK: - 状态标签
+    @ViewBuilder
+    private var statusBadge: some View {
+        switch viewModel.cliState {
+        case .notInstalled:
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(Color.secondary.opacity(0.55))
+                    .frame(width: 5, height: 5)
+                Text(L("prefs.cli.status.notInstalled"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.primary.opacity(0.04))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+            )
+
+        case .installing:
+            HStack(spacing: 4) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text(L("prefs.cli.status.installing"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.accentColor.opacity(0.08))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.accentColor.opacity(0.2), lineWidth: 0.5)
+            )
+
+        case .installed:
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 5, height: 5)
+                Text(L("prefs.cli.status.installed"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.green)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.green.opacity(0.08))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.green.opacity(0.2), lineWidth: 0.5)
+            )
+
+        case .failed:
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 5, height: 5)
+                Text(L("prefs.cli.status.failed"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.red)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.red.opacity(0.08))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.red.opacity(0.2), lineWidth: 0.5)
+            )
+        }
+    }
+
+    // MARK: - 操作按钮
+    @ViewBuilder
+    private var actionButton: some View {
+        switch viewModel.cliState {
+        case .notInstalled:
+            Button(L("prefs.cli.install")) {
+                viewModel.installCommandLineTool()
+            }
+
+        case .installing:
+            Button(action: {}) {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(L("prefs.cli.installingAction"))
+                }
+            }
+            .disabled(true)
+
+        case .installed:
+            Button(L("prefs.cli.uninstall")) {
+                viewModel.uninstallCommandLineTool()
+            }
+
+        case .failed:
+            Button(L("prefs.cli.retry")) {
+                viewModel.retryCommandLineTool()
+            }
+        }
+    }
+}
+
+// MARK: - CLI Error Detail Sheet
+struct CliErrorDetailSheet: View {
+    let message: String
+    let detail: String
+    @Binding var isPresented: Bool
+    @State private var isCopied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label(L("prefs.cli.error.detailTitle"), systemImage: "terminal.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Button(action: { isPresented = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .font(.system(size: 14))
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text(message)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            ScrollView {
+                Text(detail)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .frame(maxHeight: 180)
+
+            HStack {
+                Button(isCopied ? L("prefs.cli.copied") : L("prefs.cli.copyLog")) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(detail, forType: .string)
+                    withAnimation { isCopied = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation { isCopied = false }
+                    }
+                }
+                Spacer()
+                Button(L("ok")) {
+                    isPresented = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(18)
+        .frame(width: 440)
     }
 }

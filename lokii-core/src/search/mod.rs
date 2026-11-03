@@ -14,7 +14,7 @@ pub use filter::{
 use crate::compact_index::CompactIndex;
 use crate::indexer::{FileEntry, IndexStore};
 use crate::string_pool::NameSignature;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use top_k::{Candidate, TopK};
 
@@ -99,7 +99,7 @@ pub(crate) fn rank_unique_names<'a, K: Ord + Copy>(
 }
 
 /// Search mode per D-01, D-02, D-04.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Auto,

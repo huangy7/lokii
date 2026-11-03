@@ -98,7 +98,7 @@ EOF
 
 generate_bindings() {
     echo "==> [1/2] 编译 Rust 核心库 ($rust_target, release)..."
-    cargo build -p lokii-core --lib --release --target "$rust_target" --manifest-path "$repo_root/Cargo.toml"
+    cargo build -p lokii-core --lib --bin lokii --release --target "$rust_target" --manifest-path "$repo_root/Cargo.toml"
 
     echo "==> [2/2] 生成 UniFFI Swift 绑定与头文件..."
     local out_dir
@@ -124,7 +124,17 @@ build_app() {
     echo "==> 编译 Swift 原生应用 ($build_mode, $arch_flag)..."
     cd "$repo_root/Lokii"
 
-    local swift_flags=("--arch" "$arch_flag")
+    local min_os="$MACOSX_DEPLOYMENT_TARGET"
+    local sdk_version
+    sdk_version="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || echo "14.0")"
+
+    local swift_flags=(
+        "--arch" "$arch_flag"
+        "-Xlinker" "-platform_version"
+        "-Xlinker" "macos"
+        "-Xlinker" "$min_os"
+        "-Xlinker" "$sdk_version"
+    )
     if [[ "$build_mode" == "release" ]]; then
         swift_flags+=("-c" "release")
     fi
@@ -184,6 +194,10 @@ build_app() {
 
     cp "$bin_dir/Lokii" "$bundle_dir/Contents/MacOS/Lokii"
     chmod +x "$bundle_dir/Contents/MacOS/Lokii"
+
+    # CLI 放 Helpers：APFS 默认大小写不敏感，放 MacOS/lokii 会与主程序 Lokii 互相覆盖
+    mkdir -p "$bundle_dir/Contents/Helpers"
+    cp "$repo_root/target/$rust_target/release/lokii" "$bundle_dir/Contents/Helpers/lokii"
 
     # 拷贝预置资源与多语言
     if [[ -d "$repo_root/Lokii/Lokii/Resources" ]]; then
@@ -274,6 +288,7 @@ EOF
         codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$nested"
     done
     codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$bundle_dir/Contents/Frameworks/Sparkle.framework"
+    codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$bundle_dir/Contents/Helpers/lokii"
 
     # 签名 .app（若无身份则进行 ad-hoc 签名）
     if [[ -n "$signing_identity" ]]; then

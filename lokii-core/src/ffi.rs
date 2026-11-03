@@ -318,6 +318,13 @@ impl LokiiCore {
         }
     }
 
+    /// Start the local query socket used by the `lokii` CLI and external scripts.
+    pub fn start_query_server(&self) {
+        if let Err(e) = crate::query_server::start(self.store.clone(), self.config_store.clone()) {
+            eprintln!("[Lokii] Failed to start query server: {e}");
+        }
+    }
+
     /// Search the index.
     pub fn search(&self, query: String, mode: FfiSearchMode) -> FfiSearchResponse {
         let max_results = self.config_store.read().index.max_results;
