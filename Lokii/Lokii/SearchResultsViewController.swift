@@ -1139,8 +1139,9 @@ final class SearchResultsViewController: NSViewController {
     @objc func quickLookSelected(_ sender: Any? = nil) {
         guard !selectedResults.isEmpty else { return }
         let panel = QLPreviewPanel.shared()
-        panel?.reloadData()
+        // 先显示，让面板经响应链接管 dataSource（显示时同步挂载 controller），再刷新
         panel?.makeKeyAndOrderFront(nil)
+        panel?.reloadData()
     }
 
     @objc func showInfoSelected(_ sender: Any? = nil) {

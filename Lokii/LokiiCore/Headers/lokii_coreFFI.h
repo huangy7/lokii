@@ -409,6 +409,11 @@ RustBuffer uniffi_lokii_core_fn_method_lokiicore_search(void*_Nonnull ptr, RustB
 void uniffi_lokii_core_fn_method_lokiicore_start_config_watcher(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_QUERY_SERVER
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_QUERY_SERVER
+void uniffi_lokii_core_fn_method_lokiicore_start_query_server(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_WATCHER
 void uniffi_lokii_core_fn_method_lokiicore_start_watcher(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
@@ -792,6 +797,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_search(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_CONFIG_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_CONFIG_WATCHER
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_QUERY_SERVER
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_QUERY_SERVER
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_start_query_server(void
     
 );
 #endif

@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use bitcode::{Decode, Encode};
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A single file or directory entry in the index.
 ///
 /// All fields use bitcode-compatible types:
 /// - `path` is `String` (not `PathBuf`) for bitcode native Encode/Decode
 /// - `modified` is `u64` unix timestamp (not `SystemTime`) for bitcode compatibility
-#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     pub name: String,

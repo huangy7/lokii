@@ -115,6 +115,11 @@ final class SearchEngine: @unchecked Sendable {
     func initialize() {
         let handler = NotificationEventHandler()
         queue.async { [core] in
+            // Bind the CLI socket before the blocking initialize(): during a cold-start scan the
+            // CLI then gets empty results instead of "cannot connect", and a failed init no longer
+            // leaves the socket missing forever.
+            core.startQueryServer()
+
             // Peek at cache existence to determine startup mode BEFORE the
             // blocking initialize() call, so we can post the mode notification
             // to the main queue first.

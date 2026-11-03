@@ -97,7 +97,7 @@ struct SettingsGroup<Content: View, HeaderTrailing: View>: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 14)
             }
             VStack(spacing: 0) {
                 content()
@@ -136,8 +136,8 @@ struct SettingsRow<Trailing: View>: View {
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.system(size: 13, weight: .semibold))
                 if let description {
@@ -147,11 +147,12 @@ struct SettingsRow<Trailing: View>: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Spacer(minLength: 8)
+            Spacer(minLength: 16)
             trailing()
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(minHeight: 52)
     }
 }
 
@@ -164,7 +165,7 @@ extension SettingsRow where Trailing == EmptyView {
 struct SettingsRowDivider: View {
     var body: some View {
         Divider()
-            .padding(.leading, 12)
+            .padding(.leading, 14)
     }
 }
 

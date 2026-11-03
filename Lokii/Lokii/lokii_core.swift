@@ -894,6 +894,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func startConfigWatcher(eventHandler: EventHandler) 
     
     /**
+     * Start the local query socket used by the `lokii` CLI and external scripts.
+     */
+    func startQueryServer() 
+    
+    /**
      * Start the file system watcher. Calls event_handler.on_index_updated
      * whenever the index changes. Non-blocking (spawns a thread internally).
      */
@@ -1091,6 +1096,15 @@ open func search(query: String, mode: FfiSearchMode) -> FfiSearchResponse  {
 open func startConfigWatcher(eventHandler: EventHandler)  {try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_start_config_watcher(self.uniffiClonePointer(),
         FfiConverterTypeEventHandler_lower(eventHandler),$0
+    )
+}
+}
+    
+    /**
+     * Start the local query socket used by the `lokii` CLI and external scripts.
+     */
+open func startQueryServer()  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_start_query_server(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -1959,6 +1973,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher() != 32031) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_start_query_server() != 3760) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_watcher() != 17814) {
