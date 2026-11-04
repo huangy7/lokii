@@ -1,6 +1,13 @@
 name: Update Homebrew Cask
 
 on:
+  # 由 release.yml 的 homebrew job 直接调用；不走 release 事件，避免 GITHUB_TOKEN
+  # 触发的事件不产生新 run（需 RELEASE_PAT）这一坑。
+  workflow_call:
+    inputs:
+      tag_name:
+        type: string
+        required: false
   release:
     types: [published]
   workflow_dispatch:
@@ -17,10 +24,11 @@ jobs:
       - name: Extract version
         id: get_version
         run: |
-          TAG="${{ github.event.release.tag_name || inputs.tag_name }}"
-          if [ -z "$TAG" ]; then
-            TAG="${GITHUB_REF_NAME}"
-          fi
+          TAG="${{ inputs.tag_name || github.event.release.tag_name || github.ref_name }}"
+          case "$TAG" in
+            v*) ;;
+            *) echo "[FAIL] 需要以 v 开头的 tag，当前为 '$TAG'；workflow_dispatch 请填写 tag_name"; exit 1 ;;
+          esac
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT

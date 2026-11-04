@@ -209,6 +209,16 @@ jobs:
         run: |
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest -R "$GITHUB_REPOSITORY"
 
+  # 发布后同步 cask 到 homebrew-tap。作为 reusable workflow 直接调用，
+  # 不依赖 release: published 事件（GITHUB_TOKEN 触发的该事件不会启动新 run）。
+  homebrew:
+    name: 更新 Homebrew Cask
+    needs: publish
+    uses: ./.github/workflows/update-homebrew.yml
+    with:
+      tag_name: ${{ github.ref_name }}
+    secrets: inherit
+
   deploy-updates:
     name: 发布更新清单
     needs: publish
