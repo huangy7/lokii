@@ -1,5 +1,5 @@
 use crate::compact_index::{split_path, CompactIndex, EntryId};
-use crate::indexer::{score_match, IndexStore, MatchScore};
+use crate::indexer::{IndexStore, MatchScore};
 use crate::search::path_query::PathQuery;
 use crate::search::top_k::TopK;
 use crate::search::{find_positions, AdvancedSearchResult, CompiledRecordFilter, SearchMode};
@@ -146,7 +146,6 @@ pub(crate) fn find_parent_highlight_range(
 fn score_name(
     name: &str,
     folded: Option<&str>,
-    raw_path: bool,
     query: &PathQuery,
     has_wildcard: bool,
     all_terms_ascii: bool,
@@ -160,7 +159,7 @@ fn score_name(
             ascii_buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
             std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(ascii_buf) })
         } else {
-            std::borrow::Cow::Owned(name.to_lowercase())
+            crate::cjk::fold_cow(name)
         };
         let all_matched = query.name_terms.iter().all(|term| {
             if term.contains('*') || term.contains('?') {
@@ -171,11 +170,12 @@ fn score_name(
         });
         return all_matched.then_some(SCORE_NAME_PREFIX);
     }
-    let matched_score = if raw_path && !name.is_ascii() {
-        score_match(&name.to_lowercase(), &query.name_terms)
-    } else {
-        crate::indexer::score_match_zero_alloc(name, folded, &query.name_terms, all_terms_ascii)
-    };
+    let matched_score = crate::indexer::score_match_zero_alloc(
+        name,
+        folded,
+        &query.name_terms,
+        all_terms_ascii,
+    );
     matched_score.map(|score| match score {
         MatchScore::Exact => SCORE_NAME_EXACT,
         MatchScore::Prefix => SCORE_NAME_PREFIX,
@@ -286,8 +286,15 @@ pub fn search_index(
         if remembered == NAME_MISS {
             continue;
         }
+        let raw_folded;
         let (name, folded_opt) = if record.raw_path {
-            (read.record_name(record), None)
+            let n = read.record_name(record);
+            if !n.is_ascii() && crate::cjk::needs_fold(n) {
+                raw_folded = Some(crate::cjk::fold_str(n));
+                (n, raw_folded.as_deref())
+            } else {
+                (n, None)
+            }
         } else {
             match read.name_entry(record.name) {
                 Some((n, f)) => (n, f),
@@ -318,7 +325,6 @@ pub fn search_index(
                     score_name(
                         name,
                         folded_opt,
-                        record.raw_path,
                         query,
                         has_wildcard,
                         all_terms_ascii,

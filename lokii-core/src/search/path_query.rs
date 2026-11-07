@@ -78,7 +78,7 @@ impl PathQuery {
                     if !dir_part.is_empty() {
                         path_pattern = Some(dir_part.to_lowercase());
                         if !name_part.is_empty() {
-                            name_terms.push(name_part.to_lowercase());
+                            name_terms.push(crate::cjk::fold_str(name_part));
                         }
                     }
                 }
@@ -86,7 +86,7 @@ impl PathQuery {
             }
 
             // 4. 普通文件名词元
-            name_terms.push(word.to_lowercase());
+            name_terms.push(crate::cjk::fold_str(word));
         }
 
         Some(Self {

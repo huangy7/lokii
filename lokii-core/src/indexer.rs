@@ -84,7 +84,15 @@ pub(crate) fn score_match_zero_alloc(
     all_keywords_ascii: bool,
 ) -> Option<MatchScore> {
     if let Some(folded) = folded_non_ascii {
-        return score_match(folded, keywords);
+        if let Some(score) = score_match(folded, keywords) {
+            return Some(score);
+        }
+        if all_keywords_ascii {
+            if let Some(pinyin_score) = crate::pinyin::score_pinyin_match(name, keywords) {
+                return Some(pinyin_score);
+            }
+        }
+        return None;
     }
     if !all_keywords_ascii {
         // `folded_non_ascii` 只在“折叠后与原名不同”时存在；这里为 None

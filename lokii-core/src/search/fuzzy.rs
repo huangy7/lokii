@@ -34,18 +34,24 @@ pub fn search_index(
     if query.is_empty() || max_results == 0 {
         return Vec::new();
     }
+    let query_cjk = crate::cjk::to_simplified_str(query);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let pattern = Pattern::new(
-        query,
+        &query_cjk,
         CaseMatching::Ignore,
         Normalization::Smart,
         AtomKind::Fuzzy,
     );
     // Fuzzy 匹配：由 NameSignature 内部统一封装查询串特征位构造
-    let req = crate::string_pool::NameSignature::from_fuzzy_query(query);
+    let req = crate::string_pool::NameSignature::from_fuzzy_query(&query_cjk);
     let mut buffer = Vec::new();
     let matches = super::rank_unique_names(read, filter, max_results, req, |name, _| {
-        let haystack = Utf32Str::new(name, &mut buffer);
+        let name_cjk = if name.is_ascii() || !crate::pinyin::has_cjk_characters(name) {
+            std::borrow::Cow::Borrowed(name)
+        } else {
+            crate::cjk::to_simplified_str(name)
+        };
+        let haystack = Utf32Str::new(&name_cjk, &mut buffer);
         pattern.score(haystack, &mut matcher)
     });
     let mut indices = Vec::new();
@@ -55,9 +61,14 @@ pub fn search_index(
             let view = read
                 .view(crate::compact_index::EntryId(candidate.ordinal))
                 .unwrap();
-            let haystack = Utf32Str::new(view.name, &mut buffer);
+            let name_cjk = if view.name.is_ascii() || !crate::pinyin::has_cjk_characters(view.name) {
+                std::borrow::Cow::Borrowed(view.name)
+            } else {
+                crate::cjk::to_simplified_str(view.name)
+            };
+            let haystack = Utf32Str::new(&name_cjk, &mut buffer);
             indices.clear();
-            indices.resize(query.len(), 0);
+            indices.resize(query_cjk.len(), 0);
             pattern.indices(haystack, &mut matcher, &mut indices);
             let positions = indices
                 .iter()

@@ -428,11 +428,10 @@ impl QueryIndex {
     }
 
     fn set_name(&mut self, name_id: u32, name: &str) {
-        let folded = if name.is_ascii() {
+        let folded = if name.is_ascii() || !crate::cjk::needs_fold(name) {
             None
         } else {
-            let lower = name.to_lowercase();
-            (lower != name).then(|| lower.into_boxed_str())
+            Some(crate::cjk::fold_str(name).into_boxed_str())
         };
         let slot = name_id as usize;
         if slot >= self.signatures.len() {
