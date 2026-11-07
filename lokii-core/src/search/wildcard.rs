@@ -41,7 +41,7 @@ pub fn search_index(
     filter: &CompiledRecordFilter,
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
-    let pattern = query.trim().to_lowercase();
+    let pattern = crate::cjk::fold_str(query.trim());
     if pattern.is_empty() || max_results == 0 {
         return Vec::new();
     }

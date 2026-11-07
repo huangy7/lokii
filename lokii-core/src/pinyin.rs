@@ -3,7 +3,8 @@ use crate::pinyin_data;
 
 #[inline]
 pub fn char_pinyin(c: char) -> Option<(&'static str, char)> {
-    let u = c as u32;
+    let simp = crate::cjk::to_simplified_char(c);
+    let u = simp as u32;
     if (pinyin_data::CJK_START..=pinyin_data::CJK_END).contains(&u) {
         let idx = pinyin_data::PINYIN_TABLE[(u - pinyin_data::CJK_START) as usize] as usize;
         let syllable = pinyin_data::PINYIN_SYLLABLES[idx];
@@ -14,11 +15,15 @@ pub fn char_pinyin(c: char) -> Option<(&'static str, char)> {
     }
 }
 
-/// 快速判定文件名是否包含 CJK 统一表意文字。
+/// 快速判定文件名是否包含 CJK 统一表意文字或繁体汉字。
 #[inline]
 pub fn has_cjk_characters(name: &str) -> bool {
-    name.chars()
-        .any(|c| (pinyin_data::CJK_START..=pinyin_data::CJK_END).contains(&(c as u32)))
+    name.chars().any(|c| {
+        let u = c as u32;
+        (pinyin_data::CJK_START..=pinyin_data::CJK_END).contains(&u)
+            || (0x3400..=0x4DBF).contains(&u)
+            || crate::cjk::is_trad_char(c)
+    })
 }
 
 /// 拼音转写打分：零额外的堆分配，不构建字节区间映射表。

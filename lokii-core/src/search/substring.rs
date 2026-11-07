@@ -53,7 +53,7 @@ pub fn search_index(
             extension = None;
         }
     }
-    let keywords: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let keywords: Vec<String> = query.split_whitespace().map(crate::cjk::fold_str).collect();
     let matches = match &extension {
         Some(extension) => {
             let Some(ext_id) = read.extension_id(extension) else {

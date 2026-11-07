@@ -1,4 +1,4 @@
-use lokii_core::pinyin;
+use lokii_core::{cjk, pinyin};
 
 #[allow(dead_code)]
 mod compact_index {

@@ -18,6 +18,38 @@ use serde::{Deserialize, Serialize};
 
 use top_k::{Candidate, TopK};
 
+/// 在原始字符串 `name` 中查找是否有一段子串经繁简与小写归一化后与 `keyword` 相同。
+/// 若匹配，返回该子串在 `name` 中的精确原始 UTF-8 字节区间 `(start, end)`。
+fn find_cjk_folded_match(name: &str, keyword: &str) -> Option<(usize, usize)> {
+    if keyword.is_empty() || name.is_empty() || (name.is_ascii() && keyword.is_ascii()) {
+        return None;
+    }
+    let kw_chars: Vec<char> = keyword.chars().map(crate::cjk::fold_char).collect();
+    let name_chars: Vec<(usize, char)> = name.char_indices().collect();
+    if kw_chars.len() > name_chars.len() {
+        return None;
+    }
+
+    for i in 0..=(name_chars.len() - kw_chars.len()) {
+        let mut matched = true;
+        for (j, &kw_c) in kw_chars.iter().enumerate() {
+            let name_c = name_chars[i + j].1;
+            let folded_c = crate::cjk::fold_char(name_c);
+            if folded_c != kw_c {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            let start = name_chars[i].0;
+            let last_idx = i + kw_chars.len() - 1;
+            let end = name_chars[last_idx].0 + name_chars[last_idx].1.len_utf8();
+            return Some((start, end));
+        }
+    }
+    None
+}
+
 /// 计算各关键词在 `name` 或拼音转写中的字节区间，供前端高亮。
 /// 支持混合查询（如部分关键词直接命中，另一部分关键词通过拼音匹配命中）。
 pub(crate) fn find_positions<'a>(
@@ -32,6 +64,8 @@ pub(crate) fn find_positions<'a>(
     for &keyword in &kw_list {
         if let Some(start) = name_lower.find(keyword) {
             positions.push((start, start + keyword.len()));
+        } else if let Some(range) = find_cjk_folded_match(name, keyword) {
+            positions.push(range);
         } else {
             unmatched_keywords.push(keyword);
         }
