@@ -51,7 +51,16 @@ jobs:
             echo "[INFO] draft release $GITHUB_REF_NAME 已存在，复用"
             exit 0
           fi
+          # 优先读取 tag 附注中的说明（可通过 git tag -a 创建）；若无附注则自动聚合提交记录，兜底使用默认文案
           gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "Lokii $GITHUB_REF_NAME" \
+            --notes-from-tag \
+          || gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "Lokii $GITHUB_REF_NAME" \
+            --generate-notes \
+          || gh release create "$GITHUB_REF_NAME" \
             --draft \
             --title "Lokii $GITHUB_REF_NAME" \
             --notes "See the assets to download this version and install." \
@@ -99,6 +108,35 @@ jobs:
 
       - name: rust cache
         uses: Swatinem/rust-cache@v2
+
+      # 缓存 Swift Package Manager 依赖库与二进制产物（如 Sparkle.xcframework），避免网络抖动
+      - name: spm cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            Lokii/.build/artifacts
+            Lokii/.build/checkouts
+            Lokii/.build/repositories
+          key: ${{ runner.os }}-${{ matrix.arch }}-spm-${{ hashFiles('Lokii/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-spm-
+
+      # 预解析 Swift 依赖并加入 5 次重试机制，免疫 GitHub Release 静态资产 CDN 偶发 504 网关超时
+      - name: resolve swift packages with retry
+        run: |
+          cd Lokii
+          for i in 1 2 3 4 5; do
+            echo "Resolving Swift package dependencies (attempt $i)..."
+            if swift package resolve; then
+              echo "Swift packages resolved successfully."
+              exit 0
+            fi
+            echo "Package resolution failed with exit code $?, retrying in 5 seconds..."
+            sleep 5
+          done
+          echo "Failed to resolve Swift packages after 5 attempts."
+          exit 1
 
       # 优雅兼容开发者正式证书：若仓库配置了证书 Secret 则自动导入并激活签名钥匙串
       - name: setup apple certificate (optional)
@@ -161,8 +199,32 @@ jobs:
           pattern: Lokii-*
           merge-multiple: true
           path: output
+      - name: spm cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            Lokii/.build/artifacts
+            Lokii/.build/checkouts
+            Lokii/.build/repositories
+          key: ${{ runner.os }}-arm64-spm-${{ hashFiles('Lokii/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-spm-
+
       - name: resolve update tools
-        run: swift package --package-path Lokii resolve
+        run: |
+          cd Lokii
+          for i in 1 2 3 4 5; do
+            echo "Resolving update tools (attempt $i)..."
+            if swift package resolve; then
+              echo "Update tools resolved successfully."
+              exit 0
+            fi
+            echo "Package resolution failed with exit code $?, retrying in 5 seconds..."
+            sleep 5
+          done
+          echo "Failed to resolve update tools after 5 attempts."
+          exit 1
       - name: create verified update feeds
         env:
           LOKII_UPDATE_PRIVATE_KEY: ${{ secrets.LOKII_UPDATE_PRIVATE_KEY }}
