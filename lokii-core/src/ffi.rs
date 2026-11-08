@@ -154,9 +154,11 @@ fn convert_ranges(ranges: Vec<(usize, usize)>) -> Vec<FfiMatchRange> {
 pub struct LokiiCore {
     store: IndexStore,
     config_store: ConfigStore,
-    /// Set to true to cancel a running background verification scan.
-    cancel_verify: Arc<AtomicBool>,
-    /// Prevents concurrent scan operations (rebuild vs verify).
+    /// Where the index service picks up once started: set by initialization.
+    resume: Mutex<Option<watcher::Resume>>,
+    /// The running index service, once `start_watcher` has been called.
+    watcher: Mutex<Option<watcher::WatcherHandle>>,
+    /// Prevents concurrent full scans (rebuild vs the service's reconciliation).
     scan_lock: Arc<Mutex<()>>,
     /// Watcher diagnostics metrics.
     metrics: Arc<WatcherMetrics>,
@@ -173,7 +175,8 @@ impl LokiiCore {
         Arc::new(Self {
             store,
             config_store,
-            cancel_verify: Arc::new(AtomicBool::new(false)),
+            resume: Mutex::new(None),
+            watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
             metrics: Arc::new(WatcherMetrics::new()),
         })
@@ -207,7 +210,7 @@ impl LokiiCore {
         done.store(true, Ordering::Relaxed);
         poller.thread().unpark();
         let _ = poller.join();
-        self.finish_initialization(mode, config, cache_file, event_handler)
+        self.finish_initialization(mode, event_handler)
     }
 }
 
@@ -215,8 +218,6 @@ impl LokiiCore {
     fn finish_initialization(
         &self,
         mode: startup::StartupMode,
-        config: AppConfig,
-        cache_file: std::path::PathBuf,
         event_handler: Arc<dyn EventHandler>,
     ) -> FfiStartupMode {
         if let startup::StartupMode::Failed(error) = mode {
@@ -231,36 +232,22 @@ impl LokiiCore {
         let warm_store = self.store.clone();
         std::thread::spawn(move || warm_store.warm_query_index());
 
-        // For hot start, spawn background verification (non-blocking)
-        if matches!(mode, startup::StartupMode::HotStart { .. }) {
-            self.cancel_verify.store(false, Ordering::Relaxed);
-            let cancel = Arc::clone(&self.cancel_verify);
-            let store = self.store.clone();
-            let verify_config = config.clone();
-            let verify_handler = Arc::clone(&event_handler);
-            let verify_lock = Arc::clone(&self.scan_lock);
-            std::thread::spawn(move || {
-                let _guard = verify_lock.lock().unwrap();
-                verify_handler.on_index_progress("verifying".to_string(), 0);
-                if let Err(error) =
-                    startup::verify_index(&store, &verify_config, &cache_file, &cancel)
-                {
-                    verify_handler.on_watcher_error(format!("Index verification failed: {error}"));
-                    return;
-                }
-                // Only update if not cancelled (rebuild took over)
-                if !cancel.load(Ordering::Relaxed) {
-                    store.warm_query_index();
-                    verify_handler.on_index_updated(store.len() as u64);
-                }
-            });
-        }
+        // 索引服务启动后从这里接上：有检查点就回放追赶，没有就先全量校验。
+        *self.resume.lock().unwrap() = Some(match mode {
+            startup::StartupMode::HotStart {
+                checkpoint: Some(checkpoint),
+                ..
+            } => watcher::Resume::From(checkpoint.event_id),
+            startup::StartupMode::HotStart { .. } => watcher::Resume::Verify,
+            startup::StartupMode::ColdStart { event_id, .. } => watcher::Resume::From(event_id),
+            startup::StartupMode::Failed(_) => unreachable!("failed startup returned before ready"),
+        });
 
         match mode {
-            startup::StartupMode::HotStart { cached_count } => FfiStartupMode::HotStart {
+            startup::StartupMode::HotStart { cached_count, .. } => FfiStartupMode::HotStart {
                 cached_count: cached_count as u64,
             },
-            startup::StartupMode::ColdStart { scanned_count } => FfiStartupMode::ColdStart {
+            startup::StartupMode::ColdStart { scanned_count, .. } => FfiStartupMode::ColdStart {
                 scanned_count: scanned_count as u64,
             },
             startup::StartupMode::Failed(_) => unreachable!("failed startup returned before ready"),
@@ -273,32 +260,28 @@ impl LokiiCore {
     /// Start the file system watcher. Calls event_handler.on_index_updated
     /// whenever the index changes. Non-blocking (spawns a thread internally).
     pub fn start_watcher(&self, event_handler: Arc<dyn EventHandler>) {
-        let config = self.config_store.read().clone();
+        let resume = self
+            .resume
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(watcher::Resume::now);
         let handler = Arc::clone(&event_handler);
-        let metrics = Arc::clone(&self.metrics);
-
-        if let Err(e) = watcher::start_watcher(
+        let handle = watcher::start_watcher(
             self.store.clone(),
-            config.clone(),
-            metrics,
+            self.config_store.clone(),
+            Arc::clone(&self.metrics),
+            resume,
+            Arc::clone(&self.scan_lock),
             move |new_total| {
                 handler.on_index_updated(new_total as u64);
             },
-        ) {
-            event_handler.on_watcher_error(format!("{e}"));
-        }
-
-        // Start reconciliation timer
-        let recon_store = self.store.clone();
-        let recon_handler = Arc::clone(&event_handler);
-        watcher::start_reconciliation_timer(
-            recon_store,
-            config,
-            || {},
-            move |new_total| {
-                recon_handler.on_index_updated(new_total as u64);
+            |index, checkpoint| {
+                let cache_file = AppConfig::config_dir().join("index.cache");
+                startup::save_index(index, checkpoint, &cache_file);
             },
         );
+        *self.watcher.lock().unwrap() = Some(handle);
     }
 
     /// Start the config file watcher for hot-reload.
@@ -357,19 +340,15 @@ impl LokiiCore {
     /// Rebuild the index from scratch. Blocking — call from background thread.
     /// Caller should check `is_scanning()` first; if true, skip the rebuild.
     pub fn rebuild_index(&self, event_handler: Arc<dyn EventHandler>) -> bool {
-        // Try to acquire scan lock — if verify is still running, skip.
+        // Try to acquire scan lock — if the index service is reconciling, skip.
         let guard = match self.scan_lock.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::WouldBlock) => {
-                // Background verify is already doing a full scan — skip.
+                // A full scan is already running — skip.
                 return false;
             }
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
-
-        // No concurrent scan running — cancel verify flag (in case it's
-        // about to start) and do a full rebuild.
-        self.cancel_verify.store(true, Ordering::Relaxed);
 
         let progress = Arc::new(AtomicUsize::new(0));
 
@@ -392,6 +371,7 @@ impl LokiiCore {
         });
 
         let config = self.config_store.read().clone();
+        let checkpoint = startup::checkpoint(&config);
         let paths = config.resolve_paths();
 
         let filter = Arc::new(crate::filter::CompiledFilter::from_config(&config));
@@ -410,15 +390,40 @@ impl LokiiCore {
         // Save cache before publishing the index: encoding a multi-million
         // entry index must not happen while holding the store lock.
         let cache_file = AppConfig::config_dir().join("index.cache");
-        let _ = cache::save_compact(&fresh, &cache_file);
+        let _ = cache::save_compact(&fresh, Some(checkpoint), &cache_file);
 
-        self.store.replace_compact(fresh);
+        // 交给索引服务换入：它会从扫描前的事件 ID 重放，补上扫描期间写入旧索引的变更。
+        // 不持着 watcher 锁等待，免得退出时的存盘被卡住。
+        let watcher = self.watcher.lock().unwrap().clone();
+        let unswapped = match watcher {
+            Some(watcher) => watcher.replace(fresh, checkpoint).err(),
+            None => Some(fresh),
+        };
+        if let Some(fresh) = unswapped {
+            // 服务已不在：它的检查点不再对应索引，退出时不能拿来存盘。
+            *self.watcher.lock().unwrap() = None;
+            self.store.replace_compact(fresh);
+            let warm_store = self.store.clone();
+            std::thread::spawn(move || warm_store.warm_query_index());
+        }
 
         drop(guard);
-        let warm_store = self.store.clone();
-        std::thread::spawn(move || warm_store.warm_query_index());
         event_handler.on_index_ready(self.store.len() as u64);
         true
+    }
+
+    /// Save the index with its replay checkpoint. Call before the app quits so
+    /// the next launch only replays what changed after this point.
+    pub fn persist_index(&self) {
+        let Some(watcher) = self.watcher.lock().unwrap().clone() else {
+            return;
+        };
+        // 先锁索引再读检查点：服务换入新索引时检查点先降、指纹后升，这样读到的不会比索引新。
+        let index = self.store.read();
+        if let Some(checkpoint) = watcher.checkpoint() {
+            let cache_file = AppConfig::config_dir().join("index.cache");
+            startup::save_index(&index, checkpoint, &cache_file);
+        }
     }
 
     /// Check if macOS Full Disk Access is granted.
@@ -583,7 +588,8 @@ mod tests {
         LokiiCore {
             store: IndexStore::new(),
             config_store: ConfigStore::new(AppConfig::default()),
-            cancel_verify: Arc::new(AtomicBool::new(true)),
+            resume: Mutex::new(None),
+            watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
             metrics: Arc::new(WatcherMetrics::new()),
         }
@@ -594,19 +600,14 @@ mod tests {
         for error in [IndexError::IdOverflow, IndexError::ReferenceOverflow] {
             let core = core();
             let handler = Arc::new(RecordingHandler::default());
-            let directory = tempfile::tempdir().unwrap();
-            let result = core.finish_initialization(
-                startup::StartupMode::Failed(error),
-                AppConfig::default(),
-                directory.path().join("index.cache"),
-                handler.clone(),
-            );
+            let result =
+                core.finish_initialization(startup::StartupMode::Failed(error), handler.clone());
             let FfiStartupMode::Failed { message } = result else {
                 panic!("failed initialization must not report a successful startup");
             };
             assert_eq!(message, format!("Index initialization failed: {error}"));
             assert!(handler.events.lock().unwrap().is_empty());
-            assert!(core.cancel_verify.load(Ordering::Relaxed));
+            assert!(core.resume.lock().unwrap().is_none());
             assert!(core.store.is_empty());
         }
     }
@@ -615,11 +616,11 @@ mod tests {
     fn empty_cold_start_is_success_and_still_reports_ready() {
         let core = core();
         let handler = Arc::new(RecordingHandler::default());
-        let directory = tempfile::tempdir().unwrap();
         let result = core.finish_initialization(
-            startup::StartupMode::ColdStart { scanned_count: 0 },
-            AppConfig::default(),
-            directory.path().join("index.cache"),
+            startup::StartupMode::ColdStart {
+                scanned_count: 0,
+                event_id: 7,
+            },
             handler.clone(),
         );
         assert!(matches!(
@@ -627,6 +628,7 @@ mod tests {
             FfiStartupMode::ColdStart { scanned_count: 0 }
         ));
         assert_eq!(*handler.events.lock().unwrap(), ["ready:0"]);
+        assert_eq!(*core.resume.lock().unwrap(), Some(watcher::Resume::From(7)));
     }
 
     /// 前端下发的配置只覆盖它建模过的字段，未建模字段必须原样保留，

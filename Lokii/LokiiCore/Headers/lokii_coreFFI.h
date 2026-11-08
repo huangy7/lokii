@@ -389,6 +389,11 @@ int8_t uniffi_lokii_core_fn_method_lokiicore_is_scanning(void*_Nonnull ptr, Rust
 int8_t uniffi_lokii_core_fn_method_lokiicore_open_file(void*_Nonnull ptr, RustBuffer path, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PERSIST_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PERSIST_INDEX
+void uniffi_lokii_core_fn_method_lokiicore_persist_index(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REBUILD_INDEX
 int8_t uniffi_lokii_core_fn_method_lokiicore_rebuild_index(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
@@ -773,6 +778,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_is_scanning(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_OPEN_FILE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_OPEN_FILE
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_open_file(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_PERSIST_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_PERSIST_INDEX
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_persist_index(void
     
 );
 #endif

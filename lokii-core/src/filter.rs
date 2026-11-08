@@ -179,6 +179,7 @@ mod tests {
             exclude_paths: exclude_paths.iter().map(|s| s.to_string()).collect(),
             include_hidden: true,
             max_results: 500,
+            network_rescan_minutes: 5,
         };
         CompiledFilter::from_config(&config)
     }

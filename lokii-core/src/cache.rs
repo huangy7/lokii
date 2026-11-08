@@ -9,6 +9,17 @@ const CACHE_MAGIC: &[u8; 4] = b"LOKI";
 const CACHE_VERSION: u32 = 3;
 /// Version of the compact index payload (shared string tables plus records).
 const CACHE_VERSION_COMPACT: u32 = 4;
+/// Compact payload preceded by a 16-byte [`Checkpoint`] (event id 0 = none).
+const CACHE_VERSION_CHECKPOINT: u32 = 5;
+
+/// What the cached snapshot is known to reflect: every FSEvents event up to
+/// `event_id`, scanned under the config/permission state hashed into
+/// `fingerprint`. Replaying from it is only valid while the fingerprint matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub event_id: u64,
+    pub fingerprint: u64,
+}
 
 /// Errors that can occur during cache operations.
 #[derive(Debug)]
@@ -97,37 +108,64 @@ pub fn load_cache(path: &Path) -> Result<Vec<FileEntry>, CacheError> {
 
 pub fn save_compact(
     index: &crate::compact_index::CompactIndex,
+    checkpoint: Option<Checkpoint>,
     path: &Path,
 ) -> Result<(), CacheError> {
-    write_cache(
-        CACHE_VERSION_COMPACT,
-        &bitcode::encode(&index.to_cache()),
-        path,
-    )
+    let checkpoint = checkpoint.unwrap_or(Checkpoint {
+        event_id: 0,
+        fingerprint: 0,
+    });
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&checkpoint.event_id.to_le_bytes());
+    payload.extend_from_slice(&checkpoint.fingerprint.to_le_bytes());
+    payload.extend_from_slice(&bitcode::encode(&index.to_cache()));
+    write_cache(CACHE_VERSION_CHECKPOINT, &payload, path)
 }
 
-pub fn load_compact(path: &Path) -> Result<crate::compact_index::CompactIndex, CacheError> {
+pub fn load_compact(
+    path: &Path,
+) -> Result<(crate::compact_index::CompactIndex, Option<Checkpoint>), CacheError> {
     let (version, data) = read_cache(path)?;
     match version {
         CACHE_VERSION => {
             let entries: Vec<crate::compact_index::BorrowedFileEntry<'_>> =
                 bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
             crate::compact_index::CompactIndex::from_borrowed_entries(entries)
+                .map(|index| (index, None))
                 .map_err(CacheError::InvalidIndex)
         }
         CACHE_VERSION_COMPACT => {
             let cache = bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
-            crate::compact_index::CompactIndex::from_cache(cache).map_err(CacheError::InvalidIndex)
+            crate::compact_index::CompactIndex::from_cache(cache)
+                .map(|index| (index, None))
+                .map_err(CacheError::InvalidIndex)
+        }
+        CACHE_VERSION_CHECKPOINT => {
+            if data.len() < 24 {
+                return Err(CacheError::TooSmall);
+            }
+            let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+            let checkpoint = Checkpoint {
+                event_id: word(8),
+                fingerprint: word(16),
+            };
+            let cache = bitcode::decode(&data[24..]).map_err(CacheError::Decode)?;
+            crate::compact_index::CompactIndex::from_cache(cache)
+                .map(|index| (index, (checkpoint.event_id != 0).then_some(checkpoint)))
+                .map_err(CacheError::InvalidIndex)
         }
         found => Err(CacheError::VersionMismatch {
             found,
-            expected: CACHE_VERSION_COMPACT,
+            expected: CACHE_VERSION_CHECKPOINT,
         }),
     }
 }
 
 /// Write `[4 bytes "LOKI"] [4 bytes version u32 LE] [payload]` atomically.
 fn write_cache(version: u32, payload: &[u8], path: &Path) -> Result<(), CacheError> {
+    // 索引服务、重建、对账与退出时都会存盘，共用同一个 .tmp：串行化，免得改名到别人写了一半的文件。
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -137,6 +175,8 @@ fn write_cache(version: u32, payload: &[u8], path: &Path) -> Result<(), CacheErr
     file.write_all(&version.to_le_bytes())?;
     file.write_all(payload)?;
     file.flush()?;
+    // 先落盘再改名：断电后要么是旧缓存，要么是完整的新缓存。
+    file.sync_data()?;
     fs::rename(temporary, path)?;
     Ok(())
 }

@@ -536,6 +536,7 @@ version = "0.1.8"
 dependencies = [
  "bitcode",
  "dirs",
+ "fsevent-sys",
  "glob-match",
  "jwalk",
  "libc",

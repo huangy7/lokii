@@ -6,7 +6,7 @@ use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
 /// 从通配符模式中提取所有不跨越 `*`/`?`/`[`/`]`/`{`/`}` 的字面量片段并生成签名超集掩码。
-fn required_signature_for_glob(pattern_lower: &str) -> NameSignature {
+pub(crate) fn required_signature_for_glob(pattern_lower: &str) -> NameSignature {
     if pattern_lower.contains('[') || pattern_lower.contains('{') || pattern_lower.contains('\\') {
         return NameSignature::default();
     }

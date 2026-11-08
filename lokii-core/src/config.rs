@@ -43,6 +43,8 @@ pub struct IndexConfig {
     pub include_hidden: bool,
     /// Maximum number of search results to return.
     pub max_results: usize,
+    /// 非本地卷（网络共享等）上的索引根每隔多少分钟整棵重扫一次；FSEvents 看不到远端改动。0 表示不重扫。
+    pub network_rescan_minutes: u64,
 }
 
 impl Default for IndexConfig {
@@ -115,6 +117,7 @@ impl Default for IndexConfig {
             ],
             include_hidden: false,
             max_results: 500,
+            network_rescan_minutes: 5,
         }
     }
 }
@@ -278,6 +281,9 @@ include_hidden = false
 
 # 搜索结果最大返回数量
 max_results = 500
+
+# 网络共享等非本地卷上的索引目录，每隔多少分钟整体重扫一次（0 表示不重扫）
+network_rescan_minutes = 5
 
 [window]
 # 窗口失去焦点时是否自动隐藏

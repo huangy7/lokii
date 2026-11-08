@@ -62,6 +62,10 @@
 "prefs.excludePatterns.editor.cancel" = "取消";
 "prefs.includeHidden" = "索引隐藏文件";
 "prefs.includeHidden.description" = "包含以点开头的文件和目录，例如 `.ssh`、`.config`。";
+"prefs.networkRescan" = "网络卷重扫间隔";
+"prefs.networkRescan.description" = "网络共享等非本地卷上的远端改动无法实时感知，按此间隔整体重扫这些索引目录。";
+"prefs.networkRescan.minutes" = "%d 分钟";
+"prefs.networkRescan.off" = "关闭";
 "prefs.index.unsaved" = "有未保存的更改";
 "prefs.resetToDefaults" = "恢复默认";
 "prefs.save" = "保存";

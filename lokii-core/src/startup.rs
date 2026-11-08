@@ -4,29 +4,68 @@ use crate::indexer::IndexStore;
 use crate::scanner;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// Result of index initialization.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StartupMode {
-    /// Loaded from cache, user can search immediately.
-    /// Background verification will follow.
+    /// Loaded from cache, user can search immediately; the index service
+    /// catches up from `checkpoint` (or re-verifies without one).
     HotStart {
         cached_count: usize,
+        /// Replay point stored with the cache, if it still matches the config.
+        checkpoint: Option<cache::Checkpoint>,
     },
     /// No cache available, performed full scan.
     ColdStart {
         scanned_count: usize,
+        /// Event id read before the scan: replaying from it covers changes made meanwhile.
+        event_id: u64,
     },
     Failed(crate::compact_index::IndexError),
+}
+
+/// Capture a checkpoint for a snapshot about to be scanned or replayed: the
+/// event id is read first, so anything that changes during the work is
+/// replayed again next time rather than lost.
+pub fn checkpoint(config: &AppConfig) -> cache::Checkpoint {
+    let event_id = crate::fsevents::current_event_id();
+    cache::Checkpoint {
+        event_id,
+        fingerprint: scope_fingerprint(config),
+    }
+}
+
+/// Hash of everything that decides which paths get indexed: roots, exclusion
+/// rules, hidden files and Full Disk Access.
+pub fn scope_fingerprint(config: &AppConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // A different binary may hash differently; that only costs one full scan.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.resolve_paths().hash(&mut hasher);
+    config.resolve_exclude_paths().hash(&mut hasher);
+    config.index.exclude.hash(&mut hasher);
+    config.index.include_hidden.hash(&mut hasher);
+    crate::permissions::has_full_disk_access().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Save `index` with the replay checkpoint it reflects.
+pub fn save_index(
+    index: &crate::compact_index::CompactIndex,
+    checkpoint: cache::Checkpoint,
+    cache_file: &Path,
+) {
+    if let Err(error) = cache::save_compact(index, Some(checkpoint), cache_file) {
+        eprintln!("[Lokii] index cache save failed: {error}");
+    }
 }
 
 /// Initialize the index: try cache first, fall back to full scan.
 ///
 /// For hot start: loads cache into store and returns immediately so the UI
-/// can become interactive. The caller is responsible for triggering
-/// `verify_index` afterwards on a background thread.
+/// can become interactive. The index service then catches up in the background.
 ///
 /// For cold start: performs a full blocking scan.
 pub fn initialize_index(
@@ -39,19 +78,22 @@ pub fn initialize_index(
 
     // Try hot start from cache
     match cache::load_compact(cache_file) {
-        Ok(entries) => {
+        Ok((entries, saved)) => {
             let count = entries.len();
             store.replace_compact(entries);
 
             // Report cached count as initial progress
             progress.store(count, std::sync::atomic::Ordering::Relaxed);
 
+            let fingerprint = scope_fingerprint(config);
             StartupMode::HotStart {
                 cached_count: count,
+                checkpoint: saved.filter(|saved| saved.fingerprint == fingerprint),
             }
         }
         Err(_) => {
             // Cold start: full scan (silently fall back on any cache error)
+            let checkpoint = checkpoint(config);
             let filter = Arc::new(crate::filter::CompiledFilter::from_config(config));
             let fresh = match scanner::scan_compact(
                 &paths,
@@ -65,42 +107,15 @@ pub fn initialize_index(
             let count = fresh.len();
 
             // Save cache for next startup
-            let _ = cache::save_compact(&fresh, cache_file);
+            let _ = cache::save_compact(&fresh, Some(checkpoint), cache_file);
 
             store.replace_compact(fresh);
             StartupMode::ColdStart {
                 scanned_count: count,
+                event_id: checkpoint.event_id,
             }
         }
     }
-}
-
-/// Verify the cached index by doing a fresh scan and replacing the store.
-/// Call this on a background thread after a hot start.
-/// Checks `cancel` flag — if set, aborts early without modifying the store.
-pub fn verify_index(
-    store: &IndexStore,
-    config: &AppConfig,
-    cache_file: &Path,
-    cancel: &AtomicBool,
-) -> Result<(), crate::compact_index::IndexError> {
-    let paths = config.resolve_paths();
-    let progress = Arc::new(AtomicUsize::new(0));
-
-    let filter = Arc::new(crate::filter::CompiledFilter::from_config(config));
-    let fresh = scanner::scan_compact(&paths, filter, config.index.include_hidden, progress)?;
-
-    // If cancelled (e.g. rebuild started), don't overwrite the store
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(());
-    }
-
-    // Re-save cache with verified data. Serialize before taking the store lock
-    // so the watcher is not blocked for the duration of the encode.
-    let _ = cache::save_compact(&fresh, cache_file);
-
-    store.replace_compact(fresh);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -152,7 +167,7 @@ mod tests {
         let mode = initialize_index(&store, &config, make_progress(), &cache_file);
 
         match mode {
-            StartupMode::ColdStart { scanned_count } => {
+            StartupMode::ColdStart { scanned_count, .. } => {
                 assert!(scanned_count > 0, "Should have scanned some entries");
             }
             other => panic!("Expected ColdStart, got: {other:?}"),
@@ -185,7 +200,7 @@ mod tests {
         let mode = initialize_index(&store, &config, make_progress(), &cache_file);
 
         match mode {
-            StartupMode::HotStart { cached_count } => {
+            StartupMode::HotStart { cached_count, .. } => {
                 assert_eq!(cached_count, 10);
             }
             other => panic!("Expected HotStart, got: {other:?}"),
@@ -212,11 +227,55 @@ mod tests {
         let mode = initialize_index(&store, &config, make_progress(), &cache_file);
 
         match mode {
-            StartupMode::ColdStart { scanned_count } => {
+            StartupMode::ColdStart { scanned_count, .. } => {
                 assert!(scanned_count > 0, "Should fall back to full scan");
             }
             other => panic!("Expected ColdStart fallback, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn saved_index_resumes_from_its_checkpoint() {
+        let scan_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let cache_file = cache_dir.path().join("index.cache");
+        let config = make_test_config(scan_dir.path());
+        let store = IndexStore::new();
+        store.replace(make_entries(3));
+
+        let checkpoint = cache::Checkpoint {
+            event_id: 99,
+            fingerprint: scope_fingerprint(&config),
+        };
+        save_index(&store.read(), checkpoint, &cache_file);
+        let mode = initialize_index(&IndexStore::new(), &config, make_progress(), &cache_file);
+        assert!(matches!(
+            mode,
+            StartupMode::HotStart {
+                cached_count: 3,
+                checkpoint: Some(cache::Checkpoint { event_id: 99, .. })
+            }
+        ));
+    }
+
+    #[test]
+    fn changed_config_discards_checkpoint() {
+        let scan_dir = TempDir::new().unwrap();
+        fs::write(scan_dir.path().join("a.txt"), "a").unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let cache_file = cache_dir.path().join("index.cache");
+        let mut config = make_test_config(scan_dir.path());
+        initialize_index(&IndexStore::new(), &config, make_progress(), &cache_file);
+
+        config.index.include_hidden = false;
+        let mode = initialize_index(&IndexStore::new(), &config, make_progress(), &cache_file);
+        assert!(matches!(
+            mode,
+            StartupMode::HotStart {
+                checkpoint: None,
+                ..
+            }
+        ));
     }
 
     #[test]

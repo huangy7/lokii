@@ -96,12 +96,14 @@ class PreferencesViewModel: ObservableObject {
     @Published var excludePatterns: [String] = []
     @Published var excludePaths: [String] = []
     @Published var includeHidden: Bool = false
+    @Published var networkRescanMinutes: Int = 5
     
     // Saved configurations for diffing
     @Published var savedIndexPaths: [String] = []
     @Published var savedExcludePatterns: [String] = []
     @Published var savedExcludePaths: [String] = []
     @Published var savedIncludeHidden: Bool = false
+    @Published var savedNetworkRescanMinutes: Int = 5
     
     @Published var hasFullDiskAccess: Bool = false
     @Published var selectedTab: String = "general"
@@ -361,11 +363,13 @@ class PreferencesViewModel: ObservableObject {
         self.excludePatterns = config.index.exclude
         self.excludePaths = config.index.excludePaths
         self.includeHidden = config.index.includeHidden
+        self.networkRescanMinutes = config.index.networkRescanMinutes
         
         self.savedIndexPaths = config.index.indexPaths
         self.savedExcludePatterns = config.index.exclude
         self.savedExcludePaths = config.index.excludePaths
         self.savedIncludeHidden = config.index.includeHidden
+        self.savedNetworkRescanMinutes = config.index.networkRescanMinutes
         isLoading = false
         refreshAvailableTerminals()
     }
@@ -379,7 +383,8 @@ class PreferencesViewModel: ObservableObject {
                 exclude: savedExcludePatterns,
                 excludePaths: savedExcludePaths,
                 includeHidden: savedIncludeHidden,
-                maxResults: maxResults
+                maxResults: maxResults,
+                networkRescanMinutes: savedNetworkRescanMinutes
             ),
             window: .init(
                 hideOnBlur: hideOnBlur,
@@ -392,7 +397,8 @@ class PreferencesViewModel: ObservableObject {
         indexPaths != savedIndexPaths ||
         excludePatterns != savedExcludePatterns ||
         excludePaths != savedExcludePaths ||
-        includeHidden != savedIncludeHidden
+        includeHidden != savedIncludeHidden ||
+        networkRescanMinutes != savedNetworkRescanMinutes
     }
     
     func saveIndexChanges() -> Bool {
@@ -410,6 +416,7 @@ class PreferencesViewModel: ObservableObject {
         config.index.exclude = excludePatterns
         config.index.excludePaths = excludePaths
         config.index.includeHidden = includeHidden
+        config.index.networkRescanMinutes = networkRescanMinutes
         
         let success = engine.updateConfig(config)
         if success {
@@ -417,6 +424,7 @@ class PreferencesViewModel: ObservableObject {
             savedExcludePatterns = excludePatterns
             savedExcludePaths = excludePaths
             savedIncludeHidden = includeHidden
+            savedNetworkRescanMinutes = networkRescanMinutes
             if needsRebuild {
                 engine.rebuildIndex()
             }
@@ -429,6 +437,7 @@ class PreferencesViewModel: ObservableObject {
         excludePatterns = savedExcludePatterns
         excludePaths = savedExcludePaths
         includeHidden = savedIncludeHidden
+        networkRescanMinutes = savedNetworkRescanMinutes
     }
     
     func restoreIndexDefaults() {
@@ -436,11 +445,13 @@ class PreferencesViewModel: ObservableObject {
         excludePatterns = Self.defaultExcludePatterns
         excludePaths = Self.defaultExcludePaths
         includeHidden = false
+        networkRescanMinutes = Self.defaultNetworkRescanMinutes
     }
 
     /// 索引配置的出厂默认值，与 Rust 侧 IndexConfig::default 保持一致。
     /// 重置入口与“当前是否处于默认态”判定共用此定义，避免两处字面量各自漂移。
     static let defaultIndexPaths = ["~"]
+    static let defaultNetworkRescanMinutes = 5
     static let defaultExcludePatterns = ["node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn", "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__", "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp", "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata"]
     static let defaultExcludePaths = [
         "/System", "/Library", "/private", "/bin", "/sbin", "/usr", "/dev",
@@ -470,7 +481,8 @@ class PreferencesViewModel: ObservableObject {
         indexPaths == Self.defaultIndexPaths &&
         excludePatterns == Self.defaultExcludePatterns &&
         excludePaths == Self.defaultExcludePaths &&
-        !includeHidden
+        !includeHidden &&
+        networkRescanMinutes == Self.defaultNetworkRescanMinutes
     }
 }
 
@@ -971,6 +983,17 @@ struct PreferencesView: View {
                             Toggle("", isOn: $viewModel.includeHidden)
                                 .toggleStyle(.switch)
                                 .labelsHidden()
+                        }
+                        SettingsRowDivider()
+                        SettingsRow(L("prefs.networkRescan"), description: L("prefs.networkRescan.description")) {
+                            HStack(spacing: 8) {
+                                Text(viewModel.networkRescanMinutes == 0
+                                     ? L("prefs.networkRescan.off")
+                                     : String(format: L("prefs.networkRescan.minutes"), viewModel.networkRescanMinutes))
+                                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                Stepper("", value: $viewModel.networkRescanMinutes, in: 0...120)
+                                    .labelsHidden()
+                            }
                         }
                     }
                 }
