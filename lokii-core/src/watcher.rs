@@ -1605,6 +1605,58 @@ mod tests {
     }
 
     #[test]
+    fn volume_mounted_after_start_is_scanned_without_restart() {
+        // 外置卷在启动后才挂载：配置里的根一开始不存在，挂载后应自动对账收录。
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("990evo");
+        let config = scoped_config(&root);
+        let scope = Scope::new(&config);
+        let store = IndexStore::new();
+        let (control_tx, control) = mpsc::channel();
+        let fingerprint = Arc::new(AtomicU64::new(scope.fingerprint));
+        let mut service = Service {
+            store: store.clone(),
+            config_store: ConfigStore::new(config),
+            metrics: Arc::new(WatcherMetrics::default()),
+            scan_lock: Arc::new(std::sync::Mutex::new(())),
+            on_batch: |_| {},
+            persist: |_: &crate::compact_index::CompactIndex, _| {},
+            scope,
+            scope_checked: Instant::now(),
+            stream: None,
+            events: mpsc::channel().1,
+            control,
+            control_tx,
+            applied: Arc::new(AtomicU64::new(5)),
+            fingerprint,
+            pending_fingerprint: None,
+            pending: HashMap::new(),
+            seen: 5,
+            first_pending: None,
+            rescans: Vec::new(),
+            full_reconcile: false,
+            reconcile_after: 0,
+            reconcile_retry: None,
+            gap: None,
+            gap_replays: 0,
+            catching_up: false,
+            history_done: false,
+            history_paths: 0,
+            dirty: false,
+            last_persist: Instant::now(),
+            network_scanned: None,
+            network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("movie.mkv"), "x").unwrap();
+        service.scope_checked = Instant::now() - Duration::from_secs(1);
+        service.poll_scope();
+        assert!(service.reconcile_pending(), "newly mounted root widens the scope");
+        service.flush();
+        assert!(indexed(&store, &root.join("movie.mkv")));
+    }
+
+    #[test]
     fn blocked_reconciliation_backs_off_instead_of_spinning() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().canonicalize().unwrap();
