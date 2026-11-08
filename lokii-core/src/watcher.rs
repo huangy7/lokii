@@ -1175,6 +1175,8 @@ mod tests {
         fs::rename(root.join("old_dir"), root.join("new_dir")).unwrap();
         fs::create_dir_all(root.join("made/deep")).unwrap();
         fs::write(root.join("made/deep/file.txt"), "e").unwrap();
+        // 给系统 fseventsd 留出提交时间，确保离线变更完整进入日志
+        std::thread::sleep(Duration::from_millis(200));
 
         let (handle, persisted) = serve(&store, &root, Resume::From(since));
         let checkpoint = persisted.recv_timeout(Duration::from_secs(10)).expect("caught up");
@@ -1713,7 +1715,8 @@ mod tests {
 
         config.index.index_paths = vec![new_root.to_string_lossy().into_owned()];
         config_store.update(config);
-        std::thread::sleep(Duration::from_millis(1500));
+        // 等待服务线程在轮询窗口内感知配置变化并重启流
+        std::thread::sleep(Duration::from_millis(2000));
         let fresh = new_root.join("fresh.txt");
         let stale = old_root.join("stale.txt");
         fs::write(&fresh, "new").unwrap();
