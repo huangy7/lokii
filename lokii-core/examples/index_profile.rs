@@ -58,6 +58,8 @@ fn main() {
         ("regex:^file_00", SearchMode::Regex),
         ("f001", SearchMode::Fuzzy),
         ("missing-needle", SearchMode::Auto),
+        ("long_directory_component/file_001", SearchMode::Auto),
+        ("in:/synthetic/developer/project_0001234 file", SearchMode::Auto),
     ] {
         std::hint::black_box(dispatch(&store, query, mode, 500));
         let mut samples = Vec::new();

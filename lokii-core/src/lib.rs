@@ -15,6 +15,7 @@ pub mod startup;
 pub mod watcher;
 
 mod ffi;
+mod fsevents;
 mod string_pool;
 
 uniffi::setup_scaffolding!();

@@ -38,6 +38,7 @@ struct LokiiConfig: Codable {
         var excludePaths: [String]
         var includeHidden: Bool
         var maxResults: Int
+        var networkRescanMinutes: Int
 
         enum CodingKeys: String, CodingKey {
             case indexPaths = "index_paths"
@@ -45,6 +46,7 @@ struct LokiiConfig: Codable {
             case excludePaths = "exclude_paths"
             case includeHidden = "include_hidden"
             case maxResults = "max_results"
+            case networkRescanMinutes = "network_rescan_minutes"
         }
 
         init(
@@ -52,13 +54,15 @@ struct LokiiConfig: Codable {
             exclude: [String] = [],
             excludePaths: [String] = [],
             includeHidden: Bool = false,
-            maxResults: Int = 1000
+            maxResults: Int = 1000,
+            networkRescanMinutes: Int = 5
         ) {
             self.indexPaths = indexPaths
             self.exclude = exclude
             self.excludePaths = excludePaths
             self.includeHidden = includeHidden
             self.maxResults = maxResults
+            self.networkRescanMinutes = networkRescanMinutes
         }
 
         init(from decoder: Decoder) throws {
@@ -68,6 +72,7 @@ struct LokiiConfig: Codable {
             self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? []
             self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? false
             self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? 1000
+            self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? 5
         }
     }
 
@@ -178,6 +183,11 @@ final class SearchEngine: @unchecked Sendable {
         DispatchQueue.global(qos: .userInitiated).async { [core] in
             _ = core.rebuildIndex(eventHandler: handler)
         }
+    }
+
+    /// Save the index with its replay checkpoint (blocking; call on quit).
+    func persistIndex() {
+        core.persistIndex()
     }
 
     /// Check Full Disk Access permission.

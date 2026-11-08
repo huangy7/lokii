@@ -53,7 +53,8 @@ do {
         "exclude": ["node_modules", ".git"],
         "exclude_paths": ["~/Library", "/System"],
         "include_hidden": false,
-        "max_results": 200
+        "max_results": 200,
+        "network_rescan_minutes": 15
     }
     \"\"\".data(using: .utf8)!
 
@@ -63,6 +64,7 @@ do {
     assertEqual(config1.exclude, ["node_modules", ".git"], "exclude 解析匹配")
     assertEqual(config1.excludePaths, ["~/Library", "/System"], "excludePaths 解析匹配")
     assertEqual(config1.maxResults, 200, "maxResults 解析匹配")
+    assertEqual(config1.networkRescanMinutes, 15, "networkRescanMinutes 解析匹配")
 
     print("[2/3] 测试 IndexConfig 缺少 exclude_paths 时的优雅回退（默认空数组）...")
     let jsonWithoutExcludePaths = \"\"\"
@@ -79,12 +81,14 @@ do {
     assertEqual(config2.exclude, ["target"], "exclude 正常")
     assertEqual(config2.excludePaths, [], "缺少 exclude_paths 时回退为空数组")
     assertTrue(config2.includeHidden, "includeHidden 为 true")
+    assertEqual(config2.networkRescanMinutes, 5, "缺少 network_rescan_minutes 时回退为 5 分钟")
 
     print("[3/3] 测试 IndexConfig 序列化能正确输出 exclude_paths 字段...")
     let encoder = JSONEncoder()
     let encodedData = try encoder.encode(config1)
     let encodedJSON = String(data: encodedData, encoding: .utf8)!
     assertTrue(encodedJSON.contains("\\"exclude_paths\\":"), "JSON 中应包含 exclude_paths 字段")
+    assertTrue(encodedJSON.contains("\\"network_rescan_minutes\\":15"), "JSON 中应保留 network_rescan_minutes")
     print("IndexConfig 编解码与回退测试全部通过！")
 } catch {
     fputs("测试执行抛出异常: \\(error)\\n", stderr)

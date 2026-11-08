@@ -38,7 +38,7 @@ Lokii is a native macOS instant file search tool engineered for developer-grade 
 | :--- | :--- |
 | **Instant As-You-Type Search** | Sub-millisecond response latency across 500,000+ files with low memory footprint (under 100MB). |
 | **Multi-Mode Query Engine** | Intelligent mode detection supporting substring, wildcard (`*`, `?`), regular expression (`^...$`), and fuzzy matching. |
-| **Real-Time FSEvents Stream** | Multi-channel FSEvents event stream with dirty-queue debouncing to keep the index in sync without high CPU overhead. |
+| **Real-Time FSEvents Stream** | A checkpointed FSEvents stream keeps the index in sync with low CPU overhead; on relaunch Lokii replays only what changed while it was closed instead of rescanning the disk. |
 | **Native AppKit Density** | High-density virtualized table view, native macOS file icons, zebra striping, and spring-damped micro-interactions. |
 | **Keyboard-First Workflow** | Global shortcut toggle (`⌘⇧Space`), arrow navigation, `Enter` to reveal in Finder, `⌘C` to copy path, and `Esc` to hide. |
 | **Persistent Binary Cache** | Versioned bitcode cache with shared string tables, automatic loading of legacy v3 caches, and v4 saves after background verification. |

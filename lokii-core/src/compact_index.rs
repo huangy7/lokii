@@ -1416,34 +1416,9 @@ impl CompactIndex {
         Ok((added, removed))
     }
 
-    pub fn reconcile(&mut self, fresh: &Self) -> Result<(), IndexError> {
-        let existing: HashSet<_> = self.iter().map(|(_, view)| view.path_key()).collect();
-        let added: Vec<_> = fresh
-            .iter()
-            .filter(|(_, view)| !existing.contains(&view.path_key()))
-            .map(|(id, _)| id)
-            .collect();
-        drop(existing);
-        let mut staged = Vec::with_capacity(added.len());
-        for id in added {
-            match self.acquire(&fresh.materialize(id)?) {
-                Ok(record) => staged.push(record),
-                Err(error) => {
-                    self.release_all(staged);
-                    return Err(error);
-                }
-            }
-        }
-        let current: HashSet<_> = fresh.iter().map(|(_, view)| view.path_key()).collect();
-        let (_, first_removed) = self.remove_without_refresh(|view| !current.contains(&view.path_key()));
-        if let Some(first_removed) = first_removed {
-            self.on_records_removed(first_removed);
-        }
-        let base_ordinal = self.records.len();
-        self.on_records_appended(base_ordinal, &staged);
-        self.records.reserve_exact(staged.len());
-        self.records.extend(staged);
-        Ok(())
+    /// 索引里是否有以 `dir` 为父目录的条目。
+    pub fn has_children(&self, dir: &str) -> bool {
+        self.parents.find(&format!("{dir}/")).is_some()
     }
 
     pub fn pool_counts(&self) -> (usize, usize, usize, usize) {

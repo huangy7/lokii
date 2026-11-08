@@ -62,14 +62,22 @@ fn compact_cache_migrates_legacy_and_rejects_corruption() {
     legacy.extend_from_slice(&3u32.to_le_bytes());
     legacy.extend_from_slice(&bitcode::encode(&originals));
     std::fs::write(&path, legacy).unwrap();
-    let compact = lokii_core::cache::load_compact(&path).unwrap();
-    lokii_core::cache::save_compact(&compact, &path).unwrap();
-    assert_eq!(&std::fs::read(&path).unwrap()[4..8], &4u32.to_le_bytes());
-    let restored = lokii_core::cache::load_compact(&path).unwrap();
+    let (compact, checkpoint) = lokii_core::cache::load_compact(&path).unwrap();
+    assert_eq!(checkpoint, None);
+    let saved = lokii_core::cache::Checkpoint {
+        event_id: 42,
+        fingerprint: 7,
+    };
+    lokii_core::cache::save_compact(&compact, Some(saved), &path).unwrap();
+    assert_eq!(&std::fs::read(&path).unwrap()[4..8], &5u32.to_le_bytes());
+    let (restored, checkpoint) = lokii_core::cache::load_compact(&path).unwrap();
+    assert_eq!(checkpoint, Some(saved));
     for (ordinal, original) in originals.iter().enumerate() {
         assert_eq!(&restored.materialize(EntryId(ordinal)).unwrap(), original);
     }
     std::fs::write(&path, b"LOKI\x04\0\0\0bad").unwrap();
+    assert!(lokii_core::cache::load_compact(&path).is_err());
+    std::fs::write(&path, b"LOKI\x05\0\0\0short").unwrap();
     assert!(lokii_core::cache::load_compact(&path).is_err());
 }
 
@@ -90,14 +98,15 @@ fn legacy_migration_preserves_empty_duplicate_and_unusual_records() {
     originals[0].is_dir = true;
     for records in [&[][..], originals.as_slice()] {
         lokii_core::cache::save_cache(records, &path).unwrap();
-        let compact = lokii_core::cache::load_compact(&path).unwrap();
+        let (compact, _) = lokii_core::cache::load_compact(&path).unwrap();
         assert_eq!(compact.len(), records.len());
         for (ordinal, original) in records.iter().enumerate() {
             assert_eq!(&compact.materialize(EntryId(ordinal)).unwrap(), original);
         }
         compact.validate().unwrap();
-        lokii_core::cache::save_compact(&compact, &path).unwrap();
-        let restored = lokii_core::cache::load_compact(&path).unwrap();
+        lokii_core::cache::save_compact(&compact, None, &path).unwrap();
+        let (restored, checkpoint) = lokii_core::cache::load_compact(&path).unwrap();
+        assert_eq!(checkpoint, None);
         for (ordinal, original) in records.iter().enumerate() {
             assert_eq!(&restored.materialize(EntryId(ordinal)).unwrap(), original);
         }
@@ -132,15 +141,6 @@ fn compact_scanner_preserves_legacy_records() {
     actual.sort_by(|left, right| left.path.cmp(&right.path));
     assert_eq!(actual, expected);
     assert_eq!(actual.len(), 3);
-}
-
-#[test]
-fn reconciliation_compares_full_path_not_name() {
-    let mut current = CompactIndex::from_entries([entry("old-name", "/same-path")]).unwrap();
-    let fresh = CompactIndex::from_entries([entry("new-name", "/same-path")]).unwrap();
-    current.reconcile(&fresh).unwrap();
-    assert_eq!(current.len(), 1);
-    assert_eq!(current.materialize(EntryId(0)).unwrap().name, "old-name");
 }
 
 #[test]
@@ -235,10 +235,10 @@ fn failed_cache_save_preserves_previous_file() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("index.cache");
     let index = CompactIndex::from_entries([entry("main.rs", "/a/main.rs")]).unwrap();
-    lokii_core::cache::save_compact(&index, &path).unwrap();
+    lokii_core::cache::save_compact(&index, None, &path).unwrap();
     let previous = std::fs::read(&path).unwrap();
     std::fs::create_dir(path.with_extension("tmp")).unwrap();
-    assert!(lokii_core::cache::save_compact(&index, &path).is_err());
+    assert!(lokii_core::cache::save_compact(&index, None, &path).is_err());
     assert_eq!(std::fs::read(path).unwrap(), previous);
 }
 
@@ -362,14 +362,20 @@ fn removes_beside_creates_still_drop_every_match() {
             &[],
             &[],
             &["/g".into()],
-            vec![entry("new.rs", "/n/new.rs"), entry("alias.rs", "/a/alias.rs")],
+            vec![
+                entry("new.rs", "/n/new.rs"),
+                entry("alias.rs", "/a/alias.rs"),
+            ],
         )
         .unwrap();
     assert_eq!((added, removed), (2, 1));
     let paths: Vec<String> = (0..index.len())
         .map(|ordinal| index.materialize(EntryId(ordinal)).unwrap().path)
         .collect();
-    assert_eq!(paths, ["/a/old.rs", "/k/keep.rs", "/n/new.rs", "/a/alias.rs"]);
+    assert_eq!(
+        paths,
+        ["/a/old.rs", "/k/keep.rs", "/n/new.rs", "/a/alias.rs"]
+    );
     index.validate().unwrap();
 }
 

@@ -3,6 +3,7 @@ use crate::indexer::{score_match, IndexStore, MatchScore};
 use crate::search::path_query::PathQuery;
 use crate::search::top_k::TopK;
 use crate::search::{find_positions, AdvancedSearchResult, CompiledRecordFilter, SearchMode};
+use crate::string_pool::NameSignature;
 
 /// 目录实体自身命中时的基准分。
 const SCORE_DIR_SELF: u32 = 500;
@@ -141,6 +142,47 @@ pub(crate) fn find_parent_highlight_range(
     (start < end).then_some((start, end))
 }
 
+/// 对单个文件名打分，返回未叠加路径加成的基准分；未命中返回 `None`。
+fn score_name(
+    name: &str,
+    folded: Option<&str>,
+    raw_path: bool,
+    query: &PathQuery,
+    has_wildcard: bool,
+    all_terms_ascii: bool,
+    ascii_buf: &mut Vec<u8>,
+) -> Option<u32> {
+    if has_wildcard {
+        let name_lower_cow: std::borrow::Cow<'_, str> = if let Some(f) = folded {
+            std::borrow::Cow::Borrowed(f)
+        } else if name.is_ascii() {
+            ascii_buf.clear();
+            ascii_buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+            std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(ascii_buf) })
+        } else {
+            std::borrow::Cow::Owned(name.to_lowercase())
+        };
+        let all_matched = query.name_terms.iter().all(|term| {
+            if term.contains('*') || term.contains('?') {
+                glob_match::glob_match(term, &name_lower_cow)
+            } else {
+                name_lower_cow.contains(term.as_str())
+            }
+        });
+        return all_matched.then_some(SCORE_NAME_PREFIX);
+    }
+    let matched_score = if raw_path && !name.is_ascii() {
+        score_match(&name.to_lowercase(), &query.name_terms)
+    } else {
+        crate::indexer::score_match_zero_alloc(name, folded, &query.name_terms, all_terms_ascii)
+    };
+    matched_score.map(|score| match score {
+        MatchScore::Exact => SCORE_NAME_EXACT,
+        MatchScore::Prefix => SCORE_NAME_PREFIX,
+        MatchScore::Substring => SCORE_NAME_SUBSTRING,
+    })
+}
+
 /// 执行路径感知流式检索。
 pub fn search(
     store: &IndexStore,
@@ -182,6 +224,24 @@ pub fn search_index(
     let mut top_k = TopK::new(max_results);
     let mut ascii_buf = Vec::with_capacity(128);
 
+    // 宽路径下大量记录共用同一批文件名：每个唯一名只判定一次，首次判定前先过签名预筛。
+    // 0 表示尚未判定；同名记录得分相同，原始路径记录的名字不在名字池里，不走这张表。
+    const NAME_UNSCORED: u16 = 0;
+    const NAME_MISS: u16 = 1;
+    let query_index = read.query_index();
+    let required_signature = query.name_terms.iter().fold(NameSignature::default(), |sig, term| {
+        sig.union(if term.contains('*') || term.contains('?') {
+            crate::search::wildcard::required_signature_for_glob(term)
+        } else {
+            NameSignature::from_substring_query(term)
+        })
+    });
+    let mut name_scores = if query.name_terms.is_empty() {
+        Vec::new()
+    } else {
+        vec![NAME_UNSCORED; query_index.slot_count()]
+    };
+
     // 阶段 1：单趟扫描记录
     for (ordinal, record) in read.records().iter().enumerate() {
         if !filter.matches_record(record, || Some(read.record_name(record))) {
@@ -219,6 +279,13 @@ pub fn search_index(
         }
 
         // 3. 打分（零分配）
+        let memo_slot = (!record.raw_path).then_some(record.name as usize);
+        let remembered = memo_slot
+            .and_then(|slot| name_scores.get(slot).copied())
+            .unwrap_or(NAME_UNSCORED);
+        if remembered == NAME_MISS {
+            continue;
+        }
         let (name, folded_opt) = if record.raw_path {
             (read.record_name(record), None)
         } else {
@@ -238,48 +305,33 @@ pub fn search_index(
             }
         } else {
             // 带文件名检索（如 "src/main.rs"）
-            let base_score: u32 = if has_wildcard {
-                let name_lower_cow: std::borrow::Cow<'_, str> = if let Some(f) = folded_opt {
-                    std::borrow::Cow::Borrowed(f)
-                } else if name.is_ascii() {
-                    ascii_buf.clear();
-                    ascii_buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
-                    std::borrow::Cow::Borrowed(unsafe {
-                        std::str::from_utf8_unchecked(&ascii_buf)
-                    })
-                } else {
-                    std::borrow::Cow::Owned(name.to_lowercase())
-                };
-                let all_matched = query.name_terms.iter().all(|term| {
-                    if term.contains('*') || term.contains('?') {
-                        glob_match::glob_match(term, &name_lower_cow)
-                    } else {
-                        name_lower_cow.contains(term.as_str())
-                    }
-                });
-                if !all_matched {
-                    continue;
-                }
-                SCORE_NAME_PREFIX
+            let base_score = if remembered != NAME_UNSCORED {
+                u32::from(remembered)
             } else {
-                let matched_score = if record.raw_path && !name.is_ascii() {
-                    score_match(&name.to_lowercase(), &query.name_terms)
+                let pruned = !record.raw_path
+                    && query_index
+                        .signature(record.name)
+                        .is_some_and(|signature| !signature.contains(required_signature));
+                let scored = if pruned {
+                    None
                 } else {
-                    crate::indexer::score_match_zero_alloc(
+                    score_name(
                         name,
                         folded_opt,
-                        &query.name_terms,
+                        record.raw_path,
+                        query,
+                        has_wildcard,
                         all_terms_ascii,
+                        &mut ascii_buf,
                     )
                 };
-                let Some(score) = matched_score else {
+                if let Some(memo) = memo_slot.and_then(|slot| name_scores.get_mut(slot)) {
+                    *memo = scored.map_or(NAME_MISS, |score| score as u16);
+                }
+                let Some(score) = scored else {
                     continue;
                 };
-                match score {
-                    MatchScore::Exact => SCORE_NAME_EXACT,
-                    MatchScore::Prefix => SCORE_NAME_PREFIX,
-                    MatchScore::Substring => SCORE_NAME_SUBSTRING,
-                }
+                score
             };
 
             let path_bonus: u32 = match parent_quality {
@@ -338,6 +390,42 @@ pub fn search_index(
 mod tests {
     use super::*;
     use crate::indexer::{FileEntry, IndexStore};
+
+    /// 同名记录分属不同目录：判定结果按唯一名复用后，命中与未命中都不能串到别的记录上。
+    #[test]
+    fn shared_names_keep_per_record_results() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("main.rs", "/p/src/main.rs", false),
+            make_entry("main.rs", "/p/lib/main.rs", false),
+            make_entry("main.rs", "/q/src/main.rs", false),
+            make_entry("other.rs", "/p/src/other.rs", false),
+            make_entry("Main.RS", "/p/src/deep/Main.RS", false),
+            make_entry("中文笔记.txt", "/p/src/中文笔记.txt", false),
+            // 名字与路径末段不一致的原始路径记录：按路径末段搜索，不走按名缓存。
+            make_entry("alias", "/p/src/alias", false),
+            make_entry("alias", "/p/src/actual", false),
+        ]);
+        let run = |query: &str| {
+            let query = PathQuery::parse(query).unwrap();
+            let mut paths: Vec<_> = search(&store, &query, &CompiledRecordFilter::default(), 500)
+                .into_iter()
+                .map(|result| result.entry.path)
+                .collect();
+            paths.sort();
+            paths
+        };
+
+        assert_eq!(
+            run("src/main"),
+            ["/p/src/deep/Main.RS", "/p/src/main.rs", "/q/src/main.rs"]
+        );
+        assert_eq!(run("lib/main"), ["/p/lib/main.rs"]);
+        assert_eq!(run("src/ma*.rs"), ["/p/src/deep/Main.RS", "/p/src/main.rs", "/q/src/main.rs"]);
+        assert_eq!(run("src/zhongwen"), ["/p/src/中文笔记.txt"]);
+        assert_eq!(run("src/actual"), ["/p/src/actual"]);
+        assert!(run("src/missing").is_empty());
+    }
 
     fn make_entry(name: &str, path: &str, is_dir: bool) -> FileEntry {
         let extension = if is_dir {

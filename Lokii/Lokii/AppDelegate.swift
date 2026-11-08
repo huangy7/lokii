@@ -44,6 +44,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppUpdater.shared.start()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // 存下索引与回放检查点，下次启动只需回放此后的变更（数百万条约数百毫秒）。
+        engine.persistIndex()
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         mainWindow?.showWindow(nil)
         return true

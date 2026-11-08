@@ -62,6 +62,10 @@
 "prefs.excludePatterns.editor.cancel" = "Cancel";
 "prefs.includeHidden" = "Index hidden files";
 "prefs.includeHidden.description" = "Include dotfiles and hidden folders such as `.ssh` and `.config`.";
+"prefs.networkRescan" = "Network volume rescan";
+"prefs.networkRescan.description" = "Changes made remotely on network shares can't be seen live, so indexed folders on non-local volumes are rescanned at this interval.";
+"prefs.networkRescan.minutes" = "%d min";
+"prefs.networkRescan.off" = "Off";
 "prefs.index.unsaved" = "Unsaved changes";
 "prefs.resetToDefaults" = "Restore Defaults";
 "prefs.save" = "Save";

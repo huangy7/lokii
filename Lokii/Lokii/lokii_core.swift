@@ -873,6 +873,12 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func openFile(path: String)  -> Bool
     
     /**
+     * Save the index with its replay checkpoint. Call before the app quits so
+     * the next launch only replays what changed after this point.
+     */
+    func persistIndex() 
+    
+    /**
      * Rebuild the index from scratch. Blocking — call from background thread.
      * Caller should check `is_scanning()` first; if true, skip the rebuild.
      */
@@ -1053,6 +1059,16 @@ open func openFile(path: String) -> Bool  {
         FfiConverterString.lower(path),$0
     )
 })
+}
+    
+    /**
+     * Save the index with its replay checkpoint. Call before the app quits so
+     * the next launch only replays what changed after this point.
+     */
+open func persistIndex()  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_persist_index(self.uniffiClonePointer(),$0
+    )
+}
 }
     
     /**
@@ -1961,6 +1977,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_open_file() != 16752) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_persist_index() != 24654) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_rebuild_index() != 27709) {
