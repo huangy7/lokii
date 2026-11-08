@@ -718,6 +718,8 @@ final class SearchResultsViewController: NSViewController {
         tableView.allowsColumnResizing = true
         tableView.allowsMultipleSelection = true
         tableView.allowsColumnSelection = false
+        tableView.autosaveTableColumns = true
+        tableView.autosaveName = "SearchResultsTable"
         tableView.gridStyleMask = []
         tableView.selectionHighlightStyle = .regular
         tableView.usesAlternatingRowBackgroundColors = true
@@ -765,9 +767,31 @@ final class SearchResultsViewController: NSViewController {
         sizeCol.title = L("search.col.size")
         sizeCol.width = 80
         sizeCol.minWidth = 50
-        sizeCol.headerCell.alignment = .right
         sizeCol.sortDescriptorPrototype = NSSortDescriptor(key: "size", ascending: false)
         tableView.addTableColumn(sizeCol)
+
+        updateColumnAlignments()
+    }
+
+    /// 动态刷新列头与单元格文本对齐方式：
+    /// 仅大小与修改时间列在处于表格末列时采用右对齐以贴合视窗边界，处于非末列时统一左对齐保持纵向对齐线整洁；
+    /// 名称与路径文本列始终保持左对齐。
+    public func updateColumnAlignments() {
+        guard let lastCol = tableView.tableColumns.last else { return }
+        for col in tableView.tableColumns {
+            let isLast = (col === lastCol)
+            let alignment: NSTextAlignment
+            switch col.identifier {
+            case .columnSize, .columnModified:
+                alignment = isLast ? .right : .left
+            default:
+                alignment = .left
+            }
+            if col.headerCell.alignment != alignment {
+                col.headerCell.alignment = alignment
+            }
+        }
+        tableView.headerView?.needsDisplay = true
     }
 
     @objc private func onTableDensityChanged(_ notification: Notification) {
@@ -1547,6 +1571,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         guard row < results.count, let column = tableColumn else { return nil }
         let result = results[row]
         let colID = column.identifier
+        let isLastColumn = tableView.tableColumns.last?.identifier == colID
 
         switch colID {
         case .columnName:
@@ -1558,7 +1583,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
                 string: dateText(for: TimeInterval(result.modified)),
                 font: fontCache.regular,
                 color: .labelColor,
-                alignment: .left,
+                alignment: isLastColumn ? .right : .left,
                 identifier: colID,
                 in: tableView
             )
@@ -1568,13 +1593,19 @@ extension SearchResultsViewController: NSTableViewDelegate {
                 string: str,
                 font: fontCache.monospacedDigit,
                 color: .secondaryLabelColor,
-                alignment: .right,
+                alignment: isLastColumn ? .right : .left,
                 identifier: colID,
                 in: tableView
             )
         default:
             return nil
         }
+    }
+
+    /// 用户拖拽调整列顺序回调：动态计算末列并刷新表头及单元格对齐方式
+    public func tableViewColumnDidMove(_ notification: Notification) {
+        updateColumnAlignments()
+        tableView.reloadData()
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -1667,6 +1698,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         let textField = NSTextField(labelWithString: "")
         textField.translatesAutoresizingMaskIntoConstraints = false
         textField.font = fontCache.regular
+        textField.alignment = .left
         textField.lineBreakMode = .byTruncatingMiddle
         textField.maximumNumberOfLines = 1
         textField.cell?.wraps = false

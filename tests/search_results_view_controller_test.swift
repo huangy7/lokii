@@ -137,7 +137,8 @@ final class MockDelegate: SearchResultsViewControllerDelegate {
     }
 }
 
-print("[1/8] 测试控制器初始化与内聚底栏视图层次构建...")
+print("[1/12] 测试控制器初始化与内聚底栏视图层次构建...")
+UserDefaults.standard.removeObject(forKey: "NSTableView Columns SearchResultsTable")
 let controller = SearchResultsViewController()
 let _ = controller.view // 触发 loadView 与 viewDidLoad
 
@@ -152,6 +153,8 @@ let topConstraint = controller.view.constraints.first {
 }
 assertTrue(topConstraint?.secondItem is NSLayoutGuide, "tableScrollView 顶端必须锚定至 safeAreaLayoutGuide")
 assertEqual(controller.tableView.numberOfColumns, 4, "虚拟列表应具备 4 个排版列 (名称/路径/修改时间/大小)")
+assertTrue(controller.tableView.autosaveTableColumns, "虚拟列表应开启列配置自动持久化")
+assertEqual(controller.tableView.autosaveName, "SearchResultsTable", "虚拟列表 autosaveName 应为 SearchResultsTable")
 assertTrue(controller.tableView.usesAlternatingRowBackgroundColors, "虚拟列表应启用斑马纹交替背景色")
 assertEqual(controller.tableView.rowHeight, 24, "行高应为 24 pt")
 
@@ -165,7 +168,7 @@ assertTrue(controller.rebuildContainer.subviews.contains(controller.rebuildButto
 let bottomBarHeightConstraint = controller.bottomBar.constraints.first { $0.firstAttribute == .height }
 assertEqual(bottomBarHeightConstraint?.constant, 28, "底栏高度约束应为 28 pt")
 
-print("[2/8] 测试展示检索结果与单元格渲染 (displayResults)...")
+print("[2/12] 测试展示检索结果与单元格渲染 (displayResults)...")
 let sampleItems = [
     FfiSearchResult(name: "alpha.rs", path: "/tmp/src/alpha.rs", extension: "rs", isDir: false, size: 2048, created: 100, modified: 300, matchPositions: [FfiMatchRange(start: 0, end: 5)]),
     FfiSearchResult(name: "beta.md", path: "/tmp/docs/beta.md", extension: "md", isDir: false, size: 1024, created: 100, modified: 200),
@@ -198,7 +201,7 @@ assertEqual(pathCellView?.textField?.toolTip, "/tmp/src/alpha.rs", "路径列文
 let sizeCellView = controller.tableView(controller.tableView, viewFor: sizeCol, row: 2) as? NSTableCellView
 assertEqual(sizeCellView?.textField?.stringValue, "--", "目录行大小应显示为 --")
 
-print("[3/8] 测试表头多字段排序联动 (sortDescriptorsDidChange)...")
+print("[3/12] 测试表头多字段排序联动 (sortDescriptorsDidChange)...")
 // 按名称降序排序
 let nameDescSort = NSSortDescriptor(key: "name", ascending: false)
 controller.tableView.sortDescriptors = [nameDescSort]
@@ -213,7 +216,7 @@ controller.tableView(controller.tableView, sortDescriptorsDidChange: [])
 assertEqual(controller.results[0].name, "alpha.rs", "按大小降序排在首位的应为 alpha.rs (2048 bytes)")
 assertEqual(controller.results[2].name, "gamma_dir", "按大小降序排在末位的应为 gamma_dir (0 bytes)")
 
-print("[4/8] 测试保留选区智能恢复 (preserveSelection)...")
+print("[4/12] 测试保留选区智能恢复 (preserveSelection)...")
 // 选中 beta.md
 controller.selectFirstRow()
 let selectedItem = controller.results[1]
@@ -231,7 +234,7 @@ let filteredItems = [sampleItems[0]]
 controller.displayResults(filteredItems, preserveSelection: true)
 assertEqual(controller.selectedResult, nil, "已选条目不在新集合中时应安全清空选区")
 
-print("[5/8] 测试 selectFirstRow 与代理回调机制...")
+print("[5/12] 测试 selectFirstRow 与代理回调机制...")
 let mockDelegate = MockDelegate()
 controller.delegate = mockDelegate
 
@@ -243,7 +246,7 @@ assertEqual(mockDelegate.selectedResult?.name, "alpha.rs", "代理应接收到�
 controller.openSelected()
 assertEqual(mockDelegate.doubleClickedResult?.name, "alpha.rs", "openSelected 应触发首选条目确认回调")
 
-print("[6/8] 测试剪贴板拷贝行为与右键菜单结构 (copyFile, copyPath, copyName & contextMenu)...")
+print("[6/12] 测试剪贴板拷贝行为与右键菜单结构 (copyFile, copyPath, copyName & contextMenu)...")
 controller.selectFirstRow()
 controller.copyFile()
 let copiedUrls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: nil) as? [URL]
@@ -391,7 +394,7 @@ while mockDelegate.trashCallCount == 1 && Date() < deadlineStale {
 assertEqual(mockDelegate.trashCallCount, 2, "遇到已不存在的文件时应自愈完成并向代理派发移除回调")
 assertEqual(controller.results.count, countBeforeStale - 1, "已不存在的幽灵条目应自愈从本地列表中剔除")
 
-print("[7/8] 测试 Quick Look 快速预览响应者协议与数据源契约...")
+print("[7/12] 测试 Quick Look 快速预览响应者协议与数据源契约...")
 // 无选中条目时
 controller.displayResults([], preserveSelection: false)
 assertEqual(controller.acceptsPreviewPanelControl(nil), false, "列表为空或无选区时 acceptsPreviewPanelControl 应返回 false")
@@ -412,7 +415,7 @@ assertEqual((previewItem as? NSURL)?.path, "/tmp/src/alpha.rs", "预览项路径
 let offscreenFrame = controller.previewPanel(nil, sourceFrameOnScreenFor: previewItem)
 assertEqual(offscreenFrame, NSRect.zero, "脱离屏幕视窗时 sourceFrameOnScreenFor 应安全回退为 .zero")
 
-print("[8/8] 测试底栏状态更新、进度指示与重建动作代理派发...")
+print("[8/12] 测试底栏状态更新、进度指示与重建动作代理派发...")
 // 路径更新
 controller.updateBottomPath(with: "/tmp/src/alpha.rs")
 assertEqual(controller.pathBar.url?.path, "/tmp/src/alpha.rs", "updateBottomPath 应正确设置路径")
@@ -467,7 +470,7 @@ controller.delegate = mockRebuildDelegate
 controller.rebuildButton.sendAction(controller.rebuildButton.action!, to: controller.rebuildButton.target)
 assertEqual(mockRebuildDelegate.rebuildCallCount, 1, "点击重建按钮应通过代理派发 searchResultsDidRequestRebuild")
 
-print("[9/10] 测试键盘导航焦点接力与首行上移回调 (focusResults & SearchTableView.moveUp)...")
+print("[9/12] 测试键盘导航焦点接力与首行上移回调 (focusResults & SearchTableView.moveUp)...")
 let navDelegate = MockDelegate()
 controller.delegate = navDelegate
 
@@ -537,7 +540,7 @@ let shiftUpArrowEvent = NSEvent.keyEvent(
 controller.tableView.keyDown(with: shiftUpArrowEvent)
 assertEqual(navDelegate.focusSearchFieldCallCount, 1, "带有 ⇧ 修饰键的方向上键不应触发回焦代理")
 
-print("[10/10] 测试排版密度模型与动态字号/行高/图标/列宽联动 (applyFontSize)...")
+print("[10/12] 测试排版密度模型与动态字号/行高/图标/列宽联动 (applyFontSize)...")
 // 测试应用紧凑字号 11pt
 controller.applyFontSize(CGFloat(TableDensity.compact.rawValue))
 assertEqual(controller.currentFontSize, 11, "当前生效字号应为 11 pt")
@@ -562,7 +565,7 @@ assertEqual(controller.currentFontSize, 13, "当前生效字号应恢复为 13 p
 assertEqual(controller.tableView.rowHeight, 24, "标准模式行高应为 24 pt")
 assertEqual(controller.currentIconSize, 16, "标准模式图标尺寸应为 16 pt")
 
-print("[11/11] 测试完全磁盘访问权限受限提示与底栏路径让位互斥逻辑 (updateFDAStatus & updateBottomPath)...")
+print("[11/12] 测试完全磁盘访问权限受限提示与底栏路径让位互斥逻辑 (updateFDAStatus & updateBottomPath)...")
 // 1. 模拟未获得完全磁盘访问权限，未选中文件时应呈现提示按钮并隐藏路径栏
 controller.updateFDAStatus(hasFDA: false)
 controller.updateBottomPath(with: nil)
@@ -592,7 +595,57 @@ if let action = controller.fdaHintButton.action {
 }
 assertEqual(fdaGuideTriggered, true, "点击受限提示按钮应成功触发引导回调闭包")
 
-print("测试全部通过：11/11 项断言成功。")
+print("[12/12] 测试表格列拖拽重排与动态末列对齐联动 (tableViewColumnDidMove)...")
+let modifiedCol = controller.tableView.tableColumns.first { $0.identifier == .columnModified }!
+let testSizeCol = controller.tableView.tableColumns.first { $0.identifier == .columnSize }!
+let testPathCol = controller.tableView.tableColumns.first { $0.identifier == .columnPath }!
+let testNameCol = controller.tableView.tableColumns.first { $0.identifier == .columnName }!
+
+// 1. 初始状态：大小位于末列，应为右对齐；修改时间位于中间列，应为左对齐
+assertEqual(controller.tableView.tableColumns.last?.identifier, .columnSize, "默认末列应为大小列")
+assertEqual(testSizeCol.headerCell.alignment, .right, "默认状态下大小列表头应为右对齐")
+let initialSizeCell = controller.tableView(controller.tableView, viewFor: testSizeCol, row: 0) as? NSTableCellView
+assertEqual(initialSizeCell?.textField?.alignment, .right, "默认状态下大小列单元格应为右对齐")
+
+assertEqual(modifiedCol.headerCell.alignment, .left, "默认状态下修改时间列表头应为左对齐")
+let initialModifiedCell = controller.tableView(controller.tableView, viewFor: modifiedCol, row: 0) as? NSTableCellView
+assertEqual(initialModifiedCell?.textField?.alignment, .left, "默认状态下修改时间列单元格应为左对齐")
+
+// 2. 模拟将大小列从第 3 列拖动到第 1 列 (Name, Size, Path, Modified)
+let oldSizeIndex = controller.tableView.column(withIdentifier: .columnSize)
+controller.tableView.moveColumn(oldSizeIndex, toColumn: 1)
+controller.tableViewColumnDidMove(Notification(
+    name: NSTableView.columnDidMoveNotification,
+    object: controller.tableView,
+    userInfo: ["NSOldColumn": oldSizeIndex, "NSNewColumn": 1]
+))
+
+assertEqual(controller.tableView.tableColumns.last?.identifier, .columnModified, "拖拽后末列应变为修改时间列")
+assertEqual(testSizeCol.headerCell.alignment, .left, "移至中间列后大小列表头应自适应为左对齐")
+let movedSizeCell = controller.tableView(controller.tableView, viewFor: testSizeCol, row: 0) as? NSTableCellView
+assertEqual(movedSizeCell?.textField?.alignment, .left, "移至中间列后大小列单元格应自适应为左对齐")
+
+assertEqual(modifiedCol.headerCell.alignment, .right, "成为末列后修改时间列表头应自适应为右对齐")
+let movedModifiedCell = controller.tableView(controller.tableView, viewFor: modifiedCol, row: 0) as? NSTableCellView
+assertEqual(movedModifiedCell?.textField?.alignment, .right, "成为末列后修改时间列单元格应自适应为右对齐")
+
+// 3. 模拟将路径列拖动到末列 (Name, Size, Modified, Path)
+let oldPathIndex = controller.tableView.column(withIdentifier: .columnPath)
+let targetLastIndex = controller.tableView.tableColumns.count - 1
+controller.tableView.moveColumn(oldPathIndex, toColumn: targetLastIndex)
+controller.tableViewColumnDidMove(Notification(
+    name: NSTableView.columnDidMoveNotification,
+    object: controller.tableView,
+    userInfo: ["NSOldColumn": oldPathIndex, "NSNewColumn": targetLastIndex]
+))
+
+assertEqual(controller.tableView.tableColumns.last?.identifier, .columnPath, "拖拽后末列应变为路径列")
+assertEqual(testPathCol.headerCell.alignment, .left, "路径列移至末列仍应保持左对齐")
+let movedPathCell = controller.tableView(controller.tableView, viewFor: testPathCol, row: 0) as? NSTableCellView
+assertEqual(movedPathCell?.textField?.alignment, .left, "路径列移至末列单元格仍应保持左对齐")
+assertEqual(modifiedCol.headerCell.alignment, .left, "修改时间列离开末列后应恢复为左对齐")
+
+print("测试全部通过：12/12 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
