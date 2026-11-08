@@ -1162,6 +1162,8 @@ mod tests {
         fs::write(root.join("deleted.txt"), "b").unwrap();
         fs::create_dir(root.join("old_dir")).unwrap();
         fs::write(root.join("old_dir/child.txt"), "c").unwrap();
+        // 给系统 fseventsd 留出提交时间，确保初态文件的创建事件已落库，不会漏入 since 之后
+        std::thread::sleep(Duration::from_millis(150));
         let mut entries = scan(&root);
         // Only in the index and never mentioned by an event: replay keeps it, a rescan would not.
         let ghost = root.join("ghost.txt");
@@ -1175,8 +1177,8 @@ mod tests {
         fs::rename(root.join("old_dir"), root.join("new_dir")).unwrap();
         fs::create_dir_all(root.join("made/deep")).unwrap();
         fs::write(root.join("made/deep/file.txt"), "e").unwrap();
-        // 给系统 fseventsd 留出提交时间，确保离线变更完整进入日志
-        std::thread::sleep(Duration::from_millis(200));
+        // 给系统 fseventsd 留出提交时间，确保离线变更完整进入日志，避免虚拟化 CI (Rosetta 2) 下合并目录事件
+        std::thread::sleep(Duration::from_millis(400));
 
         let (handle, persisted) = serve(&store, &root, Resume::From(since));
         let checkpoint = persisted.recv_timeout(Duration::from_secs(10)).expect("caught up");

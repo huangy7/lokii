@@ -264,7 +264,7 @@ mod tests {
         let file = root.join("before.txt");
         std::fs::write(&file, "x").unwrap();
         // 给系统 fseventsd 守护进程留出足够时间将写事件提交至历史日志数据库，避免历史流开启时漏读
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(300));
 
         let (tx, rx) = std::sync::mpsc::channel();
         let _stream = watch(&[root.clone()], since, tx).expect("stream");
