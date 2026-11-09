@@ -9,8 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md"><img src="https://img.shields.io/badge/lang-English-blue?style=flat-square" alt="English"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/lang-简体中文-lightgrey?style=flat-square" alt="简体中文"></a>
+  <a href="README.zh-CN.md"><b>简体中文</b></a> | <b>English</b>
 </p>
 
 <p align="center">
@@ -31,6 +30,32 @@
 </p>
 
 Lokii is a native macOS instant file search tool engineered for developer-grade speed and desktop ergonomics — bringing the beloved, lightning-fast "Everything" file search experience to macOS. Powered by a high-performance in-memory index engine in Rust (`lokii-core`) bridged to a native Swift/AppKit user interface via UniFFI, Lokii delivers sub-millisecond query latency across hundreds of thousands of files with real-time FSEvents filesystem synchronization.
+
+## Installation
+
+### Homebrew (Recommended)
+
+Install Lokii via Homebrew Cask from the official tap:
+
+```bash
+brew tap huangy7/tap
+brew install --cask lokii
+```
+
+Or run directly in a single command:
+
+```bash
+brew install --cask huangy7/tap/lokii
+```
+
+### Direct Download
+
+Download the prebuilt `.dmg` disk image for your Mac architecture from the [Releases page](https://github.com/huangy7/lokii/releases/latest):
+
+- **Apple Silicon (M1/M2/M3/M4)**: `Lokii-arm64.dmg`
+- **Intel**: `Lokii-x86_64.dmg`
+
+Open the downloaded `.dmg` and drag `Lokii.app` into your `Applications` folder.
 
 ## Features
 
@@ -87,14 +112,6 @@ macOS comes with powerful system search tools, yet developers and power users co
 ## Privacy
 
 Lokii runs 100% locally on your Mac. There are no user accounts, no telemetry, no tracking, and zero outbound network connections. Your filenames, directory structures, and search queries never leave your device.
-
-## Architecture
-
-```
-lokii-core/       Rust core library & CLI — in-memory inverted index, parallel scanner, FSEvents queue, v5 incremental checkpoints, IPC query server, and lokii CLI
-Lokii/            macOS Swift/AppKit application — virtualized table view, tray item, settings window, terminal integrations
-scripts/          Build and packaging automation (UniFFI bindings generation, DMG creation)
-```
 
 ## Build from Source
 
