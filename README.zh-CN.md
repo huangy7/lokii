@@ -52,8 +52,10 @@ brew install --cask huangy7/tap/lokii
 
 在 [Releases 页面](https://github.com/huangy7/lokii/releases/latest) 获取适合你 Mac 芯片架构的最新安装包：
 
-- **Apple Silicon (M系列芯片)**: `Lokii-arm64.dmg`
-- **Intel 芯片**: `Lokii-x86_64.dmg`
+| 芯片架构 / 平台 | 适用机型 | 安装包（.dmg） |
+| :--- | :--- | :--- |
+| **Apple Silicon** | 搭载 Apple Silicon 芯片的 Mac（M1 / M2 / M3 / M4 系列） | [Lokii-arm64.dmg](https://github.com/huangy7/lokii/releases/latest/download/Lokii-arm64.dmg) |
+| **Intel 芯片** | 搭载 Intel Core 处理器的 Mac 机型 | [Lokii-x86_64.dmg](https://github.com/huangy7/lokii/releases/latest/download/Lokii-x86_64.dmg) |
 
 下载后打开 `.dmg` 镜像，将 `Lokii.app` 拖入 `Applications`（应用程序）目录即可。
 

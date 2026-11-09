@@ -52,8 +52,10 @@ brew install --cask huangy7/tap/lokii
 
 Download the prebuilt `.dmg` disk image for your Mac architecture from the [Releases page](https://github.com/huangy7/lokii/releases/latest):
 
-- **Apple Silicon (M1/M2/M3/M4)**: `Lokii-arm64.dmg`
-- **Intel**: `Lokii-x86_64.dmg`
+| Architecture / Platform | Compatible Devices | Package (.dmg) |
+| :--- | :--- | :--- |
+| **Apple Silicon** | Mac with Apple Silicon (M1 / M2 / M3 / M4) | [Lokii-arm64.dmg](https://github.com/huangy7/lokii/releases/latest/download/Lokii-arm64.dmg) |
+| **Intel** | Mac with Intel Core processors | [Lokii-x86_64.dmg](https://github.com/huangy7/lokii/releases/latest/download/Lokii-x86_64.dmg) |
 
 Open the downloaded `.dmg` and drag `Lokii.app` into your `Applications` folder.
 
