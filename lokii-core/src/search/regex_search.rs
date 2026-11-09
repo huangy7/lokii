@@ -75,7 +75,7 @@ pub fn search(
     max_results: usize,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
     let read = store.read();
-    search_index(&read, query, filter, max_results)
+    search_index(&read, query, filter, max_results, false)
 }
 
 /// 接收统一快照读锁的正则检索实现，杜绝锁重入与快照位掩码漂移。
@@ -84,13 +84,20 @@ pub fn search_index(
     query: &str,
     filter: &CompiledRecordFilter,
     max_results: usize,
+    case_sensitive: bool,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
     let pattern = query.trim().strip_prefix("regex:").unwrap_or(query.trim());
     if pattern.is_empty() {
         return (Vec::new(), None);
     }
+    if pattern.len() > 1024 {
+        return (
+            Vec::new(),
+            Some("Regex pattern exceeds 1024 bytes limit".to_string()),
+        );
+    }
     let regex = match RegexBuilder::new(pattern)
-        .case_insensitive(true)
+        .case_insensitive(!case_sensitive)
         .size_limit(10_000_000)
         .build()
     {
@@ -125,23 +132,54 @@ pub fn search_index(
             }
         }
     }
+    let capture_count = regex.captures_len();
     let results = top
         .finish()
         .into_iter()
-    .map(|candidate| {
-        let view = read
-            .view(crate::compact_index::EntryId(candidate.ordinal))
-            .unwrap();
-        let matched = regex.find(view.name).unwrap();
-        AdvancedSearchResult {
-            entry: view.materialize(),
-            score: 1.0,
-            match_positions: vec![(matched.start(), matched.end())],
-            parent_match_positions: Vec::new(),
-            search_mode: SearchMode::Regex,
-        }
-    })
-    .collect();
+        .filter_map(|candidate| {
+            let view = read.view(crate::compact_index::EntryId(candidate.ordinal))?;
+            let name = view.name;
+
+            let mut match_positions = Vec::new();
+
+            if capture_count > 1 {
+                // 模式 A：用户显式定义了捕获组（如 /(test_\d+)/ 或 prefix_(.+)_suffix）
+                // 优先提取 1..N 捕获组区间，为用户提供靶向投影高亮
+                for caps in regex.captures_iter(name) {
+                    let mut captured_any = false;
+                    for i in 1..caps.len() {
+                        if let Some(m) = caps.get(i) {
+                            if !m.as_str().is_empty() {
+                                match_positions.push((m.start(), m.end()));
+                                captured_any = true;
+                            }
+                        }
+                    }
+                    if !captured_any {
+                        if let Some(m0) = caps.get(0) {
+                            match_positions.push((m0.start(), m0.end()));
+                        }
+                    }
+                }
+            } else {
+                // 模式 B：普通正则，提取所有匹配到的整体区间（支持单文件名内多处命中）
+                for m in regex.find_iter(name) {
+                    match_positions.push((m.start(), m.end()));
+                }
+            }
+
+            let merged_positions =
+                super::disjunction::merge_highlight_spans(match_positions, name.len());
+
+            Some(AdvancedSearchResult {
+                entry: view.materialize(),
+                score: 1.0,
+                match_positions: merged_positions,
+                parent_match_positions: Vec::new(),
+                search_mode: SearchMode::Regex,
+            })
+        })
+        .collect();
     (results, None)
 }
 

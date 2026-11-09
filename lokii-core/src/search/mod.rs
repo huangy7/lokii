@@ -1,15 +1,23 @@
+pub mod disjunction;
 pub mod filter;
 pub mod fuzzy;
 pub mod path_query;
 pub mod path_search;
 pub mod regex_search;
+pub mod regex_sugar;
 pub mod substring;
 pub mod top_k;
 pub mod wildcard;
 
+pub use disjunction::{
+    has_unescaped_pipe, merge_highlight_spans, split_query_pipes, unescape_literal_pipes,
+    DisjunctionQuery, OrClause,
+};
 pub use filter::{
     is_dotfile_query, parse_query_filter, CompiledRecordFilter, FileType, QueryFilter, SizeFilter,
 };
+pub use regex_sugar::{is_regex_metachar, parse_regex_sugar, RegexSugar};
+pub use substring::search_disjunction;
 
 use crate::compact_index::CompactIndex;
 use crate::indexer::{FileEntry, IndexStore};
@@ -52,34 +60,72 @@ fn find_cjk_folded_match(name: &str, keyword: &str) -> Option<(usize, usize)> {
 
 /// 计算各关键词在 `name` 或拼音转写中的字节区间，供前端高亮。
 /// 支持混合查询（如部分关键词直接命中，另一部分关键词通过拼音匹配命中）。
+/// 接收提前映射好的 `(raw_term, lower_term)` 关键词对，避免循环内部重复小写堆分配。
 pub(crate) fn find_positions<'a>(
     name: &str,
     name_lower: &str,
-    keywords: impl IntoIterator<Item = &'a str>,
+    keywords: &[(&'a str, &'a str)],
 ) -> Vec<(usize, usize)> {
     let mut positions = Vec::new();
-    let kw_list: Vec<&'a str> = keywords.into_iter().filter(|k| !k.is_empty()).collect();
     let mut unmatched_keywords = Vec::new();
 
-    for &keyword in &kw_list {
-        if let Some(start) = name_lower.find(keyword) {
+    for &(keyword, keyword_lower) in keywords {
+        if keyword.is_empty() {
+            continue;
+        }
+        if let Some(start) = name.find(keyword) {
             positions.push((start, start + keyword.len()));
         } else if let Some(range) = find_cjk_folded_match(name, keyword) {
             positions.push(range);
+        } else if let Some(start) = name_lower.find(keyword_lower) {
+            let lower_start = start;
+            let lower_end = start + keyword_lower.len();
+            if let Some(pos) = map_lower_span_to_orig(name, lower_start, lower_end) {
+                positions.push(pos);
+            }
         } else {
             unmatched_keywords.push(keyword);
         }
     }
 
     if !unmatched_keywords.is_empty() && name.as_bytes().iter().any(|&b| b >= 0x80) {
-        let kw_strings: Vec<String> = unmatched_keywords.iter().map(|s| s.to_string()).collect();
-        let pinyin_pos = crate::pinyin::find_pinyin_positions(name, &kw_strings);
+        let pinyin_pos = crate::pinyin::find_pinyin_positions(name, &unmatched_keywords);
         positions.extend(pinyin_pos);
     }
 
     positions.sort_by_key(|&(s, e)| (s, e));
     positions.dedup();
     positions
+}
+
+/// 将小写字符串中的字节匹配区间安全映射回原字符串的字节区间。
+/// 快速路径：原串与小写串字节长度相等且字符边界对齐时直接复用区间；
+/// 慢速路径：逐字符对齐，严格确保字符边界与字节长度安全。
+fn map_lower_span_to_orig(name: &str, lower_start: usize, lower_end: usize) -> Option<(usize, usize)> {
+    if lower_end <= name.len() && name.is_char_boundary(lower_start) && name.is_char_boundary(lower_end) {
+        return Some((lower_start, lower_end));
+    }
+    let mut orig_byte = 0;
+    let mut lower_byte = 0;
+    let mut matched_start = None;
+    let mut matched_end = None;
+
+    for c in name.chars() {
+        if lower_byte == lower_start {
+            matched_start = Some(orig_byte);
+        }
+        let lower_c_len = c.to_lowercase().fold(0, |acc, lc| acc + lc.len_utf8());
+        lower_byte += lower_c_len;
+        orig_byte += c.len_utf8();
+        if lower_byte == lower_end {
+            matched_end = Some(orig_byte);
+            break;
+        }
+    }
+    match (matched_start, matched_end) {
+        (Some(s), Some(e)) if s < e && e <= name.len() => Some((s, e)),
+        _ => None,
+    }
 }
 
 /// 在按名字字节序排好序的唯一名表上使用 128 位签名超集预筛后对每个唯一名只计算一次 `score`，
@@ -143,6 +189,90 @@ pub enum SearchMode {
     Fuzzy,
 }
 
+/// 大小写匹配策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CaseSensitivity {
+    /// 自动启发式判定：仅当目标词元包含有效大写字符时启用敏感匹配
+    #[default]
+    Auto,
+    /// 强制区分大小写
+    Sensitive,
+    /// 强制忽略大小写
+    Insensitive,
+}
+
+/// 提取参与 Smart Case 判定的有效文件名词元。
+///
+/// 过滤 `in:` 作用域语法与路径中的父目录前缀，避免路径修饰词的大写误触发文件名敏感匹配。
+pub fn extract_content_terms_for_smart_case<'a>(
+    clean_query: &'a str,
+    search_mode: SearchMode,
+) -> Vec<&'a str> {
+    if search_mode == SearchMode::Regex {
+        let raw = clean_query.strip_prefix("regex:").unwrap_or(clean_query);
+        return vec![raw];
+    }
+
+    let mut terms = Vec::new();
+    for word in clean_query.split_whitespace() {
+        if word.starts_with("in:") {
+            continue;
+        }
+        if word.contains('/') {
+            if word.ends_with('/') {
+                continue;
+            }
+            if let Some((_, name_part)) = word.rsplit_once('/') {
+                if !name_part.is_empty() {
+                    terms.push(name_part);
+                }
+            }
+            continue;
+        }
+        if word.starts_with('.') && !crate::search::filter::is_dotfile_query(word) {
+            continue;
+        }
+        terms.push(word);
+    }
+    terms
+}
+
+/// 检测词元是否包含有效大写字符。正则模式下跳过 `\D`、`\S` 等反斜杠转义元字符。
+pub fn has_effective_uppercase(term: &str, is_regex: bool) -> bool {
+    if !is_regex {
+        return term.chars().any(|c| c.is_uppercase());
+    }
+    let mut chars = term.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if c.is_uppercase() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 解析查询语句在指定配置下的最终大小写敏感判定结果。
+pub fn resolve_case_sensitive(
+    clean_query: &str,
+    setting: CaseSensitivity,
+    search_mode: SearchMode,
+) -> bool {
+    match setting {
+        CaseSensitivity::Sensitive => true,
+        CaseSensitivity::Insensitive => false,
+        CaseSensitivity::Auto => {
+            let terms = extract_content_terms_for_smart_case(clean_query, search_mode);
+            let is_regex = search_mode == SearchMode::Regex;
+            terms.into_iter().any(|term| has_effective_uppercase(term, is_regex))
+        }
+    }
+}
+
 /// Result from advanced search. Per D-06.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,14 +285,17 @@ pub struct AdvancedSearchResult {
     pub search_mode: SearchMode,
 }
 
-/// Detect search mode from query string. Per D-02.
+/// Detect search mode from query string.
+/// - Starts with `regex:` or matches regex sugar `/<pattern>/` -> Regex
+/// - Contains unescaped `|` -> Auto (or disjunction)
 /// - Contains `*` or `?` -> Wildcard
-/// - Starts with `regex:` -> Regex
 /// - Otherwise -> Auto
 pub fn detect_mode(query: &str) -> SearchMode {
     let trimmed = query.trim();
-    if trimmed.starts_with("regex:") {
+    if trimmed.starts_with("regex:") || parse_regex_sugar(trimmed).is_some() {
         SearchMode::Regex
+    } else if has_unescaped_pipe(trimmed) {
+        SearchMode::Auto
     } else if trimmed.contains('*') || trimmed.contains('?') {
         SearchMode::Wildcard
     } else {
@@ -181,8 +314,9 @@ pub fn dispatch_with_filter(
     query: &str,
     mode: SearchMode,
     filter: QueryFilter,
+    case_sensitivity: CaseSensitivity,
     max_results: usize,
-) -> (Vec<AdvancedSearchResult>, Option<String>) {
+) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
     let (clean_query, inline_filter) = parse_query_filter(query);
 
     let has_explicit_type_all = query.split_whitespace().any(|t| {
@@ -264,18 +398,93 @@ pub fn dispatch_with_filter(
         inferred_exts: inline_filter.inferred_exts,
     };
 
+    // 识别行内正则语法糖（仅在 Auto 模式下推导，Locked 模式下用户输入直接作为纯正则模式处理）
+    let regex_sugar = if mode == SearchMode::Auto {
+        parse_regex_sugar(&clean_query)
+    } else {
+        None
+    };
+
+    // 权威裁决实际生效模式：显式 Regex 锁定或语法糖命中均派发至 Regex 模式；显式指定非 Auto 模式时保持原模式
     let effective_mode = match mode {
-        SearchMode::Auto => detect_mode(&clean_query),
+        SearchMode::Auto => {
+            if regex_sugar.is_some() || clean_query.starts_with("regex:") {
+                SearchMode::Regex
+            } else {
+                detect_mode(&clean_query)
+            }
+        }
         other => other,
     };
 
+    // 提取参与底层编译的纯模式文本与三级大小写仲裁策略：
+    // 第 1 级（最高）：行内语法糖显式标志（如 /pattern/i 强制不敏感）
+    // 第 2 级：全局显式锁定（Sensitive / Insensitive）
+    // 第 3 级：Smart Case 启发式自适应推导
+    let (pattern_to_run, is_case_sensitive) = if effective_mode == SearchMode::Regex {
+        if let Some(sugar) = regex_sugar {
+            let case_sens = if sugar.case_insensitive {
+                false
+            } else {
+                resolve_case_sensitive(&sugar.pattern, case_sensitivity, SearchMode::Regex)
+            };
+            (Some(sugar.pattern), case_sens)
+        } else {
+            let raw = clean_query.strip_prefix("regex:").unwrap_or(&clean_query);
+            let case_sens = resolve_case_sensitive(raw, case_sensitivity, SearchMode::Regex);
+            (Some(raw.to_string()), case_sens)
+        }
+    } else {
+        let case_sens = resolve_case_sensitive(&clean_query, case_sensitivity, effective_mode);
+        (None, case_sens)
+    };
+
+    let explicit_lock = case_sensitivity == CaseSensitivity::Sensitive;
+
     let compiled_filter = CompiledRecordFilter::compile(&read, &effective_filter);
+
+    // 并集检索（OR 查询）路由：
+    // 若查询包含未转义管道符且非正则模式，提升至最高并集优先级处理。
+    if effective_mode != SearchMode::Regex
+        && !clean_query.starts_with("regex:")
+        && has_unescaped_pipe(&clean_query)
+    {
+        let global_case = match case_sensitivity {
+            CaseSensitivity::Auto => None,
+            CaseSensitivity::Sensitive => Some(true),
+            CaseSensitivity::Insensitive => Some(false),
+        };
+        let disjunction_query = DisjunctionQuery::parse(&clean_query, global_case);
+        if disjunction_query.is_empty() {
+            return (Vec::new(), false, None, effective_mode);
+        }
+        let is_case_sensitive = match case_sensitivity {
+            CaseSensitivity::Sensitive => true,
+            CaseSensitivity::Insensitive => false,
+            CaseSensitivity::Auto => disjunction_query.clauses.iter().any(|c| c.is_case_sensitive),
+        };
+        let results = substring::search_disjunction(
+            &read,
+            &disjunction_query,
+            &compiled_filter,
+            max_results,
+            explicit_lock,
+        );
+        return (results, is_case_sensitive, None, effective_mode);
+    }
 
     // 含路径语法（'/' 或 'in:'）时交由路径检索器。
     if effective_mode != SearchMode::Regex {
-        if let Some(path_query) = path_query::PathQuery::parse(&clean_query) {
-            let results = path_search::search_index(&read, &path_query, &compiled_filter, max_results);
-            return (results, None);
+        if let Some(path_query) = path_query::PathQuery::parse_with_case(&clean_query, is_case_sensitive) {
+            let results = path_search::search_index(
+                &read,
+                &path_query,
+                &compiled_filter,
+                max_results,
+                is_case_sensitive,
+                explicit_lock,
+            );
+            return (results, is_case_sensitive, None, effective_mode);
         }
     }
 
@@ -283,15 +492,35 @@ pub fn dispatch_with_filter(
     // 保持高确定性与精准度：普通文本输入严格按连续子串匹配，搜不到即返回空列表，避免无脑降级为模糊跳字匹配。
     let (results, error) = match effective_mode {
         SearchMode::Auto | SearchMode::Substring => {
-            let results = substring::search_index(&read, &clean_query, &compiled_filter, max_results);
+            let results = substring::search_index(
+                &read,
+                &clean_query,
+                &compiled_filter,
+                max_results,
+                is_case_sensitive,
+                explicit_lock,
+            );
             (results, None)
         }
         SearchMode::Wildcard => {
-            let results = wildcard::search_index(&read, &clean_query, &compiled_filter, max_results);
+            let results = wildcard::search_index(
+                &read,
+                &clean_query,
+                &compiled_filter,
+                max_results,
+                is_case_sensitive,
+            );
             (results, None)
         }
         SearchMode::Regex => {
-            regex_search::search_index(&read, &clean_query, &compiled_filter, max_results)
+            let pattern = pattern_to_run.as_deref().unwrap_or(&clean_query);
+            regex_search::search_index(
+                &read,
+                pattern,
+                &compiled_filter,
+                max_results,
+                is_case_sensitive,
+            )
         }
         SearchMode::Fuzzy => {
             let results = fuzzy::search_index(&read, &clean_query, &compiled_filter, max_results);
@@ -299,19 +528,58 @@ pub fn dispatch_with_filter(
         }
     };
 
-    (results, error)
+    (results, is_case_sensitive, error, effective_mode)
+}
+
+/// 支持指定大小写匹配策略的高级检索分发入口。
+pub fn dispatch_with_options(
+    store: &IndexStore,
+    query: &str,
+    mode: SearchMode,
+    case_sensitivity: CaseSensitivity,
+    max_results: usize,
+) -> (Vec<AdvancedSearchResult>, bool, Option<String>) {
+    let (results, is_case_sensitive, error, _) = dispatch_with_filter(
+        store,
+        query,
+        mode,
+        QueryFilter::default(),
+        case_sensitivity,
+        max_results,
+    );
+    (results, is_case_sensitive, error)
+}
+
+/// 支持指定大小写匹配策略的高级检索分发入口，附带权威生效模式反馈。
+pub fn dispatch_with_details(
+    store: &IndexStore,
+    query: &str,
+    mode: SearchMode,
+    case_sensitivity: CaseSensitivity,
+    max_results: usize,
+) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
+    dispatch_with_filter(
+        store,
+        query,
+        mode,
+        QueryFilter::default(),
+        case_sensitivity,
+        max_results,
+    )
 }
 
 /// 主检索分发器包装入口。
 ///
-/// 委托 `dispatch_with_filter` 并传入默认过滤器，由其统一解析查询串中的过滤词元并完成检索分发。
+/// 委托 `dispatch_with_options` 并传入默认 Auto 大小写策略与默认过滤器，保持向后兼容。
 pub fn dispatch(
     store: &IndexStore,
     query: &str,
     mode: SearchMode,
     max_results: usize,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
-    dispatch_with_filter(store, query, mode, QueryFilter::default(), max_results)
+    let (results, _, error) =
+        dispatch_with_options(store, query, mode, CaseSensitivity::Auto, max_results);
+    (results, error)
 }
 
 #[cfg(test)]
@@ -341,6 +609,11 @@ mod tests {
     #[test]
     fn test_detect_mode_empty() {
         assert_eq!(detect_mode(""), SearchMode::Auto);
+    }
+
+    #[test]
+    fn test_detect_mode_or_pipe_overrides_wildcard() {
+        assert_eq!(detect_mode("*.png | *.jpg"), SearchMode::Auto);
     }
 
     #[test]
@@ -658,7 +931,8 @@ mod tests {
             custom_ext: None,
             ..Default::default()
         };
-        let (results, err) = dispatch_with_filter(&store, "search", SearchMode::Auto, filter, 10);
+        let (results, _, err, _) =
+            dispatch_with_filter(&store, "search", SearchMode::Auto, filter, CaseSensitivity::Auto, 10);
         assert!(err.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "search_engine.rs");
@@ -724,7 +998,8 @@ mod tests {
             custom_ext: None,
             ..Default::default()
         };
-        let (results, err) = dispatch_with_filter(&store, "rndrvw", SearchMode::Fuzzy, filter, 10);
+        let (results, _, err, _) =
+            dispatch_with_filter(&store, "rndrvw", SearchMode::Fuzzy, filter, CaseSensitivity::Auto, 10);
         assert!(err.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "render_view.rs");
@@ -759,8 +1034,8 @@ mod tests {
             custom_ext: None,
             ..Default::default()
         };
-        let (results, err) =
-            dispatch_with_filter(&store, "src/component", SearchMode::Auto, filter, 10);
+        let (results, _, err, _) =
+            dispatch_with_filter(&store, "src/component", SearchMode::Auto, filter, CaseSensitivity::Auto, 10);
         assert!(err.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "component.rs");
@@ -796,8 +1071,8 @@ mod tests {
             custom_ext: None,
             ..Default::default()
         };
-        let (results, err) =
-            dispatch_with_filter(&store, "pipeline type:doc", SearchMode::Auto, filter, 10);
+        let (results, _, err, _) =
+            dispatch_with_filter(&store, "pipeline type:doc", SearchMode::Auto, filter, CaseSensitivity::Auto, 10);
         assert!(err.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "pipeline.md");
@@ -834,7 +1109,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (results, err) = dispatch_with_filter(&store, "rs", SearchMode::Auto, filter, 10);
+        let (results, _, err, _) = dispatch_with_filter(&store, "rs", SearchMode::Auto, filter, CaseSensitivity::Auto, 10);
         assert!(err.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "large.rs");

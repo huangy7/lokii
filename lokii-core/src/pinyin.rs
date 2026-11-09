@@ -1,5 +1,6 @@
 use crate::indexer::MatchScore;
 use crate::pinyin_data;
+use crate::string_pool::find_ascii_ignore_case;
 
 #[inline]
 pub fn char_pinyin(c: char) -> Option<(&'static str, char)> {
@@ -27,6 +28,7 @@ pub fn has_cjk_characters(name: &str) -> bool {
 }
 
 /// 拼音转写打分：零额外的堆分配，不构建字节区间映射表。
+/// 内部比对采用 ASCII 大小写无关匹配，避免热路径构建 lower_keywords。
 /// 仅当查询关键词均为 ASCII 且目标文件名包含 CJK 字符时触发。
 pub(crate) fn score_pinyin_match(name: &str, keywords: &[String]) -> Option<MatchScore> {
     if keywords.is_empty() || !keywords.iter().all(|k| k.is_ascii()) {
@@ -56,11 +58,11 @@ pub(crate) fn score_pinyin_match(name: &str, keywords: &[String]) -> Option<Matc
             continue;
         }
         let kw_str = kw.as_str();
-        let full_idx = full_pinyin.find(kw_str);
+        let full_idx = find_ascii_ignore_case(full_pinyin.as_bytes(), kw_str.as_bytes());
         let init_idx = if full_idx.is_some() {
             None
         } else {
-            initials.find(kw_str)
+            find_ascii_ignore_case(initials.as_bytes(), kw_str.as_bytes())
         };
 
         if full_idx.is_none() && init_idx.is_none() {
@@ -81,7 +83,7 @@ pub(crate) fn score_pinyin_match(name: &str, keywords: &[String]) -> Option<Matc
 
 /// 仅对进入 Top-K 的命中结果计算拼音对应原始文件名的字节区间，供界面高亮。
 /// 严格保证字节偏移与原始 UTF-8 字符范围 1:1 对齐，杜绝因多字节字符导致的越界崩溃。
-pub(crate) fn find_pinyin_positions(name: &str, keywords: &[String]) -> Vec<(usize, usize)> {
+pub(crate) fn find_pinyin_positions<S: AsRef<str>>(name: &str, keywords: &[S]) -> Vec<(usize, usize)> {
     if keywords.is_empty() || !has_cjk_characters(name) {
         return Vec::new();
     }
@@ -123,19 +125,19 @@ pub(crate) fn find_pinyin_positions(name: &str, keywords: &[String]) -> Vec<(usi
 
     let mut positions = Vec::new();
     for kw in keywords {
-        if kw.is_empty() {
+        let kw_str = kw.as_ref();
+        if kw_str.is_empty() {
             continue;
         }
-        let kw_str = kw.as_str();
-        if let Some(start) = full_pinyin.find(kw_str) {
-            let end = start + kw.len();
+        if let Some(start) = find_ascii_ignore_case(full_pinyin.as_bytes(), kw_str.as_bytes()) {
+            let end = start + kw_str.len();
             if end > 0 && end <= pinyin_char_byte_ranges.len() {
                 let orig_start = pinyin_char_byte_ranges[start].0;
                 let orig_end = pinyin_char_byte_ranges[end - 1].1;
                 positions.push((orig_start, orig_end));
             }
-        } else if let Some(start) = initials.find(kw_str) {
-            let end = start + kw.len();
+        } else if let Some(start) = find_ascii_ignore_case(initials.as_bytes(), kw_str.as_bytes()) {
+            let end = start + kw_str.len();
             if end > 0 && end <= initials_byte_ranges.len() {
                 let orig_start = initials_byte_ranges[start].0;
                 let orig_end = initials_byte_ranges[end - 1].1;
@@ -147,4 +149,50 @@ pub(crate) fn find_pinyin_positions(name: &str, keywords: &[String]) -> Vec<(usi
     positions.sort_by_key(|&(s, e)| (s, e));
     positions.dedup();
     positions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_ascii_ignore_case() {
+        assert_eq!(find_ascii_ignore_case(b"hello world", b""), Some(0));
+        assert_eq!(find_ascii_ignore_case(b"hi", b"hello"), None);
+        assert_eq!(find_ascii_ignore_case(b"gongzuohuibao", b"GONGZUO"), Some(0));
+        assert_eq!(find_ascii_ignore_case(b"gongzuohuibao", b"Zuo"), Some(4));
+        assert_eq!(find_ascii_ignore_case(b"gzhb", b"GZ"), Some(0));
+        assert_eq!(find_ascii_ignore_case(b"gzhb", b"HB"), Some(2));
+        assert_eq!(find_ascii_ignore_case(b"gzhb", b"xyz"), None);
+    }
+
+    #[test]
+    fn test_score_pinyin_match_case_insensitivity() {
+        let kw_upper = vec!["GZHB".to_string()];
+        assert_eq!(
+            score_pinyin_match("工作汇报.docx", &kw_upper),
+            Some(MatchScore::Prefix)
+        );
+
+        let kw_mixed = vec!["GongZuo".to_string()];
+        assert_eq!(
+            score_pinyin_match("工作汇报.docx", &kw_mixed),
+            Some(MatchScore::Prefix)
+        );
+
+        let kw_empty: Vec<String> = vec![];
+        assert_eq!(score_pinyin_match("工作汇报.docx", &kw_empty), None);
+
+        let kw_non_ascii = vec!["中文".to_string()];
+        assert_eq!(score_pinyin_match("工作汇报.docx", &kw_non_ascii), None);
+    }
+
+    #[test]
+    fn test_find_pinyin_positions_case_insensitivity() {
+        let kw = vec!["GZHB".to_string()];
+        let pos = find_pinyin_positions("工作汇报.docx", &kw);
+        assert!(!pos.is_empty());
+        // 工作汇报 四个汉字共 12 字节（每个汉字 3 字节）
+        assert_eq!(pos, vec![(0, 12)]);
+    }
 }

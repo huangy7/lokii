@@ -40,10 +40,13 @@ struct ParentMatch {
     span: (usize, usize),
 }
 
-/// 在已转小写的父目录上判定约束，同时产出质量层级与高亮区间。
+/// 在父目录上判定约束，同时产出质量层级与高亮区间。
 ///
 /// 绝对路径按前缀命中；相对路径优先取结尾命中的直接父级，其次取中段命中的祖先。
-fn match_parent(parent_lower: &str, query: &PathQuery) -> Option<ParentMatch> {
+/// 依据 macOS APFS 特性与 Smart Case 设计，父目录恒定保持大小写不敏感匹配。
+fn match_parent(parent: &str, query: &PathQuery) -> Option<ParentMatch> {
+    let parent_lower = parent.to_lowercase();
+
     if let Some(ref scope) = query.scope_prefix {
         if !parent_lower.starts_with(scope.as_str()) {
             return None;
@@ -77,7 +80,7 @@ fn match_parent(parent_lower: &str, query: &PathQuery) -> Option<ParentMatch> {
     } else if parent_lower.ends_with(pat.as_str()) {
         Some(ParentMatch {
             quality: ParentQuality::Direct,
-            span: (parent_lower.len() - pat.len(), parent_lower.len()),
+            span: (parent.len() - pat.len(), parent.len()),
         })
     } else {
         let start = parent_lower.find(pat.as_str())?;
@@ -89,15 +92,22 @@ fn match_parent(parent_lower: &str, query: &PathQuery) -> Option<ParentMatch> {
 }
 
 /// 预判单个父目录的约束质量。
-pub(crate) fn evaluate_parent_quality(parent_str: &str, query: &PathQuery) -> ParentQuality {
-    match match_parent(&parent_str.to_lowercase(), query) {
+pub(crate) fn evaluate_parent_quality(
+    parent_str: &str,
+    query: &PathQuery,
+) -> ParentQuality {
+    match match_parent(parent_str, query) {
         Some(matched) => matched.quality,
         None => ParentQuality::None,
     }
 }
 
 /// 当前目录实体是否正是查询的目标目录（如 "Desktop/"）。
-pub(crate) fn is_target_directory_self(parent: &str, name: &str, query: &PathQuery) -> bool {
+pub(crate) fn is_target_directory_self(
+    parent: &str,
+    name: &str,
+    query: &PathQuery,
+) -> bool {
     if !query.is_dir_only {
         return false;
     }
@@ -106,7 +116,7 @@ pub(crate) fn is_target_directory_self(parent: &str, name: &str, query: &PathQue
     };
     let pat_clean = pat.trim_end_matches('/');
     let target_name = split_path(pat_clean).1;
-    // 末级目录名必须完全相等（忽略大小写）
+    // 目录名匹配恒定大小写无关
     if !name.eq_ignore_ascii_case(target_name) {
         return false;
     }
@@ -119,9 +129,8 @@ pub(crate) fn is_target_directory_self(parent: &str, name: &str, query: &PathQue
     }
     // 相对或绝对路径前缀匹配
     if query.is_absolute_prefix {
-        format!("{parent}{name}/")
-            .to_lowercase()
-            .starts_with(pat.as_str())
+        let full = format!("{parent_lower}{}/", name.to_lowercase());
+        full.starts_with(pat.as_str())
     } else {
         let (dir_part, _) = split_path(pat_clean);
         dir_part.is_empty() || parent_lower.ends_with(dir_part)
@@ -133,7 +142,7 @@ pub(crate) fn find_parent_highlight_range(
     parent: &str,
     query: &PathQuery,
 ) -> Option<(usize, usize)> {
-    let (start, mut end) = match_parent(&parent.to_lowercase(), query)?.span;
+    let (start, mut end) = match_parent(parent, query)?.span;
 
     // 前端展示串不含末尾 '/'，区间若含之会越界并丢失整段高亮，故剪裁。
     while end > start && parent.as_bytes().get(end - 1) == Some(&b'/') {
@@ -150,9 +159,13 @@ fn score_name(
     has_wildcard: bool,
     all_terms_ascii: bool,
     ascii_buf: &mut Vec<u8>,
+    case_sensitive: bool,
+    explicit_lock: bool,
 ) -> Option<u32> {
     if has_wildcard {
-        let name_lower_cow: std::borrow::Cow<'_, str> = if let Some(f) = folded {
+        let name_lower_cow: std::borrow::Cow<'_, str> = if case_sensitive {
+            std::borrow::Cow::Borrowed(name)
+        } else if let Some(f) = folded {
             std::borrow::Cow::Borrowed(f)
         } else if name.is_ascii() {
             ascii_buf.clear();
@@ -175,6 +188,8 @@ fn score_name(
         folded,
         &query.name_terms,
         all_terms_ascii,
+        case_sensitive,
+        explicit_lock,
     );
     matched_score.map(|score| match score {
         MatchScore::Exact => SCORE_NAME_EXACT,
@@ -194,7 +209,7 @@ pub fn search(
         return Vec::new();
     }
     let read = store.read();
-    search_index(&read, query, filter, max_results)
+    search_index(&read, query, filter, max_results, false, false)
 }
 
 /// 接收统一快照读锁的路径检索实现，杜绝锁重入与快照位掩码漂移。
@@ -203,6 +218,8 @@ pub fn search_index(
     query: &PathQuery,
     filter: &CompiledRecordFilter,
     max_results: usize,
+    case_sensitive: bool,
+    explicit_lock: bool,
 ) -> Vec<AdvancedSearchResult> {
     if max_results == 0 {
         return Vec::new();
@@ -230,10 +247,11 @@ pub fn search_index(
     const NAME_MISS: u16 = 1;
     let query_index = read.query_index();
     let required_signature = query.name_terms.iter().fold(NameSignature::default(), |sig, term| {
+        let term_lower = term.to_lowercase();
         sig.union(if term.contains('*') || term.contains('?') {
-            crate::search::wildcard::required_signature_for_glob(term)
+            crate::search::wildcard::required_signature_for_glob(&term_lower)
         } else {
-            NameSignature::from_substring_query(term)
+            NameSignature::from_substring_query(&term_lower)
         })
     });
     let mut name_scores = if query.name_terms.is_empty() {
@@ -329,6 +347,8 @@ pub fn search_index(
                         has_wildcard,
                         all_terms_ascii,
                         &mut ascii_buf,
+                        case_sensitive,
+                        explicit_lock,
                     )
                 };
                 if let Some(memo) = memo_slot.and_then(|slot| name_scores.get_mut(slot)) {
@@ -353,6 +373,20 @@ pub fn search_index(
     }
 
     // 阶段 2：仅对 Top-K 结果计算高亮区间
+    let kw_prepared: Vec<(&str, String)> = query
+        .name_terms
+        .iter()
+        .map(|t| (t.as_str(), t.to_lowercase()))
+        .collect();
+    let kw_refs: Vec<(&str, &str)> = kw_prepared
+        .iter()
+        .map(|(raw, lower)| (*raw, lower.as_str()))
+        .collect();
+    let target_name_opt = query.path_pattern.as_deref().map(|pat| {
+        let target = split_path(pat.trim_end_matches('/')).1;
+        (target, target.to_lowercase())
+    });
+
     let candidates = top_k.finish();
     candidates
         .into_iter()
@@ -370,15 +404,14 @@ pub fn search_index(
             let name_lower = name.to_lowercase();
             let match_positions = if is_dir_self && query.name_terms.is_empty() {
                 // 目标目录实体自身：高亮其末级目录名
-                match query.path_pattern.as_deref() {
-                    Some(pat) => {
-                        let target_name = split_path(pat.trim_end_matches('/')).1;
-                        find_positions(&view.name, &name_lower, [target_name])
+                match target_name_opt.as_ref() {
+                    Some((target, target_lower)) => {
+                        find_positions(&view.name, &name_lower, &[(*target, target_lower.as_str())])
                     }
                     None => Vec::new(),
                 }
             } else {
-                find_positions(&view.name, &name_lower, query.name_terms.iter().map(String::as_str))
+                find_positions(&view.name, &name_lower, &kw_refs)
             };
 
             AdvancedSearchResult {

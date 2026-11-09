@@ -56,6 +56,9 @@ pub struct SearchResult {
 ///
 /// Returns `None` if any keyword is not found in the name.
 pub fn score_match(name_lower: &str, keywords: &[String]) -> Option<MatchScore> {
+    if keywords.is_empty() {
+        return None;
+    }
     for kw in keywords {
         if !name_lower.contains(kw.as_str()) {
             return None;
@@ -74,15 +77,41 @@ pub fn score_match(name_lower: &str, keywords: &[String]) -> Option<MatchScore> 
     Some(score)
 }
 
-/// 零分配打分：若名字为纯 ASCII，直接在原始字节上做大小写无关比较；
-/// 若包含非 ASCII 字符，则使用池中已预折叠的 `folded_non_ascii`。
+/// 零分配打分：若开启大小写敏感（case_sensitive），直接按原名进行子串匹配；
+/// 若关闭大小写敏感，纯 ASCII 按字节做大小写无关比较，非 ASCII 则使用池中已预折叠的 `folded_non_ascii`。
+/// 拼音分层仲裁：显式锁定 Sensitive 时彻底跳过拼音；Auto 敏感激活态下保留拼音降权兜底。
 #[inline]
-pub(crate) fn score_match_zero_alloc(
+pub fn score_match_zero_alloc(
     name: &str,
     folded_non_ascii: Option<&str>,
     keywords: &[String],
     all_keywords_ascii: bool,
+    case_sensitive: bool,
+    explicit_sensitive_lock: bool,
 ) -> Option<MatchScore> {
+    if keywords.is_empty() {
+        return None;
+    }
+
+    if case_sensitive {
+        if let Some(score) = score_match(name, keywords) {
+            return Some(score);
+        }
+
+        // 拼音分层仲裁：显式锁定 Sensitive 时彻底跳过拼音
+        if explicit_sensitive_lock {
+            return None;
+        }
+
+        // Auto 敏感模式下，若存在非 ASCII 字符且关键词全为 ASCII，允许拼音匹配但降权为 Substring
+        if all_keywords_ascii && name.as_bytes().iter().any(|&b| b >= 0x80) {
+            if crate::pinyin::score_pinyin_match(name, keywords).is_some() {
+                return Some(MatchScore::Substring);
+            }
+        }
+        return None;
+    }
+
     if let Some(folded) = folded_non_ascii {
         if let Some(score) = score_match(folded, keywords) {
             return Some(score);
@@ -275,7 +304,7 @@ impl IndexStore {
                 let all_ascii = keywords.iter().all(|k| k.is_ascii());
                 let filter = crate::search::CompiledRecordFilter::default();
                 crate::search::rank_unique_names(&read, &filter, max_results, req, |name, folded| {
-                    score_match_zero_alloc(name, folded, &keywords, all_ascii)
+                    score_match_zero_alloc(name, folded, &keywords, all_ascii, false, false)
                 })
             }
         };

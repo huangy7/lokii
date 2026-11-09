@@ -80,11 +80,14 @@ final class SearchWindow: NSWindowController {
     private var searchField: NSSearchField!
     private let searchContainer = NSView()
     private let searchDivider = NSBox()
+    private let caseSensitivityButton = CaseSensitivityButton()
+    private let regexModeButton = RegexModeButton()
     private let filterButton = FilterTriggerButton()
     private let filterPopoverController = FilterPopoverController()
     private var searchWorkItem: DispatchWorkItem?
     private static let searchModes: [FfiSearchMode] = [.auto, .substring, .wildcard, .regex, .fuzzy]
     private var currentMode: FfiSearchMode = .auto
+    private var currentCaseSensitivity: FfiCaseSensitivity = .auto
     private var statusText: LocalizedText = .key("search.indexing") {
         didSet { updateStatusLabel() }
     }
@@ -293,6 +296,18 @@ final class SearchWindow: NSWindowController {
         searchDivider.borderWidth = 0
         searchDivider.fillColor = .separatorColor
 
+        caseSensitivityButton.translatesAutoresizingMaskIntoConstraints = false
+        caseSensitivityButton.target = self
+        caseSensitivityButton.action = #selector(caseSensitivityButtonClicked(_:))
+        caseSensitivityButton.setContentHuggingPriority(.required, for: .horizontal)
+        caseSensitivityButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        regexModeButton.translatesAutoresizingMaskIntoConstraints = false
+        regexModeButton.target = self
+        regexModeButton.action = #selector(regexModeButtonClicked(_:))
+        regexModeButton.setContentHuggingPriority(.required, for: .horizontal)
+        regexModeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         filterButton.translatesAutoresizingMaskIntoConstraints = false
         filterButton.isBordered = false
         filterButton.focusRingType = .none
@@ -304,6 +319,8 @@ final class SearchWindow: NSWindowController {
         filterButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         searchContainer.addSubview(searchField)
+        searchContainer.addSubview(caseSensitivityButton)
+        searchContainer.addSubview(regexModeButton)
         searchContainer.addSubview(searchDivider)
         searchContainer.addSubview(filterButton)
 
@@ -313,14 +330,24 @@ final class SearchWindow: NSWindowController {
 
             searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
             searchField.leadingAnchor.constraint(equalTo: searchContainer.leadingAnchor),
-            searchField.trailingAnchor.constraint(equalTo: searchDivider.leadingAnchor, constant: -4),
+            searchField.trailingAnchor.constraint(equalTo: caseSensitivityButton.leadingAnchor, constant: -6),
             searchField.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
             searchField.heightAnchor.constraint(equalToConstant: 28),
 
+            caseSensitivityButton.trailingAnchor.constraint(equalTo: regexModeButton.leadingAnchor, constant: -4),
+            caseSensitivityButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            caseSensitivityButton.widthAnchor.constraint(equalToConstant: 28),
+            caseSensitivityButton.heightAnchor.constraint(equalToConstant: 20),
+
+            regexModeButton.trailingAnchor.constraint(equalTo: searchDivider.leadingAnchor, constant: -5),
+            regexModeButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            regexModeButton.widthAnchor.constraint(equalToConstant: 28),
+            regexModeButton.heightAnchor.constraint(equalToConstant: 20),
+
+            searchDivider.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor, constant: -5),
+            searchDivider.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
             searchDivider.widthAnchor.constraint(equalToConstant: 1),
             searchDivider.heightAnchor.constraint(equalToConstant: 14),
-            searchDivider.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
-            searchDivider.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor, constant: -5),
 
             filterButton.trailingAnchor.constraint(equalTo: searchContainer.trailingAnchor, constant: -4),
             filterButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
@@ -469,6 +496,7 @@ final class SearchWindow: NSWindowController {
         let tag = sender.tag
         guard tag >= 0, tag < Self.searchModes.count else { return }
         currentMode = Self.searchModes[tag]
+        updateRegexModeButtonState()
         syncSearchMenuState(targetMenu: sender.menu)
         if let query = searchField?.stringValue, !query.isEmpty {
             performSearch(query: query)
@@ -541,6 +569,7 @@ final class SearchWindow: NSWindowController {
         }
         updateStatusLabel()
         updateFilterButtonState(forQuery: searchField.stringValue)
+        regexModeButton.updateTooltipAndAccessibility()
         overlayState?.headingText = L("search.buildingIndex")
         overlayState?.statusText = L("search.scanningFiles")
     }
@@ -865,6 +894,7 @@ final class SearchWindow: NSWindowController {
 
         if query.isEmpty {
             searchResultsViewController.updateBottomPath(with: nil)
+            updateCaseSensitivityButtonState()
             loadDefaultResults()
             return
         }
@@ -937,10 +967,11 @@ final class SearchWindow: NSWindowController {
         searchMatchText = .key("search.searching")
 
         let mode = currentMode
+        let caseSensitivity = currentCaseSensitivity
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let response = self.engine.search(query: query, mode: mode)
+            let response = self.engine.search(query: query, mode: mode, caseSensitivity: caseSensitivity)
             let tree: ResultDirectoryTree? = response.results.isEmpty ? nil : ResultDirectoryTree.build(from: response.results)
             DispatchQueue.main.async {
                 self.isSearching = false
@@ -949,9 +980,12 @@ final class SearchWindow: NSWindowController {
                 self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
                 self.syncSearchMenuState()
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
+                self.updateCaseSensitivityButtonState(responseCaseSensitive: response.isCaseSensitive)
+                self.updateRegexModeButtonState(effectiveMode: response.effectiveMode)
 
                 if let error = response.error {
-                    self.searchMatchText = .verbatim(error)
+                    let formattedError = error.hasPrefix("⚠️") ? error : "⚠️ \(error)"
+                    self.searchMatchText = .verbatim(formattedError)
                 } else {
                     let count = response.results.count
                     if count == 1 {
@@ -961,9 +995,9 @@ final class SearchWindow: NSWindowController {
                     }
                 }
 
-                // 检索期间若输入内容变动或检索模式发生切换，在此重新调度
+                // 检索期间若输入内容变动或检索模式/大小写敏感发生切换，在此重新调度
                 let currentText = self.searchField.stringValue
-                if (currentText != query && !currentText.isEmpty) || self.currentMode != mode {
+                if (currentText != query && !currentText.isEmpty) || self.currentMode != mode || self.currentCaseSensitivity != caseSensitivity {
                     if currentText.isEmpty {
                         self.searchResultsViewController.updateBottomPath(with: nil)
                         self.loadDefaultResults()
@@ -995,6 +1029,126 @@ final class SearchWindow: NSWindowController {
         for item in selected {
             engine.openFile(path: item.path)
         }
+    }
+
+    // MARK: - Case Sensitivity Actions & State
+
+    @objc private func caseSensitivityButtonClicked(_ sender: NSButton) {
+        cycleCaseSensitivity()
+    }
+
+    private func cycleCaseSensitivity() {
+        switch currentCaseSensitivity {
+        case .auto:
+            currentCaseSensitivity = .sensitive
+        case .sensitive:
+            currentCaseSensitivity = .insensitive
+        case .insensitive:
+            currentCaseSensitivity = .auto
+        }
+        updateCaseSensitivityButtonState()
+        if let query = searchField?.stringValue, !query.isEmpty {
+            performSearch(query: query)
+        }
+    }
+
+    private func updateCaseSensitivityButtonState(responseCaseSensitive: Bool? = nil) {
+        switch currentCaseSensitivity {
+        case .sensitive:
+            caseSensitivityButton.visualState = .locked
+        case .insensitive:
+            caseSensitivityButton.visualState = .inactiveSlashed
+        case .auto:
+            if let effective = responseCaseSensitive {
+                caseSensitivityButton.visualState = effective ? .autoActive : .inactive
+            } else {
+                let query = searchField?.stringValue ?? ""
+                let hasUpper = Self.hasEffectiveUppercase(query: query)
+                caseSensitivityButton.visualState = hasUpper ? .autoActive : .inactive
+            }
+        }
+    }
+
+    static func hasEffectiveUppercase(query: String) -> Bool {
+        for word in query.split(separator: " ") {
+            if word.hasPrefix("in:") || word.hasPrefix("type:") || word.hasPrefix("ext:") || word.hasPrefix("size:") {
+                continue
+            }
+            if word.contains("/") {
+                if word.hasSuffix("/") { continue }
+                if let last = word.split(separator: "/").last,
+                   last.contains(where: { $0.isUppercase }) {
+                    return true
+                }
+                continue
+            }
+            if word.hasPrefix(".") && !word.hasPrefix("..") {
+                continue
+            }
+            if word.contains(where: { $0.isUppercase }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // MARK: - Regex Mode Actions & State
+
+    @objc private func regexModeButtonClicked(_ sender: NSButton) {
+        currentMode = (currentMode == .regex) ? .auto : .regex
+        updateRegexModeButtonState()
+        syncSearchMenuState()
+        if let query = searchField?.stringValue, !query.isEmpty {
+            performSearch(query: query)
+        }
+    }
+
+    private func updateRegexModeButtonState(effectiveMode: FfiSearchMode? = nil) {
+        if currentMode == .regex {
+            regexModeButton.visualState = .locked
+        } else if let effective = effectiveMode {
+            regexModeButton.visualState = (effective == .regex) ? .autoActive : .inactive
+        } else {
+            let hasSugar = Self.hasRegexSugar(query: searchField?.stringValue ?? "")
+            regexModeButton.visualState = hasSugar ? .autoActive : .inactive
+        }
+    }
+
+    static func hasRegexSugar(query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("regex:") { return true }
+        guard trimmed.hasPrefix("/"), trimmed.count >= 2 else { return false }
+        // Check if closed by unescaped slash
+        let chars = Array(trimmed)
+        var i = chars.count - 1
+        // Check for trailing 'i' or 'I'
+        if i >= 1 && (chars[i] == "i" || chars[i] == "I") {
+            i -= 1
+        }
+        guard i >= 1 && chars[i] == "/" else { return false }
+        var backslashCount = 0
+        var j = i - 1
+        while j >= 0 && chars[j] == "\\" {
+            backslashCount += 1
+            j -= 1
+        }
+        guard backslashCount % 2 == 0 else { return false }
+
+        // Intermediate unescaped slashes indicate a directory path rather than a regex pattern
+        var k = 1
+        var intermediateBackslashes = 0
+        while k < i {
+            if chars[k] == "/" && intermediateBackslashes % 2 == 0 {
+                return false
+            }
+            if chars[k] == "\\" {
+                intermediateBackslashes += 1
+            } else {
+                intermediateBackslashes = 0
+            }
+            k += 1
+        }
+        return true
     }
 
     // MARK: - Filter Popover Actions & State
@@ -1078,6 +1232,7 @@ final class SearchWindow: NSWindowController {
         if !searchField.stringValue.isEmpty {
             searchField.stringValue = ""
             applyQuerySyntaxHighlighting()
+            updateCaseSensitivityButtonState()
             searchChanged()
             focusSearchField()
             return
@@ -1151,6 +1306,8 @@ extension SearchWindow: NSWindowDelegate {
 extension SearchWindow: NSSearchFieldDelegate {
     func controlTextDidChange(_ obj: Notification) {
         applyQuerySyntaxHighlighting()
+        updateCaseSensitivityButtonState()
+        updateRegexModeButtonState()
         searchChanged()
     }
 

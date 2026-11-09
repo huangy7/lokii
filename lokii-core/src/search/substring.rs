@@ -2,8 +2,10 @@ use crate::compact_index::CompactIndex;
 use crate::indexer::{score_match_zero_alloc, IndexStore, MatchScore};
 use crate::string_pool::NameSignature;
 
+use super::disjunction::{extension_matches, extension_signature};
 use super::{
-    find_positions, is_dotfile_query, AdvancedSearchResult, CompiledRecordFilter, SearchMode,
+    find_positions, is_dotfile_query, merge_highlight_spans, AdvancedSearchResult,
+    CompiledRecordFilter, DisjunctionQuery, SearchMode,
 };
 
 /// Convert MatchScore to normalized f64 per research recommendation.
@@ -24,7 +26,7 @@ pub fn search(
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
     let read = store.read();
-    search_index(&read, query, filter, max_results)
+    search_index(&read, query, filter, max_results, false, false)
 }
 
 /// 接收统一快照读锁的子串检索实现，杜绝锁重入与快照位掩码漂移。
@@ -33,6 +35,8 @@ pub fn search_index(
     query: &str,
     filter: &CompiledRecordFilter,
     max_results: usize,
+    case_sensitive: bool,
+    explicit_lock: bool,
 ) -> Vec<AdvancedSearchResult> {
     let query = query.trim();
     if max_results == 0 {
@@ -53,18 +57,20 @@ pub fn search_index(
             extension = None;
         }
     }
-    let keywords: Vec<String> = query.split_whitespace().map(crate::cjk::fold_str).collect();
+    let keywords: Vec<String> = if case_sensitive {
+        query
+            .split_whitespace()
+            .map(|s| crate::cjk::to_simplified_str(s).into_owned())
+            .collect()
+    } else {
+        query.split_whitespace().map(crate::cjk::fold_str).collect()
+    };
     let matches = match &extension {
         Some(extension) => {
             let Some(ext_id) = read.extension_id(extension) else {
                 return Vec::new();
             };
-            let req = if extension.is_empty() {
-                NameSignature::default()
-            } else {
-                NameSignature::from_substring_query(".")
-                    .union(NameSignature::from_substring_query(extension))
-            };
+            let req = extension_signature(extension);
             let ext_ascii = extension.is_ascii();
             let mut top = super::top_k::TopK::new(max_results);
             let sorted = read.sorted_names();
@@ -79,17 +85,7 @@ pub fn search_index(
                 let Some((name, folded)) = read.name_entry(name_id) else {
                     continue;
                 };
-                let matched = if extension.is_empty() {
-                    true
-                } else if let Some(f) = folded {
-                    f.rsplit_once('.').is_some_and(|(_, ext)| ext == extension)
-                } else if ext_ascii {
-                    name.rsplit_once('.')
-                        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(extension))
-                } else {
-                    // `folded` 为 None 意味着该名字小写折叠后与原串一致（如中文或已小写的重音扩展名）
-                    name.rsplit_once('.').is_some_and(|(_, ext)| ext == extension)
-                };
+                let matched = extension_matches(name, folded, extension, ext_ascii);
                 if !matched {
                     continue;
                 }
@@ -131,38 +127,276 @@ pub fn search_index(
             } else {
                 let mut req = NameSignature::default();
                 for kw in &keywords {
-                    req = req.union(NameSignature::from_substring_query(kw));
+                    req = req.union(NameSignature::from_substring_query(&kw.to_lowercase()));
                 }
                 let all_ascii = keywords.iter().all(|k| k.is_ascii());
                 super::rank_unique_names(&read, filter, max_results, req, |name, folded| {
-                    score_match_zero_alloc(name, folded, &keywords, all_ascii)
+                    score_match_zero_alloc(
+                        name,
+                        folded,
+                        &keywords,
+                        all_ascii,
+                        case_sensitive,
+                        explicit_lock,
+                    )
                 })
             }
         }
     };
+    let kw_prepared: Vec<(&str, String)> = keywords
+        .iter()
+        .map(|k| (k.as_str(), k.to_lowercase()))
+        .collect();
+    let kw_refs: Vec<(&str, &str)> = kw_prepared
+        .iter()
+        .map(|(raw, lower)| (*raw, lower.as_str()))
+        .collect();
+
     matches
         .into_iter()
         .map(|candidate| {
             let view = read
                 .view(crate::compact_index::EntryId(candidate.ordinal))
                 .unwrap();
+            let match_positions = if extension.is_some() || query.is_empty() {
+                Vec::new()
+            } else {
+                find_positions(
+                    &view.name,
+                    &view.name.to_lowercase(),
+                    &kw_refs,
+                )
+            };
             AdvancedSearchResult {
                 entry: view.materialize(),
                 score: score_to_f64(candidate.score),
-                match_positions: if extension.is_some() || query.is_empty() {
-                    Vec::new()
-                } else {
-                    find_positions(
-                        &view.name,
-                        &view.name.to_lowercase(),
-                        keywords.iter().map(String::as_str),
-                    )
-                },
+                match_positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Substring,
             }
         })
         .collect()
+}
+
+struct PreparedDisjunctionClause<'a> {
+    is_extension: bool,
+    extension: Option<&'a str>,
+    ext_id: Option<u32>,
+    ext_ascii: bool,
+    keywords: Vec<String>,
+    all_ascii: bool,
+    case_sensitive: bool,
+    required_sig: NameSignature,
+    kw_prepared: Vec<(&'a str, String)>,
+}
+
+/// 并集检索执行引擎：支持带管道符多子句的单趟签名位运算预筛与极值打分遍历。
+///
+/// 算法核心机制：
+/// 1. 单趟 128 位超集签名预筛：多子句签名求或（Any），零堆分配短路快速跳过无关名字；
+/// 2. 候选极值打分：对每个唯一名合并计算最佳匹配分数，一旦出现 Exact 得分即提前终止子句比对；
+/// 3. 分数梯度堆顶动态置换：严禁在外层名字遍历中依据堆满状态早退，确保低字典序的高分记录顺利置换低分项；
+/// 4. 扩展名类型守卫：纯扩展名匹配子句在展开 CSR 条目时严格校验非目录属性与扩展名池编号；
+/// 5. 命中子句高亮隔离：仅对实际产生匹配判定的子句提取高亮字符区间，杜绝未命中词元误高亮，并执行 UTF-8 字符边界对齐。
+pub fn search_disjunction(
+    read: &CompactIndex,
+    query: &DisjunctionQuery,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    explicit_lock: bool,
+) -> Vec<AdvancedSearchResult> {
+    if max_results == 0 || query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut prepared_clauses = Vec::with_capacity(query.clauses.len());
+    for clause in &query.clauses {
+        let is_extension = clause.extension.is_some();
+        if clause.keywords.is_empty() && !is_extension {
+            continue;
+        }
+
+        let case_sensitive = clause.is_case_sensitive;
+
+        let ext_str = clause.extension.as_deref();
+        let ext_id = ext_str.and_then(|ext| read.extension_id(ext));
+        let ext_ascii = ext_str.map_or(true, |ext| ext.is_ascii());
+
+        let keywords: Vec<String> = if case_sensitive {
+            clause.keywords.clone()
+        } else {
+            clause.keywords.iter().map(|k| k.to_lowercase()).collect()
+        };
+        let all_ascii = keywords.iter().all(|k| k.is_ascii());
+
+        let kw_prepared: Vec<(&str, String)> = clause
+            .keywords
+            .iter()
+            .map(|k| (k.as_str(), k.to_lowercase()))
+            .collect();
+
+        prepared_clauses.push(PreparedDisjunctionClause {
+            is_extension,
+            extension: ext_str,
+            ext_id,
+            ext_ascii,
+            keywords,
+            all_ascii,
+            case_sensitive,
+            required_sig: clause.required_sig,
+            kw_prepared,
+        });
+    }
+
+    if prepared_clauses.is_empty() {
+        return Vec::new();
+    }
+
+    let sorted = read.sorted_names();
+    let mut top = super::top_k::TopK::new(max_results);
+
+    for &name_id in &sorted.ids {
+        // 1. 单趟 128 位超集签名位运算预筛
+        if let Some(sig) = read.name_signature(name_id) {
+            let signature_matched = prepared_clauses.iter().any(|c| {
+                if c.keywords.is_empty() && !c.is_extension {
+                    return false;
+                }
+                if c.is_extension && c.ext_id.is_none() {
+                    return false;
+                }
+                sig.contains(c.required_sig)
+            });
+            if !signature_matched {
+                continue;
+            }
+        }
+
+        let Some((name, folded)) = read.name_entry(name_id) else {
+            continue;
+        };
+
+        // 2. 多子句极值打分与短路
+        let mut best_keyword_score: Option<MatchScore> = None;
+        let mut matched_ext_id: Option<u32> = None;
+
+        for clause in &prepared_clauses {
+            if clause.is_extension {
+                if matched_ext_id.is_none() {
+                    if let (Some(ext), Some(ext_id)) = (clause.extension, clause.ext_id) {
+                        if extension_matches(name, folded, ext, clause.ext_ascii) {
+                            matched_ext_id = Some(ext_id);
+                        }
+                    }
+                }
+            } else {
+                if best_keyword_score == Some(MatchScore::Exact) {
+                    continue;
+                }
+                if let Some(score) = score_match_zero_alloc(
+                    name,
+                    folded,
+                    &clause.keywords,
+                    clause.all_ascii,
+                    clause.case_sensitive,
+                    explicit_lock,
+                ) {
+                    if best_keyword_score.map_or(true, |b| score > b) {
+                        best_keyword_score = Some(score);
+                    }
+                    if score == MatchScore::Exact {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if matched_ext_id.is_none() && best_keyword_score.is_none() {
+            continue;
+        }
+
+        // 3. CSR 条目展开与记录级守卫
+        // 严禁依据 top.is_full() 中断外层名字循环，确保分数梯度能正确置换堆顶
+        for &ordinal in read.entries_for_name(name_id) {
+            let Some(record) = read.records().get(ordinal as usize) else {
+                continue;
+            };
+
+            let score = if !record.is_dir
+                && matched_ext_id.is_some()
+                && Some(record.extension) == matched_ext_id
+            {
+                MatchScore::Exact
+            } else if let Some(kw_score) = best_keyword_score {
+                kw_score
+            } else {
+                continue;
+            };
+
+            if !filter.matches_record(record, || Some(name)) {
+                continue;
+            }
+            top.offer(ordinal as usize, score, name);
+        }
+    }
+
+    // 4. 高亮隔离与三态合并
+    let candidates = top.finish();
+    let mut results = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        let Some(view) = read.view(crate::compact_index::EntryId(candidate.ordinal)) else {
+            continue;
+        };
+        let name = view.name;
+        let name_lower = name.to_lowercase();
+        let record = &read.records()[candidate.ordinal];
+        let folded = read.name_entry(record.name).and_then(|(_, f)| f);
+
+        let mut all_spans = Vec::new();
+        for clause in &prepared_clauses {
+            if clause.is_extension || clause.keywords.is_empty() {
+                continue;
+            }
+            let matched = score_match_zero_alloc(
+                name,
+                folded,
+                &clause.keywords,
+                clause.all_ascii,
+                clause.case_sensitive,
+                explicit_lock,
+            )
+            .is_some();
+
+            if matched {
+                let kw_refs: Vec<(&str, &str)> = clause
+                    .kw_prepared
+                    .iter()
+                    .map(|(raw, lower)| (*raw, lower.as_str()))
+                    .collect();
+                let spans = find_positions(name, &name_lower, &kw_refs);
+                all_spans.extend(spans);
+            }
+        }
+
+        all_spans.retain(|&(s, e)| {
+            s < e
+                && e <= name.len()
+                && name.is_char_boundary(s)
+                && name.is_char_boundary(e)
+        });
+        let match_positions = merge_highlight_spans(all_spans, name.len());
+
+        results.push(AdvancedSearchResult {
+            entry: view.materialize(),
+            score: score_to_f64(candidate.score),
+            match_positions,
+            parent_match_positions: Vec::new(),
+            search_mode: SearchMode::Substring,
+        });
+    }
+
+    results
 }
 
 #[cfg(test)]

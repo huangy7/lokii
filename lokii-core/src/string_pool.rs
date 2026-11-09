@@ -589,32 +589,24 @@ impl StringPool {
 
 /// 零分配大小写无关比较与子串查找辅助函数。
 #[inline]
-pub(crate) fn ascii_contains_ignore_case(haystack: &[u8], needle_lower: &[u8]) -> bool {
-    let n_len = needle_lower.len();
+pub(crate) fn find_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let n_len = needle.len();
     if n_len == 0 {
-        return true;
+        return Some(0);
     }
     if haystack.len() < n_len {
-        return false;
+        return None;
     }
-    let first = needle_lower[0];
-    if n_len == 1 {
-        return haystack.iter().any(|&h| h.to_ascii_lowercase() == first);
-    }
-    let last = needle_lower[n_len - 1];
-    let limit = haystack.len() - n_len;
-    for i in 0..=limit {
-        if haystack[i].to_ascii_lowercase() == first
-            && haystack[i + n_len - 1].to_ascii_lowercase() == last
-            && haystack[i + 1..i + n_len - 1]
-                .iter()
-                .zip(&needle_lower[1..n_len - 1])
-                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
-        {
-            return true;
-        }
-    }
-    false
+    let first = needle[0].to_ascii_lowercase();
+    (0..=haystack.len() - n_len).find(|&i| {
+        haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + n_len].eq_ignore_ascii_case(needle)
+    })
+}
+
+#[inline]
+pub(crate) fn ascii_contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    find_ascii_ignore_case(haystack, needle).is_some()
 }
 
 #[cfg(test)]
