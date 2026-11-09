@@ -9,8 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md"><img src="https://img.shields.io/badge/lang-English-lightgrey?style=flat-square" alt="English"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/lang-简体中文-blue?style=flat-square" alt="简体中文"></a>
+  <b>简体中文</b> | <a href="README.md"><b>English</b></a>
 </p>
 
 <p align="center">
@@ -31,6 +30,32 @@
 </p>
 
 Lokii 是一款专为 Mac 用户与开发者打造的原生即时文件搜索利器，为你带来类似 Windows 下 Everything 般极速、轻巧的文件检索体验。它基于高性能 Rust 内存倒排索引核心（`lokii-core`），通过 UniFFI 桥接至纯原生 Swift/AppKit 用户界面，在数十万文件的规模下依然提供亚毫秒级的输入即检索响应，并通过 FSEvents 实时监控文件系统的增量变更。
+
+## 安装方式
+
+### 方式一：Homebrew 安装（推荐）
+
+通过官方 Tap 安装 Lokii Cask：
+
+```bash
+brew tap huangy7/tap
+brew install --cask lokii
+```
+
+或使用单行命令：
+
+```bash
+brew install --cask huangy7/tap/lokii
+```
+
+### 方式二：直接下载 DMG 镜像
+
+在 [Releases 页面](https://github.com/huangy7/lokii/releases/latest) 获取适合你 Mac 芯片架构的最新安装包：
+
+- **Apple Silicon (M系列芯片)**: `Lokii-arm64.dmg`
+- **Intel 芯片**: `Lokii-x86_64.dmg`
+
+下载后打开 `.dmg` 镜像，将 `Lokii.app` 拖入 `Applications`（应用程序）目录即可。
 
 ## 核心功能
 
@@ -87,14 +112,6 @@ macOS 自带了强大的聚焦搜索（Spotlight），但对于开发者和重�
 ## 隐私与安全
 
 Lokii 100% 运行在您的本地 Mac 上。没有任何用户账号体系，没有遥测（Telemetry），不发送任何网络请求。您的文件名、磁盘结构与搜索记录永远不会离开您的设备。
-
-## 架构组成
-
-```
-lokii-core/       Rust 核心库与 CLI — 内存倒排索引、并行目录扫描器、FSEvents 监听队列、v5 增量检查点、IPC 查询服务与 lokii 命令行工具
-Lokii/            macOS Swift/AppKit 原生应用 — 高性能虚拟列表、系统托盘常驻、设置窗口、终端集成
-scripts/          构建与打包脚本（UniFFI 桥接生成、自动化 DMG 镜像装配）
-```
 
 ## 从源码构建
 
