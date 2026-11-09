@@ -122,6 +122,15 @@
 "search.empty.title" = "No Matching Files";
 "search.empty.subtitle" = "Check spelling, try fuzzy matching, or press ⌥F to adjust filters";
 "search.toolbar.pin" = "Pin Window";
+"search.caseSensitivity.auto" = "Match Case: Auto";
+"search.caseSensitivity.autoActive" = "Match Case: Auto (Uppercase Detected)";
+"search.caseSensitivity.sensitive" = "Match Case: On";
+"search.caseSensitivity.insensitive" = "Match Case: Off";
+
+/* Regex Mode & Syntax Sugar */
+"search.regex.inactive" = "Regular Expression Mode (Inactive)";
+"search.regex.autoActive" = "Regular Expression Auto-detected (Inline /.../ sugar)";
+"search.regex.locked" = "Regular Expression Mode Locked (All text treated as regex)";
 "search.history.title" = "Recent Searches";
 "search.history.clear" = "Clear Search History";
 "prefs.launchAtLogin" = "Launch at Login";

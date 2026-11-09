@@ -163,8 +163,12 @@ final class SearchEngine: @unchecked Sendable {
     }
 
     /// Search synchronously (fast — sub-millisecond for in-memory index).
-    func search(query: String, mode: FfiSearchMode = .auto) -> FfiSearchResponse {
-        core.search(query: query, mode: mode)
+    func search(
+        query: String,
+        mode: FfiSearchMode = .auto,
+        caseSensitivity: FfiCaseSensitivity = .auto
+    ) -> FfiSearchResponse {
+        core.search(query: query, mode: mode, caseSensitivity: caseSensitivity)
     }
 
     /// Get current index stats.

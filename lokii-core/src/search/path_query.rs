@@ -26,6 +26,11 @@ impl PathQuery {
 
     /// 解析查询；无路径语法时返回 None。
     pub fn parse(query: &str) -> Option<Self> {
+        Self::parse_with_case(query, false)
+    }
+
+    /// 接收大小写敏感配置解析路径感知查询。
+    pub fn parse_with_case(query: &str, case_sensitive: bool) -> Option<Self> {
         let trimmed = query.trim();
         if trimmed.is_empty() || !Self::is_path_query(trimmed) {
             return None;
@@ -52,7 +57,11 @@ impl PathQuery {
             // 2. 独立扩展名: .rs, .toml（排除隐藏点文件，如 .env、.gitignore）
             if word.starts_with('.') && !word.contains('/') && word.len() > 1 {
                 if crate::search::filter::is_dotfile_query(word) {
-                    name_terms.push(word.to_string());
+                    name_terms.push(if case_sensitive {
+                        word.to_string()
+                    } else {
+                        word.to_lowercase()
+                    });
                 } else {
                     extension = Some(word[1..].to_lowercase());
                 }
@@ -69,16 +78,20 @@ impl PathQuery {
                 }
 
                 if collapsed.ends_with('/') {
-                    // 以 '/' 结尾
+                    // 以 '/' 结尾（父目录约束始终小写）
                     is_dir_only = true;
                     path_pattern = Some(collapsed.to_lowercase());
                 } else {
-                    // 中间含 '/'：拆成目录与文件名
+                    // 中间含 '/'：拆成目录与文件名（父目录约束始终小写，仅文件名按需区分大小写）
                     let (dir_part, name_part) = split_path(&collapsed);
                     if !dir_part.is_empty() {
                         path_pattern = Some(dir_part.to_lowercase());
                         if !name_part.is_empty() {
-                            name_terms.push(crate::cjk::fold_str(name_part));
+                            name_terms.push(if case_sensitive {
+                                crate::cjk::to_simplified_str(name_part).into_owned()
+                            } else {
+                                crate::cjk::fold_str(name_part)
+                            });
                         }
                     }
                 }
@@ -86,7 +99,11 @@ impl PathQuery {
             }
 
             // 4. 普通文件名词元
-            name_terms.push(crate::cjk::fold_str(word));
+            name_terms.push(if case_sensitive {
+                crate::cjk::to_simplified_str(word).into_owned()
+            } else {
+                crate::cjk::fold_str(word)
+            });
         }
 
         Some(Self {
@@ -227,5 +244,16 @@ mod tests {
         assert_eq!(collapse_consecutive_slashes("a///b//c/"), "a/b/c/");
         assert_eq!(collapse_consecutive_slashes("////"), "/");
         assert_eq!(collapse_consecutive_slashes("plain"), "plain");
+    }
+
+    #[test]
+    fn test_parse_with_case_dir_and_name() {
+        let q = PathQuery::parse_with_case("Src/AppDelegate.swift", true).expect("should parse");
+        assert_eq!(q.path_pattern.as_deref(), Some("src/"));
+        assert_eq!(q.name_terms, vec!["AppDelegate.swift"]);
+
+        let q2 = PathQuery::parse_with_case("Src/AppDelegate.swift", false).expect("should parse");
+        assert_eq!(q2.path_pattern.as_deref(), Some("src/"));
+        assert_eq!(q2.name_terms, vec!["appdelegate.swift"]);
     }
 }

@@ -20,12 +20,15 @@ pub struct Request {
     pub q: String,
     pub mode: Option<SearchMode>,
     pub limit: Option<usize>,
+    pub case_sensitivity: Option<search::CaseSensitivity>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Response {
     pub results: Vec<FileEntry>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_case_sensitive: Option<bool>,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -111,15 +114,19 @@ fn handle_connection(
             let max_results = config_store.read().index.max_results;
             let limit = request.limit.unwrap_or(max_results).min(max_results);
             let mode = request.mode.unwrap_or(SearchMode::Auto);
-            let (results, error) = search::dispatch(store, &request.q, mode, limit);
+            let case_sensitivity = request.case_sensitivity.unwrap_or_default();
+            let (results, is_case_sensitive, error) =
+                search::dispatch_with_options(store, &request.q, mode, case_sensitivity, limit);
             Response {
                 results: results.into_iter().map(|r| r.entry).collect(),
                 error,
+                is_case_sensitive: Some(is_case_sensitive),
             }
         }
         Err(e) => Response {
             results: Vec::new(),
             error: Some(format!("invalid request: {e}")),
+            is_case_sensitive: None,
         },
     };
     let mut out = serde_json::to_vec(&response)?;
@@ -167,8 +174,27 @@ mod tests {
 
         let found = query(&path, r#"{"q":"main","mode":"substring"}"#);
         assert_eq!(found.error, None);
+        assert_eq!(found.is_case_sensitive, Some(false));
         let paths: Vec<_> = found.results.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, ["/src/main.rs"]);
+
+        // Auto + uppercase -> smart case sensitive
+        let auto_upper = query(&path, r#"{"q":"MAIN","mode":"substring"}"#);
+        assert_eq!(auto_upper.error, None);
+        assert_eq!(auto_upper.is_case_sensitive, Some(true));
+        assert!(auto_upper.results.is_empty());
+
+        // Explicit insensitive
+        let forced_insensitive = query(&path, r#"{"q":"MAIN","mode":"substring","case_sensitivity":"insensitive"}"#);
+        assert_eq!(forced_insensitive.error, None);
+        assert_eq!(forced_insensitive.is_case_sensitive, Some(false));
+        assert_eq!(forced_insensitive.results.len(), 1);
+
+        // Explicit sensitive
+        let forced_sensitive = query(&path, r#"{"q":"main","mode":"substring","case_sensitivity":"sensitive"}"#);
+        assert_eq!(forced_sensitive.error, None);
+        assert_eq!(forced_sensitive.is_case_sensitive, Some(true));
+        assert_eq!(forced_sensitive.results.len(), 1);
 
         let limited = query(&path, r#"{"q":".rs","limit":1}"#);
         assert_eq!(limited.results.len(), 1);

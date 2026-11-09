@@ -64,6 +64,7 @@ fn main() {
         q: words.join(" "),
         mode,
         limit,
+        case_sensitivity: None,
     };
     let response = query(&request).unwrap_or_else(|e| {
         fail(

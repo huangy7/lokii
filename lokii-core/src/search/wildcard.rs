@@ -31,7 +31,7 @@ pub fn search(
     max_results: usize,
 ) -> Vec<AdvancedSearchResult> {
     let read = store.read();
-    search_index(&read, query, filter, max_results)
+    search_index(&read, query, filter, max_results, false)
 }
 
 /// 接收统一快照读锁的通配符检索实现，杜绝锁重入与快照位掩码漂移。
@@ -40,11 +40,17 @@ pub fn search_index(
     query: &str,
     filter: &CompiledRecordFilter,
     max_results: usize,
+    case_sensitive: bool,
 ) -> Vec<AdvancedSearchResult> {
-    let pattern = crate::cjk::fold_str(query.trim());
-    if pattern.is_empty() || max_results == 0 {
+    let raw_pattern = query.trim();
+    if raw_pattern.is_empty() || max_results == 0 {
         return Vec::new();
     }
+    let pattern = if case_sensitive {
+        crate::cjk::to_simplified_str(raw_pattern).into_owned()
+    } else {
+        crate::cjk::fold_str(raw_pattern)
+    };
     // 当查询为全匹配通配符 "*" 时，全局遍历所有记录并按修改时间倒序（最近活跃优先）保留 Top-K 结果，
     // 规避首屏按文件名自然字母截断导致的最近修改文件漏显问题。
     if pattern == "*" {
@@ -75,7 +81,8 @@ pub fn search_index(
             .collect();
     }
 
-    let req = required_signature_for_glob(&pattern);
+    let pattern_lower = raw_pattern.to_lowercase();
+    let req = required_signature_for_glob(&pattern_lower);
 
     // 针对纯 `*.ext` 模式（无其他通配符），直接跳过 `glob_match` 字符串自动机，做后缀字节比对
     let simple_suffix = pattern.strip_prefix("*.").filter(|rest| {
@@ -96,7 +103,16 @@ pub fn search_index(
         let Some((name, folded)) = read.name_entry(name_id) else {
             continue;
         };
-        let matched = if let Some(ext) = simple_suffix {
+        let matched = if case_sensitive {
+            if let Some(ext) = simple_suffix {
+                let suffix_len = ext.len() + 1;
+                name.len() >= suffix_len
+                    && name.as_bytes()[name.len() - suffix_len] == b'.'
+                    && &name[name.len() - ext.len()..] == ext
+            } else {
+                glob_match(&pattern, name)
+            }
+        } else if let Some(ext) = simple_suffix {
             let suffix_len = ext.len() + 1;
             if let Some(f) = folded {
                 f.len() >= suffix_len

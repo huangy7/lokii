@@ -1,7 +1,7 @@
 mod legacy;
 
 use lokii_core::indexer::{FileEntry, IndexStore};
-use lokii_core::search::{dispatch, SearchMode};
+use lokii_core::search::{dispatch, dispatch_with_options, CaseSensitivity, SearchMode};
 
 fn fixture() -> Vec<FileEntry> {
     [
@@ -120,6 +120,75 @@ fn all_modes_match_frozen_legacy() {
                     let actual = dispatch(&current, query, mode, limit);
                     assert_eq!(actual.1, None);
                     assert!(actual.0.is_empty());
+                }
+                continue;
+            }
+
+            // 大小写控制机制：当输入大写查询词（如 "MAIN"）时，Smart Case 判定为大小写敏感，
+            // 严格要求匹配大写（在测试库只有 main.rs 时返回空）；在 Insensitive 模式下保持与历史全小写等价态一致。
+            if query == "MAIN" && mode != SearchMode::Fuzzy {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let actual = dispatch(&current, query, mode, limit);
+                    assert_eq!(actual.1, None);
+                    assert!(actual.0.is_empty());
+
+                    let (insensitive, _, err) =
+                        dispatch_with_options(&current, query, mode, CaseSensitivity::Insensitive, limit);
+                    assert_eq!(err, None);
+                    let expected = legacy::search::dispatch(&old, query, old_mode, limit);
+                    assert_eq!(
+                        serde_json::to_value(insensitive).unwrap(),
+                        serde_json::to_value(expected.0).unwrap(),
+                        "{mode:?}/{query}/{limit}"
+                    );
+                }
+                continue;
+            }
+
+            // "İ" (U+0130 大写带点 I)：在 Auto/Substring 模式下触发 Smart Case 大写敏感匹配，
+            // 匹配位置精确指向原始 2 字节大写字符 (0..2)；
+            // 在 CaseSensitivity::Insensitive 下与历史 3 字节小写重音展开折叠态 (0..3) 一致。
+            if query == "İ" && (mode == SearchMode::Auto || mode == SearchMode::Substring) {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let actual = dispatch(&current, query, mode, limit);
+                    assert_eq!(actual.1, None);
+                    if limit > 0 {
+                        assert_eq!(actual.0[0].match_positions, vec![(0, 2)]);
+                    } else {
+                        assert!(actual.0.is_empty());
+                    }
+
+                    let (insensitive, _, err) =
+                        dispatch_with_options(&current, query, mode, CaseSensitivity::Insensitive, limit);
+                    assert_eq!(err, None);
+                    let expected = legacy::search::dispatch(&old, query, old_mode, limit);
+                    assert_eq!(
+                        serde_json::to_value(insensitive).unwrap(),
+                        serde_json::to_value(expected.0).unwrap(),
+                        "{mode:?}/{query}/{limit}"
+                    );
+                }
+                continue;
+            }
+
+            // 正则模式全命中区间合并：对于单字符通配正则（如 "."），旧版仅提取单次 find 匹配首字，
+            // 现重构为 find_iter 提取全量匹配并平滑合并为连续高亮区间。
+            if mode == SearchMode::Regex && query == "." {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let actual = dispatch(&current, query, mode, limit);
+                    let expected = legacy::search::dispatch(&old, query, old_mode, limit);
+                    assert_eq!(actual.1, expected.1, "{mode:?}/{query}/{limit}");
+                    assert_eq!(actual.0.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
+                    for (act, exp) in actual.0.iter().zip(expected.0.iter()) {
+                        assert_eq!(
+                            serde_json::to_value(&act.entry).unwrap(),
+                            serde_json::to_value(&exp.entry).unwrap()
+                        );
+                        assert_eq!(act.score, exp.score);
+                        assert_eq!(act.match_positions, vec![(0, act.entry.name.len())]);
+                        assert_eq!(exp.match_positions.len(), 1);
+                        assert_eq!(exp.match_positions[0].0, 0);
+                    }
                 }
                 continue;
             }

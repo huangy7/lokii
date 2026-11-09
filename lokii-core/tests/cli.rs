@@ -57,7 +57,7 @@ fn double_dash_allows_queries_starting_with_dash_and_alfred_gets_match() {
             created_at: 0,
             extension: "rs".into(),
         };
-        let response = Response { results: vec![entry], error: None };
+        let response = Response { results: vec![entry], error: None, is_case_sensitive: None };
         (&stream).write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).unwrap();
         request
     });

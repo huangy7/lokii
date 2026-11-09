@@ -49,6 +49,7 @@ test: bindings
 	@swift tests/filter_popover_controller_test.swift
 	@swift tests/breadcrumb_and_services_test.swift
 	@swift tests/terminal_launcher_test.swift
+	@swift tests/case_sensitivity_test.swift
 
 
 check:

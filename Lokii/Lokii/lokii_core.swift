@@ -892,7 +892,7 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     /**
      * Search the index.
      */
-    func search(query: String, mode: FfiSearchMode)  -> FfiSearchResponse
+    func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity)  -> FfiSearchResponse
     
     /**
      * Start the config file watcher for hot-reload.
@@ -1097,11 +1097,12 @@ open func revealInFinder(path: String) -> Bool  {
     /**
      * Search the index.
      */
-open func search(query: String, mode: FfiSearchMode) -> FfiSearchResponse  {
+open func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity) -> FfiSearchResponse  {
     return try!  FfiConverterTypeFfiSearchResponse_lift(try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_search(self.uniffiClonePointer(),
         FfiConverterString.lower(query),
-        FfiConverterTypeFfiSearchMode_lower(mode),$0
+        FfiConverterTypeFfiSearchMode_lower(mode),
+        FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),$0
     )
 })
 }
@@ -1356,17 +1357,21 @@ public func FfiConverterTypeFfiMatchRange_lower(_ value: FfiMatchRange) -> RustB
 
 
 /**
- * Search response including optional error string.
+ * Search response including optional error string and case sensitivity flag.
  */
 public struct FfiSearchResponse {
     public var results: [FfiSearchResult]
     public var error: String?
+    public var isCaseSensitive: Bool
+    public var effectiveMode: FfiSearchMode
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(results: [FfiSearchResult], error: String?) {
+    public init(results: [FfiSearchResult], error: String?, isCaseSensitive: Bool, effectiveMode: FfiSearchMode) {
         self.results = results
         self.error = error
+        self.isCaseSensitive = isCaseSensitive
+        self.effectiveMode = effectiveMode
     }
 }
 
@@ -1383,12 +1388,20 @@ extension FfiSearchResponse: Equatable, Hashable {
         if lhs.error != rhs.error {
             return false
         }
+        if lhs.isCaseSensitive != rhs.isCaseSensitive {
+            return false
+        }
+        if lhs.effectiveMode != rhs.effectiveMode {
+            return false
+        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(results)
         hasher.combine(error)
+        hasher.combine(isCaseSensitive)
+        hasher.combine(effectiveMode)
     }
 }
 
@@ -1402,13 +1415,17 @@ public struct FfiConverterTypeFfiSearchResponse: FfiConverterRustBuffer {
         return
             try FfiSearchResponse(
                 results: FfiConverterSequenceTypeFfiSearchResult.read(from: &buf), 
-                error: FfiConverterOptionString.read(from: &buf)
+                error: FfiConverterOptionString.read(from: &buf), 
+                isCaseSensitive: FfiConverterBool.read(from: &buf), 
+                effectiveMode: FfiConverterTypeFfiSearchMode.read(from: &buf)
         )
     }
 
     public static func write(_ value: FfiSearchResponse, into buf: inout [UInt8]) {
         FfiConverterSequenceTypeFfiSearchResult.write(value.results, into: &buf)
         FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterBool.write(value.isCaseSensitive, into: &buf)
+        FfiConverterTypeFfiSearchMode.write(value.effectiveMode, into: &buf)
     }
 }
 
@@ -1571,6 +1588,83 @@ public func FfiConverterTypeFfiSearchResult_lift(_ buf: RustBuffer) throws -> Ff
 public func FfiConverterTypeFfiSearchResult_lower(_ value: FfiSearchResult) -> RustBuffer {
     return FfiConverterTypeFfiSearchResult.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiCaseSensitivity {
+    
+    case auto
+    case sensitive
+    case insensitive
+}
+
+
+#if compiler(>=6)
+extension FfiCaseSensitivity: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCaseSensitivity: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCaseSensitivity
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCaseSensitivity {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .auto
+        
+        case 2: return .sensitive
+        
+        case 3: return .insensitive
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCaseSensitivity, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .auto:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .sensitive:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .insensitive:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCaseSensitivity_lift(_ buf: RustBuffer) throws -> FfiCaseSensitivity {
+    return try FfiConverterTypeFfiCaseSensitivity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCaseSensitivity_lower(_ value: FfiCaseSensitivity) -> RustBuffer {
+    return FfiConverterTypeFfiCaseSensitivity.lower(value)
+}
+
+
+extension FfiCaseSensitivity: Equatable, Hashable {}
+
+
+
+
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -1988,7 +2082,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_reveal_in_finder() != 23865) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_search() != 25414) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_search() != 32566) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher() != 32031) {

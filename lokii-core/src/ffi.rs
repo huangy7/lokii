@@ -43,11 +43,13 @@ pub struct FfiIndexStats {
     pub is_ready: bool,
 }
 
-/// Search response including optional error string.
+/// Search response including optional error string and case sensitivity flag.
 #[derive(uniffi::Record)]
 pub struct FfiSearchResponse {
     pub results: Vec<FfiSearchResult>,
     pub error: Option<String>,
+    pub is_case_sensitive: bool,
+    pub effective_mode: FfiSearchMode,
 }
 
 // ── UniFFI Enums ────────────────────────────────────────────────────────
@@ -63,7 +65,14 @@ pub enum FfiFileType {
     Folder,
 }
 
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum FfiCaseSensitivity {
+    Auto,
+    Sensitive,
+    Insensitive,
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfiSearchMode {
     Auto,
     Substring,
@@ -113,6 +122,16 @@ impl From<SearchMode> for FfiSearchMode {
             SearchMode::Wildcard => FfiSearchMode::Wildcard,
             SearchMode::Regex => FfiSearchMode::Regex,
             SearchMode::Fuzzy => FfiSearchMode::Fuzzy,
+        }
+    }
+}
+
+impl From<FfiCaseSensitivity> for search::CaseSensitivity {
+    fn from(mode: FfiCaseSensitivity) -> Self {
+        match mode {
+            FfiCaseSensitivity::Auto => search::CaseSensitivity::Auto,
+            FfiCaseSensitivity::Sensitive => search::CaseSensitivity::Sensitive,
+            FfiCaseSensitivity::Insensitive => search::CaseSensitivity::Insensitive,
         }
     }
 }
@@ -309,14 +328,27 @@ impl LokiiCore {
     }
 
     /// Search the index.
-    pub fn search(&self, query: String, mode: FfiSearchMode) -> FfiSearchResponse {
+    pub fn search(
+        &self,
+        query: String,
+        mode: FfiSearchMode,
+        case_sensitivity: FfiCaseSensitivity,
+    ) -> FfiSearchResponse {
         let max_results = self.config_store.read().index.max_results;
         let search_mode = SearchMode::from(&mode);
-        let (results, error) = search::dispatch(&self.store, &query, search_mode, max_results);
+        let (results, is_case_sensitive, error, effective_mode) = search::dispatch_with_details(
+            &self.store,
+            &query,
+            search_mode,
+            case_sensitivity.into(),
+            max_results,
+        );
 
         FfiSearchResponse {
             results: convert_results(results),
             error,
+            is_case_sensitive,
+            effective_mode: effective_mode.into(),
         }
     }
 
@@ -690,5 +722,79 @@ mod tests {
     fn malformed_config_patch_is_rejected() {
         assert!(merge_config_patch(&AppConfig::default(), "not json").is_none());
         assert!(merge_config_patch(&AppConfig::default(), r#"{ "index": 42 }"#).is_none());
+    }
+
+    #[test]
+    fn search_honors_case_sensitivity_and_reports_effective_flag() {
+        let core = core();
+        core.store.replace(vec![crate::indexer::FileEntry {
+            name: "FooBar.txt".to_string(),
+            path: "/path/FooBar.txt".to_string(),
+            is_dir: false,
+            size: 10,
+            modified: 100,
+            created_at: 100,
+            extension: "txt".to_string(),
+        }]);
+
+        // Auto + lowercase -> Case-insensitive (is_case_sensitive: false)
+        let res_auto_lower = core.search(
+            "foo".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(res_auto_lower.results.len(), 1);
+        assert!(!res_auto_lower.is_case_sensitive);
+        assert_eq!(res_auto_lower.effective_mode, FfiSearchMode::Substring);
+
+        // Auto + uppercase -> Smart case triggers sensitive (is_case_sensitive: true)
+        let res_auto_upper = core.search(
+            "FOO".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(res_auto_upper.results.len(), 0);
+        assert!(res_auto_upper.is_case_sensitive);
+        assert_eq!(res_auto_upper.effective_mode, FfiSearchMode::Substring);
+
+        // Force Insensitive -> is_case_sensitive: false
+        let res_insens = core.search(
+            "FOO".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Insensitive,
+        );
+        assert_eq!(res_insens.results.len(), 1);
+        assert!(!res_insens.is_case_sensitive);
+        assert_eq!(res_insens.effective_mode, FfiSearchMode::Substring);
+
+        // Force Sensitive -> is_case_sensitive: true
+        let res_sens = core.search(
+            "foo".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Sensitive,
+        );
+        assert_eq!(res_sens.results.len(), 0);
+        assert!(res_sens.is_case_sensitive);
+        assert_eq!(res_sens.effective_mode, FfiSearchMode::Substring);
+
+        // Auto search mode with inline regex sugar /pattern/i
+        let res_regex_sugar = core.search(
+            "/foo/i".to_string(),
+            FfiSearchMode::Auto,
+            FfiCaseSensitivity::Sensitive,
+        );
+        assert_eq!(res_regex_sugar.results.len(), 1);
+        assert_eq!(res_regex_sugar.effective_mode, FfiSearchMode::Regex);
+        assert!(!res_regex_sugar.is_case_sensitive);
+
+        // Explicit locked regex mode
+        let res_regex_locked = core.search(
+            "Foo.*".to_string(),
+            FfiSearchMode::Regex,
+            FfiCaseSensitivity::Sensitive,
+        );
+        assert_eq!(res_regex_locked.results.len(), 1);
+        assert_eq!(res_regex_locked.effective_mode, FfiSearchMode::Regex);
+        assert!(res_regex_locked.is_case_sensitive);
     }
 }

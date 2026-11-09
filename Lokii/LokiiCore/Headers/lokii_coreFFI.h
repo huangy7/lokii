@@ -406,7 +406,7 @@ int8_t uniffi_lokii_core_fn_method_lokiicore_reveal_in_finder(void*_Nonnull ptr,
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH
-RustBuffer uniffi_lokii_core_fn_method_lokiicore_search(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_search(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustBuffer case_sensitivity, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_CONFIG_WATCHER

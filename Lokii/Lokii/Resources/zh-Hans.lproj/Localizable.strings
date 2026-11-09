@@ -122,6 +122,15 @@
 "search.empty.title" = "未找到匹配项";
 "search.empty.subtitle" = "请检查拼写、尝试使用模糊匹配模式，或按 ⌥F 调整过滤条件";
 "search.toolbar.pin" = "置顶视窗";
+"search.caseSensitivity.auto" = "大小写敏感: 自动";
+"search.caseSensitivity.autoActive" = "大小写敏感: 自动 (检测到大写)";
+"search.caseSensitivity.sensitive" = "大小写敏感: 开启";
+"search.caseSensitivity.insensitive" = "大小写敏感: 关闭";
+
+/* Regex Mode & Syntax Sugar */
+"search.regex.inactive" = "正则表达式模式（未激活）";
+"search.regex.autoActive" = "正则表达式自动激活（已识别 /.../ 语法糖）";
+"search.regex.locked" = "正则表达式模式已锁定（所有输入均按正则匹配）";
 "search.history.title" = "最近搜索";
 "search.history.clear" = "清除搜索历史";
 "prefs.launchAtLogin" = "登录时自动启动";
