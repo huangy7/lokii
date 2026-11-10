@@ -34,5 +34,13 @@ if [[ -z "$macho_sdk_major" || "$macho_sdk_major" -lt 14 ]]; then
     exit 1
 fi
 
+# 验证主程序签名 Designated Requirement 不依赖易变的 cdhash，确保 TCC 完全磁盘访问权限在跨版本更新后持久留存
+dr_output="$(codesign -d -r- "$bundle" 2>&1)"
+if printf '%s' "$dr_output" | grep -q '# designated => cdhash'; then
+    printf '[FAIL] 主程序 Designated Requirement 仍回退至易变的 cdhash，会导致跨版本升级丢失完全磁盘访问权限！\n' >&2
+    printf '       实际 DR: %s\n' "$dr_output" >&2
+    exit 1
+fi
+
 codesign --verify --deep --strict "$bundle"
 printf '更新包结构与签名检查通过：%s\n' "$architecture"
