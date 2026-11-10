@@ -214,7 +214,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     @objc private func toggleWindow() {
-        if let window = mainWindow?.window, window.isVisible, NSApp.isActive {
+        // 以窗口是否实际可见判定收起：点击状态栏图标不会激活应用，依赖 NSApp.isActive 会在失焦后误判为显示
+        if let window = mainWindow?.window, window.isVisible, window.occlusionState.contains(.visible) {
             window.orderOut(nil)
         } else {
             mainWindow?.showWindow(nil)
