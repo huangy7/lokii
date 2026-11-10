@@ -14,6 +14,8 @@ protocol SearchMainSplitViewControllerDelegate: AnyObject {
     func searchMainSplitViewDidRequestFocusSearchField()
     /// 检索结果条目被移入废纸篓回调（用于联动外部窗口更新命中项计数等）
     func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int)
+    /// 检索结果条目被有效消费回调（如访达定位、终端唤起、复制、预览、拖拽等），用于归档有效搜索历史
+    func searchMainSplitViewDidConsumeResult()
 }
 
 extension SearchMainSplitViewControllerDelegate {
@@ -22,6 +24,7 @@ extension SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidRequestRebuild() {}
     func searchMainSplitViewDidRequestFocusSearchField() {}
     func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {}
+    func searchMainSplitViewDidConsumeResult() {}
 }
 
 // MARK: - SearchMainSplitViewController
@@ -199,5 +202,9 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
 
     func searchResultsDidRequestScopeFilter(path: String) {
         filterByDirectory(path: path)
+    }
+
+    func searchResultsDidConsumeResult() {
+        delegate?.searchMainSplitViewDidConsumeResult()
     }
 }

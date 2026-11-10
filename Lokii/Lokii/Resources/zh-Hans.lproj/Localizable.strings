@@ -127,12 +127,16 @@
 "search.caseSensitivity.sensitive" = "大小写敏感: 开启";
 "search.caseSensitivity.insensitive" = "大小写敏感: 关闭";
 
-/* Regex Mode & Syntax Sugar */
+/* Regex & Fuzzy Mode & Recent Searches */
 "search.regex.inactive" = "正则表达式模式（未激活）";
 "search.regex.autoActive" = "正则表达式自动激活（已识别 /.../ 语法糖）";
 "search.regex.locked" = "正则表达式模式已锁定（所有输入均按正则匹配）";
+"search.fuzzy.inactive" = "模糊匹配（未开启，点击按首字母或跳字匹配）";
+"search.fuzzy.locked" = "模糊匹配已开启（支持首字母与跳字匹配）";
 "search.history.title" = "最近搜索";
+"search.history.empty" = "暂无搜索历史";
 "search.history.clear" = "清除搜索历史";
+"search.history.removeItem" = "移除“%@”";
 "prefs.launchAtLogin" = "登录时自动启动";
 "prefs.launchAtLogin.description" = "开机或登录 macOS 时在后台静默启动 Lokii";
 
@@ -168,14 +172,6 @@
 "search.col.path" = "路径";
 "search.col.dateModified" = "修改日期";
 "search.col.size" = "大小";
-
-/* SearchWindow - search mode */
-"search.mode.title" = "搜索模式";
-"search.mode.auto" = "自动";
-"search.mode.substring" = "子字符串";
-"search.mode.wildcard" = "通配符";
-"search.mode.regex" = "正则表达式";
-"search.mode.fuzzy" = "模糊";
 
 /* FDAGuideWindowController */
 "fda.windowTitle" = "将 Lokii 添加到完全磁盘访问权限";

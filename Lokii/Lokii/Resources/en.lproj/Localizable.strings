@@ -127,12 +127,16 @@
 "search.caseSensitivity.sensitive" = "Match Case: On";
 "search.caseSensitivity.insensitive" = "Match Case: Off";
 
-/* Regex Mode & Syntax Sugar */
+/* Regex & Fuzzy Mode & Recent Searches */
 "search.regex.inactive" = "Regular Expression Mode (Inactive)";
 "search.regex.autoActive" = "Regular Expression Auto-detected (Inline /.../ sugar)";
 "search.regex.locked" = "Regular Expression Mode Locked (All text treated as regex)";
+"search.fuzzy.inactive" = "Fuzzy Match (Off, click for subsequence matching)";
+"search.fuzzy.locked" = "Fuzzy Match On (Subsequence matching active)";
 "search.history.title" = "Recent Searches";
+"search.history.empty" = "No Recent Searches";
 "search.history.clear" = "Clear Search History";
+"search.history.removeItem" = "Remove “%@”";
 "prefs.launchAtLogin" = "Launch at Login";
 "prefs.launchAtLogin.description" = "Automatically start Lokii silently when logging in to macOS";
 
@@ -168,14 +172,6 @@
 "search.col.path" = "Path";
 "search.col.dateModified" = "Date Modified";
 "search.col.size" = "Size";
-
-/* SearchWindow - search mode */
-"search.mode.title" = "Search Mode";
-"search.mode.auto" = "Auto";
-"search.mode.substring" = "Substring";
-"search.mode.wildcard" = "Wildcard";
-"search.mode.regex" = "Regex";
-"search.mode.fuzzy" = "Fuzzy";
 
 /* FDAGuideWindowController */
 "fda.windowTitle" = "Add Lokii to Full Disk Access";

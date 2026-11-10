@@ -40,6 +40,7 @@
 		D845C945605829EFD6777B02 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */; };
 		DB72F207E9C6F823A2970A05 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 732101997548517319E501C8 /* Sparkle */; };
 		DC942CCE0D73D3222712A032 /* RegexModeButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95EBAFBC71F29E323D18DB36 /* RegexModeButton.swift */; };
+		DD831BBD0E62C2111601B143 /* FuzzyModeButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84DA9EAB60E18D212C07CA25 /* FuzzyModeButton.swift */; };
 		E3E4DE9A56D155386481CA7D /* CaseSensitivityButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41638A26BE94DDC67F2CFFB5 /* CaseSensitivityButton.swift */; };
 		E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8727ED2D2029A80C7739E625 /* ViewModifiers.swift */; };
 		E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */; };
@@ -81,6 +82,7 @@
 		8F2785E445C9283940228F3D /* FilterPopoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterPopoverView.swift; sourceTree = "<group>"; };
 		927DA1B3D54D6EE81E6EE89C /* Name.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Name.swift; sourceTree = "<group>"; };
 		947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSMenuItem++.swift"; sourceTree = "<group>"; };
+		84DA9EAB60E18D212C07CA25 /* FuzzyModeButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyModeButton.swift; sourceTree = "<group>"; };
 		95EBAFBC71F29E323D18DB36 /* RegexModeButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RegexModeButton.swift; sourceTree = "<group>"; };
 		A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizedMenu.swift; sourceTree = "<group>"; };
 		A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesWindowController.swift; sourceTree = "<group>"; };
@@ -124,6 +126,7 @@
 				813464940F363EDC00821512 /* FilterPopoverController.swift */,
 				8F2785E445C9283940228F3D /* FilterPopoverView.swift */,
 				3373E36AED0BB84FF41FBE05 /* FilterQuerySyncCoordinator.swift */,
+				84DA9EAB60E18D212C07CA25 /* FuzzyModeButton.swift */,
 				8B947458DDBFC6998183062C /* Info.plist */,
 				D9E872F523B17EC320CBF98C /* InlinePillButton.swift */,
 				4945594BBD178DAC175979A5 /* L10n.swift */,
@@ -305,6 +308,7 @@
 				ECE64A8C9247F97E4B382BBD /* FilterPopoverController.swift in Sources */,
 				CFC1A9DD189A03E00F8F2FF3 /* FilterPopoverView.swift in Sources */,
 				CCFEB9A2297EF1A1BA18AA6B /* FilterQuerySyncCoordinator.swift in Sources */,
+				DD831BBD0E62C2111601B143 /* FuzzyModeButton.swift in Sources */,
 				ED945BBDE80A0B891DDD90E6 /* InlinePillButton.swift in Sources */,
 				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
 				3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */,

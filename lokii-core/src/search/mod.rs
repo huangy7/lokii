@@ -444,8 +444,9 @@ pub fn dispatch_with_filter(
     let compiled_filter = CompiledRecordFilter::compile(&read, &effective_filter);
 
     // 并集检索（OR 查询）路由：
-    // 若查询包含未转义管道符且非正则模式，提升至最高并集优先级处理。
-    if effective_mode != SearchMode::Regex
+    // 仅在智能模式（Auto）下将未转义管道符解析为并集子句；
+    // 纯字面量模式（Substring）下管道符按原始字面字符匹配。
+    if effective_mode == SearchMode::Auto
         && !clean_query.starts_with("regex:")
         && has_unescaped_pipe(&clean_query)
     {
@@ -1113,5 +1114,44 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "large.rs");
+    }
+
+    #[test]
+    fn test_substring_mode_treats_metachars_literally() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            crate::indexer::FileEntry {
+                name: "a|b.txt".to_string(),
+                path: "/docs/a|b.txt".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 1700000000,
+                created_at: 0,
+                extension: "txt".to_string(),
+            },
+            crate::indexer::FileEntry {
+                name: "alpha.txt".to_string(),
+                path: "/docs/alpha.txt".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 1700000000,
+                created_at: 0,
+                extension: "txt".to_string(),
+            },
+        ]);
+
+        // 在 Substring（纯字面量）模式下，"a|b" 仅匹配真正包含字面量 "a|b" 的文件名，不展开为并集查询
+        let (results, _, err, effective_mode) = dispatch_with_filter(
+            &store,
+            "a|b",
+            SearchMode::Substring,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            10,
+        );
+        assert!(err.is_none());
+        assert_eq!(effective_mode, SearchMode::Substring);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.name, "a|b.txt");
     }
 }
