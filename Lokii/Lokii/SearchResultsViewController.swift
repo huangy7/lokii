@@ -258,6 +258,8 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidTrashItems(paths: Set<String>)
     /// 请求设置作用域目录过滤回调
     func searchResultsDidRequestScopeFilter(path: String)
+    /// 检索结果条目被用户有效消费回调（如访达定位、终端唤起、复制、预览、拖拽等），用于归档有效搜索历史
+    func searchResultsDidConsumeResult()
 }
 
 extension SearchResultsViewControllerDelegate {
@@ -265,6 +267,7 @@ extension SearchResultsViewControllerDelegate {
     func searchResultsDidRequestFocusSearchField() {}
     func searchResultsDidTrashItems(paths: Set<String>) {}
     func searchResultsDidRequestScopeFilter(path: String) {}
+    func searchResultsDidConsumeResult() {}
 }
 
 // MARK: - Breadcrumb Navigation & Delegation
@@ -1101,6 +1104,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc private func pathBarClicked() {
         if let url = pathBar.clickedPathItem?.url ?? pathBar.url {
+            delegate?.searchResultsDidConsumeResult()
             revealFilesHandler([url])
         }
     }
@@ -1152,6 +1156,7 @@ final class SearchResultsViewController: NSViewController {
     @objc func copyFile(_ sender: Any? = nil) {
         let selected = selectedResults
         guard !selected.isEmpty else { return }
+        delegate?.searchResultsDidConsumeResult()
         let urls = selected.map { NSURL(fileURLWithPath: $0.path) }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -1162,6 +1167,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc func quickLookSelected(_ sender: Any? = nil) {
         guard !selectedResults.isEmpty else { return }
+        delegate?.searchResultsDidConsumeResult()
         let panel = QLPreviewPanel.shared()
         // 先显示，让面板经响应链接管 dataSource（显示时同步挂载 controller），再刷新
         panel?.makeKeyAndOrderFront(nil)
@@ -1175,6 +1181,7 @@ final class SearchResultsViewController: NSViewController {
     private func openFinderInfoWindow(for paths: [String]) {
         let targets = paths.prefix(10).filter { FileManager.default.fileExists(atPath: $0) }
         guard !targets.isEmpty else { return }
+        delegate?.searchResultsDidConsumeResult()
 
         DispatchQueue.global(qos: .userInitiated).async {
             let statements = targets.map { path -> String in
@@ -1200,6 +1207,7 @@ final class SearchResultsViewController: NSViewController {
 
     /// 以纯文本写入系统剪贴板，供路径与名称复制动作共用
     private func writeStringToPasteboard(_ string: String) {
+        delegate?.searchResultsDidConsumeResult()
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(string, forType: .string)
     }
@@ -1227,6 +1235,7 @@ final class SearchResultsViewController: NSViewController {
     @objc func revealSelected(_ sender: Any? = nil) {
         let selected = selectedResults
         guard !selected.isEmpty else { return }
+        delegate?.searchResultsDidConsumeResult()
         // 统一调用 activateFileViewerSelecting 接口，无论单选或多选、文件或文件夹，
         // 均在父级视窗中精准定位并高亮目标项，规避 selectFile(nil, ...) 导致的直接打开文档或穿透进入文件夹缺陷
         let urls = selected.map { URL(fileURLWithPath: $0.path) }
@@ -1236,6 +1245,7 @@ final class SearchResultsViewController: NSViewController {
     @objc func openInTerminalSelected(_ sender: Any? = nil) {
         let selected = selectedResults
         guard !selected.isEmpty else { return }
+        delegate?.searchResultsDidConsumeResult()
         let urls = selected.map { URL(fileURLWithPath: $0.path) }
         openInTerminalHandler(urls)
     }
@@ -1284,6 +1294,7 @@ final class SearchResultsViewController: NSViewController {
         guard let appURL = sender.representedObject as? URL else { return }
         let urls = contextualURLs
         guard !urls.isEmpty else { return }
+        delegate?.searchResultsDidConsumeResult()
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
         NSWorkspace.shared.open(urls, withApplicationAt: appURL, configuration: config, completionHandler: nil)
@@ -1298,8 +1309,9 @@ final class SearchResultsViewController: NSViewController {
         panel.allowsMultipleSelection = false
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.allowedContentTypes = [UTType.application, UTType.applicationBundle]
-        panel.begin { response in
+        panel.begin { [weak self] response in
             guard response == .OK, let appURL = panel.url else { return }
+            self?.delegate?.searchResultsDidConsumeResult()
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
             NSWorkspace.shared.open(urls, withApplicationAt: appURL, configuration: config, completionHandler: nil)
@@ -1535,6 +1547,9 @@ extension SearchResultsViewController: NSServicesMenuRequestor {
             didWrite = true
         }
 
+        if didWrite {
+            delegate?.searchResultsDidConsumeResult()
+        }
         return didWrite
     }
 }
@@ -1549,6 +1564,10 @@ extension SearchResultsViewController: NSTableViewDataSource {
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard row >= 0, row < results.count else { return nil }
         return NSURL(fileURLWithPath: results[row].path)
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+        delegate?.searchResultsDidConsumeResult()
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
@@ -1891,11 +1910,13 @@ extension SearchResultsViewController: BreadcrumbPathControlDelegate {
 
     @objc private func breadcrumbRevealInFinder(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        delegate?.searchResultsDidConsumeResult()
         revealFilesHandler([url])
     }
 
     @objc private func breadcrumbOpenItem(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        delegate?.searchResultsDidConsumeResult()
         NSWorkspace.shared.open(url)
     }
 
@@ -1911,11 +1932,13 @@ extension SearchResultsViewController: BreadcrumbPathControlDelegate {
 
     @objc private func breadcrumbOpenInTerminal(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        delegate?.searchResultsDidConsumeResult()
         openInTerminalHandler([url])
     }
 
     @objc private func breadcrumbFilterByDirectory(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        delegate?.searchResultsDidConsumeResult()
         delegate?.searchResultsDidRequestScopeFilter(path: url.path)
     }
 
@@ -1993,7 +2016,7 @@ final class SearchTableView: NSTableView {
             if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
                 QLPreviewPanel.shared().orderOut(nil)
             } else if selectedRow >= 0 {
-                QLPreviewPanel.shared().makeKeyAndOrderFront(nil)
+                (delegate as? SearchResultsViewController)?.quickLookSelected()
             }
             return
         }

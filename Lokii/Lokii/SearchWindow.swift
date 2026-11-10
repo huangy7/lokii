@@ -81,11 +81,13 @@ final class SearchWindow: NSWindowController {
     private let searchContainer = NSView()
     private let searchDivider = NSBox()
     private let caseSensitivityButton = CaseSensitivityButton()
+    private let fuzzyModeButton = FuzzyModeButton()
     private let regexModeButton = RegexModeButton()
     private let filterButton = FilterTriggerButton()
     private let filterPopoverController = FilterPopoverController()
     private var searchWorkItem: DispatchWorkItem?
-    private static let searchModes: [FfiSearchMode] = [.auto, .substring, .wildcard, .regex, .fuzzy]
+    static let maxRecentSearches = 8
+    static let maxHistoryDisplayLength = 36
     private var currentMode: FfiSearchMode = .auto
     private var currentCaseSensitivity: FfiCaseSensitivity = .auto
     private var statusText: LocalizedText = .key("search.indexing") {
@@ -155,7 +157,7 @@ final class SearchWindow: NSWindowController {
         applyInitialWindowFrame()
         window.delegate = self
         window.contentView?.wantsLayer = true
-        setupSearchModeMenu()
+        setupRecentSearchesMenu()
         setupNotifications()
         onLanguageChanged()
 
@@ -302,6 +304,12 @@ final class SearchWindow: NSWindowController {
         caseSensitivityButton.setContentHuggingPriority(.required, for: .horizontal)
         caseSensitivityButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        fuzzyModeButton.translatesAutoresizingMaskIntoConstraints = false
+        fuzzyModeButton.target = self
+        fuzzyModeButton.action = #selector(fuzzyModeButtonClicked(_:))
+        fuzzyModeButton.setContentHuggingPriority(.required, for: .horizontal)
+        fuzzyModeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         regexModeButton.translatesAutoresizingMaskIntoConstraints = false
         regexModeButton.target = self
         regexModeButton.action = #selector(regexModeButtonClicked(_:))
@@ -320,6 +328,7 @@ final class SearchWindow: NSWindowController {
 
         searchContainer.addSubview(searchField)
         searchContainer.addSubview(caseSensitivityButton)
+        searchContainer.addSubview(fuzzyModeButton)
         searchContainer.addSubview(regexModeButton)
         searchContainer.addSubview(searchDivider)
         searchContainer.addSubview(filterButton)
@@ -334,10 +343,15 @@ final class SearchWindow: NSWindowController {
             searchField.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
             searchField.heightAnchor.constraint(equalToConstant: 28),
 
-            caseSensitivityButton.trailingAnchor.constraint(equalTo: regexModeButton.leadingAnchor, constant: -4),
+            caseSensitivityButton.trailingAnchor.constraint(equalTo: fuzzyModeButton.leadingAnchor, constant: -4),
             caseSensitivityButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
             caseSensitivityButton.widthAnchor.constraint(equalToConstant: 28),
             caseSensitivityButton.heightAnchor.constraint(equalToConstant: 20),
+
+            fuzzyModeButton.trailingAnchor.constraint(equalTo: regexModeButton.leadingAnchor, constant: -4),
+            fuzzyModeButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            fuzzyModeButton.widthAnchor.constraint(equalToConstant: 28),
+            fuzzyModeButton.heightAnchor.constraint(equalToConstant: 20),
 
             regexModeButton.trailingAnchor.constraint(equalTo: searchDivider.leadingAnchor, constant: -5),
             regexModeButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
@@ -383,124 +397,123 @@ final class SearchWindow: NSWindowController {
         window?.toolbar = toolbar
     }
 
-    // MARK: - Search Mode Menu & Recent Searches (on the magnifying glass)
+    // MARK: - Recent Searches Menu (on the magnifying glass)
 
     private let recentSearchesKey = "LokiiRecentSearches"
     private var recentSearches: [String] {
-        get { Array((UserDefaults.standard.stringArray(forKey: recentSearchesKey) ?? []).prefix(5)) }
-        set { UserDefaults.standard.set(Array(newValue.prefix(5)), forKey: recentSearchesKey) }
+        get { Array((UserDefaults.standard.stringArray(forKey: recentSearchesKey) ?? []).prefix(Self.maxRecentSearches)) }
+        set { UserDefaults.standard.set(Array(newValue.prefix(Self.maxRecentSearches)), forKey: recentSearchesKey) }
     }
 
-    private func recordSearchQuery(_ query: String) {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 2 else { return }
-        var current = recentSearches
-        current.removeAll { item in
-            item.caseInsensitiveCompare(trimmed) == .orderedSame ||
-            trimmed.hasPrefix(item) ||
-            item.hasPrefix(trimmed)
-        }
-        current.insert(trimmed, at: 0)
-        if current.count > 5 {
-            current = Array(current.prefix(5))
-        }
-        recentSearches = current
-        setupSearchModeMenu()
+    /// 针对菜单展示层对超长历史检索词执行中间省略（保留首尾关键字符），
+    /// 防止深层目录路径将下拉菜单横向撑爆，完整检索词仍保存在 `representedObject` 与 `toolTip` 中。
+    static func truncatedHistoryDisplayTitle(_ query: String) -> String {
+        let maxLength = maxHistoryDisplayLength
+        guard query.count > maxLength else { return query }
+        let headCount = (maxLength - 1) / 2
+        let tailCount = maxLength - 1 - headCount
+        let head = query.prefix(headCount)
+        let tail = query.suffix(tailCount)
+        return "\(head)…\(tail)"
+    }
+
+    /// 归档当前检索词：
+    /// 1. 要求存在实际命中结果且首尾裁剪后长度 >= 2，拦截零命中错别字与单字符碎片；
+    /// 2. 前缀演进合并：仅移除与新词相同或为其更短前缀的旧记录（忽略大小写，如先搜 "v2ray" 后搜 "v2rayn"），
+    ///    保护已归档的更长完整检索词（如已存在 "lokii_promo_optimized.mp4" 时再搜 "lokii" 不会误删前者）；
+    /// 3. 队列未变化时跳过写盘与菜单重建，避免连续消费动作重复开销。
+    private func recordCurrentSearchQueryIfNeeded() {
+        let trimmed = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !splitViewController.rawResults.isEmpty, trimmed.count >= 2 else { return }
+        let lowerTrimmed = trimmed.lowercased()
+        let current = recentSearches
+        let updated = Array(([trimmed] + current.filter { !lowerTrimmed.hasPrefix($0.lowercased()) }).prefix(Self.maxRecentSearches))
+        guard updated != current else { return }
+        recentSearches = updated
+        setupRecentSearchesMenu()
     }
 
     @objc private func recentSearchSelected(_ sender: NSMenuItem) {
         guard let query = sender.representedObject as? String else { return }
         searchField.stringValue = query
+        applyQuerySyntaxHighlighting()
+        updateCaseSensitivityButtonState()
+        updateRegexModeButtonState()
         focusSearchField()
         performSearch(query: query)
     }
 
-    @objc private func clearRecentSearches() {
-        recentSearches = []
-        setupSearchModeMenu()
+    @objc private func removeRecentSearchItem(_ sender: NSMenuItem) {
+        guard let query = sender.representedObject as? String else { return }
+        recentSearches = recentSearches.filter { $0.caseInsensitiveCompare(query) != .orderedSame }
+        setupRecentSearchesMenu()
     }
 
-    private func setupSearchModeMenu() {
-        let menu = NSMenu(title: L("search.mode.title"))
-        let keys = [
-            "search.mode.auto",
-            "search.mode.substring",
-            "search.mode.wildcard",
-            "search.mode.regex",
-            "search.mode.fuzzy",
-        ]
-        for (i, key) in keys.enumerated() {
-            let item = NSMenuItem(localizedKey: key, action: #selector(searchModeSelected(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = i
-            menu.addItem(item)
-        }
+    @objc private func clearRecentSearches() {
+        recentSearches = []
+        setupRecentSearchesMenu()
+    }
+
+    private func setupRecentSearchesMenu() {
+        let historyTitle = L("search.history.title")
+        let menu = NSMenu(title: historyTitle)
+
+        let headerItem = NSMenuItem(title: historyTitle, action: nil, keyEquivalent: "")
+        headerItem.isEnabled = false
+        menu.addItem(headerItem)
 
         let history = recentSearches
-        if !history.isEmpty {
-            menu.addItem(NSMenuItem.separator())
-            let headerItem = NSMenuItem(title: L("search.history.title"), action: nil, keyEquivalent: "")
-            headerItem.isEnabled = false
-            headerItem.tag = -1
-            menu.addItem(headerItem)
+        if history.isEmpty {
+            let emptyItem = NSMenuItem(title: L("search.history.empty"), action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            menu.addItem(emptyItem)
+        } else {
+            let iconConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
+            let clockIcon = NSImage(systemSymbolName: "clock", accessibilityDescription: nil)?.withSymbolConfiguration(iconConfig)
+            clockIcon?.isTemplate = true
+            let trashIcon = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)?.withSymbolConfiguration(iconConfig)
+            trashIcon?.isTemplate = true
 
             for query in history {
-                let item = NSMenuItem(title: query, action: #selector(recentSearchSelected(_:)), keyEquivalent: "")
+                let displayTitle = Self.truncatedHistoryDisplayTitle(query)
+                let item = NSMenuItem(title: displayTitle, action: #selector(recentSearchSelected(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = query
-                item.tag = -1
+                item.toolTip = query
+                item.keyEquivalentModifierMask = []
+                item.image = clockIcon
                 menu.addItem(item)
+
+                // 按住 Option (⌥) 键时动态切换为单条历史移除项
+                let removeTitle = String(format: L("search.history.removeItem"), displayTitle)
+                let alternateItem = NSMenuItem(title: removeTitle, action: #selector(removeRecentSearchItem(_:)), keyEquivalent: "")
+                alternateItem.target = self
+                alternateItem.representedObject = query
+                alternateItem.toolTip = query
+                alternateItem.keyEquivalentModifierMask = [.option]
+                alternateItem.isAlternate = true
+                alternateItem.image = trashIcon
+                menu.addItem(alternateItem)
             }
 
             menu.addItem(NSMenuItem.separator())
             let clearItem = NSMenuItem(title: L("search.history.clear"), action: #selector(clearRecentSearches), keyEquivalent: "")
             clearItem.target = self
-            clearItem.tag = -1
             menu.addItem(clearItem)
         }
 
-        (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate = menu
-        syncSearchMenuState()
-
-        // D-04: Optimize magnifying glass icon for visual symmetry
-        if let searchButtonCell = (searchField.cell as? NSSearchFieldCell)?.searchButtonCell {
-            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
-            searchButtonCell.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Search")?.withSymbolConfiguration(config)
-        }
-    }
-
-    /// 同步搜索菜单勾选状态。
-    /// 因 `NSSearchFieldCell` 展开菜单时会对 `searchMenuTemplate` 建立深拷贝，
-    /// 状态同步必须同时写入模板菜单与当前处于激活状态的弹出菜单实例。
-    private func syncSearchMenuState(targetMenu: NSMenu? = nil) {
-        let templateMenu = (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate
-        var menusToUpdate: [NSMenu] = []
-        if let templateMenu {
-            menusToUpdate.append(templateMenu)
-        }
-        if let targetMenu, targetMenu !== templateMenu {
-            menusToUpdate.append(targetMenu)
-        }
-
-        for menu in menusToUpdate {
-            for item in menu.items {
-                guard !item.isSeparatorItem else { continue }
-                if item.tag >= 0 && item.tag < Self.searchModes.count {
-                    item.state = (Self.searchModes[item.tag] == currentMode) ? .on : .off
+        if let searchCell = searchField?.cell as? NSSearchFieldCell {
+            searchCell.searchMenuTemplate = menu
+            if let searchButtonCell = searchCell.searchButtonCell {
+                let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+                if let image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: historyTitle)?.withSymbolConfiguration(config) {
+                    image.isTemplate = true
+                    searchButtonCell.image = image
                 }
             }
         }
-    }
-
-    @objc private func searchModeSelected(_ sender: NSMenuItem) {
-        let tag = sender.tag
-        guard tag >= 0, tag < Self.searchModes.count else { return }
-        currentMode = Self.searchModes[tag]
-        updateRegexModeButtonState()
-        syncSearchMenuState(targetMenu: sender.menu)
-        if let query = searchField?.stringValue, !query.isEmpty {
-            performSearch(query: query)
-        }
+        searchField?.toolTip = historyTitle
+        searchField?.needsDisplay = true
     }
 
     // MARK: - Notifications
@@ -563,12 +576,11 @@ final class SearchWindow: NSWindowController {
             }
         }
         splitViewController.onLanguageChanged()
-        if let menu = (searchField.cell as? NSSearchFieldCell)?.searchMenuTemplate {
-            menu.title = L("search.mode.title")
-            menu.refreshLocalizedTitles()
-        }
+        setupRecentSearchesMenu()
         updateStatusLabel()
         updateFilterButtonState(forQuery: searchField.stringValue)
+        caseSensitivityButton.updateTooltipAndAccessibility()
+        fuzzyModeButton.updateTooltipAndAccessibility()
         regexModeButton.updateTooltipAndAccessibility()
         overlayState?.headingText = L("search.buildingIndex")
         overlayState?.statusText = L("search.scanningFiles")
@@ -944,7 +956,6 @@ final class SearchWindow: NSWindowController {
             DispatchQueue.main.async {
                 self.isSearching = false
                 guard self.indexingState != .failed else { return }
-                self.syncSearchMenuState()
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
 
                 let currentText = self.searchField.stringValue
@@ -978,7 +989,6 @@ final class SearchWindow: NSWindowController {
                 guard self.indexingState != .failed else { return }
                 self.searchResultsViewController.hasActiveSearchQuery = !query.isEmpty
                 self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
-                self.syncSearchMenuState()
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
                 self.updateCaseSensitivityButtonState(responseCaseSensitive: response.isCaseSensitive)
                 self.updateRegexModeButtonState(effectiveMode: response.effectiveMode)
@@ -1020,10 +1030,7 @@ final class SearchWindow: NSWindowController {
     }
 
     @objc private func openSelected() {
-        let currentQuery = searchField.stringValue
-        if !currentQuery.isEmpty {
-            recordSearchQuery(currentQuery)
-        }
+        recordCurrentSearchQueryIfNeeded()
         let selected = selectedResults
         guard !selected.isEmpty else { return }
         for item in selected {
@@ -1092,15 +1099,27 @@ final class SearchWindow: NSWindowController {
         return false
     }
 
-    // MARK: - Regex Mode Actions & State
+    // MARK: - Fuzzy & Regex Mode Actions & State
+
+    @objc private func fuzzyModeButtonClicked(_ sender: NSButton) {
+        toggleMode(.fuzzy)
+    }
 
     @objc private func regexModeButtonClicked(_ sender: NSButton) {
-        currentMode = (currentMode == .regex) ? .auto : .regex
+        toggleMode(.regex)
+    }
+
+    private func toggleMode(_ mode: FfiSearchMode) {
+        currentMode = (currentMode == mode) ? .auto : mode
+        updateFuzzyModeButtonState()
         updateRegexModeButtonState()
-        syncSearchMenuState()
         if let query = searchField?.stringValue, !query.isEmpty {
             performSearch(query: query)
         }
+    }
+
+    private func updateFuzzyModeButtonState() {
+        fuzzyModeButton.visualState = (currentMode == .fuzzy) ? .locked : .inactive
     }
 
     private func updateRegexModeButtonState(effectiveMode: FfiSearchMode? = nil) {
@@ -1260,11 +1279,12 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
     }
 
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {
-        let currentQuery = searchField.stringValue
-        if !currentQuery.isEmpty {
-            recordSearchQuery(currentQuery)
-        }
+        recordCurrentSearchQueryIfNeeded()
         engine.openFile(path: result.path)
+    }
+
+    func searchMainSplitViewDidConsumeResult() {
+        recordCurrentSearchQueryIfNeeded()
     }
 
     func searchMainSplitViewDidRequestRebuild() {
@@ -1312,12 +1332,8 @@ extension SearchWindow: NSSearchFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        // 回车确认命令：记录搜索历史并打开当前选定条目
+        // 回车确认命令：当存在命中结果时归档有效搜索历史，并打开当前选定条目
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            let currentQuery = searchField.stringValue
-            if !currentQuery.isEmpty {
-                recordSearchQuery(currentQuery)
-            }
             openSelected()
             return true
         }

@@ -50,6 +50,10 @@ do {
         "density.comfortable",
         "density.large",
         "menu.preferences",
+        "search.history.title",
+        "search.history.empty",
+        "search.history.clear",
+        "search.history.removeItem",
     ]
 
     for key in requiredKeys {
@@ -282,4 +286,22 @@ do {
     assertTrue(source.contains("allowsDisplayModeCustomization = false"), "SearchWindow.swift 必须禁用工具栏显示模式自定义以屏蔽'图标和文本'右键选项")
 }
 
-print("测试全部通过：5/5 项断言成功。")
+print("[6/6] 测试搜索框左侧纯最近搜索菜单与单条删除替代项...")
+do {
+    let searchWindowPath = "Lokii/Lokii/SearchWindow.swift"
+    let resultsVCPath = "Lokii/Lokii/SearchResultsViewController.swift"
+    guard let swSource = try? String(contentsOfFile: searchWindowPath, encoding: .utf8),
+          let rvSource = try? String(contentsOfFile: resultsVCPath, encoding: .utf8) else {
+        fputs("无法读取源码文件\n", stderr)
+        exit(1)
+    }
+
+    assertTrue(swSource.contains("static let maxRecentSearches = 8"), "最近搜索容量上限应为 8 条")
+    assertTrue(!swSource.contains("searchModeSelected"), "左侧放大镜下拉菜单应 100% 专注于最近搜索，不再混杂模式选择")
+    assertTrue(swSource.contains("L(\"search.history.empty\")"), "历史记录为空时菜单应显示空状态引导项")
+    assertTrue(swSource.contains("alternateItem.isAlternate = true"), "最近搜索应支持按住 Option 键切换为单条删除替代项")
+    assertTrue(swSource.contains("alternateItem.keyEquivalentModifierMask = [.option]"), "单条删除替代项必须绑定 Option 修饰键")
+    assertTrue(rvSource.contains("func searchResultsDidConsumeResult()"), "结果列表控制器必须定义有效消费动作代理回调以触发历史归档")
+}
+
+print("测试全部通过：6/6 项断言成功。")
