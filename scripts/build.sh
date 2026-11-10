@@ -288,7 +288,11 @@ EOF
         codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$nested"
     done
     codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$bundle_dir/Contents/Frameworks/Sparkle.framework"
-    codesign --force ${signing_options[@]+"${signing_options[@]}"} --sign "$nested_identity" "$bundle_dir/Contents/Helpers/lokii"
+    local helper_requirements=(--identifier "com.lokii.cli")
+    if [[ -z "$signing_identity" ]]; then
+        helper_requirements+=(--requirements '=designated => identifier "com.lokii.cli"')
+    fi
+    codesign --force ${signing_options[@]+"${signing_options[@]}"} "${helper_requirements[@]}" --sign "$nested_identity" "$bundle_dir/Contents/Helpers/lokii"
 
     # 签名 .app（若无身份则进行 ad-hoc 签名）
     if [[ -n "$signing_identity" ]]; then
@@ -302,11 +306,14 @@ EOF
             "$bundle_dir"
         codesign --verify --deep --strict --verbose=2 "$bundle_dir"
     else
-        echo "==> 执行 Ad-hoc 本地代码签名..."
+        echo "==> 执行 Ad-hoc 本地代码签名（显式绑定 Designated Requirement，避免更新后丢失完全磁盘访问权限）..."
         find "$bundle_dir" -name "*.bundle" | while read -r b; do
             codesign --force --sign - "$b"
         done
-        codesign --force --sign - "$bundle_dir"
+        codesign --force --sign - \
+            --entitlements "$entitlements" \
+            --requirements="=designated => identifier \"$bundle_id\"" \
+            "$bundle_dir"
     fi
 
     bash "$repo_root/scripts/verify-update-bundle.sh" "$bundle_dir" "$arch_flag"
