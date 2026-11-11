@@ -39,11 +39,6 @@ public enum KeyboardShortcuts {
 	private static var closeMenuObserver: NSObjectProtocol?
 
 	/**
-	When `true`, event handlers will not be called for registered keyboard shortcuts.
-	*/
-	static var isPaused = false
-
-	/**
 	Enable/disable monitoring of all keyboard shortcuts.
 
 	The default is `true`.
@@ -380,10 +375,6 @@ public enum KeyboardShortcuts {
 	}
 
 	private static func handleOnKeyDown(_ shortcut: Shortcut) {
-		guard !isPaused else {
-			return
-		}
-
 		for (name, handlers) in legacyKeyDownHandlers {
 			guard getShortcut(for: name) == shortcut else {
 				continue
@@ -406,10 +397,6 @@ public enum KeyboardShortcuts {
 	}
 
 	private static func handleOnKeyUp(_ shortcut: Shortcut) {
-		guard !isPaused else {
-			return
-		}
-
 		for (name, handlers) in legacyKeyUpHandlers {
 			guard getShortcut(for: name) == shortcut else {
 				continue

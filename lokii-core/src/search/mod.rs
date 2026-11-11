@@ -524,7 +524,33 @@ pub fn dispatch_with_filter(
             )
         }
         SearchMode::Fuzzy => {
-            let results = fuzzy::search_index(&read, &clean_query, &compiled_filter, max_results);
+            // 模糊模式是 Auto 的放宽：子串/拼音命中在前，跳字命中去重后补足剩余名额
+            let mut results = substring::search_index(
+                &read,
+                &clean_query,
+                &compiled_filter,
+                max_results,
+                is_case_sensitive,
+                explicit_lock,
+            );
+            let remaining = max_results.saturating_sub(results.len());
+            if remaining == 0 {
+                return (results, is_case_sensitive, None, effective_mode);
+            }
+            let seen: std::collections::HashSet<String> =
+                results.iter().map(|r| r.entry.path.clone()).collect();
+            results.extend(
+                fuzzy::search_index(
+                    &read,
+                    &clean_query,
+                    &compiled_filter,
+                    max_results,
+                    is_case_sensitive,
+                )
+                    .into_iter()
+                    .filter(|r| !seen.contains(&r.entry.path))
+                    .take(remaining),
+            );
             (results, None)
         }
     };
@@ -652,6 +678,28 @@ mod tests {
         assert!(error.is_none());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].search_mode, SearchMode::Substring);
+    }
+
+    #[test]
+    fn test_dispatch_fuzzy_mode_extends_auto() {
+        let store = IndexStore::new();
+        let entry = |name: &str| crate::indexer::FileEntry {
+            name: name.to_string(),
+            path: format!("/docs/{name}"),
+            is_dir: false,
+            size: 1024,
+            modified: 1700000000,
+            created_at: 0,
+            extension: name.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_default(),
+        };
+        store.replace(vec![entry("z_u_o_y_e.md"), entry("作业.docx"), entry("zuoye.txt")]);
+        let (results, error) = dispatch(&store, "zuoye", SearchMode::Fuzzy, 500);
+        assert!(error.is_none());
+        let names: Vec<_> = results.iter().map(|r| r.entry.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "no duplicates, nothing dropped: {names:?}");
+        assert!(names[..2].contains(&"作业.docx"), "pinyin hit kept and ranked first: {names:?}");
+        assert!(names[..2].contains(&"zuoye.txt"));
+        assert_eq!(names[2], "z_u_o_y_e.md", "subsequence-only hit appended last");
     }
 
     #[test]

@@ -49,6 +49,7 @@ do {
     assertTrue(recorderSource.contains("flagsChanged"), "必须监听并处理 flagsChanged 事件以实现按住修饰键实时点亮")
     assertTrue(recorderSource.contains("currentModifiers"), "必须维护当前已按住修饰键状态 currentModifiers")
     assertTrue(recorderSource.contains("isRecording"), "必须维护录制中状态 isRecording")
+    assertTrue(recorderSource.contains("KeyboardShortcuts.isEnabled = false"), "录制期间必须注销自身全局热键，否则按下当前快捷键会被系统截走，录制收不到")
 }
 
 print("[4/5] 测试按键拦截与状态守卫机制 (Escape / Delete / 纯字母阻隔) 约束...")
