@@ -129,13 +129,13 @@ fn test_fuzzy_and_wildcard_cjk_interoperability() {
     let filter = CompiledRecordFilter::default();
 
     // 1. 模糊匹配：简体搜繁体并校验高亮区间非空
-    let fuzzy_results = fuzzy::search(&store, "开发规范", &filter, 10);
+    let fuzzy_results = fuzzy::search(&store, "开发规范", &filter, 10, false);
     assert!(!fuzzy_results.is_empty());
     assert_eq!(fuzzy_results[0].entry.name, "開發規範.md");
     assert!(!fuzzy_results[0].match_positions.is_empty());
 
     // 2. 模糊匹配：繁体搜简体
-    let fuzzy_results = fuzzy::search(&store, "系統設置", &filter, 10);
+    let fuzzy_results = fuzzy::search(&store, "系統設置", &filter, 10, false);
     assert!(!fuzzy_results.is_empty());
     assert_eq!(fuzzy_results[0].entry.name, "系统设置指南.pdf");
 

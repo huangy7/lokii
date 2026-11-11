@@ -131,8 +131,8 @@
 "search.regex.inactive" = "正则表达式模式（未激活）";
 "search.regex.autoActive" = "正则表达式自动激活（已识别 /.../ 语法糖）";
 "search.regex.locked" = "正则表达式模式已锁定（所有输入均按正则匹配）";
-"search.fuzzy.inactive" = "模糊匹配（未开启，点击按首字母或跳字匹配）";
-"search.fuzzy.locked" = "模糊匹配已开启（支持首字母与跳字匹配）";
+"search.fuzzy.inactive" = "模糊匹配（未开启，点击额外显示跳字命中的结果）";
+"search.fuzzy.locked" = "模糊匹配已开启（跳字命中的结果排在常规结果之后）";
 "search.history.title" = "最近搜索";
 "search.history.empty" = "暂无搜索历史";
 "search.history.clear" = "清除搜索历史";

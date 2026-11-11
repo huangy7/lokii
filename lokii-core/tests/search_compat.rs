@@ -107,9 +107,39 @@ fn all_modes_match_frozen_legacy() {
             "中文",
             "does-not-exist",
         ] {
-            // 独立扩展名语法（如 ".rs"）在分发层解析为扩展名预过滤。
-            // 在 Auto 与 Substring 模式下行为与旧版完全一致；显式指定非子串模式时，空检索词不再退化为字面量扫描。
-            if query == ".rs" && (mode == SearchMode::Fuzzy || mode == SearchMode::Regex) {
+            // 独立扩展名语法（如 ".rs"）在分发层解析为扩展名预过滤；正则模式按字面量处理，不参与扩展名预过滤。
+            if query == ".rs" && mode == SearchMode::Regex {
+                continue;
+            }
+
+            // 模糊模式是常规检索的放宽：结果以同查询的子串结果为前缀，其后只追加去重的跳字命中。
+            if mode == SearchMode::Fuzzy {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let (fuzzy, err) = dispatch(&current, query, mode, limit);
+                    let (substring, _) = dispatch(&current, query, SearchMode::Substring, limit);
+                    assert_eq!(err, None);
+                    assert!(fuzzy.len() <= limit, "{query}/{limit}");
+                    let paths: Vec<_> = fuzzy.iter().map(|r| r.entry.path.as_str()).collect();
+                    assert_eq!(
+                        serde_json::to_value(&fuzzy[..substring.len()]).unwrap(),
+                        serde_json::to_value(&substring).unwrap(),
+                        "{query}/{limit}"
+                    );
+                    for r in &fuzzy[substring.len()..] {
+                        assert_eq!(r.search_mode, SearchMode::Fuzzy, "{query}/{limit}");
+                        assert!(!paths[..substring.len()].contains(&r.entry.path.as_str()), "{query}/{limit}");
+                    }
+                }
+                if query == "MAIN" {
+                    let (smart, _, err) =
+                        dispatch_with_options(&current, query, mode, CaseSensitivity::Auto, 500);
+                    assert_eq!(err, None);
+                    assert!(smart.is_empty(), "Smart Case 大写查询不得被跳字补充放行：{smart:?}");
+                    let (insensitive, _, err) =
+                        dispatch_with_options(&current, query, mode, CaseSensitivity::Insensitive, 500);
+                    assert_eq!(err, None);
+                    assert!(!insensitive.is_empty(), "Insensitive 下的命中必须保留");
+                }
                 continue;
             }
 

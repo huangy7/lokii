@@ -18,9 +18,10 @@ pub fn search(
     query: &str,
     filter: &CompiledRecordFilter,
     max_results: usize,
+    case_sensitive: bool,
 ) -> Vec<AdvancedSearchResult> {
     let read = store.read();
-    search_index(&read, query, filter, max_results)
+    search_index(&read, query, filter, max_results, case_sensitive)
 }
 
 /// 接收统一快照读锁的模糊检索实现，杜绝锁重入与快照位掩码漂移。
@@ -29,16 +30,22 @@ pub fn search_index(
     query: &str,
     filter: &CompiledRecordFilter,
     max_results: usize,
+    case_sensitive: bool,
 ) -> Vec<AdvancedSearchResult> {
     let query = query.trim();
     if query.is_empty() || max_results == 0 {
         return Vec::new();
     }
     let query_cjk = crate::cjk::to_simplified_str(query);
+    let case_matching = if case_sensitive {
+        CaseMatching::Respect
+    } else {
+        CaseMatching::Ignore
+    };
     let mut matcher = Matcher::new(Config::DEFAULT);
     let pattern = Pattern::new(
         &query_cjk,
-        CaseMatching::Ignore,
+        case_matching,
         Normalization::Smart,
         AtomKind::Fuzzy,
     );
@@ -68,7 +75,6 @@ pub fn search_index(
             };
             let haystack = Utf32Str::new(&name_cjk, &mut buffer);
             indices.clear();
-            indices.resize(query_cjk.len(), 0);
             pattern.indices(haystack, &mut matcher, &mut indices);
             let positions = indices
                 .iter()
@@ -116,7 +122,7 @@ mod tests {
         let store = IndexStore::new();
         store.replace(vec![make_entry("main.rs"), make_entry("readme.md")]);
         let filter = CompiledRecordFilter::default();
-        let results = search(&store, "mnrs", &filter, 500);
+        let results = search(&store, "mnrs", &filter, 500, false);
         assert!(!results.is_empty(), "mnrs should fuzzy match main.rs");
         assert_eq!(results[0].entry.name, "main.rs");
         assert_eq!(results[0].search_mode, SearchMode::Fuzzy);
@@ -127,8 +133,27 @@ mod tests {
         let store = IndexStore::new();
         store.replace(vec![make_entry("main.rs")]);
         let filter = CompiledRecordFilter::default();
-        let results = search(&store, "xxxxxx", &filter, 500);
+        let results = search(&store, "xxxxxx", &filter, 500, false);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_fuzzy_case_sensitive() {
+        let store = IndexStore::new();
+        store.replace(vec![make_entry("main.rs"), make_entry("MAIN.rs")]);
+        let filter = CompiledRecordFilter::default();
+
+        let sensitive: Vec<_> = search(&store, "MAIN", &filter, 500, true)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(sensitive, ["MAIN.rs"]);
+
+        let insensitive: Vec<_> = search(&store, "MAIN", &filter, 500, false)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert_eq!(insensitive.len(), 2);
     }
 
     #[test]
@@ -136,7 +161,7 @@ mod tests {
         let store = IndexStore::new();
         store.replace(vec![make_entry("main.rs")]);
         let filter = CompiledRecordFilter::default();
-        let results = search(&store, "mnrs", &filter, 500);
+        let results = search(&store, "mnrs", &filter, 500, false);
         assert!(
             !results[0].match_positions.is_empty(),
             "Should have match positions for highlighted chars"
@@ -151,7 +176,7 @@ mod tests {
             make_entry("my_amazing_narrative.rs"),
         ]);
         let filter = CompiledRecordFilter::default();
-        let results = search(&store, "mnrs", &filter, 500);
+        let results = search(&store, "mnrs", &filter, 500, false);
         // main.rs should score higher (shorter, more compact match)
         if results.len() >= 2 {
             assert!(results[0].score >= results[1].score);
@@ -163,7 +188,7 @@ mod tests {
         let store = IndexStore::new();
         store.replace(vec![make_entry("main.rs")]);
         let filter = CompiledRecordFilter::default();
-        let results = search(&store, "", &filter, 500);
+        let results = search(&store, "", &filter, 500, false);
         assert!(results.is_empty());
     }
 
@@ -180,7 +205,7 @@ mod tests {
         let filter = CompiledRecordFilter::compile(&read, &query_filter);
         drop(read);
 
-        let results = search(&store, "mn", &filter, 500);
+        let results = search(&store, "mn", &filter, 500, false);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.name, "main.md");
     }
@@ -195,13 +220,13 @@ mod tests {
         ]);
         let filter = CompiledRecordFilter::default();
 
-        let cafe_results: Vec<_> = search(&store, "cafe", &filter, 500)
+        let cafe_results: Vec<_> = search(&store, "cafe", &filter, 500, false)
             .into_iter()
             .map(|r| r.entry.name)
             .collect();
         assert_eq!(cafe_results, ["café.txt"]);
 
-        let naive_results: Vec<_> = search(&store, "naive", &filter, 500)
+        let naive_results: Vec<_> = search(&store, "naive", &filter, 500, false)
             .into_iter()
             .map(|r| r.entry.name)
             .collect();

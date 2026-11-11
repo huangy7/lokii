@@ -131,8 +131,8 @@
 "search.regex.inactive" = "Regular Expression Mode (Inactive)";
 "search.regex.autoActive" = "Regular Expression Auto-detected (Inline /.../ sugar)";
 "search.regex.locked" = "Regular Expression Mode Locked (All text treated as regex)";
-"search.fuzzy.inactive" = "Fuzzy Match (Off, click for subsequence matching)";
-"search.fuzzy.locked" = "Fuzzy Match On (Subsequence matching active)";
+"search.fuzzy.inactive" = "Fuzzy Match (Off, click to also show subsequence matches)";
+"search.fuzzy.locked" = "Fuzzy Match On (Subsequence matches shown after regular results)";
 "search.history.title" = "Recent Searches";
 "search.history.empty" = "No Recent Searches";
 "search.history.clear" = "Clear Search History";

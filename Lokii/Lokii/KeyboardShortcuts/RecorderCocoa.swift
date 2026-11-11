@@ -150,7 +150,9 @@ extension KeyboardShortcuts {
 		override public var intrinsicContentSize: NSSize {
 			let labelSize = displayLabel.intrinsicContentSize
 			let clearWidth: CGFloat = (hasShortcut && !isRecording) ? 19 : 0
-			let width = max(76, labelSize.width + 16 + clearWidth)
+			// 宽度至少容纳录制提示语，进出录制与按住修饰键时控件不伸缩，右对齐布局下左边缘不跳动
+			let promptWidth = ("press_shortcut".localized as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium)]).width
+			let width = ceil(max(76, labelSize.width + 16 + clearWidth, promptWidth + 16))
 			return NSSize(width: width, height: controlHeight)
 		}
 
@@ -188,21 +190,23 @@ extension KeyboardShortcuts {
 			}
 
 			let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+			// 0.5pt 边框在 1x 屏上只落在右/下两条边，按屏幕缩放取一个物理像素保证四边完整
+			let hairline = 1 / (window?.backingScaleFactor ?? 1)
 
 			// 单体原生按钮质感调色（彻底消灭多层小框嵌套）
 			if isRecording {
 				layer.borderColor = NSColor.controlAccentColor.cgColor
-				layer.borderWidth = 1.5
-				layer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(isDark ? 0.15 : 0.08).cgColor
+				layer.borderWidth = 1
+				layer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(isDark ? 0.12 : 0.06).cgColor
 			} else {
 				if isDark {
-					layer.borderColor = NSColor(white: 1.0, alpha: 0.15).cgColor
-					layer.borderWidth = 0.5
+					layer.borderColor = NSColor(white: 1.0, alpha: 0.10).cgColor
+					layer.borderWidth = hairline
 					let baseAlpha: CGFloat = isHovered ? 0.18 : 0.10
 					layer.backgroundColor = NSColor(white: 1.0, alpha: baseAlpha).cgColor
 				} else {
-					layer.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
-					layer.borderWidth = 0.5
+					layer.borderColor = NSColor.separatorColor.withAlphaComponent(0.2).cgColor
+					layer.borderWidth = hairline
 					let baseAlpha: CGFloat = isHovered ? 0.12 : 0.06
 					layer.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(baseAlpha).cgColor
 				}
@@ -215,10 +219,11 @@ extension KeyboardShortcuts {
 				displayLabel.textColor = .systemOrange
 			} else if isRecording {
 				displayLabel.font = .systemFont(ofSize: 11, weight: .medium)
-				displayLabel.textColor = .controlAccentColor
 				if currentModifiers.isEmpty {
+					displayLabel.textColor = .secondaryLabelColor
 					displayLabel.stringValue = "press_shortcut".localized
 				} else {
+					displayLabel.textColor = .labelColor
 					let symbols = modifierSymbols(from: currentModifiers)
 					displayLabel.stringValue = symbols.joined(separator: " ") + " …"
 				}
@@ -233,6 +238,11 @@ extension KeyboardShortcuts {
 			}
 
 			invalidateIntrinsicContentSize()
+		}
+
+		override public func viewDidChangeBackingProperties() {
+			super.viewDidChangeBackingProperties()
+			updateUI()
 		}
 
 		override public func updateLayer() {
@@ -305,7 +315,8 @@ extension KeyboardShortcuts {
 				return event
 			}
 
-			KeyboardShortcuts.isPaused = true
+			// 注销自身全局热键，否则系统会先截走当前快捷键，录制控件收不到按键
+			KeyboardShortcuts.isEnabled = false
 			NotificationCenter.default.post(
 				name: .recorderActiveStatusDidChange,
 				object: nil,
@@ -320,7 +331,7 @@ extension KeyboardShortcuts {
 			currentModifiers = []
 			temporaryNotice = nil
 			removeEventMonitor()
-			KeyboardShortcuts.isPaused = false
+			KeyboardShortcuts.isEnabled = true
 			NotificationCenter.default.post(
 				name: .recorderActiveStatusDidChange,
 				object: nil,
