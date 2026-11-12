@@ -53,11 +53,7 @@ pub fn search_index(
     let req = crate::string_pool::NameSignature::from_fuzzy_query(&query_cjk);
     let mut buffer = Vec::new();
     let matches = super::rank_unique_names(read, filter, max_results, req, |name, _| {
-        let name_cjk = if name.is_ascii() || !crate::pinyin::has_cjk_characters(name) {
-            std::borrow::Cow::Borrowed(name)
-        } else {
-            crate::cjk::to_simplified_str(name)
-        };
+        let name_cjk = crate::cjk::to_simplified_str(name);
         let haystack = Utf32Str::new(&name_cjk, &mut buffer);
         pattern.score(haystack, &mut matcher)
     });
@@ -68,11 +64,7 @@ pub fn search_index(
             let view = read
                 .view(crate::compact_index::EntryId(candidate.ordinal))
                 .unwrap();
-            let name_cjk = if view.name.is_ascii() || !crate::pinyin::has_cjk_characters(view.name) {
-                std::borrow::Cow::Borrowed(view.name)
-            } else {
-                crate::cjk::to_simplified_str(view.name)
-            };
+            let name_cjk = crate::cjk::to_simplified_str(view.name);
             let haystack = Utf32Str::new(&name_cjk, &mut buffer);
             indices.clear();
             pattern.indices(haystack, &mut matcher, &mut indices);
@@ -231,5 +223,80 @@ mod tests {
             .map(|r| r.entry.name)
             .collect();
         assert_eq!(naive_results, ["naïve.md"]);
+    }
+
+    /// 签名预筛只能做超集剪枝：nucleo 判定的每个命中，其索引签名必须包含查询要求的全部位。
+    /// 覆盖汉字、繁体、假名、谚文、变音拉丁与纯 ASCII，防止收紧预筛后静默漏结果。
+    #[test]
+    fn signature_prefilter_never_drops_a_real_match() {
+        let names = [
+            "作业.docx", "作业本", "zuoye.txt", "哈哈哈.txt", "amplitude.txt",
+            "cafe.md", "café.md", "檔案.txt", "档案.txt", "ファイル.txt", "한글.txt",
+            "example.rs", "hc_a.txt", "Hadoopabc.md",
+        ];
+        let store = IndexStore::new();
+        store.replace(names.iter().map(|name| make_entry(name)).collect());
+
+        let queries = [
+            "作业", "哈哈哈", "档案", "檔案", "cafe", "café", "abcd", "ha", "la",
+            "ファイル", "한글", "xyz",
+        ];
+        // 直接检查索引里真实生成的签名，避免在测试里复刻折叠规则
+        let read = store.read();
+        let index = read.query_index();
+        let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let mut buffer = Vec::new();
+        let mut checked = 0usize;
+
+        for query in queries {
+            let query_fold = crate::cjk::to_simplified_str(query);
+            let required = crate::string_pool::NameSignature::from_fuzzy_query(&query_fold);
+            let pattern = nucleo_matcher::pattern::Pattern::new(
+                &query_fold,
+                nucleo_matcher::pattern::CaseMatching::Ignore,
+                nucleo_matcher::pattern::Normalization::Smart,
+                nucleo_matcher::pattern::AtomKind::Fuzzy,
+            );
+            for name_id in 0..index.slot_count() as u32 {
+                if !index.is_ready(name_id) {
+                    continue;
+                }
+                let Some(name) = read.name_text(name_id) else {
+                    continue;
+                };
+                // 与模糊检索一致：打分输入是折叠后的文件名，不是原始名
+                let name_cjk = crate::cjk::to_simplified_str(name);
+                let matched = pattern
+                    .score(nucleo_matcher::Utf32Str::new(&name_cjk, &mut buffer), &mut matcher)
+                    .is_some();
+                if !matched {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    index.signature_at(name_id).contains(required),
+                    "签名预筛会漏掉命中: q={query} name={name}"
+                );
+            }
+        }
+        assert!(checked > 0, "用例应至少产生一个真实命中");
+    }
+
+    #[test]
+    fn cjk_fuzzy_query_still_finds_results() {
+        let store = IndexStore::new();
+        store.replace(vec![
+            make_entry("作业.docx"),
+            make_entry("作业本"),
+            make_entry("zuoye.txt"),
+        ]);
+        let filter = CompiledRecordFilter::default();
+
+        let names: Vec<_> = search(&store, "作业", &filter, 500, false)
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        assert!(names.contains(&"作业.docx".to_string()), "汉字模糊检索结果: {names:?}");
+        assert!(names.contains(&"作业本".to_string()), "汉字模糊检索结果: {names:?}");
     }
 }

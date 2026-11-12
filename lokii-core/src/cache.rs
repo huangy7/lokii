@@ -88,7 +88,7 @@ pub fn cache_path() -> PathBuf {
 /// Uses atomic write: writes to a .tmp file first, then renames to final path
 /// to prevent corruption if the process crashes mid-write.
 pub fn save_cache(entries: &[FileEntry], path: &Path) -> Result<(), CacheError> {
-    write_cache(CACHE_VERSION, &bitcode::encode(entries), path)
+    write_cache(CACHE_VERSION, &[&bitcode::encode(entries)], path)
 }
 
 /// Load file entries from a cache file, validating the version header.
@@ -115,11 +115,16 @@ pub fn save_compact(
         event_id: 0,
         fingerprint: 0,
     });
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&checkpoint.event_id.to_le_bytes());
-    payload.extend_from_slice(&checkpoint.fingerprint.to_le_bytes());
-    payload.extend_from_slice(&bitcode::encode(&index.to_cache()));
-    write_cache(CACHE_VERSION_CHECKPOINT, &payload, path)
+    // 检查点与编码结果分段写入文件，不再拼成一份连续负载，省掉一次整份复制。
+    write_cache(
+        CACHE_VERSION_CHECKPOINT,
+        &[
+            &checkpoint.event_id.to_le_bytes(),
+            &checkpoint.fingerprint.to_le_bytes(),
+            &index.encode_cache(),
+        ],
+        path,
+    )
 }
 
 pub fn load_compact(
@@ -161,8 +166,8 @@ pub fn load_compact(
     }
 }
 
-/// Write `[4 bytes "LOKI"] [4 bytes version u32 LE] [payload]` atomically.
-fn write_cache(version: u32, payload: &[u8], path: &Path) -> Result<(), CacheError> {
+/// Write `[4 bytes "LOKI"] [4 bytes version u32 LE] [payload parts...]` atomically.
+fn write_cache(version: u32, payload: &[&[u8]], path: &Path) -> Result<(), CacheError> {
     // 索引服务、重建、对账与退出时都会存盘，共用同一个 .tmp：串行化，免得改名到别人写了一半的文件。
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -173,7 +178,9 @@ fn write_cache(version: u32, payload: &[u8], path: &Path) -> Result<(), CacheErr
     let mut file = fs::File::create(&temporary)?;
     file.write_all(CACHE_MAGIC)?;
     file.write_all(&version.to_le_bytes())?;
-    file.write_all(payload)?;
+    for part in payload {
+        file.write_all(part)?;
+    }
     file.flush()?;
     // 先落盘再改名：断电后要么是旧缓存，要么是完整的新缓存。
     file.sync_data()?;

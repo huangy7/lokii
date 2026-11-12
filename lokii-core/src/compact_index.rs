@@ -646,6 +646,16 @@ pub(crate) struct CacheIndex {
     records: Vec<CompactRecord>,
 }
 
+/// 与 [`CacheIndex`] 字段顺序一致、线格式相同；直接借用池内文本，存盘时不再为每个串单独分配一份。
+#[derive(bitcode::Encode)]
+struct CacheIndexRef<'a> {
+    names: Vec<&'a str>,
+    parents: Vec<&'a str>,
+    extensions: Vec<&'a str>,
+    raw_paths: Vec<&'a str>,
+    records: Vec<CompactRecord>,
+}
+
 #[derive(bitcode::Decode)]
 pub(crate) struct BorrowedFileEntry<'a> {
     name: &'a str,
@@ -1469,7 +1479,8 @@ impl CompactIndex {
         self.raw_paths.validate_references(&raw_paths)
     }
 
-    pub(crate) fn to_cache(&self) -> CacheIndex {
+    /// 编码为缓存负载，读取侧用 [`CacheIndex`] 解码。
+    pub(crate) fn encode_cache(&self) -> Vec<u8> {
         let (names, name_ids) = self.names.cache_strings();
         let (parents, parent_ids) = self.parents.cache_strings();
         let (extensions, extension_ids) = self.extensions.cache_strings();
@@ -1488,13 +1499,13 @@ impl CompactIndex {
                 ..*record
             })
             .collect();
-        CacheIndex {
+        bitcode::encode(&CacheIndexRef {
             names,
             parents,
             extensions,
             raw_paths,
             records,
-        }
+        })
     }
 
     pub(crate) fn from_cache(cache: CacheIndex) -> Result<Self, IndexError> {
@@ -1597,8 +1608,9 @@ mod tests {
         compact.validate().unwrap();
     }
 
+    // 经编码再按 CacheIndex 解码：顺带守住借用编码与读取侧的线格式一致。
     fn cache_fixture() -> CacheIndex {
-        CompactIndex::from_entries([FileEntry {
+        let encoded = CompactIndex::from_entries([FileEntry {
             name: "main.rs".into(),
             path: "/src/main.rs".into(),
             extension: "rs".into(),
@@ -1608,7 +1620,45 @@ mod tests {
             created_at: u64::MAX,
         }])
         .unwrap()
-        .to_cache()
+        .encode_cache();
+        bitcode::decode(&encoded).unwrap()
+    }
+
+    #[test]
+    fn borrowed_cache_encoding_matches_owned() {
+        let encoded = CompactIndex::from_entries([
+            FileEntry {
+                name: "main.rs".into(),
+                path: "/src/main.rs".into(),
+                extension: "rs".into(),
+                is_dir: false,
+                size: 1,
+                modified: 2,
+                created_at: 3,
+            },
+            FileEntry {
+                name: "src".into(),
+                path: "/src".into(),
+                extension: String::new(),
+                is_dir: true,
+                size: 0,
+                modified: 0,
+                created_at: 0,
+            },
+            FileEntry {
+                name: "报告\u{1F4C4}.txt".into(),
+                path: "/文档/报告\u{1F4C4}.txt".into(),
+                extension: "txt".into(),
+                is_dir: false,
+                size: 4,
+                modified: 5,
+                created_at: 6,
+            },
+        ])
+        .unwrap()
+        .encode_cache();
+        let owned: CacheIndex = bitcode::decode(&encoded).unwrap();
+        assert_eq!(bitcode::encode(&owned), encoded);
     }
 
     #[test]
