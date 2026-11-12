@@ -104,11 +104,8 @@ impl NameSignature {
                     // 确保模糊匹配器的智能变音归一化（如 cafe 命中 café.txt、naive 命中 naïve.md）不被签名预筛误剪枝。
                     let norm = nucleo_matcher::chars::normalize(ch);
                     if norm.is_ascii() {
-                        let folded = (norm as u8).to_ascii_lowercase();
-                        if folded.is_ascii_lowercase() {
-                            lo |= 1u64 << (folded - b'a');
-                        } else if folded.is_ascii_digit() {
-                            lo |= 1u64 << (26 + (folded - b'0'));
+                        if let Some(bit) = ascii_alnum_bit(norm as u8) {
+                            lo |= 1u64 << bit;
                         }
                     }
                 }
@@ -120,19 +117,43 @@ impl NameSignature {
 
     /// 根据模糊查询串生成必需签名位（超集过滤掩码）。
     ///
-    /// 当查询为纯 ASCII 时，所有 ASCII 字母与数字（含拉丁变音归一化等价字符）必须出现在目标文件名中。
+    /// ASCII 字符按字母与数字位收拢；汉字额外要求汉字标记位并收拢其拼音字母位，
+    /// 使非 ASCII 查询也能在预筛阶段剪枝，而不是让每个唯一名都进入评分。
+    /// 模糊匹配是子序列语义，查询可能被拆成多个空白分隔的子句，
+    /// 因此这里只要求字符出现位，不要求符号位、相邻二元组与词首位。
     #[inline]
     pub fn from_fuzzy_query(query: &str) -> Self {
-        if !query.is_ascii() {
-            return Self::default();
-        }
         let mut lo = 0u64;
-        for b in query.bytes() {
-            let lower = b.to_ascii_lowercase();
-            if lower.is_ascii_lowercase() {
-                lo |= 1u64 << (lower - b'a');
-            } else if lower.is_ascii_digit() {
-                lo |= 1u64 << (26 + (lower - b'0'));
+        for ch in query.chars() {
+            if ch.is_ascii() {
+                if let Some(bit) = ascii_alnum_bit(ch as u8) {
+                    lo |= 1u64 << bit;
+                }
+                continue;
+            }
+            let u = ch as u32;
+            if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
+                lo |= 1u64 << 52;
+                // 命中的文件名必然包含该汉字，其签名也必然携带同一组拼音字母位
+                if let Some((syllable, _)) = crate::pinyin::char_pinyin(ch) {
+                    for b in syllable.bytes() {
+                        if let Some(bit) = ascii_alnum_bit(b) {
+                            lo |= 1u64 << bit;
+                        }
+                    }
+                }
+            } else if (0x3040..=0x30FF).contains(&u) {
+                lo |= 1u64 << 53;
+            } else if (0xAC00..=0xD7AF).contains(&u) {
+                lo |= 1u64 << 54;
+            } else {
+                // 变音字符经归一化后仍是同一基础字母，签名位口径与 from_name 保持一致
+                let norm = nucleo_matcher::chars::normalize(ch);
+                if norm.is_ascii() {
+                    if let Some(bit) = ascii_alnum_bit(norm as u8) {
+                        lo |= 1u64 << bit;
+                    }
+                }
             }
         }
         Self { lo, hi: 0 }
@@ -239,6 +260,19 @@ impl NameSignature {
             }
         }
         false
+    }
+}
+
+/// ASCII 字母/数字映射到签名位；其余字节不参与字母数字位。
+#[inline]
+fn ascii_alnum_bit(b: u8) -> Option<u32> {
+    let lower = b.to_ascii_lowercase();
+    if lower.is_ascii_lowercase() {
+        Some((lower - b'a') as u32)
+    } else if lower.is_ascii_digit() {
+        Some(26 + (lower - b'0') as u32)
+    } else {
+        None
     }
 }
 
@@ -574,13 +608,13 @@ impl StringPool {
         vec![0; self.slots.len()]
     }
 
-    pub(crate) fn cache_strings(&self) -> (Vec<String>, Vec<u32>) {
+    pub(crate) fn cache_strings(&self) -> (Vec<&str>, Vec<u32>) {
         let mut strings = Vec::with_capacity(self.live);
         let mut mapping = vec![u32::MAX; self.slots.len()];
         for (ordinal, slot) in self.slots.iter().enumerate() {
             if let Some(slot) = slot {
                 mapping[ordinal] = u32::try_from(strings.len()).expect("pool ID fits u32");
-                strings.push(slot.text.to_string());
+                strings.push(&*slot.text);
             }
         }
         (strings, mapping)
