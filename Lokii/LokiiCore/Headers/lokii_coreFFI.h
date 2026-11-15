@@ -274,14 +274,21 @@ typedef void (*UniffiCallbackInterfaceEventHandlerMethod2)(uint64_t, uint64_t, v
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD3
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD3
-typedef void (*UniffiCallbackInterfaceEventHandlerMethod3)(uint64_t, RustBuffer, void* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceEventHandlerMethod3)(uint64_t, uint64_t, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD4
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD4
-typedef void (*UniffiCallbackInterfaceEventHandlerMethod4)(uint64_t, void* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceEventHandlerMethod4)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD5
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD5
+typedef void (*UniffiCallbackInterfaceEventHandlerMethod5)(uint64_t, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 
@@ -292,8 +299,9 @@ typedef struct UniffiVTableCallbackInterfaceEventHandler {
     UniffiCallbackInterfaceEventHandlerMethod0 _Nonnull onIndexProgress;
     UniffiCallbackInterfaceEventHandlerMethod1 _Nonnull onIndexReady;
     UniffiCallbackInterfaceEventHandlerMethod2 _Nonnull onIndexUpdated;
-    UniffiCallbackInterfaceEventHandlerMethod3 _Nonnull onWatcherError;
-    UniffiCallbackInterfaceEventHandlerMethod4 _Nonnull onConfigReloaded;
+    UniffiCallbackInterfaceEventHandlerMethod3 _Nonnull onContentIndexUpdated;
+    UniffiCallbackInterfaceEventHandlerMethod4 _Nonnull onWatcherError;
+    UniffiCallbackInterfaceEventHandlerMethod5 _Nonnull onConfigReloaded;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceEventHandler;
 
@@ -328,6 +336,11 @@ void uniffi_lokii_core_fn_method_eventhandler_on_index_ready(void*_Nonnull ptr, 
 void uniffi_lokii_core_fn_method_eventhandler_on_index_updated(void*_Nonnull ptr, uint64_t new_total, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_EVENTHANDLER_ON_CONTENT_INDEX_UPDATED
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_EVENTHANDLER_ON_CONTENT_INDEX_UPDATED
+void uniffi_lokii_core_fn_method_eventhandler_on_content_index_updated(void*_Nonnull ptr, uint64_t live_docs, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_EVENTHANDLER_ON_WATCHER_ERROR
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_EVENTHANDLER_ON_WATCHER_ERROR
 void uniffi_lokii_core_fn_method_eventhandler_on_watcher_error(void*_Nonnull ptr, RustBuffer msg, RustCallStatus *_Nonnull out_status
@@ -354,14 +367,34 @@ void*_Nonnull uniffi_lokii_core_fn_constructor_lokiicore_new(RustCallStatus *_No
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CANCEL_CONTENT_SEARCH
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CANCEL_CONTENT_SEARCH
+void uniffi_lokii_core_fn_method_lokiicore_cancel_content_search(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CHECK_FDA
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CHECK_FDA
 int8_t uniffi_lokii_core_fn_method_lokiicore_check_fda(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CLEAR_CONTENT_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CLEAR_CONTENT_CACHE
+void uniffi_lokii_core_fn_method_lokiicore_clear_content_cache(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_config_json(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONTENT_SNIPPETS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONTENT_SNIPPETS
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_content_snippets(void*_Nonnull ptr, RustBuffer path, RustBuffer query, RustBuffer case_sensitivity, int8_t force_content, int8_t force_regex, int8_t force_symbol, uint32_t max_matches, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONTENT_STATS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONTENT_STATS
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_content_stats(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_METRICS
@@ -374,6 +407,16 @@ RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_metrics(void*_Nonnull ptr, 
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_stats(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_HAS_CONTENT_DIRECTIVE
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_HAS_CONTENT_DIRECTIVE
+int8_t uniffi_lokii_core_fn_method_lokiicore_has_content_directive(void*_Nonnull ptr, RustBuffer query, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_INGEST_RICH_DOCUMENT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_INGEST_RICH_DOCUMENT
+int8_t uniffi_lokii_core_fn_method_lokiicore_ingest_rich_document(void*_Nonnull ptr, RustBuffer path, RustBuffer source_kind, int64_t mtime_secs, uint64_t size_bytes, RustBuffer decoded_text, uint32_t aux_meta, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_INITIALIZE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_INITIALIZE
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_initialize(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
@@ -382,6 +425,11 @@ RustBuffer uniffi_lokii_core_fn_method_lokiicore_initialize(void*_Nonnull ptr, v
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_IS_SCANNING
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_IS_SCANNING
 int8_t uniffi_lokii_core_fn_method_lokiicore_is_scanning(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_LIST_RICH_DOCUMENT_CANDIDATES
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_LIST_RICH_DOCUMENT_CANDIDATES
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_list_rich_document_candidates(void*_Nonnull ptr, int8_t include_pdf, int8_t include_images, uint32_t max_items, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_OPEN_FILE
@@ -409,6 +457,11 @@ int8_t uniffi_lokii_core_fn_method_lokiicore_reveal_in_finder(void*_Nonnull ptr,
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_search(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustBuffer case_sensitivity, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH_CONTENT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH_CONTENT
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_search_content(void*_Nonnull ptr, RustBuffer query, RustBuffer case_sensitivity, int8_t force_content, int8_t force_regex, int8_t force_symbol, uint32_t max_results, uint32_t budget_ms, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_CONFIG_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_CONFIG_WATCHER
 void uniffi_lokii_core_fn_method_lokiicore_start_config_watcher(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
@@ -422,6 +475,11 @@ void uniffi_lokii_core_fn_method_lokiicore_start_query_server(void*_Nonnull ptr,
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_WATCHER
 void uniffi_lokii_core_fn_method_lokiicore_start_watcher(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_TRIGGER_CONTENT_RESYNC
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_TRIGGER_CONTENT_RESYNC
+void uniffi_lokii_core_fn_method_lokiicore_trigger_content_resync(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_UPDATE_CONFIG_FROM_JSON
@@ -727,6 +785,12 @@ uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_index_updated(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_CONTENT_INDEX_UPDATED
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_CONTENT_INDEX_UPDATED
+uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_content_index_updated(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_WATCHER_ERROR
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_WATCHER_ERROR
 uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_watcher_error(void
@@ -739,15 +803,39 @@ uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_config_reloaded(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CANCEL_CONTENT_SEARCH
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CANCEL_CONTENT_SEARCH
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_cancel_content_search(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CHECK_FDA
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CHECK_FDA
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_check_fda(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CLEAR_CONTENT_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CLEAR_CONTENT_CACHE
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_clear_content_cache(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_CONFIG_JSON
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_CONFIG_JSON
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_get_config_json(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_CONTENT_SNIPPETS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_CONTENT_SNIPPETS
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_get_content_snippets(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_CONTENT_STATS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_CONTENT_STATS
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_get_content_stats(void
     
 );
 #endif
@@ -763,6 +851,18 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_get_stats(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_HAS_CONTENT_DIRECTIVE
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_HAS_CONTENT_DIRECTIVE
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_has_content_directive(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_INGEST_RICH_DOCUMENT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_INGEST_RICH_DOCUMENT
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_ingest_rich_document(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_INITIALIZE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_INITIALIZE
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_initialize(void
@@ -772,6 +872,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_initialize(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_IS_SCANNING
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_IS_SCANNING
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_is_scanning(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_LIST_RICH_DOCUMENT_CANDIDATES
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_LIST_RICH_DOCUMENT_CANDIDATES
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_list_rich_document_candidates(void
     
 );
 #endif
@@ -805,6 +911,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_search(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_CONTENT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_CONTENT
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_search_content(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_CONFIG_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_CONFIG_WATCHER
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher(void
@@ -820,6 +932,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_start_query_server(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_START_WATCHER
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_start_watcher(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_TRIGGER_CONTENT_RESYNC
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_TRIGGER_CONTENT_RESYNC
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_trigger_content_resync(void
     
 );
 #endif

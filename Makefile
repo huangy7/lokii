@@ -34,7 +34,7 @@ release:
 	@./scripts/build.sh app --arch=$(ARCH) --release
 
 test: bindings
-	@cargo test --workspace --target $(RUST_TARGET)
+	@env -u MACOSX_DEPLOYMENT_TARGET cargo test --workspace --target $(RUST_TARGET)
 	@cd Lokii && LOKII_RUST_TARGET=$(RUST_TARGET) swift build --arch $(ARCH)
 	@swift tests/result_directory_tree_test.swift
 	@swift tests/search_results_view_controller_test.swift
@@ -53,7 +53,7 @@ test: bindings
 
 
 check:
-	@cargo check --workspace --all-targets --target $(RUST_TARGET)
+	@env -u MACOSX_DEPLOYMENT_TARGET cargo check --workspace --all-targets --target $(RUST_TARGET)
 
 package:
 	@./scripts/build.sh dmg --arch=$(ARCH)

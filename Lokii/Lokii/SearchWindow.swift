@@ -83,13 +83,18 @@ final class SearchWindow: NSWindowController {
     private let caseSensitivityButton = CaseSensitivityButton()
     private let fuzzyModeButton = FuzzyModeButton()
     private let regexModeButton = RegexModeButton()
+    private let contentModeButton = ContentModeButton()
     private let filterButton = FilterTriggerButton()
     private let filterPopoverController = FilterPopoverController()
     private var searchWorkItem: DispatchWorkItem?
+    private var contentSearchWorkItem: DispatchWorkItem?
+    private let contentSearchQueue = DispatchQueue(label: "com.lokii.search.content", qos: .userInitiated)
+    private var searchGeneration: UInt64 = 0
     static let maxRecentSearches = 8
     static let maxHistoryDisplayLength = 36
     private var currentMode: FfiSearchMode = .auto
     private var currentCaseSensitivity: FfiCaseSensitivity = .auto
+    private var isContentModeForced: Bool = false
     private var statusText: LocalizedText = .key("search.indexing") {
         didSet { updateStatusLabel() }
     }
@@ -316,6 +321,12 @@ final class SearchWindow: NSWindowController {
         regexModeButton.setContentHuggingPriority(.required, for: .horizontal)
         regexModeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        contentModeButton.translatesAutoresizingMaskIntoConstraints = false
+        contentModeButton.target = self
+        contentModeButton.action = #selector(contentModeButtonClicked(_:))
+        contentModeButton.setContentHuggingPriority(.required, for: .horizontal)
+        contentModeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
         filterButton.translatesAutoresizingMaskIntoConstraints = false
         filterButton.isBordered = false
         filterButton.focusRingType = .none
@@ -330,12 +341,13 @@ final class SearchWindow: NSWindowController {
         searchContainer.addSubview(caseSensitivityButton)
         searchContainer.addSubview(fuzzyModeButton)
         searchContainer.addSubview(regexModeButton)
+        searchContainer.addSubview(contentModeButton)
         searchContainer.addSubview(searchDivider)
         searchContainer.addSubview(filterButton)
 
         NSLayoutConstraint.activate([
             searchContainer.heightAnchor.constraint(equalToConstant: 28),
-            searchContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
+            searchContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 392),
 
             searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
             searchField.leadingAnchor.constraint(equalTo: searchContainer.leadingAnchor),
@@ -353,10 +365,15 @@ final class SearchWindow: NSWindowController {
             fuzzyModeButton.widthAnchor.constraint(equalToConstant: 28),
             fuzzyModeButton.heightAnchor.constraint(equalToConstant: 20),
 
-            regexModeButton.trailingAnchor.constraint(equalTo: searchDivider.leadingAnchor, constant: -5),
+            regexModeButton.trailingAnchor.constraint(equalTo: contentModeButton.leadingAnchor, constant: -4),
             regexModeButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
             regexModeButton.widthAnchor.constraint(equalToConstant: 28),
             regexModeButton.heightAnchor.constraint(equalToConstant: 20),
+
+            contentModeButton.trailingAnchor.constraint(equalTo: searchDivider.leadingAnchor, constant: -5),
+            contentModeButton.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
+            contentModeButton.widthAnchor.constraint(equalToConstant: 28),
+            contentModeButton.heightAnchor.constraint(equalToConstant: 20),
 
             searchDivider.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor, constant: -5),
             searchDivider.centerYAnchor.constraint(equalTo: searchContainer.centerYAnchor),
@@ -375,6 +392,11 @@ final class SearchWindow: NSWindowController {
                 guard let self = self else { return }
                 self.lastQuery = query
                 if query.isEmpty {
+                    self.searchWorkItem?.cancel()
+                    self.contentSearchWorkItem?.cancel()
+                    self.engine.cancelContentSearch()
+                    self.searchGeneration &+= 1
+                    self.updateContentModeButtonState()
                     self.searchResultsViewController.updateBottomPath(with: nil)
                     self.loadDefaultResults()
                 } else {
@@ -439,6 +461,7 @@ final class SearchWindow: NSWindowController {
         applyQuerySyntaxHighlighting()
         updateCaseSensitivityButtonState()
         updateRegexModeButtonState()
+        updateContentModeButtonState()
         focusSearchField()
         performSearch(query: query)
     }
@@ -903,10 +926,14 @@ final class SearchWindow: NSWindowController {
         guard query != lastQuery else { return }
         lastQuery = query
         searchWorkItem?.cancel()
+        contentSearchWorkItem?.cancel()
+        engine.cancelContentSearch()
 
         if query.isEmpty {
+            searchGeneration &+= 1
             searchResultsViewController.updateBottomPath(with: nil)
             updateCaseSensitivityButtonState()
+            updateContentModeButtonState()
             loadDefaultResults()
             return
         }
@@ -973,12 +1000,92 @@ final class SearchWindow: NSWindowController {
     }
 
     private func performSearch(query: String) {
-        guard indexingState != .failed, !isSearching else { return }
-        isSearching = true
-        searchMatchText = .key("search.searching")
+        guard indexingState != .failed else { return }
+        contentSearchWorkItem?.cancel()
+        engine.cancelContentSearch()
+
+        searchGeneration &+= 1
+        let generation = searchGeneration
 
         let mode = currentMode
         let caseSensitivity = currentCaseSensitivity
+        let forceContent = isContentModeForced
+        let hasDirective = engine.hasContentDirective(query: query)
+        let isContentActive = forceContent || hasDirective
+        updateContentModeButtonState(hasDirective: hasDirective)
+
+        if isContentActive {
+            // 双阶段混合管线：
+            // 1. 强全内容模式下先做 16ms 级文件名瞬时初筛（如有非指令关键字），保持交互零等待；
+            // 2. 80ms 防抖调度可原子取消的正文分段倒排检索与按需实盘验证，验证完成后无缝切换正文片段列表。
+            if forceContent && !hasDirective {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    let prelim = self.engine.search(query: query, mode: mode, caseSensitivity: caseSensitivity)
+                    let prelimTree: ResultDirectoryTree? = prelim.results.isEmpty ? nil : ResultDirectoryTree.build(from: prelim.results)
+                    DispatchQueue.main.async {
+                        guard self.searchGeneration == generation, self.indexingState != .failed else { return }
+                        self.searchResultsViewController.hasActiveSearchQuery = !query.isEmpty
+                        self.splitViewController.updateSearchResults(rawResults: prelim.results, tree: prelimTree)
+                        self.searchMatchText = .key("search.content.searching")
+                    }
+                }
+            } else {
+                self.searchMatchText = .key("search.content.searching")
+            }
+
+            let forceRegex = (mode == .regex)
+            let contentItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.contentSearchQueue.async {
+                    guard self.searchGeneration == generation else { return }
+                    let response = self.engine.searchContent(
+                        query: query,
+                        caseSensitivity: caseSensitivity,
+                        forceContent: forceContent,
+                        forceRegex: forceRegex,
+                        forceSymbol: false,
+                        maxResults: 200,
+                        budgetMs: 250
+                    )
+                    if response.cancelled {
+                        return
+                    }
+                    let mappedResults = SearchMainSplitViewController.mapContentHitsToSearchResults(response.hits)
+                    let tree: ResultDirectoryTree? = mappedResults.isEmpty ? nil : ResultDirectoryTree.build(from: mappedResults)
+                    DispatchQueue.main.async {
+                        guard self.searchGeneration == generation, self.indexingState != .failed else { return }
+                        self.searchResultsViewController.hasActiveSearchQuery = !query.isEmpty
+                        self.splitViewController.updateContentSearchResults(hits: response.hits, tree: tree)
+                        self.updateFilterButtonState(forQuery: self.searchField.stringValue)
+                        self.updateCaseSensitivityButtonState(responseCaseSensitive: response.isCaseSensitive)
+                        self.updateContentModeButtonState(hasDirective: hasDirective)
+
+                        let count = response.hits.count
+                        if response.truncatedByBudget {
+                            self.searchMatchText = .formatted(
+                                "search.content.matchedTruncated",
+                                formatFileCount(UInt64(count))
+                            )
+                        } else if count == 1 {
+                            self.searchMatchText = .key("search.content.matchedCount.one")
+                        } else {
+                            self.searchMatchText = .formatted(
+                                "search.content.matchedCount",
+                                formatFileCount(UInt64(count))
+                            )
+                        }
+                    }
+                }
+            }
+            contentSearchWorkItem = contentItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.080, execute: contentItem)
+            return
+        }
+
+        guard !isSearching else { return }
+        isSearching = true
+        searchMatchText = .key("search.searching")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -986,7 +1093,7 @@ final class SearchWindow: NSWindowController {
             let tree: ResultDirectoryTree? = response.results.isEmpty ? nil : ResultDirectoryTree.build(from: response.results)
             DispatchQueue.main.async {
                 self.isSearching = false
-                guard self.indexingState != .failed else { return }
+                guard self.indexingState != .failed, self.searchGeneration == generation else { return }
                 self.searchResultsViewController.hasActiveSearchQuery = !query.isEmpty
                 self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
@@ -1133,6 +1240,25 @@ final class SearchWindow: NSWindowController {
         }
     }
 
+    // MARK: - Content Mode Actions & State
+
+    @objc private func contentModeButtonClicked(_ sender: NSButton) {
+        isContentModeForced.toggle()
+        updateContentModeButtonState()
+        if let query = searchField?.stringValue, !query.isEmpty {
+            performSearch(query: query)
+        }
+    }
+
+    private func updateContentModeButtonState(hasDirective: Bool? = nil) {
+        if isContentModeForced {
+            contentModeButton.visualState = .locked
+        } else {
+            let active = hasDirective ?? engine.hasContentDirective(query: searchField?.stringValue ?? "")
+            contentModeButton.visualState = active ? .autoActive : .inactive
+        }
+    }
+
     static func hasRegexSugar(query: String) -> Bool {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("regex:") { return true }
@@ -1252,6 +1378,8 @@ final class SearchWindow: NSWindowController {
             searchField.stringValue = ""
             applyQuerySyntaxHighlighting()
             updateCaseSensitivityButtonState()
+            updateRegexModeButtonState()
+            updateContentModeButtonState()
             searchChanged()
             focusSearchField()
             return
@@ -1328,6 +1456,7 @@ extension SearchWindow: NSSearchFieldDelegate {
         applyQuerySyntaxHighlighting()
         updateCaseSensitivityButtonState()
         updateRegexModeButtonState()
+        updateContentModeButtonState()
         searchChanged()
     }
 

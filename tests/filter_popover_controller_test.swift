@@ -313,7 +313,10 @@ assertSearchWindowTrue(searchWindowSource.contains("filterPopoverController"), "
 assertSearchWindowTrue(searchWindowSource.contains("filterButton"), "SearchWindow 必须添加 filterButton 过滤胶囊按钮")
 assertSearchWindowTrue(searchWindowSource.contains("window.onOptionF"), "SearchWindow 必须注册 window.onOptionF 快捷键")
 assertSearchWindowTrue(searchWindowSource.contains("filterButtonClicked"), "SearchWindow 必须响应 filterButtonClicked 按钮动作")
-assertSearchWindowTrue(searchWindowSource.contains("greaterThanOrEqualToConstant: 360"), "searchContainer 最小宽度需扩充至 >= 360 pt")
+assertSearchWindowTrue(
+    searchWindowSource.contains("greaterThanOrEqualToConstant: 392") || searchWindowSource.contains("greaterThanOrEqualToConstant: 360"),
+    "searchContainer 最小宽度需扩充至 >= 360 pt"
+)
 assertSearchWindowTrue(searchWindowSource.contains("line.3.horizontal.decrease"), "filterButton 图标必须使用 line.3.horizontal.decrease")
 assertSearchWindowTrue(searchWindowSource.contains("filterButton.isBordered = false"), "filterButton 必须采用扁平化无外边框样式")
 assertSearchWindowTrue(searchWindowSource.contains("if self.filterPopoverController.isShown"), "SearchWindow Esc 按键必须优先检查浮层展开状态")

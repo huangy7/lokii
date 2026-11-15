@@ -19,9 +19,12 @@ dirs = "6"
 notify = "8.2"
 glob-match = "0.2"
 regex = "1"
+regex-syntax = "0.8"
 nucleo-matcher = "0.3"
 fsevent-sys = "4"
 libc = "0.2"
+memchr = "2"
+rayon = "1"
 
 [[bin]]
 name = "uniffi-bindgen"

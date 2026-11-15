@@ -399,8 +399,8 @@ public final class FilterQuerySyncCoordinator {
             .foregroundColor: NSColor.labelColor
         ], range: fullRange)
 
-        // 匹配限定词语法：(type|size|ext):(\S*)
-        let pattern = "(?i)\\b(type|size|ext):([^\\s]*)"
+        // 匹配限定词语法：(type|size|ext|in|content|grep|c|cregex|sym):(...)
+        let pattern = "(?i)(?:^|(?<=\\s))(type|size|ext|in|content|grep|c|cregex|sym):(\"[^\"]*\"|'[^']*'|[^\\s]*)"
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return result
         }

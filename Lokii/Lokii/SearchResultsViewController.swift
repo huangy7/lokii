@@ -441,6 +441,7 @@ final class SearchResultsViewController: NSViewController {
     private var temporaryStatusWorkItem: DispatchWorkItem?
 
     private(set) var results: [FfiSearchResult] = []
+    private(set) var contentHitsByPath: [String: FfiContentSearchHit] = [:]
     private let iconCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
         cache.countLimit = 512
@@ -873,10 +874,22 @@ final class SearchResultsViewController: NSViewController {
         return selectedResults.map { URL(fileURLWithPath: $0.path) }
     }
 
-    /// 更新并渲染检索结果集合
-    func displayResults(_ results: [FfiSearchResult], preserveSelection: Bool) {
+    /// 更新并渲染检索结果集合（可选附带全文匹配摘要字典）
+    func displayResults(
+        _ results: [FfiSearchResult],
+        contentHits: [FfiContentSearchHit]? = nil,
+        preserveSelection: Bool
+    ) {
         let previousPath = preserveSelection ? selectedResult?.path : nil
         self.results = results
+        if let contentHits {
+            self.contentHitsByPath = Dictionary(
+                contentHits.map { ($0.path, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+        } else {
+            self.contentHitsByPath.removeAll()
+        }
         // 图标按路径稳定复用，跨检索保留；展示串缓存随结果集更替释放，避免无限增长
         dateTextCache.removeAll()
         sizeTextCache.removeAll()
@@ -888,6 +901,9 @@ final class SearchResultsViewController: NSViewController {
         }
 
         reloadWithFade()
+        if !results.isEmpty {
+            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<results.count))
+        }
 
         if let previousPath,
            let matchIndex = self.results.firstIndex(where: { $0.path == previousPath }) {
@@ -1586,6 +1602,17 @@ extension SearchResultsViewController: NSTableViewDataSource {
 // MARK: - NSTableViewDelegate
 
 extension SearchResultsViewController: NSTableViewDelegate {
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard !contentHitsByPath.isEmpty,
+              row >= 0,
+              row < results.count,
+              let hit = contentHitsByPath[results[row].path],
+              !hit.lineMatches.isEmpty else {
+            return tableView.rowHeight
+        }
+        return tableView.rowHeight + 16
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row < results.count, let column = tableColumn else { return nil }
         let result = results[row]
@@ -1652,11 +1679,12 @@ extension SearchResultsViewController: NSTableViewDelegate {
 
     private func nameCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier("NameCell")
+        let contentHit = contentHitsByPath[result.path]
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
             reused.imageView?.image = iconForFile(at: result.path)
             reused.updateIconSize(currentIconSize)
             reused.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
-            reused.configure(name: result.name, matchPositions: result.matchPositions)
+            reused.configure(name: result.name, matchPositions: result.matchPositions, contentHit: contentHit)
             return reused
         }
 
@@ -1683,22 +1711,42 @@ extension SearchResultsViewController: NSTableViewDelegate {
         cell.addSubview(textField)
         cell.textField = textField
 
+        let snippetLabel = NSTextField(labelWithString: "")
+        snippetLabel.translatesAutoresizingMaskIntoConstraints = false
+        snippetLabel.lineBreakMode = .byTruncatingTail
+        snippetLabel.maximumNumberOfLines = 1
+        snippetLabel.cell?.wraps = false
+        snippetLabel.cell?.isScrollable = false
+        snippetLabel.isEditable = false
+        snippetLabel.isBezeled = false
+        snippetLabel.drawsBackground = false
+        snippetLabel.isHidden = true
+        cell.addSubview(snippetLabel)
+        cell.snippetLabel = snippetLabel
+
         let widthConstraint = imageView.widthAnchor.constraint(equalToConstant: currentIconSize)
         let heightConstraint = imageView.heightAnchor.constraint(equalToConstant: currentIconSize)
+        let centerYConstraint = textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+        let topConstraint = textField.topAnchor.constraint(equalTo: cell.topAnchor, constant: 3)
+        topConstraint.isActive = false
 
         NSLayoutConstraint.activate([
             imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            imageView.centerYAnchor.constraint(equalTo: textField.centerYAnchor),
             widthConstraint,
             heightConstraint,
             textField.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 4),
             textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-            textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            centerYConstraint,
+            snippetLabel.leadingAnchor.constraint(equalTo: textField.leadingAnchor),
+            snippetLabel.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+            snippetLabel.topAnchor.constraint(equalTo: textField.bottomAnchor, constant: 1),
         ])
 
         cell.setIconConstraints(width: widthConstraint, height: heightConstraint)
+        cell.setVerticalLayoutConstraints(centered: centerYConstraint, top: topConstraint)
         cell.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
-        cell.configure(name: result.name, matchPositions: result.matchPositions)
+        cell.configure(name: result.name, matchPositions: result.matchPositions, contentHit: contentHit)
 
         return cell
     }
@@ -2153,8 +2201,8 @@ class SearchHighlightCellView: NSTableCellView {
     }
 
     /// 后端下发的是 UTF-8 字节偏移，需夹取后映射为 NSRange。
-    private static func nsRanges(in string: String,
-                                 byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
+    static func nsRanges(in string: String,
+                         byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
         let utf8 = string.utf8
         return byteRanges.compactMap { range in
             guard range.start < range.end,
@@ -2204,12 +2252,39 @@ final class SearchNameTableCellView: SearchHighlightCellView {
     /// 选中态下普通字符用微透明白保持层级，命中字符用纯白加粗突出。
     override var selectedAlpha: CGFloat { 0.82 }
 
+    var snippetLabel: NSTextField?
     private(set) var iconWidthConstraint: NSLayoutConstraint?
     private(set) var iconHeightConstraint: NSLayoutConstraint?
+    private(set) var nameCenterYConstraint: NSLayoutConstraint?
+    private(set) var nameTopConstraint: NSLayoutConstraint?
+
+    private var snippetDisplay: String = ""
+    private var snippetRanges: [NSRange] = []
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet {
+            renderSnippetText()
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        renderSnippetText()
+    }
+
+    override func applyFonts(regular: NSFont, bold: NSFont) {
+        super.applyFonts(regular: regular, bold: bold)
+        renderSnippetText()
+    }
 
     func setIconConstraints(width: NSLayoutConstraint, height: NSLayoutConstraint) {
         self.iconWidthConstraint = width
         self.iconHeightConstraint = height
+    }
+
+    func setVerticalLayoutConstraints(centered: NSLayoutConstraint, top: NSLayoutConstraint) {
+        self.nameCenterYConstraint = centered
+        self.nameTopConstraint = top
     }
 
     func updateIconSize(_ size: CGFloat) {
@@ -2217,10 +2292,76 @@ final class SearchNameTableCellView: SearchHighlightCellView {
         iconHeightConstraint?.constant = size
     }
 
-    func configure(name: String, matchPositions: [FfiMatchRange]) {
+    func configure(name: String, matchPositions: [FfiMatchRange], contentHit: FfiContentSearchHit? = nil) {
         setDisplay(name, ranges: matchPositions.map { (Int($0.start), Int($0.end)) })
-        toolTip = name
-        textField?.toolTip = name
+
+        if let hit = contentHit, let firstLine = hit.lineMatches.first {
+            nameCenterYConstraint?.isActive = false
+            nameTopConstraint?.isActive = true
+            snippetLabel?.isHidden = false
+
+            let rawLine = firstLine.lineText
+            let contentStart = rawLine.firstIndex(where: { !$0.isWhitespace }) ?? rawLine.endIndex
+            let trimBytes = rawLine[..<contentStart].utf8.count
+            let trimmedLine = String(rawLine[contentStart...])
+
+            let countSuffix = hit.totalMatchesInFile > 1 ? " (\(hit.totalMatchesInFile))" : ""
+            let symBadge = firstLine.isSymbolDef ? "def " : ""
+            let prefix = "\(symBadge)L\(firstLine.lineNumber)\(countSuffix): "
+            let prefixBytes = prefix.utf8.count
+
+            let fullSnippet = prefix + trimmedLine
+            let shifted: [(start: Int, end: Int)] = firstLine.matchRanges.compactMap { r in
+                let s = Int(r.start) - trimBytes
+                let e = Int(r.end) - trimBytes
+                guard e > 0 else { return nil }
+                return (prefixBytes + max(0, s), prefixBytes + max(0, e))
+            }
+            snippetDisplay = fullSnippet
+            snippetRanges = Self.nsRanges(in: fullSnippet, byteRanges: shifted)
+            renderSnippetText()
+
+            let multiTip = hit.lineMatches.prefix(5).map { line in
+                "L\(line.lineNumber): \(line.lineText.trimmingCharacters(in: .whitespaces))"
+            }.joined(separator: "\n")
+            let fullTip = "\(name)\n\(multiTip)"
+            toolTip = fullTip
+            textField?.toolTip = fullTip
+        } else {
+            nameTopConstraint?.isActive = false
+            nameCenterYConstraint?.isActive = true
+            snippetLabel?.isHidden = true
+            snippetDisplay = ""
+            snippetRanges = []
+            toolTip = name
+            textField?.toolTip = name
+        }
+    }
+
+    private func renderSnippetText() {
+        guard !snippetDisplay.isEmpty, let label = snippetLabel else {
+            snippetLabel?.stringValue = ""
+            return
+        }
+        let isSelected = backgroundStyle == .emphasized
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let snippetSize = max(10.0, regularFont.pointSize - 2.0)
+        let monoRegular = NSFont.monospacedSystemFont(ofSize: snippetSize, weight: .regular)
+        let monoBold = NSFont.monospacedSystemFont(ofSize: snippetSize, weight: .bold)
+        let baseColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(0.75) : .secondaryLabelColor
+        let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .systemBlue)
+
+        let attributed = NSMutableAttributedString(
+            string: snippetDisplay,
+            attributes: [.font: monoRegular, .foregroundColor: baseColor]
+        )
+        for range in snippetRanges {
+            attributed.addAttributes([
+                .font: monoBold,
+                .foregroundColor: highlightColor,
+            ], range: range)
+        }
+        label.attributedStringValue = attributed
     }
 }
 

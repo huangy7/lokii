@@ -9,9 +9,11 @@
 /* Begin PBXBuildFile section */
 		03C2AA4693B5C868CC54C847 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 4DA89C31BAA12806D874CFA3 /* AppIcon.icon */; };
 		0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAD6916CAB8EDC0C1974B6F /* Key.swift */; };
+		140473377C6C1054A88AEA9E /* ContentModeButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A4BB24A4646AA7624CAD032 /* ContentModeButton.swift */; };
 		15AAEC0CDA3C27720C7F2E18 /* KeyboardShortcuts in Frameworks */ = {isa = PBXBuildFile; productRef = 484225E67DB191B3777194BF /* KeyboardShortcuts */; };
 		1B4BCC5BF4FE72D28BAEF0A4 /* Name.swift in Sources */ = {isa = PBXBuildFile; fileRef = 927DA1B3D54D6EE81E6EE89C /* Name.swift */; };
 		220E4427CE25A98CD96F9AA1 /* lokii_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1ABEB6DD96D45D2B3AB5A122 /* lokii_core.swift */; };
+		22E4AE6D31AD58AC34B7E656 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C62AB91E648E73C5ECFAF56A /* main.swift */; };
 		29140F081BAFBB147E42A200 /* Lokii.icns in Resources */ = {isa = PBXBuildFile; fileRef = B32FC7DD2AD33DB9A5618344 /* Lokii.icns */; };
 		3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */; };
 		322DC1AF3FB9D3ECEC310A29 /* LocalizedMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */; };
@@ -30,6 +32,7 @@
 		7C0237F13F88BCC09F5A3AD2 /* TerminalLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10066A78C3F4FB2CFA1C9BB3 /* TerminalLauncher.swift */; };
 		857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */; };
 		87860C9B63B288E5747D5F5E /* SidebarTreeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D0F2BCF8E46E2EBC3770B95 /* SidebarTreeViewController.swift */; };
+		8DFC5FD99747B881291B18F5 /* FuzzyModeButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00E1647C6F31C0CE13528EDC /* FuzzyModeButton.swift */; };
 		92AC1F76A67199CD539E3A27 /* SearchMainSplitViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4C9FAED6C7E08E9EE9C482 /* SearchMainSplitViewController.swift */; };
 		936E3DE734BD1E2769EEE65C /* SearchResultsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13D34F183E4D57DC9DB688CD /* SearchResultsViewController.swift */; };
 		9C2A33321DC2344068BC4713 /* SearchWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD267E77C749892BFB3B6BFA /* SearchWindow.swift */; };
@@ -40,7 +43,6 @@
 		D845C945605829EFD6777B02 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */; };
 		DB72F207E9C6F823A2970A05 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 732101997548517319E501C8 /* Sparkle */; };
 		DC942CCE0D73D3222712A032 /* RegexModeButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95EBAFBC71F29E323D18DB36 /* RegexModeButton.swift */; };
-		DD831BBD0E62C2111601B143 /* FuzzyModeButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84DA9EAB60E18D212C07CA25 /* FuzzyModeButton.swift */; };
 		E3E4DE9A56D155386481CA7D /* CaseSensitivityButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41638A26BE94DDC67F2CFFB5 /* CaseSensitivityButton.swift */; };
 		E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8727ED2D2029A80C7739E625 /* ViewModifiers.swift */; };
 		E73C4DEB99F636147064019F /* LokiiWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */; };
@@ -53,12 +55,14 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		00E1647C6F31C0CE13528EDC /* FuzzyModeButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyModeButton.swift; sourceTree = "<group>"; };
 		029F8156A3FE4133E39F1024 /* ResultDirectoryTree.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultDirectoryTree.swift; sourceTree = "<group>"; };
 		04B808522771C196E501D47E /* ThemeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeManager.swift; sourceTree = "<group>"; };
 		0EEF1864B7BFEBFEB32B4C84 /* Lokii.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Lokii.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		10066A78C3F4FB2CFA1C9BB3 /* TerminalLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalLauncher.swift; sourceTree = "<group>"; };
 		13527D399236306E42D34EB3 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
 		13D34F183E4D57DC9DB688CD /* SearchResultsViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchResultsViewController.swift; sourceTree = "<group>"; };
+		1A4BB24A4646AA7624CAD032 /* ContentModeButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentModeButton.swift; sourceTree = "<group>"; };
 		1ABEB6DD96D45D2B3AB5A122 /* lokii_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = lokii_core.swift; sourceTree = "<group>"; };
 		245A938DDC4CD962CF827FD1 /* Lokii.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Lokii.entitlements; sourceTree = "<group>"; };
 		2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -69,6 +73,7 @@
 		4945594BBD178DAC175979A5 /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
 		4DA89C31BAA12806D874CFA3 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcuts.swift; sourceTree = "<group>"; };
+		60ECA772B1F02CC53236AEF3 /* LokiiContentHelper */ = {isa = PBXFileReference; includeInIndex = 0; path = LokiiContentHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 		65BA160DCBC72B8377D8BDE6 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LokiiWindow.swift; sourceTree = "<group>"; };
 		71E72A2DABCA6C6F23E1053A /* Shortcut.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shortcut.swift; sourceTree = "<group>"; };
@@ -82,7 +87,6 @@
 		8F2785E445C9283940228F3D /* FilterPopoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterPopoverView.swift; sourceTree = "<group>"; };
 		927DA1B3D54D6EE81E6EE89C /* Name.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Name.swift; sourceTree = "<group>"; };
 		947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSMenuItem++.swift"; sourceTree = "<group>"; };
-		84DA9EAB60E18D212C07CA25 /* FuzzyModeButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyModeButton.swift; sourceTree = "<group>"; };
 		95EBAFBC71F29E323D18DB36 /* RegexModeButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RegexModeButton.swift; sourceTree = "<group>"; };
 		A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizedMenu.swift; sourceTree = "<group>"; };
 		A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesWindowController.swift; sourceTree = "<group>"; };
@@ -90,6 +94,7 @@
 		B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		B32FC7DD2AD33DB9A5618344 /* Lokii.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Lokii.icns; sourceTree = "<group>"; };
 		BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsComponents.swift; sourceTree = "<group>"; };
+		C62AB91E648E73C5ECFAF56A /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FDAGuideWindowController.swift; sourceTree = "<group>"; };
 		CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarbonKeyboardShortcuts.swift; sourceTree = "<group>"; };
 		CBF42044E61241F1D42161BC /* FDAGuideView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FDAGuideView.swift; sourceTree = "<group>"; };
@@ -121,12 +126,13 @@
 				85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */,
 				2AEB468C3641DA4F03ED3B21 /* Assets.xcassets */,
 				41638A26BE94DDC67F2CFFB5 /* CaseSensitivityButton.swift */,
+				1A4BB24A4646AA7624CAD032 /* ContentModeButton.swift */,
 				CBF42044E61241F1D42161BC /* FDAGuideView.swift */,
 				C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */,
 				813464940F363EDC00821512 /* FilterPopoverController.swift */,
 				8F2785E445C9283940228F3D /* FilterPopoverView.swift */,
 				3373E36AED0BB84FF41FBE05 /* FilterQuerySyncCoordinator.swift */,
-				84DA9EAB60E18D212C07CA25 /* FuzzyModeButton.swift */,
+				00E1647C6F31C0CE13528EDC /* FuzzyModeButton.swift */,
 				8B947458DDBFC6998183062C /* Info.plist */,
 				D9E872F523B17EC320CBF98C /* InlinePillButton.swift */,
 				4945594BBD178DAC175979A5 /* L10n.swift */,
@@ -170,10 +176,19 @@
 			path = KeyboardShortcuts;
 			sourceTree = "<group>";
 		};
+		529CA58A394546A0B594450B /* LokiiContentHelper */ = {
+			isa = PBXGroup;
+			children = (
+				C62AB91E648E73C5ECFAF56A /* main.swift */,
+			);
+			path = LokiiContentHelper;
+			sourceTree = "<group>";
+		};
 		88ECA066C464C2072D91B368 = {
 			isa = PBXGroup;
 			children = (
 				0DF61DC06876D6CA9971D4A5 /* Lokii */,
+				529CA58A394546A0B594450B /* LokiiContentHelper */,
 				C5102A6210EAC3B741344AED /* Products */,
 			);
 			sourceTree = "<group>";
@@ -191,6 +206,7 @@
 			isa = PBXGroup;
 			children = (
 				0EEF1864B7BFEBFEB32B4C84 /* Lokii.app */,
+				60ECA772B1F02CC53236AEF3 /* LokiiContentHelper */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -220,6 +236,23 @@
 			productReference = 0EEF1864B7BFEBFEB32B4C84 /* Lokii.app */;
 			productType = "com.apple.product-type.application";
 		};
+		D3CA767894C2E7CED7E91816 /* LokiiContentHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F01077BD377ED171DD0CE19C /* Build configuration list for PBXNativeTarget "LokiiContentHelper" */;
+			buildPhases = (
+				B928DF81E1087E4CC65F1B70 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LokiiContentHelper;
+			packageProductDependencies = (
+			);
+			productName = LokiiContentHelper;
+			productReference = 60ECA772B1F02CC53236AEF3 /* LokiiContentHelper */;
+			productType = "com.apple.product-type.tool";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -230,6 +263,9 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					C44FE80D185D3621601457BB = {
+						ProvisioningStyle = Automatic;
+					};
+					D3CA767894C2E7CED7E91816 = {
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -254,6 +290,7 @@
 			projectRoot = "";
 			targets = (
 				C44FE80D185D3621601457BB /* Lokii */,
+				D3CA767894C2E7CED7E91816 /* LokiiContentHelper */,
 			);
 		};
 /* End PBXProject section */
@@ -303,12 +340,13 @@
 				5361A50B42CFD165A023AC82 /* AppUpdater.swift in Sources */,
 				857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */,
 				E3E4DE9A56D155386481CA7D /* CaseSensitivityButton.swift in Sources */,
+				140473377C6C1054A88AEA9E /* ContentModeButton.swift in Sources */,
 				6C65440D3707233BEDDD2F59 /* FDAGuideView.swift in Sources */,
 				F83537D65D3FFF9BA1F7BB06 /* FDAGuideWindowController.swift in Sources */,
 				ECE64A8C9247F97E4B382BBD /* FilterPopoverController.swift in Sources */,
 				CFC1A9DD189A03E00F8F2FF3 /* FilterPopoverView.swift in Sources */,
 				CCFEB9A2297EF1A1BA18AA6B /* FilterQuerySyncCoordinator.swift in Sources */,
-				DD831BBD0E62C2111601B143 /* FuzzyModeButton.swift in Sources */,
+				8DFC5FD99747B881291B18F5 /* FuzzyModeButton.swift in Sources */,
 				ED945BBDE80A0B891DDD90E6 /* InlinePillButton.swift in Sources */,
 				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
 				3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */,
@@ -336,6 +374,14 @@
 				E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */,
 				220E4427CE25A98CD96F9AA1 /* lokii_core.swift in Sources */,
 				7472ED6EAE1690E80EB277EB /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B928DF81E1087E4CC65F1B70 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				22E4AE6D31AD58AC34B7E656 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -438,9 +484,11 @@
 				);
 				"OTHER_LDFLAGS[arch=arm64]" = (
 					"$(SRCROOT)/../target/aarch64-apple-darwin/release/liblokii_core.a",
+					"-lcompression",
 				);
 				"OTHER_LDFLAGS[arch=x86_64]" = (
 					"$(SRCROOT)/../target/x86_64-apple-darwin/release/liblokii_core.a",
+					"-lcompression",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.lokii.app;
 				PRODUCT_NAME = Lokii;
@@ -470,9 +518,11 @@
 				);
 				"OTHER_LDFLAGS[arch=arm64]" = (
 					"$(SRCROOT)/../target/aarch64-apple-darwin/release/liblokii_core.a",
+					"-lcompression",
 				);
 				"OTHER_LDFLAGS[arch=x86_64]" = (
 					"$(SRCROOT)/../target/x86_64-apple-darwin/release/liblokii_core.a",
+					"-lcompression",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.lokii.app;
 				PRODUCT_NAME = Lokii;
@@ -480,6 +530,20 @@
 				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/LokiiCore/Headers";
 			};
 			name = Release;
+		};
+		9C123BFA1E284E5BBFBB3584 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.lokii.LokiiContentHelper;
+				PRODUCT_NAME = LokiiContentHelper;
+				SDKROOT = macosx;
+			};
+			name = Debug;
 		};
 		D6561575FD4F397F01C9F1B2 /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -537,6 +601,20 @@
 			};
 			name = Release;
 		};
+		FE42A537B8A3180020694CE5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.lokii.LokiiContentHelper;
+				PRODUCT_NAME = LokiiContentHelper;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -554,6 +632,15 @@
 			buildConfigurations = (
 				247B8CEBDE2D121C6EF6F54F /* Debug */,
 				D6561575FD4F397F01C9F1B2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F01077BD377ED171DD0CE19C /* Build configuration list for PBXNativeTarget "LokiiContentHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9C123BFA1E284E5BBFBB3584 /* Debug */,
+				FE42A537B8A3180020694CE5 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

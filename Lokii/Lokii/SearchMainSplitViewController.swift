@@ -48,6 +48,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
     let contentSplitViewItem: NSSplitViewItem
 
     private(set) var rawResults: [FfiSearchResult] = []
+    private(set) var rawContentHits: [FfiContentSearchHit] = []
     private var isUpdatingSearchResults = false
 
     // MARK: - Initialization
@@ -125,6 +126,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
         defer { isUpdatingSearchResults = false }
 
         self.rawResults = rawResults
+        self.rawContentHits = []
 
         // 1. 同步更新左侧目录聚合树（内部会静默恢复用户先前的展开与选中路径）
         sidebarTreeViewController.updateTree(tree)
@@ -134,10 +136,47 @@ final class SearchMainSplitViewController: NSSplitViewController {
         displayResults(byDirectoryPrefix: activePrefix)
     }
 
+    /// 派发并同步最新内容检索结果与正文摘要片段，同时复用左栏目录聚合树协同过滤。
+    func updateContentSearchResults(hits: [FfiContentSearchHit], tree: ResultDirectoryTree?) {
+        isUpdatingSearchResults = true
+        defer { isUpdatingSearchResults = false }
+
+        self.rawContentHits = hits
+        self.rawResults = Self.mapContentHitsToSearchResults(hits)
+
+        sidebarTreeViewController.updateTree(tree)
+        let activePrefix = sidebarTreeViewController.selectedPath
+        displayResults(byDirectoryPrefix: activePrefix)
+    }
+
+    static func mapContentHitsToSearchResults(_ hits: [FfiContentSearchHit]) -> [FfiSearchResult] {
+        hits.map { hit in
+            FfiSearchResult(
+                name: hit.name,
+                path: hit.path,
+                isDir: false,
+                size: hit.size,
+                modified: hit.modified,
+                created: hit.modified,
+                extension: hit.extension,
+                score: Double(max(0, hit.score)),
+                matchPositions: [],
+                parentMatchPositions: [],
+                searchMode: .auto
+            )
+        }
+    }
+
     /// 按目录作用域裁剪全量结果并刷新主列表，供首轮渲染、侧边栏选择与面包屑过滤共用
     private func displayResults(byDirectoryPrefix path: String?) {
         let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
-        searchResultsViewController.displayResults(filtered, preserveSelection: false)
+        if rawContentHits.isEmpty {
+            searchResultsViewController.displayResults(filtered, contentHits: nil, preserveSelection: false)
+        } else {
+            let allowed = Set(filtered.map(\.path))
+            let filteredHits = rawContentHits.filter { allowed.contains($0.path) }
+            searchResultsViewController.displayResults(filtered, contentHits: filteredHits, preserveSelection: false)
+        }
     }
 
     /// 基于指定目录路径过滤检索结果，并联动更新侧边栏选中状态
@@ -195,6 +234,7 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
 
     func searchResultsDidTrashItems(paths: Set<String>) {
         rawResults.removeAll { paths.contains($0.path) }
+        rawContentHits.removeAll { paths.contains($0.path) }
         let tree = ResultDirectoryTree.build(from: rawResults)
         sidebarTreeViewController.updateTree(tree)
         delegate?.searchMainSplitViewDidTrashItems(paths: paths, remainingCount: rawResults.count)

@@ -160,9 +160,58 @@ impl Default for ShortcutConfig {
     }
 }
 
+/// 内容全文检索配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContentConfig {
+    /// 是否启用内容全文检索索引。
+    pub enabled: bool,
+    /// 是否提取 Office XML 文档（docx / xlsx / pptx）。
+    pub index_office: bool,
+    /// 是否支持 PDF 正文提取（经由独立低优先级辅助进程）。
+    pub index_pdf: bool,
+    /// 是否对截图与图片执行可选光学文字识别（默认关闭）。
+    pub index_images: bool,
+    /// 是否遵守 `.gitignore` 与 `.ignore` 规则。
+    pub respect_gitignore: bool,
+    /// 富文档解压正文 LRU 内存缓存硬上限（MiB）。
+    pub max_lru_mb: usize,
+}
+
+impl Default for ContentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            index_office: true,
+            index_pdf: true,
+            index_images: false,
+            respect_gitignore: true,
+            max_lru_mb: 32,
+        }
+    }
+}
+
+impl ContentConfig {
+    pub fn to_scope_config(&self, extra_exclude_dirs: &[String]) -> crate::content_index::scope::ScopeConfig {
+        crate::content_index::scope::ScopeConfig {
+            index_plain_text: self.enabled,
+            index_office: self.enabled && self.index_office,
+            index_pdf: self.enabled && self.index_pdf,
+            index_images: self.enabled && self.index_images,
+            respect_gitignore: self.respect_gitignore,
+            extra_exclude_dirs: extra_exclude_dirs.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    pub fn max_lru_bytes(&self) -> usize {
+        self.max_lru_mb.clamp(4, 512) * 1024 * 1024
+    }
+}
+
 /// Application configuration for Lokii.
 ///
-/// Organized into TOML sections: [general], [index], [window], [shortcut].
+/// Organized into TOML sections: [general], [index], [window], [shortcut], [content].
 /// Supports partial TOML deserialization -- missing sections use defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -175,6 +224,8 @@ pub struct AppConfig {
     pub window: WindowConfig,
     #[serde(default)]
     pub shortcut: ShortcutConfig,
+    #[serde(default)]
+    pub content: ContentConfig,
 }
 
 impl Default for AppConfig {
@@ -184,6 +235,7 @@ impl Default for AppConfig {
             index: IndexConfig::default(),
             window: WindowConfig::default(),
             shortcut: ShortcutConfig::default(),
+            content: ContentConfig::default(),
         }
     }
 }
@@ -296,6 +348,15 @@ remember_position = false
 # 全局快捷键，用于显示/隐藏搜索窗口
 # 格式: 修饰键+按键，例如 "Cmd+Shift+Space", "Cmd+Alt+F"
 toggle_window = "Cmd+Shift+Space"
+
+[content]
+# 是否启用本地内容检索索引（支持代码/文本分段倒排与富文档提取）
+enabled = true
+index_office = true
+index_pdf = true
+index_images = false
+respect_gitignore = true
+max_lru_mb = 32
 "#;
 
 /// Thread-safe wrapper for AppConfig, enabling shared mutable access.

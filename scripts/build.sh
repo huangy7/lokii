@@ -98,13 +98,13 @@ EOF
 
 generate_bindings() {
     echo "==> [1/2] 编译 Rust 核心库 ($rust_target, release)..."
-    cargo build -p lokii-core --lib --bin lokii --release --target "$rust_target" --manifest-path "$repo_root/Cargo.toml"
+    env -u MACOSX_DEPLOYMENT_TARGET cargo build -p lokii-core --lib --bin lokii --release --target "$rust_target" --manifest-path "$repo_root/Cargo.toml"
 
     echo "==> [2/2] 生成 UniFFI Swift 绑定与头文件..."
     local out_dir
     out_dir="$(mktemp -d)"
 
-    cargo run -p lokii-core --bin uniffi-bindgen --manifest-path "$repo_root/Cargo.toml" -- generate \
+    env -u MACOSX_DEPLOYMENT_TARGET cargo run -p lokii-core --bin uniffi-bindgen --manifest-path "$repo_root/Cargo.toml" -- generate \
         --library "$repo_root/target/$rust_target/release/liblokii_core.a" \
         --language swift \
         --out-dir "$out_dir"
@@ -195,9 +195,13 @@ build_app() {
     cp "$bin_dir/Lokii" "$bundle_dir/Contents/MacOS/Lokii"
     chmod +x "$bundle_dir/Contents/MacOS/Lokii"
 
-    # CLI 放 Helpers：APFS 默认大小写不敏感，放 MacOS/lokii 会与主程序 Lokii 互相覆盖
+    # CLI 与隔离辅助进程放 Helpers：APFS 默认大小写不敏感，放 MacOS/lokii 会与主程序 Lokii 互相覆盖
     mkdir -p "$bundle_dir/Contents/Helpers"
     cp "$repo_root/target/$rust_target/release/lokii" "$bundle_dir/Contents/Helpers/lokii"
+    if [[ -f "$bin_dir/LokiiContentHelper" ]]; then
+        cp "$bin_dir/LokiiContentHelper" "$bundle_dir/Contents/Helpers/LokiiContentHelper"
+        chmod +x "$bundle_dir/Contents/Helpers/LokiiContentHelper"
+    fi
 
     # 拷贝预置资源与多语言
     if [[ -d "$repo_root/Lokii/Lokii/Resources" ]]; then
@@ -294,6 +298,14 @@ EOF
     fi
     codesign --force ${signing_options[@]+"${signing_options[@]}"} "${helper_requirements[@]}" --sign "$nested_identity" "$bundle_dir/Contents/Helpers/lokii"
 
+    if [[ -f "$bundle_dir/Contents/Helpers/LokiiContentHelper" ]]; then
+        local content_helper_requirements=(--identifier "com.lokii.content-helper")
+        if [[ -z "$signing_identity" ]]; then
+            content_helper_requirements+=(--requirements '=designated => identifier "com.lokii.content-helper"')
+        fi
+        codesign --force ${signing_options[@]+"${signing_options[@]}"} "${content_helper_requirements[@]}" --sign "$nested_identity" "$bundle_dir/Contents/Helpers/LokiiContentHelper"
+    fi
+
     # 签名 .app（若无身份则进行 ad-hoc 签名）
     if [[ -n "$signing_identity" ]]; then
         echo "==> 使用正式开发者证书签名: $signing_identity"
@@ -337,23 +349,35 @@ package_dmg() {
     fi
 
     echo "==> 创建 DMG 镜像: $dmg_path"
-    rm -f "$dmg_path"
+    rm -f "$dmg_path" "$output_dir"/rw.*.dmg
 
+    local dmg_created=false
     if command -v create-dmg &>/dev/null; then
-        create-dmg \
-            --volname "$app_name" \
-            --window-pos 200 120 \
-            --window-size 560 340 \
-            --icon-size 96 \
-            --text-size 13 \
-            --icon "$app_name.app" 150 175 \
-            --hide-extension "$app_name.app" \
-            --app-drop-link 400 175 \
-            --no-internet-enable \
-            "$dmg_path" \
-            "$bundle_dir"
-    else
-        echo "  提示: 未检测到 create-dmg 工具，回退至系统 hdiutil 生成基础 DMG 镜像..." >&2
+        local create_dmg_args=(
+            --volname "$app_name"
+            --window-pos 200 120
+            --window-size 560 340
+            --icon-size 96
+            --text-size 13
+            --icon "$app_name.app" 150 175
+            --hide-extension "$app_name.app"
+            --app-drop-link 400 175
+            --no-internet-enable
+        )
+        if create-dmg "${create_dmg_args[@]}" "$dmg_path" "$bundle_dir"; then
+            dmg_created=true
+        else
+            echo "  提示: Finder 窗口美化脚本超时或不可用，清理临时镜像并回退至 --skip-jenkins 模式..." >&2
+            rm -f "$dmg_path" "$output_dir"/rw.*.dmg
+            if create-dmg --skip-jenkins "${create_dmg_args[@]}" "$dmg_path" "$bundle_dir"; then
+                dmg_created=true
+            fi
+        fi
+    fi
+
+    if [[ "$dmg_created" != "true" ]]; then
+        echo "  提示: 回退至系统 hdiutil 生成基础 DMG 镜像..." >&2
+        rm -f "$dmg_path" "$output_dir"/rw.*.dmg
         local tmp_dmg_dir
         tmp_dmg_dir="$(mktemp -d)"
         cp -R "$bundle_dir" "$tmp_dmg_dir/"
@@ -406,7 +430,7 @@ bump_version() {
     fi
 
     echo "[INFO] 正在同步 Cargo.lock..."
-    (cd "$repo_root" && cargo check --workspace --quiet)
+    (cd "$repo_root" && env -u MACOSX_DEPLOYMENT_TARGET cargo check --workspace --quiet)
 
     echo "[OK] 版本更新完成: $new_ver"
     echo "  - lokii-core/Cargo.toml: $(grep -m1 '^version = ' "$cargo_toml")"

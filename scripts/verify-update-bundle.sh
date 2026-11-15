@@ -23,6 +23,8 @@ framework="$bundle/Contents/Frameworks/Sparkle.framework"
 lipo "$bundle/Contents/MacOS/Lokii" -verify_arch "$architecture"
 lipo "$framework/Sparkle" -verify_arch "$architecture"
 lipo "$bundle/Contents/Helpers/lokii" -verify_arch "$architecture"
+[[ -x "$bundle/Contents/Helpers/LokiiContentHelper" ]]
+lipo "$bundle/Contents/Helpers/LokiiContentHelper" -verify_arch "$architecture"
 otool -L "$bundle/Contents/MacOS/Lokii" | grep -q '@rpath/Sparkle.framework/'
 otool -l "$bundle/Contents/MacOS/Lokii" | grep -q '@executable_path/../Frameworks'
 

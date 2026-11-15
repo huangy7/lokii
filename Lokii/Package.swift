@@ -30,6 +30,17 @@ let package = Package(
                 // 强制静态链接，避免运行时依赖 dylib 路径
                 .unsafeFlags(["\(rustLibPath)/liblokii_core.a"]),
                 .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
+                .linkedLibrary("compression"),
+            ]
+        ),
+        .executableTarget(
+            name: "LokiiContentHelper",
+            path: "LokiiContentHelper",
+            linkerSettings: [
+                .linkedFramework("PDFKit"),
+                .linkedFramework("Vision"),
+                .linkedFramework("ImageIO"),
+                .linkedFramework("CoreGraphics"),
             ]
         ),
     ]

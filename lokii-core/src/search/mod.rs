@@ -1,3 +1,4 @@
+pub mod content_query;
 pub mod disjunction;
 pub mod filter;
 pub mod fuzzy;

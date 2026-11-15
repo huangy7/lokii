@@ -1,8 +1,13 @@
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use crate::cache;
 use crate::config::{self, AppConfig, ConfigStore};
+use crate::content_index::scope::{classify_source_kind, path_is_dataless, ContentSourceKind};
+use crate::content_index::verify::{ContentQueryOptions, ContentSearchHit};
+use crate::content_index::ContentIndex;
 use crate::indexer::IndexStore;
 use crate::metrics::WatcherMetrics;
 use crate::permissions;
@@ -30,7 +35,7 @@ pub struct FfiSearchResult {
 }
 
 /// A byte range for match highlighting.
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone)]
 pub struct FfiMatchRange {
     pub start: u32,
     pub end: u32,
@@ -50,6 +55,83 @@ pub struct FfiSearchResponse {
     pub error: Option<String>,
     pub is_case_sensitive: bool,
     pub effective_mode: FfiSearchMode,
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiContentSourceKind {
+    PlainText,
+    OfficeXml,
+    Pdf,
+    Image,
+}
+
+impl From<ContentSourceKind> for FfiContentSourceKind {
+    fn from(k: ContentSourceKind) -> Self {
+        match k {
+            ContentSourceKind::PlainText => Self::PlainText,
+            ContentSourceKind::OfficeXml => Self::OfficeXml,
+            ContentSourceKind::Pdf => Self::Pdf,
+            ContentSourceKind::Image => Self::Image,
+        }
+    }
+}
+
+impl From<FfiContentSourceKind> for ContentSourceKind {
+    fn from(k: FfiContentSourceKind) -> Self {
+        match k {
+            FfiContentSourceKind::PlainText => Self::PlainText,
+            FfiContentSourceKind::OfficeXml => Self::OfficeXml,
+            FfiContentSourceKind::Pdf => Self::Pdf,
+            FfiContentSourceKind::Image => Self::Image,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiContentLineMatch {
+    pub line_number: u32,
+    pub column: u32,
+    pub line_text: String,
+    pub match_ranges: Vec<FfiMatchRange>,
+    pub is_symbol_def: bool,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiContentSearchHit {
+    pub name: String,
+    pub path: String,
+    pub extension: String,
+    pub source_kind: FfiContentSourceKind,
+    pub score: i32,
+    pub line_matches: Vec<FfiContentLineMatch>,
+    pub total_matches_in_file: u32,
+    pub size: u64,
+    pub modified: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiContentSearchResponse {
+    pub hits: Vec<FfiContentSearchHit>,
+    pub total_candidates_matched: u64,
+    pub candidates_verified: u64,
+    pub truncated_by_budget: bool,
+    pub cancelled: bool,
+    pub elapsed_ms: u64,
+    pub is_case_sensitive: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiContentStats {
+    pub live_docs: u64,
+    pub unique_contents: u64,
+    pub segment_count: u32,
+    pub dirty_docs: u64,
+    pub mapped_bytes: u64,
+    pub text_store_entries: u64,
+    pub text_store_disk_bytes: u64,
+    pub lru_cache_bytes: u64,
+    pub lru_cache_cap_bytes: u64,
+    pub is_indexing: bool,
 }
 
 // ── UniFFI Enums ────────────────────────────────────────────────────────
@@ -96,6 +178,7 @@ pub trait EventHandler: Send + Sync {
     fn on_index_progress(&self, phase: String, scanned_files: u64);
     fn on_index_ready(&self, total: u64);
     fn on_index_updated(&self, new_total: u64);
+    fn on_content_index_updated(&self, live_docs: u64);
     fn on_watcher_error(&self, msg: String);
     fn on_config_reloaded(&self);
 }
@@ -173,6 +256,10 @@ fn convert_ranges(ranges: Vec<(usize, usize)>) -> Vec<FfiMatchRange> {
 pub struct LokiiCore {
     store: IndexStore,
     config_store: ConfigStore,
+    content_index: Arc<ContentIndex>,
+    content_tx: Mutex<Option<mpsc::Sender<watcher::ContentWatcherDelta>>>,
+    content_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    content_handler: Mutex<Option<Arc<dyn EventHandler>>>,
     /// Where the index service picks up once started: set by initialization.
     resume: Mutex<Option<watcher::Resume>>,
     /// The running index service, once `start_watcher` has been called.
@@ -189,11 +276,26 @@ impl LokiiCore {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         let (config, _error) = config::load_or_create_config();
+        let scope_cfg = config.content.to_scope_config(&config.index.exclude);
+        let max_lru_bytes = config.content.max_lru_bytes();
+        let content_dir = AppConfig::config_dir().join("content_index");
+        let content_index = Arc::new(
+            ContentIndex::open(&content_dir, scope_cfg, max_lru_bytes)
+                .unwrap_or_else(|e| {
+                    eprintln!("[Lokii] ContentIndex fallback temp dir: {e}");
+                    let fallback = std::env::temp_dir().join("lokii_content_index_fallback");
+                    ContentIndex::open_default(&fallback).expect("fallback content index")
+                }),
+        );
         let config_store = ConfigStore::new(config);
         let store = IndexStore::new();
         Arc::new(Self {
             store,
             config_store,
+            content_index,
+            content_tx: Mutex::new(None),
+            content_cancel: Mutex::new(None),
+            content_handler: Mutex::new(None),
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
@@ -262,6 +364,21 @@ impl LokiiCore {
             startup::StartupMode::Failed(_) => unreachable!("failed startup returned before ready"),
         });
 
+        *self.content_handler.lock().unwrap() = Some(Arc::clone(&event_handler));
+        let cfg = self.config_store.read().clone();
+        if cfg.content.enabled && !self.store.is_empty() {
+            let store_clone = self.store.clone();
+            let content_clone = Arc::clone(&self.content_index);
+            let handler_clone = Arc::clone(&event_handler);
+            std::thread::Builder::new()
+                .name("lokii-content-init".to_string())
+                .spawn(move || {
+                    sync_content_from_store(&store_clone, &content_clone);
+                    handler_clone.on_content_index_updated(content_clone.stats().live_docs as u64);
+                })
+                .ok();
+        }
+
         match mode {
             startup::StartupMode::HotStart { cached_count, .. } => FfiStartupMode::HotStart {
                 cached_count: cached_count as u64,
@@ -285,8 +402,20 @@ impl LokiiCore {
             .unwrap()
             .take()
             .unwrap_or_else(watcher::Resume::now);
+
+        let (ctx, crx) = mpsc::channel::<watcher::ContentWatcherDelta>();
+        *self.content_tx.lock().unwrap() = Some(ctx.clone());
+        *self.content_handler.lock().unwrap() = Some(Arc::clone(&event_handler));
+        spawn_content_delta_worker(
+            crx,
+            self.store.clone(),
+            Arc::clone(&self.content_index),
+            self.config_store.clone(),
+            Arc::clone(&event_handler),
+        );
+
         let handler = Arc::clone(&event_handler);
-        let handle = watcher::start_watcher(
+        let handle = watcher::start_watcher_with_content(
             self.store.clone(),
             self.config_store.clone(),
             Arc::clone(&self.metrics),
@@ -299,6 +428,7 @@ impl LokiiCore {
                 let cache_file = AppConfig::config_dir().join("index.cache");
                 startup::save_index(index, checkpoint, &cache_file);
             },
+            Some(ctx),
         );
         *self.watcher.lock().unwrap() = Some(handle);
     }
@@ -306,10 +436,12 @@ impl LokiiCore {
     /// Start the config file watcher for hot-reload.
     pub fn start_config_watcher(&self, event_handler: Arc<dyn EventHandler>) {
         let handler = Arc::clone(&event_handler);
+        let content_idx = Arc::clone(&self.content_index);
 
         if let Err(e) = config::start_config_watcher(
             self.config_store.clone(),
-            move |_| {
+            move |new_cfg| {
+                content_idx.set_scope_config(new_cfg.content.to_scope_config(&new_cfg.index.exclude));
                 handler.on_config_reloaded();
             },
             move |msg| {
@@ -322,7 +454,11 @@ impl LokiiCore {
 
     /// Start the local query socket used by the `lokii` CLI and external scripts.
     pub fn start_query_server(&self) {
-        if let Err(e) = crate::query_server::start(self.store.clone(), self.config_store.clone()) {
+        if let Err(e) = crate::query_server::start_with_content(
+            self.store.clone(),
+            self.config_store.clone(),
+            Some(Arc::clone(&self.content_index)),
+        ) {
             eprintln!("[Lokii] Failed to start query server: {e}");
         }
     }
@@ -447,6 +583,7 @@ impl LokiiCore {
     /// Save the index with its replay checkpoint. Call before the app quits so
     /// the next launch only replays what changed after this point.
     pub fn persist_index(&self) {
+        let _ = self.content_index.flush();
         let Some(watcher) = self.watcher.lock().unwrap().clone() else {
             return;
         };
@@ -456,6 +593,224 @@ impl LokiiCore {
             let cache_file = AppConfig::config_dir().join("index.cache");
             startup::save_index(&index, checkpoint, &cache_file);
         }
+    }
+
+    /// 快速判断输入是否包含内容检索语法词元（`content:`/`grep:`/`c:`/`cregex:`/`sym:`）。
+    pub fn has_content_directive(&self, query: String) -> bool {
+        search::content_query::has_content_directive(&query)
+    }
+
+    /// 取消当前正在并发进行的实盘内容验证请求。
+    pub fn cancel_content_search(&self) {
+        if let Some(token) = self.content_cancel.lock().unwrap().take() {
+            token.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 异步内容检索入口：自动中断上一次未完结验证，支持字面量/正则/符号定义与路径/大小/类型正交组合。
+    pub fn search_content(
+        &self,
+        query: String,
+        case_sensitivity: FfiCaseSensitivity,
+        force_content: bool,
+        force_regex: bool,
+        force_symbol: bool,
+        max_results: u32,
+        budget_ms: u32,
+    ) -> FfiContentSearchResponse {
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        {
+            let mut slot = self.content_cancel.lock().unwrap();
+            if let Some(prev) = slot.replace(Arc::clone(&cancel_token)) {
+                prev.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let Some(parsed) = search::content_query::parse_content_query(
+            &query,
+            case_sensitivity.into(),
+            force_content,
+            force_regex,
+            force_symbol,
+        ) else {
+            return FfiContentSearchResponse {
+                hits: Vec::new(),
+                total_candidates_matched: 0,
+                candidates_verified: 0,
+                truncated_by_budget: false,
+                cancelled: false,
+                elapsed_ms: 0,
+                is_case_sensitive: false,
+            };
+        };
+
+        let opts = ContentQueryOptions {
+            max_results: max_results.max(1) as usize,
+            max_matches_per_file: 3,
+            budget_ms: budget_ms.clamp(20, 5000) as u64,
+            max_candidates: 25_000,
+            min_size_bytes: parsed.query_filter.size_filter.min_bytes,
+            max_size_bytes: parsed.query_filter.size_filter.max_bytes,
+        };
+
+        let resp = match self.content_index.search(
+            parsed.mode,
+            |path| parsed.path_filter.matches_path(path),
+            &opts,
+            &cancel_token,
+        ) {
+            Ok(r) => r,
+            Err(_) => {
+                return FfiContentSearchResponse {
+                    hits: Vec::new(),
+                    total_candidates_matched: 0,
+                    candidates_verified: 0,
+                    truncated_by_budget: false,
+                    cancelled: false,
+                    elapsed_ms: 0,
+                    is_case_sensitive: parsed.is_case_sensitive,
+                };
+            }
+        };
+
+        FfiContentSearchResponse {
+            hits: resp.hits.into_iter().map(convert_content_hit).collect(),
+            total_candidates_matched: resp.total_candidates_matched as u64,
+            candidates_verified: resp.candidates_verified as u64,
+            truncated_by_budget: resp.truncated_by_budget,
+            cancelled: resp.cancelled,
+            elapsed_ms: resp.elapsed_ms,
+            is_case_sensitive: parsed.is_case_sensitive,
+        }
+    }
+
+    /// 针对单个路径按需拉取全量匹配行切片（供侧边栏/预览展开用）。
+    pub fn get_content_snippets(
+        &self,
+        path: String,
+        query: String,
+        case_sensitivity: FfiCaseSensitivity,
+        force_content: bool,
+        force_regex: bool,
+        force_symbol: bool,
+        max_matches: u32,
+    ) -> Vec<FfiContentLineMatch> {
+        let Some(parsed) = search::content_query::parse_content_query(
+            &query,
+            case_sensitivity.into(),
+            force_content,
+            force_regex,
+            force_symbol,
+        ) else {
+            return Vec::new();
+        };
+        self.content_index
+            .get_file_snippets(&path, parsed.mode, max_matches.clamp(1, 200) as usize)
+            .unwrap_or_default()
+            .into_iter()
+            .map(convert_line_match)
+            .collect()
+    }
+
+    pub fn get_content_stats(&self) -> FfiContentStats {
+        let s = self.content_index.stats();
+        FfiContentStats {
+            live_docs: s.live_docs as u64,
+            unique_contents: s.unique_contents as u64,
+            segment_count: s.segment_count as u32,
+            dirty_docs: s.dirty_docs as u64,
+            mapped_bytes: s.mapped_bytes as u64,
+            text_store_entries: s.text_store_entries as u64,
+            text_store_disk_bytes: s.text_store_disk_bytes,
+            lru_cache_bytes: s.lru_cache_bytes as u64,
+            lru_cache_cap_bytes: s.lru_cache_cap_bytes as u64,
+            is_indexing: s.is_indexing,
+        }
+    }
+
+    pub fn clear_content_cache(&self) {
+        self.content_index.clear_lru_cache();
+    }
+
+    pub fn trigger_content_resync(&self) {
+        if let Some(ref tx) = *self.content_tx.lock().unwrap() {
+            let _ = tx.send(watcher::ContentWatcherDelta {
+                full_reconcile: true,
+                ..Default::default()
+            });
+            return;
+        }
+        let store = self.store.clone();
+        let idx = Arc::clone(&self.content_index);
+        let handler = self.content_handler.lock().unwrap().clone();
+        std::thread::spawn(move || {
+            sync_content_from_store(&store, &idx);
+            if let Some(h) = handler {
+                h.on_content_index_updated(idx.stats().live_docs as u64);
+            }
+        });
+    }
+
+    /// 供外部低优先级隔离进程将 PDF / OCR 提取正文注入正文仓与分段倒排。
+    pub fn ingest_rich_document(
+        &self,
+        path: String,
+        source_kind: FfiContentSourceKind,
+        mtime_secs: i64,
+        size_bytes: u64,
+        decoded_text: String,
+        aux_meta: u32,
+    ) -> bool {
+        self.content_index
+            .ingest_rich_text(
+                Path::new(&path),
+                source_kind.into(),
+                mtime_secs,
+                size_bytes,
+                decoded_text.as_bytes(),
+                aux_meta,
+            )
+            .is_ok()
+    }
+
+    /// 从全盘文件索引中快速筛选尚未提取或已过期的 PDF 与图片路径供独立辅助进程处理。
+    pub fn list_rich_document_candidates(
+        &self,
+        include_pdf: bool,
+        include_images: bool,
+        max_items: u32,
+    ) -> Vec<String> {
+        if (!include_pdf && !include_images) || self.store.is_empty() {
+            return Vec::new();
+        }
+        let limit = max_items.clamp(1, 500) as usize;
+        let mut raw_candidates: Vec<(String, i64, u64)> = Vec::new();
+        {
+            let index = self.store.read();
+            for (_id, view) in index.iter() {
+                if view.is_dir {
+                    continue;
+                }
+                let kind = classify_source_kind(&view.name.to_ascii_lowercase());
+                let keep = match kind {
+                    Some(ContentSourceKind::Pdf) => include_pdf,
+                    Some(ContentSourceKind::Image) => include_images,
+                    _ => false,
+                };
+                if !keep {
+                    continue;
+                }
+                let mat = view.materialize();
+                if path_is_dataless(Path::new(&mat.path)) {
+                    continue;
+                }
+                raw_candidates.push((mat.path, mat.modified as i64, mat.size));
+                if raw_candidates.len() >= limit * 4 {
+                    break;
+                }
+            }
+        }
+        self.content_index.filter_stale_paths(&raw_candidates, limit)
     }
 
     /// Check if macOS Full Disk Access is granted.
@@ -543,10 +898,163 @@ impl LokiiCore {
             self.store.exclude_paths(&new_resolved);
         }
 
+        self.content_index
+            .set_scope_config(new_config.content.to_scope_config(&new_config.index.exclude));
+
         // Sync memory directly (don't wait for file watcher)
         self.config_store.update(new_config);
         true
     }
+}
+
+fn convert_line_match(lm: crate::content_index::verify::ContentLineMatch) -> FfiContentLineMatch {
+    FfiContentLineMatch {
+        line_number: lm.line_number,
+        column: lm.column,
+        line_text: lm.line_text,
+        match_ranges: lm
+            .match_ranges
+            .into_iter()
+            .map(|r| FfiMatchRange {
+                start: r.start,
+                end: r.end,
+            })
+            .collect(),
+        is_symbol_def: lm.is_symbol_def,
+    }
+}
+
+fn convert_content_hit(h: ContentSearchHit) -> FfiContentSearchHit {
+    let name = Path::new(&h.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let extension = Path::new(&name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    FfiContentSearchHit {
+        name,
+        path: h.path,
+        extension,
+        source_kind: h.source_kind.into(),
+        score: h.score,
+        line_matches: h.line_matches.into_iter().map(convert_line_match).collect(),
+        total_matches_in_file: h.total_matches_in_file,
+        size: h.size_bytes,
+        modified: h.modified_secs.max(0) as u64,
+    }
+}
+
+fn sync_content_from_store(store: &IndexStore, content_index: &ContentIndex) {
+    let cfg = content_index.scope_config();
+    if !cfg.index_plain_text && !cfg.index_office {
+        return;
+    }
+    let paths: Vec<PathBuf> = {
+        let index = store.read();
+        let mut out = Vec::new();
+        for (_id, view) in index.iter() {
+            if view.is_dir {
+                continue;
+            }
+            let lower = view.name.to_ascii_lowercase();
+            let Some(kind) = classify_source_kind(&lower) else {
+                continue;
+            };
+            match kind {
+                ContentSourceKind::PlainText if cfg.index_plain_text => {}
+                ContentSourceKind::OfficeXml if cfg.index_office => {}
+                _ => continue,
+            }
+            out.push(PathBuf::from(view.materialize().path));
+        }
+        out
+    };
+    let _ = content_index.sync_from_snapshots(paths);
+}
+
+fn spawn_content_delta_worker(
+    rx: mpsc::Receiver<watcher::ContentWatcherDelta>,
+    store: IndexStore,
+    content_index: Arc<ContentIndex>,
+    config_store: ConfigStore,
+    event_handler: Arc<dyn EventHandler>,
+) {
+    std::thread::Builder::new()
+        .name("lokii-content-worker".to_string())
+        .spawn(move || {
+            let debounce = Duration::from_millis(800);
+            let flush_idle = Duration::from_secs(5);
+            let mut pending_creates: Vec<PathBuf> = Vec::new();
+            let mut pending_removes: Vec<String> = Vec::new();
+            let mut pending_renames: Vec<(String, String)> = Vec::new();
+            let mut pending_full = false;
+            let mut has_dirty = false;
+
+            loop {
+                let wait = if !pending_creates.is_empty()
+                    || !pending_removes.is_empty()
+                    || !pending_renames.is_empty()
+                    || pending_full
+                {
+                    debounce
+                } else if has_dirty {
+                    flush_idle
+                } else {
+                    Duration::from_secs(3600)
+                };
+
+                match rx.recv_timeout(wait) {
+                    Ok(delta) => {
+                        if delta.full_reconcile {
+                            pending_full = true;
+                        }
+                        pending_creates.extend(delta.creates_or_mods);
+                        pending_removes.extend(delta.removes);
+                        pending_renames.extend(delta.renames);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !config_store.read().content.enabled {
+                            pending_creates.clear();
+                            pending_removes.clear();
+                            pending_renames.clear();
+                            pending_full = false;
+                            continue;
+                        }
+                        if pending_full {
+                            pending_full = false;
+                            pending_creates.clear();
+                            pending_removes.clear();
+                            pending_renames.clear();
+                            sync_content_from_store(&store, &content_index);
+                            has_dirty = false;
+                            event_handler
+                                .on_content_index_updated(content_index.stats().live_docs as u64);
+                        } else if !pending_creates.is_empty()
+                            || !pending_removes.is_empty()
+                            || !pending_renames.is_empty()
+                        {
+                            let creates = std::mem::take(&mut pending_creates);
+                            let removes = std::mem::take(&mut pending_removes);
+                            let renames = std::mem::take(&mut pending_renames);
+                            let _ = content_index.apply_watcher_delta(&creates, &removes, &renames);
+                            has_dirty = true;
+                            event_handler
+                                .on_content_index_updated(content_index.stats().live_docs as u64);
+                        } else if has_dirty {
+                            let _ = content_index.flush();
+                            has_dirty = false;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = content_index.flush();
+                        break;
+                    }
+                }
+            }
+        })
+        .ok();
 }
 
 /// Overlay a frontend-supplied config patch onto the currently effective config.
@@ -613,13 +1121,22 @@ mod tests {
             self.events.lock().unwrap().push(msg);
         }
 
+        fn on_content_index_updated(&self, _live_docs: u64) {}
+
         fn on_config_reloaded(&self) {}
     }
 
     fn core() -> LokiiCore {
+        let tmp = tempfile::tempdir().unwrap();
+        let content_dir = tmp.keep().join("content_idx");
+        let content_index = Arc::new(ContentIndex::open_default(&content_dir).unwrap());
         LokiiCore {
             store: IndexStore::new(),
             config_store: ConfigStore::new(AppConfig::default()),
+            content_index,
+            content_tx: Mutex::new(None),
+            content_cancel: Mutex::new(None),
+            content_handler: Mutex::new(None),
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),

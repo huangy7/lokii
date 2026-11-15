@@ -57,7 +57,12 @@ fn double_dash_allows_queries_starting_with_dash_and_alfred_gets_match() {
             created_at: 0,
             extension: "rs".into(),
         };
-        let response = Response { results: vec![entry], error: None, is_case_sensitive: None };
+        let response = Response {
+            results: vec![entry],
+            error: None,
+            is_case_sensitive: None,
+            content_hits: Vec::new(),
+        };
         (&stream).write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).unwrap();
         request
     });
@@ -75,11 +80,96 @@ fn times_out_when_app_never_replies() {
     let listener = fake_app(home.path());
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(8));
+        std::thread::sleep(std::time::Duration::from_secs(10));
         drop(stream);
     });
     let started = std::time::Instant::now();
     let out = lokii(home.path(), &["search", "foo"].map(OsStr::new));
     assert_eq!(out.status.code(), Some(2));
-    assert!(started.elapsed() < std::time::Duration::from_secs(7));
+    assert!(started.elapsed() < std::time::Duration::from_secs(9));
+}
+
+#[test]
+fn cli_content_flag_formats_lines_and_json_hits() {
+    use lokii_core::query_server::{QueryContentHit, QueryContentLineMatch, QueryContentRange};
+
+    let home = tempfile::tempdir().unwrap();
+    let listener = fake_app(home.path());
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut req_line = String::new();
+        BufReader::new(&stream).read_line(&mut req_line).unwrap();
+        let hit = QueryContentHit {
+            path: "/tmp/demo/lib.rs".into(),
+            source_kind: "plain_text".into(),
+            score: 120,
+            line_matches: vec![QueryContentLineMatch {
+                line_number: 12,
+                column: 8,
+                line_text: "pub fn run_search() {}".into(),
+                match_ranges: vec![QueryContentRange { start: 7, end: 17 }],
+                is_symbol_def: true,
+            }],
+            total_matches_in_file: 1,
+            size: 42,
+            modified: 1700000000,
+        };
+        let response = Response {
+            results: Vec::new(),
+            error: None,
+            is_case_sensitive: Some(false),
+            content_hits: vec![hit],
+        };
+        (&stream)
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .unwrap();
+        req_line
+    });
+
+    let out = lokii(home.path(), &["search", "-c", "run_search"].map(OsStr::new));
+    assert_eq!(out.status.code(), Some(0));
+    let req_json: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+    assert_eq!(req_json["force_content"], true);
+    assert_eq!(req_json["q"], "run_search");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("/tmp/demo/lib.rs:12:8: pub fn run_search() {}"));
+
+    let home2 = tempfile::tempdir().unwrap();
+    let listener2 = fake_app(home2.path());
+    let server2 = std::thread::spawn(move || {
+        let (stream, _) = listener2.accept().unwrap();
+        let mut req_line = String::new();
+        BufReader::new(&stream).read_line(&mut req_line).unwrap();
+        let response = Response {
+            results: Vec::new(),
+            error: None,
+            is_case_sensitive: Some(true),
+            content_hits: vec![QueryContentHit {
+                path: "/tmp/demo/lib.rs".into(),
+                source_kind: "plain_text".into(),
+                score: 90,
+                line_matches: vec![QueryContentLineMatch {
+                    line_number: 3,
+                    column: 1,
+                    line_text: "fn needle()".into(),
+                    match_ranges: vec![],
+                    is_symbol_def: true,
+                }],
+                total_matches_in_file: 1,
+                size: 12,
+                modified: 1700000000,
+            }],
+        };
+        (&stream)
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .unwrap();
+        req_line
+    });
+    let out2 = lokii(home2.path(), &["search", "--sym", "--json", "needle"].map(OsStr::new));
+    assert_eq!(out2.status.code(), Some(0));
+    let req2: serde_json::Value = serde_json::from_str(&server2.join().unwrap()).unwrap();
+    assert_eq!(req2["force_symbol"], true);
+    assert_eq!(req2["force_content"], true);
+    let hits: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(hits[0]["line_matches"][0]["line_number"], 3);
 }

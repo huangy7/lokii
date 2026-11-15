@@ -422,6 +422,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -431,6 +447,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     }
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -530,6 +562,8 @@ public protocol EventHandler: AnyObject, Sendable {
     
     func onIndexUpdated(newTotal: UInt64) 
     
+    func onContentIndexUpdated(liveDocs: UInt64) 
+    
     func onWatcherError(msg: String) 
     
     func onConfigReloaded() 
@@ -608,6 +642,13 @@ open func onIndexReady(total: UInt64)  {try! rustCall() {
 open func onIndexUpdated(newTotal: UInt64)  {try! rustCall() {
     uniffi_lokii_core_fn_method_eventhandler_on_index_updated(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(newTotal),$0
+    )
+}
+}
+    
+open func onContentIndexUpdated(liveDocs: UInt64)  {try! rustCall() {
+    uniffi_lokii_core_fn_method_eventhandler_on_content_index_updated(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(liveDocs),$0
     )
 }
 }
@@ -701,6 +742,30 @@ fileprivate struct UniffiCallbackInterfaceEventHandler {
                 }
                 return uniffiObj.onIndexUpdated(
                      newTotal: try FfiConverterUInt64.lift(newTotal)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onContentIndexUpdated: { (
+            uniffiHandle: UInt64,
+            liveDocs: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onContentIndexUpdated(
+                     liveDocs: try FfiConverterUInt64.lift(liveDocs)
                 )
             }
 
@@ -836,14 +901,28 @@ public func FfiConverterTypeEventHandler_lower(_ value: EventHandler) -> UnsafeM
 public protocol LokiiCoreProtocol: AnyObject, Sendable {
     
     /**
+     * 取消当前正在并发进行的实盘内容验证请求。
+     */
+    func cancelContentSearch() 
+    
+    /**
      * Check if macOS Full Disk Access is granted.
      */
     func checkFda()  -> Bool
+    
+    func clearContentCache() 
     
     /**
      * Get the current configuration as a JSON string.
      */
     func getConfigJson()  -> String
+    
+    /**
+     * 针对单个路径按需拉取全量匹配行切片（供侧边栏/预览展开用）。
+     */
+    func getContentSnippets(path: String, query: String, caseSensitivity: FfiCaseSensitivity, forceContent: Bool, forceRegex: Bool, forceSymbol: Bool, maxMatches: UInt32)  -> [FfiContentLineMatch]
+    
+    func getContentStats()  -> FfiContentStats
     
     /**
      * Get watcher diagnostic metrics as a JSON string.
@@ -856,6 +935,16 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func getStats()  -> FfiIndexStats
     
     /**
+     * 快速判断输入是否包含内容检索语法词元（`content:`/`grep:`/`c:`/`cregex:`/`sym:`）。
+     */
+    func hasContentDirective(query: String)  -> Bool
+    
+    /**
+     * 供外部低优先级隔离进程将 PDF / OCR 提取正文注入正文仓与分段倒排。
+     */
+    func ingestRichDocument(path: String, sourceKind: FfiContentSourceKind, mtimeSecs: Int64, sizeBytes: UInt64, decodedText: String, auxMeta: UInt32)  -> Bool
+    
+    /**
      * Initialize the file index (hot start from cache or cold start via scan).
      * Calls event_handler callbacks for progress and completion.
      * This is blocking — call from a background thread on the Swift side.
@@ -866,6 +955,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
      * Check if a background scan (verify) is currently running.
      */
     func isScanning()  -> Bool
+    
+    /**
+     * 从全盘文件索引中快速筛选尚未提取或已过期的 PDF 与图片路径供独立辅助进程处理。
+     */
+    func listRichDocumentCandidates(includePdf: Bool, includeImages: Bool, maxItems: UInt32)  -> [String]
     
     /**
      * Open a file with the default application (macOS `open` command).
@@ -895,6 +989,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity)  -> FfiSearchResponse
     
     /**
+     * 异步内容检索入口：自动中断上一次未完结验证，支持字面量/正则/符号定义与路径/大小/类型正交组合。
+     */
+    func searchContent(query: String, caseSensitivity: FfiCaseSensitivity, forceContent: Bool, forceRegex: Bool, forceSymbol: Bool, maxResults: UInt32, budgetMs: UInt32)  -> FfiContentSearchResponse
+    
+    /**
      * Start the config file watcher for hot-reload.
      */
     func startConfigWatcher(eventHandler: EventHandler) 
@@ -909,6 +1008,8 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
      * whenever the index changes. Non-blocking (spawns a thread internally).
      */
     func startWatcher(eventHandler: EventHandler) 
+    
+    func triggerContentResync() 
     
     /**
      * Update configuration from a JSON string. Returns true on success.
@@ -988,6 +1089,15 @@ public convenience init() {
 
     
     /**
+     * 取消当前正在并发进行的实盘内容验证请求。
+     */
+open func cancelContentSearch()  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_cancel_content_search(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
      * Check if macOS Full Disk Access is granted.
      */
 open func checkFda() -> Bool  {
@@ -997,12 +1107,42 @@ open func checkFda() -> Bool  {
 })
 }
     
+open func clearContentCache()  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_clear_content_cache(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
     /**
      * Get the current configuration as a JSON string.
      */
 open func getConfigJson() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_get_config_json(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * 针对单个路径按需拉取全量匹配行切片（供侧边栏/预览展开用）。
+     */
+open func getContentSnippets(path: String, query: String, caseSensitivity: FfiCaseSensitivity, forceContent: Bool, forceRegex: Bool, forceSymbol: Bool, maxMatches: UInt32) -> [FfiContentLineMatch]  {
+    return try!  FfiConverterSequenceTypeFfiContentLineMatch.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_get_content_snippets(self.uniffiClonePointer(),
+        FfiConverterString.lower(path),
+        FfiConverterString.lower(query),
+        FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),
+        FfiConverterBool.lower(forceContent),
+        FfiConverterBool.lower(forceRegex),
+        FfiConverterBool.lower(forceSymbol),
+        FfiConverterUInt32.lower(maxMatches),$0
+    )
+})
+}
+    
+open func getContentStats() -> FfiContentStats  {
+    return try!  FfiConverterTypeFfiContentStats_lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_get_content_stats(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1028,6 +1168,33 @@ open func getStats() -> FfiIndexStats  {
 }
     
     /**
+     * 快速判断输入是否包含内容检索语法词元（`content:`/`grep:`/`c:`/`cregex:`/`sym:`）。
+     */
+open func hasContentDirective(query: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_has_content_directive(self.uniffiClonePointer(),
+        FfiConverterString.lower(query),$0
+    )
+})
+}
+    
+    /**
+     * 供外部低优先级隔离进程将 PDF / OCR 提取正文注入正文仓与分段倒排。
+     */
+open func ingestRichDocument(path: String, sourceKind: FfiContentSourceKind, mtimeSecs: Int64, sizeBytes: UInt64, decodedText: String, auxMeta: UInt32) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_ingest_rich_document(self.uniffiClonePointer(),
+        FfiConverterString.lower(path),
+        FfiConverterTypeFfiContentSourceKind_lower(sourceKind),
+        FfiConverterInt64.lower(mtimeSecs),
+        FfiConverterUInt64.lower(sizeBytes),
+        FfiConverterString.lower(decodedText),
+        FfiConverterUInt32.lower(auxMeta),$0
+    )
+})
+}
+    
+    /**
      * Initialize the file index (hot start from cache or cold start via scan).
      * Calls event_handler callbacks for progress and completion.
      * This is blocking — call from a background thread on the Swift side.
@@ -1046,6 +1213,19 @@ open func initialize(eventHandler: EventHandler) -> FfiStartupMode  {
 open func isScanning() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_is_scanning(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * 从全盘文件索引中快速筛选尚未提取或已过期的 PDF 与图片路径供独立辅助进程处理。
+     */
+open func listRichDocumentCandidates(includePdf: Bool, includeImages: Bool, maxItems: UInt32) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_list_rich_document_candidates(self.uniffiClonePointer(),
+        FfiConverterBool.lower(includePdf),
+        FfiConverterBool.lower(includeImages),
+        FfiConverterUInt32.lower(maxItems),$0
     )
 })
 }
@@ -1108,6 +1288,23 @@ open func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSen
 }
     
     /**
+     * 异步内容检索入口：自动中断上一次未完结验证，支持字面量/正则/符号定义与路径/大小/类型正交组合。
+     */
+open func searchContent(query: String, caseSensitivity: FfiCaseSensitivity, forceContent: Bool, forceRegex: Bool, forceSymbol: Bool, maxResults: UInt32, budgetMs: UInt32) -> FfiContentSearchResponse  {
+    return try!  FfiConverterTypeFfiContentSearchResponse_lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_search_content(self.uniffiClonePointer(),
+        FfiConverterString.lower(query),
+        FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),
+        FfiConverterBool.lower(forceContent),
+        FfiConverterBool.lower(forceRegex),
+        FfiConverterBool.lower(forceSymbol),
+        FfiConverterUInt32.lower(maxResults),
+        FfiConverterUInt32.lower(budgetMs),$0
+    )
+})
+}
+    
+    /**
      * Start the config file watcher for hot-reload.
      */
 open func startConfigWatcher(eventHandler: EventHandler)  {try! rustCall() {
@@ -1133,6 +1330,12 @@ open func startQueryServer()  {try! rustCall() {
 open func startWatcher(eventHandler: EventHandler)  {try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_start_watcher(self.uniffiClonePointer(),
         FfiConverterTypeEventHandler_lower(eventHandler),$0
+    )
+}
+}
+    
+open func triggerContentResync()  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_trigger_content_resync(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -1208,6 +1411,470 @@ public func FfiConverterTypeLokiiCore_lower(_ value: LokiiCore) -> UnsafeMutable
 }
 
 
+
+
+public struct FfiContentLineMatch {
+    public var lineNumber: UInt32
+    public var column: UInt32
+    public var lineText: String
+    public var matchRanges: [FfiMatchRange]
+    public var isSymbolDef: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(lineNumber: UInt32, column: UInt32, lineText: String, matchRanges: [FfiMatchRange], isSymbolDef: Bool) {
+        self.lineNumber = lineNumber
+        self.column = column
+        self.lineText = lineText
+        self.matchRanges = matchRanges
+        self.isSymbolDef = isSymbolDef
+    }
+}
+
+#if compiler(>=6)
+extension FfiContentLineMatch: Sendable {}
+#endif
+
+
+extension FfiContentLineMatch: Equatable, Hashable {
+    public static func ==(lhs: FfiContentLineMatch, rhs: FfiContentLineMatch) -> Bool {
+        if lhs.lineNumber != rhs.lineNumber {
+            return false
+        }
+        if lhs.column != rhs.column {
+            return false
+        }
+        if lhs.lineText != rhs.lineText {
+            return false
+        }
+        if lhs.matchRanges != rhs.matchRanges {
+            return false
+        }
+        if lhs.isSymbolDef != rhs.isSymbolDef {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(lineNumber)
+        hasher.combine(column)
+        hasher.combine(lineText)
+        hasher.combine(matchRanges)
+        hasher.combine(isSymbolDef)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiContentLineMatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiContentLineMatch {
+        return
+            try FfiContentLineMatch(
+                lineNumber: FfiConverterUInt32.read(from: &buf), 
+                column: FfiConverterUInt32.read(from: &buf), 
+                lineText: FfiConverterString.read(from: &buf), 
+                matchRanges: FfiConverterSequenceTypeFfiMatchRange.read(from: &buf), 
+                isSymbolDef: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiContentLineMatch, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.lineNumber, into: &buf)
+        FfiConverterUInt32.write(value.column, into: &buf)
+        FfiConverterString.write(value.lineText, into: &buf)
+        FfiConverterSequenceTypeFfiMatchRange.write(value.matchRanges, into: &buf)
+        FfiConverterBool.write(value.isSymbolDef, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentLineMatch_lift(_ buf: RustBuffer) throws -> FfiContentLineMatch {
+    return try FfiConverterTypeFfiContentLineMatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentLineMatch_lower(_ value: FfiContentLineMatch) -> RustBuffer {
+    return FfiConverterTypeFfiContentLineMatch.lower(value)
+}
+
+
+public struct FfiContentSearchHit {
+    public var name: String
+    public var path: String
+    public var `extension`: String
+    public var sourceKind: FfiContentSourceKind
+    public var score: Int32
+    public var lineMatches: [FfiContentLineMatch]
+    public var totalMatchesInFile: UInt32
+    public var size: UInt64
+    public var modified: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, path: String, `extension`: String, sourceKind: FfiContentSourceKind, score: Int32, lineMatches: [FfiContentLineMatch], totalMatchesInFile: UInt32, size: UInt64, modified: UInt64) {
+        self.name = name
+        self.path = path
+        self.`extension` = `extension`
+        self.sourceKind = sourceKind
+        self.score = score
+        self.lineMatches = lineMatches
+        self.totalMatchesInFile = totalMatchesInFile
+        self.size = size
+        self.modified = modified
+    }
+}
+
+#if compiler(>=6)
+extension FfiContentSearchHit: Sendable {}
+#endif
+
+
+extension FfiContentSearchHit: Equatable, Hashable {
+    public static func ==(lhs: FfiContentSearchHit, rhs: FfiContentSearchHit) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.path != rhs.path {
+            return false
+        }
+        if lhs.`extension` != rhs.`extension` {
+            return false
+        }
+        if lhs.sourceKind != rhs.sourceKind {
+            return false
+        }
+        if lhs.score != rhs.score {
+            return false
+        }
+        if lhs.lineMatches != rhs.lineMatches {
+            return false
+        }
+        if lhs.totalMatchesInFile != rhs.totalMatchesInFile {
+            return false
+        }
+        if lhs.size != rhs.size {
+            return false
+        }
+        if lhs.modified != rhs.modified {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(path)
+        hasher.combine(`extension`)
+        hasher.combine(sourceKind)
+        hasher.combine(score)
+        hasher.combine(lineMatches)
+        hasher.combine(totalMatchesInFile)
+        hasher.combine(size)
+        hasher.combine(modified)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiContentSearchHit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiContentSearchHit {
+        return
+            try FfiContentSearchHit(
+                name: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                extension: FfiConverterString.read(from: &buf), 
+                sourceKind: FfiConverterTypeFfiContentSourceKind.read(from: &buf), 
+                score: FfiConverterInt32.read(from: &buf), 
+                lineMatches: FfiConverterSequenceTypeFfiContentLineMatch.read(from: &buf), 
+                totalMatchesInFile: FfiConverterUInt32.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf), 
+                modified: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiContentSearchHit, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterString.write(value.`extension`, into: &buf)
+        FfiConverterTypeFfiContentSourceKind.write(value.sourceKind, into: &buf)
+        FfiConverterInt32.write(value.score, into: &buf)
+        FfiConverterSequenceTypeFfiContentLineMatch.write(value.lineMatches, into: &buf)
+        FfiConverterUInt32.write(value.totalMatchesInFile, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterUInt64.write(value.modified, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentSearchHit_lift(_ buf: RustBuffer) throws -> FfiContentSearchHit {
+    return try FfiConverterTypeFfiContentSearchHit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentSearchHit_lower(_ value: FfiContentSearchHit) -> RustBuffer {
+    return FfiConverterTypeFfiContentSearchHit.lower(value)
+}
+
+
+public struct FfiContentSearchResponse {
+    public var hits: [FfiContentSearchHit]
+    public var totalCandidatesMatched: UInt64
+    public var candidatesVerified: UInt64
+    public var truncatedByBudget: Bool
+    public var cancelled: Bool
+    public var elapsedMs: UInt64
+    public var isCaseSensitive: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hits: [FfiContentSearchHit], totalCandidatesMatched: UInt64, candidatesVerified: UInt64, truncatedByBudget: Bool, cancelled: Bool, elapsedMs: UInt64, isCaseSensitive: Bool) {
+        self.hits = hits
+        self.totalCandidatesMatched = totalCandidatesMatched
+        self.candidatesVerified = candidatesVerified
+        self.truncatedByBudget = truncatedByBudget
+        self.cancelled = cancelled
+        self.elapsedMs = elapsedMs
+        self.isCaseSensitive = isCaseSensitive
+    }
+}
+
+#if compiler(>=6)
+extension FfiContentSearchResponse: Sendable {}
+#endif
+
+
+extension FfiContentSearchResponse: Equatable, Hashable {
+    public static func ==(lhs: FfiContentSearchResponse, rhs: FfiContentSearchResponse) -> Bool {
+        if lhs.hits != rhs.hits {
+            return false
+        }
+        if lhs.totalCandidatesMatched != rhs.totalCandidatesMatched {
+            return false
+        }
+        if lhs.candidatesVerified != rhs.candidatesVerified {
+            return false
+        }
+        if lhs.truncatedByBudget != rhs.truncatedByBudget {
+            return false
+        }
+        if lhs.cancelled != rhs.cancelled {
+            return false
+        }
+        if lhs.elapsedMs != rhs.elapsedMs {
+            return false
+        }
+        if lhs.isCaseSensitive != rhs.isCaseSensitive {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hits)
+        hasher.combine(totalCandidatesMatched)
+        hasher.combine(candidatesVerified)
+        hasher.combine(truncatedByBudget)
+        hasher.combine(cancelled)
+        hasher.combine(elapsedMs)
+        hasher.combine(isCaseSensitive)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiContentSearchResponse: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiContentSearchResponse {
+        return
+            try FfiContentSearchResponse(
+                hits: FfiConverterSequenceTypeFfiContentSearchHit.read(from: &buf), 
+                totalCandidatesMatched: FfiConverterUInt64.read(from: &buf), 
+                candidatesVerified: FfiConverterUInt64.read(from: &buf), 
+                truncatedByBudget: FfiConverterBool.read(from: &buf), 
+                cancelled: FfiConverterBool.read(from: &buf), 
+                elapsedMs: FfiConverterUInt64.read(from: &buf), 
+                isCaseSensitive: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiContentSearchResponse, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFfiContentSearchHit.write(value.hits, into: &buf)
+        FfiConverterUInt64.write(value.totalCandidatesMatched, into: &buf)
+        FfiConverterUInt64.write(value.candidatesVerified, into: &buf)
+        FfiConverterBool.write(value.truncatedByBudget, into: &buf)
+        FfiConverterBool.write(value.cancelled, into: &buf)
+        FfiConverterUInt64.write(value.elapsedMs, into: &buf)
+        FfiConverterBool.write(value.isCaseSensitive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentSearchResponse_lift(_ buf: RustBuffer) throws -> FfiContentSearchResponse {
+    return try FfiConverterTypeFfiContentSearchResponse.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentSearchResponse_lower(_ value: FfiContentSearchResponse) -> RustBuffer {
+    return FfiConverterTypeFfiContentSearchResponse.lower(value)
+}
+
+
+public struct FfiContentStats {
+    public var liveDocs: UInt64
+    public var uniqueContents: UInt64
+    public var segmentCount: UInt32
+    public var dirtyDocs: UInt64
+    public var mappedBytes: UInt64
+    public var textStoreEntries: UInt64
+    public var textStoreDiskBytes: UInt64
+    public var lruCacheBytes: UInt64
+    public var lruCacheCapBytes: UInt64
+    public var isIndexing: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(liveDocs: UInt64, uniqueContents: UInt64, segmentCount: UInt32, dirtyDocs: UInt64, mappedBytes: UInt64, textStoreEntries: UInt64, textStoreDiskBytes: UInt64, lruCacheBytes: UInt64, lruCacheCapBytes: UInt64, isIndexing: Bool) {
+        self.liveDocs = liveDocs
+        self.uniqueContents = uniqueContents
+        self.segmentCount = segmentCount
+        self.dirtyDocs = dirtyDocs
+        self.mappedBytes = mappedBytes
+        self.textStoreEntries = textStoreEntries
+        self.textStoreDiskBytes = textStoreDiskBytes
+        self.lruCacheBytes = lruCacheBytes
+        self.lruCacheCapBytes = lruCacheCapBytes
+        self.isIndexing = isIndexing
+    }
+}
+
+#if compiler(>=6)
+extension FfiContentStats: Sendable {}
+#endif
+
+
+extension FfiContentStats: Equatable, Hashable {
+    public static func ==(lhs: FfiContentStats, rhs: FfiContentStats) -> Bool {
+        if lhs.liveDocs != rhs.liveDocs {
+            return false
+        }
+        if lhs.uniqueContents != rhs.uniqueContents {
+            return false
+        }
+        if lhs.segmentCount != rhs.segmentCount {
+            return false
+        }
+        if lhs.dirtyDocs != rhs.dirtyDocs {
+            return false
+        }
+        if lhs.mappedBytes != rhs.mappedBytes {
+            return false
+        }
+        if lhs.textStoreEntries != rhs.textStoreEntries {
+            return false
+        }
+        if lhs.textStoreDiskBytes != rhs.textStoreDiskBytes {
+            return false
+        }
+        if lhs.lruCacheBytes != rhs.lruCacheBytes {
+            return false
+        }
+        if lhs.lruCacheCapBytes != rhs.lruCacheCapBytes {
+            return false
+        }
+        if lhs.isIndexing != rhs.isIndexing {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(liveDocs)
+        hasher.combine(uniqueContents)
+        hasher.combine(segmentCount)
+        hasher.combine(dirtyDocs)
+        hasher.combine(mappedBytes)
+        hasher.combine(textStoreEntries)
+        hasher.combine(textStoreDiskBytes)
+        hasher.combine(lruCacheBytes)
+        hasher.combine(lruCacheCapBytes)
+        hasher.combine(isIndexing)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiContentStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiContentStats {
+        return
+            try FfiContentStats(
+                liveDocs: FfiConverterUInt64.read(from: &buf), 
+                uniqueContents: FfiConverterUInt64.read(from: &buf), 
+                segmentCount: FfiConverterUInt32.read(from: &buf), 
+                dirtyDocs: FfiConverterUInt64.read(from: &buf), 
+                mappedBytes: FfiConverterUInt64.read(from: &buf), 
+                textStoreEntries: FfiConverterUInt64.read(from: &buf), 
+                textStoreDiskBytes: FfiConverterUInt64.read(from: &buf), 
+                lruCacheBytes: FfiConverterUInt64.read(from: &buf), 
+                lruCacheCapBytes: FfiConverterUInt64.read(from: &buf), 
+                isIndexing: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiContentStats, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.liveDocs, into: &buf)
+        FfiConverterUInt64.write(value.uniqueContents, into: &buf)
+        FfiConverterUInt32.write(value.segmentCount, into: &buf)
+        FfiConverterUInt64.write(value.dirtyDocs, into: &buf)
+        FfiConverterUInt64.write(value.mappedBytes, into: &buf)
+        FfiConverterUInt64.write(value.textStoreEntries, into: &buf)
+        FfiConverterUInt64.write(value.textStoreDiskBytes, into: &buf)
+        FfiConverterUInt64.write(value.lruCacheBytes, into: &buf)
+        FfiConverterUInt64.write(value.lruCacheCapBytes, into: &buf)
+        FfiConverterBool.write(value.isIndexing, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentStats_lift(_ buf: RustBuffer) throws -> FfiContentStats {
+    return try FfiConverterTypeFfiContentStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentStats_lower(_ value: FfiContentStats) -> RustBuffer {
+    return FfiConverterTypeFfiContentStats.lower(value)
+}
 
 
 /**
@@ -1669,6 +2336,90 @@ extension FfiCaseSensitivity: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiContentSourceKind {
+    
+    case plainText
+    case officeXml
+    case pdf
+    case image
+}
+
+
+#if compiler(>=6)
+extension FfiContentSourceKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiContentSourceKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiContentSourceKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiContentSourceKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .plainText
+        
+        case 2: return .officeXml
+        
+        case 3: return .pdf
+        
+        case 4: return .image
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiContentSourceKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .plainText:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .officeXml:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .pdf:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .image:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentSourceKind_lift(_ buf: RustBuffer) throws -> FfiContentSourceKind {
+    return try FfiConverterTypeFfiContentSourceKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiContentSourceKind_lower(_ value: FfiContentSourceKind) -> RustBuffer {
+    return FfiConverterTypeFfiContentSourceKind.lower(value)
+}
+
+
+extension FfiContentSourceKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiFileType {
     
     case all
@@ -1975,6 +2726,81 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiContentLineMatch: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiContentLineMatch]
+
+    public static func write(_ value: [FfiContentLineMatch], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiContentLineMatch.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiContentLineMatch] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiContentLineMatch]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiContentLineMatch.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiContentSearchHit: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiContentSearchHit]
+
+    public static func write(_ value: [FfiContentSearchHit], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiContentSearchHit.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiContentSearchHit] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiContentSearchHit]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiContentSearchHit.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiMatchRange: FfiConverterRustBuffer {
     typealias SwiftType = [FfiMatchRange]
 
@@ -2046,16 +2872,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_eventhandler_on_index_updated() != 41254) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_eventhandler_on_watcher_error() != 16582) {
+    if (uniffi_lokii_core_checksum_method_eventhandler_on_content_index_updated() != 12135) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_eventhandler_on_config_reloaded() != 39587) {
+    if (uniffi_lokii_core_checksum_method_eventhandler_on_watcher_error() != 31526) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_eventhandler_on_config_reloaded() != 59430) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_cancel_content_search() != 700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_check_fda() != 35374) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lokii_core_checksum_method_lokiicore_clear_content_cache() != 47807) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lokii_core_checksum_method_lokiicore_get_config_json() != 54941) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_get_content_snippets() != 57476) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_get_content_stats() != 16046) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_get_metrics() != 746) {
@@ -2064,10 +2905,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_get_stats() != 19023) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lokii_core_checksum_method_lokiicore_has_content_directive() != 23929) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_ingest_rich_document() != 7142) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lokii_core_checksum_method_lokiicore_initialize() != 40909) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_is_scanning() != 11801) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_list_rich_document_candidates() != 46051) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_open_file() != 16752) {
@@ -2085,6 +2935,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_search() != 32566) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lokii_core_checksum_method_lokiicore_search_content() != 25284) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher() != 32031) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2092,6 +2945,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_watcher() != 17814) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_trigger_content_resync() != 56142) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 16092) {

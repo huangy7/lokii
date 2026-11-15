@@ -107,6 +107,46 @@ class PreferencesViewModel: ObservableObject {
     
     @Published var hasFullDiskAccess: Bool = false
     @Published var selectedTab: String = "general"
+
+    // Content search settings (live auto-saved via config store)
+    @Published var contentEnabled: Bool = true {
+        didSet {
+            guard !isLoading, contentEnabled != oldValue else { return }
+            saveContentConfig()
+        }
+    }
+    @Published var contentIndexOffice: Bool = true {
+        didSet {
+            guard !isLoading, contentIndexOffice != oldValue else { return }
+            saveContentConfig()
+        }
+    }
+    @Published var contentIndexPdf: Bool = true {
+        didSet {
+            guard !isLoading, contentIndexPdf != oldValue else { return }
+            saveContentConfig()
+        }
+    }
+    @Published var contentIndexImages: Bool = false {
+        didSet {
+            guard !isLoading, contentIndexImages != oldValue else { return }
+            saveContentConfig()
+        }
+    }
+    @Published var contentRespectGitignore: Bool = true {
+        didSet {
+            guard !isLoading, contentRespectGitignore != oldValue else { return }
+            saveContentConfig()
+        }
+    }
+    @Published var contentMaxLruMb: Int = 32 {
+        didSet {
+            guard !isLoading, contentMaxLruMb != oldValue else { return }
+            saveContentConfig()
+        }
+    }
+    @Published var contentStats: FfiContentStats? = nil
+
     @Published var launchAtLogin: Bool = false {
         didSet {
             guard !isLoading, launchAtLogin != oldValue else { return }
@@ -115,6 +155,7 @@ class PreferencesViewModel: ObservableObject {
     }
     
     private var isLoading = false
+    private var contentStatsObserver: NSObjectProtocol?
     
     init(engine: SearchEngine) {
         self.engine = engine
@@ -122,6 +163,20 @@ class PreferencesViewModel: ObservableObject {
         updateFDAStatus()
         refreshLaunchAtLoginStatus()
         refreshCliStatus()
+        refreshContentStats()
+        contentStatsObserver = NotificationCenter.default.addObserver(
+            forName: SearchEngine.contentIndexUpdatedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshContentStats()
+        }
+    }
+
+    deinit {
+        if let observer = contentStatsObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
     
     func refreshLaunchAtLoginStatus() {
@@ -370,8 +425,28 @@ class PreferencesViewModel: ObservableObject {
         self.savedExcludePaths = config.index.excludePaths
         self.savedIncludeHidden = config.index.includeHidden
         self.savedNetworkRescanMinutes = config.index.networkRescanMinutes
+
+        self.contentEnabled = config.content.enabled
+        self.contentIndexOffice = config.content.indexOffice
+        self.contentIndexPdf = config.content.indexPdf
+        self.contentIndexImages = config.content.indexImages
+        self.contentRespectGitignore = config.content.respectGitignore
+        self.contentMaxLruMb = config.content.maxLruMb
+
         isLoading = false
         refreshAvailableTerminals()
+        refreshContentStats()
+    }
+
+    private var currentContentConfig: LokiiConfig.ContentConfig {
+        LokiiConfig.ContentConfig(
+            enabled: contentEnabled,
+            indexOffice: contentIndexOffice,
+            indexPdf: contentIndexPdf,
+            indexImages: contentIndexImages,
+            respectGitignore: contentRespectGitignore,
+            maxLruMb: contentMaxLruMb
+        )
     }
     
     private func saveGeneralConfig() {
@@ -389,8 +464,42 @@ class PreferencesViewModel: ObservableObject {
             window: .init(
                 hideOnBlur: hideOnBlur,
                 rememberPosition: rememberPosition
-            )
+            ),
+            content: currentContentConfig
         ))
+    }
+
+    private func saveContentConfig() {
+        saveGeneralConfig()
+        refreshContentStats()
+    }
+
+    func refreshContentStats() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let snapshot = self.engine.contentStats
+            DispatchQueue.main.async {
+                self.contentStats = snapshot
+            }
+        }
+    }
+
+    func resyncContentIndex() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.engine.triggerContentResync()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self?.refreshContentStats()
+            }
+        }
+    }
+
+    func clearContentCache() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.engine.clearContentCache()
+            DispatchQueue.main.async {
+                self?.refreshContentStats()
+            }
+        }
     }
     
     var isIndexDirty: Bool {
@@ -566,6 +675,7 @@ struct PreferencesView: View {
         [
             SidebarItem(id: "general", title: L("prefs.tab.general"), icon: "gearshape", iconColor: Color.gray),
             SidebarItem(id: "index", title: L("prefs.tab.index"), icon: "internaldrive", iconColor: .blue, hasBadge: viewModel.isIndexDirty),
+            SidebarItem(id: "content", title: L("prefs.tab.content"), icon: "doc.text.magnifyingglass", iconColor: .purple),
             SidebarItem(id: "privacy", title: L("prefs.tab.privacy"), icon: "hand.raised.fill", iconColor: viewModel.hasFullDiskAccess ? .green : .orange),
             SidebarItem(id: "about", title: L("prefs.tab.about"), icon: "info.circle", iconColor: .orange, hasBadge: updater.hasNewVersion)
         ]
@@ -575,6 +685,8 @@ struct PreferencesView: View {
         switch viewModel.selectedTab {
         case "index":
             return L("prefs.tab.index")
+        case "content":
+            return L("prefs.tab.content")
         case "privacy":
             return L("prefs.tab.privacy")
         case "about":
@@ -618,6 +730,7 @@ struct PreferencesView: View {
                 viewModel.updateFDAStatus()
                 viewModel.refreshLaunchAtLoginStatus()
                 viewModel.refreshCliStatus()
+                viewModel.refreshContentStats()
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 viewModel.updateFDAStatus()
@@ -629,6 +742,8 @@ struct PreferencesView: View {
     @ViewBuilder
     private var detailPane: some View {
         switch viewModel.selectedTab {
+        case "content":
+            contentPane
         case "privacy":
             privacyPane
         case "about":
@@ -1004,6 +1119,115 @@ struct PreferencesView: View {
             
             // Fixed Bottom Action Bar
             indexActionBar
+        }
+    }
+
+    // MARK: - Content Search Pane
+    @ViewBuilder
+    private var contentPane: some View {
+        SettingsGroup(L("prefs.content.group.engine")) {
+            SettingsRow(L("prefs.content.enabled"), description: L("prefs.content.enabled.description")) {
+                Toggle("", isOn: $viewModel.contentEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            SettingsRowDivider()
+            SettingsRow(L("prefs.content.respectGitignore"), description: L("prefs.content.respectGitignore.description")) {
+                Toggle("", isOn: $viewModel.contentRespectGitignore)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .disabled(!viewModel.contentEnabled)
+            }
+        }
+
+        SettingsGroup(L("prefs.content.group.formats")) {
+            SettingsRow(L("prefs.content.office"), description: L("prefs.content.office.description")) {
+                Toggle("", isOn: $viewModel.contentIndexOffice)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .disabled(!viewModel.contentEnabled)
+            }
+            SettingsRowDivider()
+            SettingsRow(L("prefs.content.pdf"), description: L("prefs.content.pdf.description")) {
+                Toggle("", isOn: $viewModel.contentIndexPdf)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .disabled(!viewModel.contentEnabled)
+            }
+            SettingsRowDivider()
+            SettingsRow(L("prefs.content.images"), description: L("prefs.content.images.description")) {
+                Toggle("", isOn: $viewModel.contentIndexImages)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .disabled(!viewModel.contentEnabled)
+            }
+        }
+
+        SettingsGroup(L("prefs.content.group.memory")) {
+            SettingsRow(L("prefs.content.lruCap"), description: L("prefs.content.lruCap.description")) {
+                HStack(spacing: 8) {
+                    Text("\(viewModel.contentMaxLruMb) MiB")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    Stepper("", value: $viewModel.contentMaxLruMb, in: 8...256, step: 8)
+                        .labelsHidden()
+                }
+                .disabled(!viewModel.contentEnabled)
+            }
+            if let stats = viewModel.contentStats {
+                SettingsRowDivider()
+                SettingsRow(L("prefs.content.stats.liveDocs")) {
+                    Text("\(stats.liveDocs) (\(stats.uniqueContents) unique)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                SettingsRowDivider()
+                SettingsRow(L("prefs.content.stats.segments")) {
+                    Text("\(stats.segmentCount) seg / \(stats.dirtyDocs) dirty")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                SettingsRowDivider()
+                SettingsRow(L("prefs.content.stats.diskText")) {
+                    let diskStr = ByteCountFormatter.string(fromByteCount: Int64(stats.textStoreDiskBytes), countStyle: .file)
+                    let lruUsed = ByteCountFormatter.string(fromByteCount: Int64(stats.lruCacheBytes), countStyle: .memory)
+                    let lruCap = ByteCountFormatter.string(fromByteCount: Int64(stats.lruCacheCapBytes), countStyle: .memory)
+                    Text("\(diskStr) / \(lruUsed) of \(lruCap)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            SettingsRowDivider()
+            HStack(spacing: 12) {
+                Button {
+                    viewModel.resyncContentIndex()
+                } label: {
+                    Text(L("prefs.content.action.resync"))
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Color.accentColor.opacity(0.14))
+                        .foregroundColor(.accentColor)
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .disabled(!viewModel.contentEnabled)
+
+                Button {
+                    viewModel.clearContentCache()
+                } label: {
+                    Text(L("prefs.content.action.clearCache"))
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Color.primary.opacity(0.06))
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(12)
+        }
+        .onAppear {
+            viewModel.refreshContentStats()
         }
     }
     

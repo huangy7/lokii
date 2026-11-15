@@ -74,12 +74,32 @@ pub fn process_event_batch(
     })
 }
 
+/// 投递给内容检索子系统的增量文件变更批次。
+#[derive(Debug, Default, Clone)]
+pub struct ContentWatcherDelta {
+    pub creates_or_mods: Vec<PathBuf>,
+    pub removes: Vec<String>,
+    pub renames: Vec<(String, String)>,
+    pub full_reconcile: bool,
+}
+
 fn apply_batch(
+    batch: EventBatch,
+    renames: Vec<(String, String)>,
+    store: &IndexStore,
+    filter: &CompiledFilter,
+    include_hidden: bool,
+) -> Result<(usize, usize), crate::compact_index::IndexError> {
+    apply_batch_with_content(batch, renames, store, filter, include_hidden, None)
+}
+
+fn apply_batch_with_content(
     mut batch: EventBatch,
     renames: Vec<(String, String)>,
     store: &IndexStore,
     filter: &CompiledFilter,
     include_hidden: bool,
+    content_tx: Option<&mpsc::Sender<ContentWatcherDelta>>,
 ) -> Result<(usize, usize), crate::compact_index::IndexError> {
     let excluded_renames: Vec<_> = renames
         .iter()
@@ -127,6 +147,21 @@ fn apply_batch(
         .chain(&dir_roots)
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
+    if let Some(tx) = content_tx {
+        let mut content_removes = remove_roots.clone();
+        content_removes.extend(excluded_renames.iter().cloned());
+        let content_creates: Vec<PathBuf> = creates
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| PathBuf::from(&e.path))
+            .collect();
+        let _ = tx.send(ContentWatcherDelta {
+            creates_or_mods: content_creates,
+            removes: content_removes,
+            renames: renames.clone(),
+            full_reconcile: false,
+        });
+    }
     store
         .write()
         .apply_event_batch(&renames, &excluded_renames, &remove_roots, creates)
@@ -556,6 +591,7 @@ struct Service<F, P> {
     last_persist: Instant,
     network_scanned: Option<Instant>,
     network_scanning: Arc<std::sync::atomic::AtomicBool>,
+    content_tx: Option<mpsc::Sender<ContentWatcherDelta>>,
 }
 
 impl<F, P> Service<F, P>
@@ -707,12 +743,13 @@ where
         let changed = !changes.is_empty();
         if changed {
             let (batch, renames) = resolve_changes(changes, &self.store);
-            if let Err(error) = apply_batch(
+            if let Err(error) = apply_batch_with_content(
                 batch,
                 renames,
                 &self.store,
                 &self.scope.filter,
                 self.scope.include_hidden,
+                self.content_tx.as_ref(),
             ) {
                 eprintln!("[Lokii] index event batch failed: {error}");
                 self.demand_reconcile(self.seen);
@@ -787,6 +824,12 @@ where
         self.store.replace_compact(index);
         self.fingerprint.store(checkpoint.fingerprint, Ordering::Release);
         self.pending_fingerprint = None;
+        if let Some(ref tx) = self.content_tx {
+            let _ = tx.send(ContentWatcherDelta {
+                full_reconcile: true,
+                ..Default::default()
+            });
+        }
         self.resync(from);
     }
 
@@ -946,6 +989,24 @@ where
     F: Fn(usize) + Send + 'static,
     P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
 {
+    start_watcher_with_content(store, config_store, metrics, resume, scan_lock, on_batch, persist, None)
+}
+
+/// 启动索引服务线程（附加内容索引增量投递通道）。
+pub fn start_watcher_with_content<F, P>(
+    store: IndexStore,
+    config_store: ConfigStore,
+    metrics: Arc<WatcherMetrics>,
+    resume: Resume,
+    scan_lock: Arc<std::sync::Mutex<()>>,
+    on_batch: F,
+    persist: P,
+    content_tx: Option<mpsc::Sender<ContentWatcherDelta>>,
+) -> WatcherHandle
+where
+    F: Fn(usize) + Send + 'static,
+    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
+{
     let (control_tx, control) = mpsc::channel();
     let service_tx = control_tx.clone();
     let applied = Arc::new(AtomicU64::new(match resume {
@@ -993,6 +1054,7 @@ where
             last_persist: Instant::now(),
             network_scanned: None,
             network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            content_tx,
         };
         service.run(resume);
     });
@@ -1266,6 +1328,7 @@ mod tests {
             last_persist: Instant::now(),
             network_scanned: None,
             network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            content_tx: None,
         }
     }
 

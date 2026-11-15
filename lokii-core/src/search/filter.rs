@@ -144,6 +144,74 @@ pub struct QueryFilter {
     pub inferred_exts: Vec<(String, String)>,
 }
 
+impl QueryFilter {
+    /// 针对独立内容候选路径的过滤判断，支持与 `type:` / `ext:` / `size:` 条件正交组合。
+    pub fn matches_file_path(&self, path: &str, size_bytes: Option<u64>) -> bool {
+        if let Some(sz) = size_bytes {
+            if let Some(min) = self.size_filter.min_bytes {
+                if sz < min {
+                    return false;
+                }
+            }
+            if let Some(max) = self.size_filter.max_bytes {
+                if sz > max {
+                    return false;
+                }
+            }
+        }
+
+        let mut custom_exts: Vec<String> = self
+            .custom_exts
+            .iter()
+            .map(|c| c.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if custom_exts.is_empty() {
+            if let Some(ref c) = self.custom_ext {
+                let norm = c.trim().trim_start_matches('.').to_ascii_lowercase();
+                if !norm.is_empty() {
+                    custom_exts.push(norm);
+                }
+            }
+        }
+
+        let mut file_types = self.file_types.clone();
+        if file_types.is_empty() && self.file_type != FileType::All {
+            file_types.push(self.file_type);
+        }
+        file_types.retain(|ft| *ft != FileType::All);
+
+        if custom_exts.is_empty() && file_types.is_empty() {
+            return true;
+        }
+
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+
+        if !custom_exts.is_empty() {
+            if ext.is_empty() && name.starts_with('.') && name.len() > 1 {
+                let dot_ext = &name[1..];
+                if custom_exts
+                    .iter()
+                    .any(|t| dot_ext.eq_ignore_ascii_case(t))
+                {
+                    return true;
+                }
+            }
+            return custom_exts.iter().any(|t| ext.eq_ignore_ascii_case(t));
+        }
+
+        if file_types.contains(&FileType::Folder) && file_types.len() == 1 {
+            return false;
+        }
+        if file_types.contains(&FileType::Code) && ext.is_empty() && is_code_special_filename(name)
+        {
+            return true;
+        }
+        file_types.iter().any(|ft| ft.matches(false, ext))
+    }
+}
+
 /// 解析单项带单位的大小字符串（如 "10m"、"500k"、"1.5g"、"1024b"），遵循 macOS 原生十进制规范（1KB = 10^3, 1MB = 10^6 等）。
 pub(crate) fn parse_size_bytes(s: &str) -> Option<u64> {
     let s = s.trim();

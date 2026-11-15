@@ -63,8 +63,10 @@ targets:
           - "$(SRCROOT)/../target/x86_64-apple-darwin/release"
         "OTHER_LDFLAGS[arch=arm64]":
           - "$(SRCROOT)/../target/aarch64-apple-darwin/release/liblokii_core.a"
+          - "-lcompression"
         "OTHER_LDFLAGS[arch=x86_64]":
           - "$(SRCROOT)/../target/x86_64-apple-darwin/release/liblokii_core.a"
+          - "-lcompression"
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: true
@@ -73,3 +75,17 @@ targets:
       path: Lokii/Lokii.entitlements
       properties:
         com.apple.security.app-sandbox: false
+
+  LokiiContentHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: LokiiContentHelper
+    settings:
+      base:
+        PRODUCT_NAME: LokiiContentHelper
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        ARCHS: "$(ARCHS_STANDARD)"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+    scheme: {}

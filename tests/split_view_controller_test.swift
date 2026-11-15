@@ -21,12 +21,83 @@ for path in sourceFiles {
 }
 
 let mockFfiSource = """
+public enum FfiSearchMode: Equatable, Hashable {
+    case auto
+    case substring
+    case wildcard
+    case regex
+    case fuzzy
+}
+
+public enum FfiContentSourceKind: Equatable, Hashable {
+    case plainText
+    case officeXml
+    case pdf
+    case image
+}
+
 public struct FfiMatchRange: Equatable, Hashable {
     public var start: UInt32
     public var end: UInt32
     public init(start: UInt32 = 0, end: UInt32 = 0) {
         self.start = start
         self.end = end
+    }
+}
+
+public struct FfiContentLineMatch: Equatable, Hashable {
+    public var lineNumber: UInt32
+    public var column: UInt32
+    public var lineText: String
+    public var matchRanges: [FfiMatchRange]
+    public var isSymbolDef: Bool
+
+    public init(
+        lineNumber: UInt32 = 1,
+        column: UInt32 = 1,
+        lineText: String = "",
+        matchRanges: [FfiMatchRange] = [],
+        isSymbolDef: Bool = false
+    ) {
+        self.lineNumber = lineNumber
+        self.column = column
+        self.lineText = lineText
+        self.matchRanges = matchRanges
+        self.isSymbolDef = isSymbolDef
+    }
+}
+
+public struct FfiContentSearchHit: Equatable, Hashable {
+    public var name: String
+    public var path: String
+    public var `extension`: String
+    public var sourceKind: FfiContentSourceKind
+    public var score: Int32
+    public var lineMatches: [FfiContentLineMatch]
+    public var totalMatchesInFile: UInt32
+    public var size: UInt64
+    public var modified: UInt64
+
+    public init(
+        name: String,
+        path: String,
+        `extension`: String = "",
+        sourceKind: FfiContentSourceKind = .plainText,
+        score: Int32 = 0,
+        lineMatches: [FfiContentLineMatch] = [],
+        totalMatchesInFile: UInt32 = 0,
+        size: UInt64 = 0,
+        modified: UInt64 = 0
+    ) {
+        self.name = name
+        self.path = path
+        self.extension = `extension`
+        self.sourceKind = sourceKind
+        self.score = score
+        self.lineMatches = lineMatches
+        self.totalMatchesInFile = totalMatchesInFile
+        self.size = size
+        self.modified = modified
     }
 }
 
@@ -38,8 +109,10 @@ public struct FfiSearchResult: Equatable, Hashable {
     public var size: UInt64
     public var created: Int64
     public var modified: Int64
+    public var score: Double = 0
     public var matchPositions: [FfiMatchRange]
     public var parentMatchPositions: [FfiMatchRange]
+    public var searchMode: FfiSearchMode = .auto
 
     public init(
         name: String,
@@ -61,6 +134,32 @@ public struct FfiSearchResult: Equatable, Hashable {
         self.modified = modified
         self.matchPositions = matchPositions
         self.parentMatchPositions = parentMatchPositions
+    }
+
+    public init(
+        name: String,
+        path: String,
+        isDir: Bool,
+        size: UInt64,
+        modified: UInt64,
+        created: UInt64,
+        `extension`: String,
+        score: Double,
+        matchPositions: [FfiMatchRange] = [],
+        parentMatchPositions: [FfiMatchRange] = [],
+        searchMode: FfiSearchMode = .auto
+    ) {
+        self.name = name
+        self.path = path
+        self.extension = `extension`
+        self.isDir = isDir
+        self.size = size
+        self.created = Int64(created)
+        self.modified = Int64(modified)
+        self.score = score
+        self.matchPositions = matchPositions
+        self.parentMatchPositions = parentMatchPositions
+        self.searchMode = searchMode
     }
 }
 """

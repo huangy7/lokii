@@ -3,6 +3,7 @@ pub mod cjk;
 pub(crate) mod cjk_data;
 pub mod compact_index;
 pub mod config;
+pub mod content_index;
 pub mod filter;
 pub mod indexer;
 pub mod metrics;
