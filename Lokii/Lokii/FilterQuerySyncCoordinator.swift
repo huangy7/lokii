@@ -507,6 +507,26 @@ public final class FilterQuerySyncCoordinator {
             let localKeyRange = match.range(at: 1)
             let localValRange = match.range(at: 2)
 
+            // 当已输入属性值时校验其语义合法性：非法的 type: / size: 词元在后端会退化为普通检索词，不渲染有效胶囊以免误导
+            if localValRange.length > 0 {
+                let nsRaw = token.raw as NSString
+                let keyLower = nsRaw.substring(with: localKeyRange).lowercased()
+                let valPayload = nsRaw.substring(with: localValRange)
+                if keyLower == "type" {
+                    let parts = valPayload
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    guard !parts.isEmpty, parts.allSatisfy({ fileType(fromCategory: $0) != nil }) else {
+                        continue
+                    }
+                } else if keyLower == "size" {
+                    guard parseSizeToken(valPayload) != nil else {
+                        continue
+                    }
+                }
+            }
+
             let keyRange = NSRange(location: token.nsRange.location + localKeyRange.location, length: localKeyRange.length)
             let colonRange = NSRange(location: keyRange.location + keyRange.length, length: 1)
             let valRange = NSRange(location: token.nsRange.location + localValRange.location, length: localValRange.length)
@@ -558,7 +578,8 @@ public final class FilterQuerySyncCoordinator {
         let serialized = Self.serialize(keyword: keyword, state: state)
         let newQuery = (!serialized.isEmpty && !state.isUnconstrained) ? "\(serialized) " : serialized
 
-        let formatted = Self.formatQuerySyntax(newQuery, baseFont: searchField.font ?? .systemFont(ofSize: 14))
+        let baseFont = searchField.font ?? .systemFont(ofSize: 14)
+        let formatted = Self.formatQuerySyntax(newQuery, baseFont: baseFont)
         searchField.attributedStringValue = formatted
 
         // 若当前处于编辑状态，同步更新字段编辑器中的文字属性并将光标推进至文本末尾（便于直接继续键入检索词）
@@ -571,6 +592,11 @@ public final class FilterQuerySyncCoordinator {
             let selection = NSRange(location: textLength, length: 0)
             fieldEditor.selectedRange = selection
             fieldEditor.scrollRangeToVisible(selection)
+            // 重置输入态默认属性，防止后续中文/多字节输入法组字继承胶囊蓝色背景与字距
+            fieldEditor.typingAttributes = [
+                .font: baseFont,
+                .foregroundColor: NSColor.labelColor,
+            ]
         }
 
         performSearch(newQuery)

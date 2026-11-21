@@ -258,6 +258,7 @@ do {
     assertEqual(markedSearchField.mockEditor.selectedRange.location, ("拼音输入zhong type:code,doc " as NSString).length, "勾选后光标必须自动推进至文本末尾空格后")
     assertEqual(markedSearchField.mockEditor.selectedRange.length, 0, "光标不应处于选中状态")
     assertTrue(markedSearchField.mockEditor.layoutManager is PillLayoutManager, "字段编辑器应自动挂载 PillLayoutManager 以绘制圆角胶囊背景")
+    assertTrue(markedSearchField.mockEditor.typingAttributes[.backgroundColor] == nil, "更新语法胶囊后必须重置 typingAttributes，避免后续输入法组字继承胶囊背景")
 
     // 4.3 pendingState 为 nil 时再次 flush 应幂等返回 false
     let emptyFlushed = coordinator.flushPendingStateIfNeeded(searchField: markedSearchField) { _ in }
@@ -351,6 +352,16 @@ do {
     assertTrue(mixedAttr.attributes(at: outsideSizeVal.location, effectiveRange: nil)[.backgroundColor] != nil, "引号外部 >10m 仍应渲染胶囊高亮")
     let outsideExtVal = nsMixed.range(of: "rs", options: .backwards)
     assertTrue(mixedAttr.attributes(at: outsideExtVal.location, effectiveRange: nil)[.backgroundColor] != nil, "引号外部 ext:rs 仍应渲染胶囊高亮")
+
+    // 非法的 type: / size: 词元（在后端会退化为普通检索词）不应渲染为蓝色有效胶囊
+    let invalidTokensQuery = "type:pdf size:notanumber report"
+    let invalidAttr = FilterQuerySyncCoordinator.formatQuerySyntax(invalidTokensQuery)
+    let nsInvalid = invalidTokensQuery as NSString
+    for idx in 0..<nsInvalid.length {
+        let attrs = invalidAttr.attributes(at: idx, effectiveRange: nil)
+        assertTrue(attrs[.backgroundColor] == nil, "非法 type:pdf / size:notanumber 不得渲染胶囊背景")
+        assertEqual(attrs[.foregroundColor] as? NSColor, NSColor.labelColor, "非法过滤词元应保持普通前景色")
+    }
 }
 
 print("FilterQuerySyncCoordinator 全部测试通过！")

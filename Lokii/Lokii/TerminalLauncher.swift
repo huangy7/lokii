@@ -9,10 +9,45 @@ struct TerminalAppItem: Identifiable {
     let name: String
     /// 应用程序包物理路径 URL
     let appURL: URL
+    /// 预先缩放缓存好的 16pt 菜单图标，规避 SwiftUI 视图重绘时重复触发磁盘图标加载与离屏重绘
+    let menuIcon: NSImage
+
+    init(id: String, name: String, appURL: URL, menuIcon: NSImage? = nil) {
+        self.id = id
+        self.name = name
+        self.appURL = appURL
+        self.menuIcon = menuIcon ?? TerminalLauncher.cachedMenuIcon(for: appURL)
+    }
 }
 
 /// 终端应用调度与探活中介者
 final class TerminalLauncher {
+    /// 已渲染的 16pt 终端应用图标缓存（按应用包路径索引）
+    private static var menuIconCache: [String: NSImage] = [:]
+    private static let menuIconCacheLock = NSLock()
+
+    /// 获取或生成指定终端应用包的 16pt Retina 菜单图标并缓存
+    static func cachedMenuIcon(for appURL: URL) -> NSImage {
+        let key = appURL.path
+        menuIconCacheLock.lock()
+        if let cached = menuIconCache[key] {
+            menuIconCacheLock.unlock()
+            return cached
+        }
+        menuIconCacheLock.unlock()
+
+        let source = NSWorkspace.shared.icon(forFile: key)
+        let targetSize = NSSize(width: 16, height: 16)
+        let rendered = NSImage(size: targetSize, flipped: false) { rect in
+            source.draw(in: rect)
+            return true
+        }
+
+        menuIconCacheLock.lock()
+        menuIconCache[key] = rendered
+        menuIconCacheLock.unlock()
+        return rendered
+    }
     /// 系统自带终端固定标识符，作为全局默认配置与终极兜底
     static let systemTerminalBundleId = "com.apple.Terminal"
     /// 系统自带终端的固定安装路径，用于应用索引不可用时的物理兜底

@@ -939,6 +939,27 @@ struct PreferencesIndexPane: View {
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
+                } else if let errorMessage = viewModel.indexSaveErrorMessage {
+                    HStack(spacing: 4) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .font(.system(size: 11))
+                        Text(errorMessage)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.red)
+                    }
+                } else if viewModel.isRebuildingIndex {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(
+                            viewModel.rebuildScannedCount > 0
+                                ? String(format: L("search.indexingCount"), formatFileCount(viewModel.rebuildScannedCount))
+                                : L("search.indexing")
+                        )
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
 

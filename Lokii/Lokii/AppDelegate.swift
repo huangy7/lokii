@@ -66,7 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard engine.getConfig()?.window.hideOnBlur ?? true else { return }
-        mainWindow?.window?.orderOut(nil)
+        mainWindow?.hideWindow(animated: false)
     }
 
     // MARK: - Global Shortcut
@@ -216,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleWindow() {
         // 以窗口是否实际可见判定收起：点击状态栏图标不会激活应用，依赖 NSApp.isActive 会在失焦后误判为显示
         if let window = mainWindow?.window, window.isVisible, window.occlusionState.contains(.visible) {
-            window.orderOut(nil)
+            mainWindow?.hideWindow(animated: false)
         } else {
             mainWindow?.showWindow(nil)
             NSApp.activate(ignoringOtherApps: true)

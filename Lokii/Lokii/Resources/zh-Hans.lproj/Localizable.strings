@@ -71,6 +71,7 @@
 "prefs.networkRescan.unit" = "分钟";
 "prefs.networkRescan.off" = "关闭";
 "prefs.index.unsaved" = "有未保存的更改";
+"prefs.index.saveFailed" = "保存索引配置失败，请重试";
 "prefs.resetToDefaults" = "恢复默认";
 "prefs.save" = "保存";
 "prefs.unsavedChanges.title" = "索引更改尚未保存";
