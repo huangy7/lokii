@@ -154,7 +154,13 @@ pub(crate) fn rank_unique_names<'a, K: Ord + Copy>(
         let Some(name) = index.name_text(name_id) else {
             continue;
         };
-        if let Some(s) = score(name, query_index.folded(name_id)) {
+        // 折叠串只为非 ASCII 名字保存，ASCII 名字直接跳过这次哈希查找
+        let folded = if name.is_ascii() {
+            None
+        } else {
+            query_index.folded(name_id)
+        };
+        if let Some(s) = score(name, folded) {
             let entries = query_index.entries(name_id);
             if passthrough {
                 for &ordinal in entries.iter().take(max_results) {
