@@ -311,3 +311,31 @@
 "prefs.cli.error.permission" = "管理员权限授权失败";
 "prefs.cli.error.uninstallFailed" = "卸载命令行工具失败";
 "prefs.cli.error.notOurSymlink" = "目标软链接不属于本应用";
+
+/* Mounted Volumes & Offline Search */
+"search.result.offline" = "未连接";
+"search.offline.actionBlocked" = "磁盘或网络卷已断开，无法执行此文件操作";
+"search.offline.openFailedTitle" = "无法打开项目";
+"prefs.volume.status.online" = "在线（%@ 项）";
+"prefs.volume.status.syncing" = "同步中...";
+"prefs.volume.status.offline" = "已离线 · 索引已保留（%@ 项）";
+"prefs.volume.status.offlineNoCount" = "已离线 · 索引已保留";
+"prefs.volume.state.offlineUncached" = "离线 · 未缓存索引";
+"prefs.volume.status.remounted" = "当前挂载于 %@";
+"prefs.volume.kind.localExternal" = "外置磁盘";
+"prefs.volume.kind.network" = "网络卷";
+"prefs.volume.rescan" = "重新扫描";
+"prefs.volume.clearCache" = "清除缓存";
+"prefs.volume.clearCacheConfirm.title" = "清除离线卷索引缓存？";
+"prefs.volume.clearCacheConfirm.message" = "清除「%@」的缓存索引后，在重新连接并扫描该卷之前将无法离线检索其中的文件。";
+"prefs.volume.clearCacheConfirm.confirm" = "清除缓存";
+"prefs.volume.errorTitle" = "卷操作失败";
+"prefs.volume.actionFailed" = "无法完成卷操作";
+"prefs.index.pathChecking" = "检查中...";
+"prefs.index.group.volumes" = "外置磁盘与网络卷";
+"prefs.index.group.volumes.description" = "开启后按独立分片索引该卷，断开后保留离线缓存供检索。";
+"prefs.volume.empty" = "未检测到已挂载的外置磁盘或网络卷";
+"prefs.volume.status.notIndexed" = "未加入索引";
+"prefs.volume.status.pendingSave" = "待保存生效";
+"prefs.volume.includeOffline" = "包含离线卷结果";
+"prefs.volume.includeOffline.description" = "外置磁盘或网络卷断开后，仍在搜索结果中保留已缓存的文件。";

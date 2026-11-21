@@ -30,18 +30,35 @@ pub struct DisjunctionQuery {
 impl DisjunctionQuery {
     /// 基于已完成结构化词法分析的单个子句构建 `OrClause`（供 `parse` 与调用方预解析未知扩展回退共用）。
     pub fn build_clause(raw: String, parsed: ParsedQuery, global_case: Option<bool>) -> OrClause {
+        Self::build_clause_with_extension_check(raw, parsed, global_case, |_| true)
+    }
+
+    pub(crate) fn build_clause_with_extension_check(
+        raw: String,
+        parsed: ParsedQuery,
+        global_case: Option<bool>,
+        has_extension: impl Fn(&str) -> bool,
+    ) -> OrClause {
         let case_setting = match global_case {
             Some(true) => CaseSensitivity::Sensitive,
             Some(false) => CaseSensitivity::Insensitive,
             None => CaseSensitivity::Auto,
         };
 
-        let (is_extension, extension) =
-            if parsed.positive_tokens.len() == 1 && !parsed.positive_tokens[0].quoted {
-                parse_clause_extension(&parsed.positive_tokens[0].text)
-            } else {
+        let (is_extension, extension) = if parsed.positive_tokens.len() == 1
+            && !parsed.positive_tokens[0].quoted
+        {
+            let token = parsed.positive_tokens[0].text.trim();
+            let (is_extension, extension) = parse_clause_extension(token);
+            if token.starts_with('.') && extension.as_deref().is_some_and(|ext| !has_extension(ext))
+            {
                 (false, None)
-            };
+            } else {
+                (is_extension, extension)
+            }
+        } else {
+            (false, None)
+        };
 
         let search_mode = detect_mode_from_tokens(&parsed.positive_tokens);
         let is_case_sensitive =

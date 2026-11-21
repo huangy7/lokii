@@ -520,7 +520,7 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 /**
- * Callback interface for Rust → Swift event notifications.
+ * Callback interface for Rust -> Swift event notifications.
  */
 public protocol EventHandler: AnyObject, Sendable {
     
@@ -534,9 +534,11 @@ public protocol EventHandler: AnyObject, Sendable {
     
     func onConfigReloaded() 
     
+    func onVolumeStatusesChanged() 
+    
 }
 /**
- * Callback interface for Rust → Swift event notifications.
+ * Callback interface for Rust -> Swift event notifications.
  */
 open class EventHandlerImpl: EventHandler, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -621,6 +623,12 @@ open func onWatcherError(msg: String)  {try! rustCall() {
     
 open func onConfigReloaded()  {try! rustCall() {
     uniffi_lokii_core_fn_method_eventhandler_on_config_reloaded(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func onVolumeStatusesChanged()  {try! rustCall() {
+    uniffi_lokii_core_fn_method_eventhandler_on_volume_statuses_changed(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -758,6 +766,28 @@ fileprivate struct UniffiCallbackInterfaceEventHandler {
                 writeReturn: writeReturn
             )
         },
+        onVolumeStatusesChanged: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onVolumeStatusesChanged(
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             let result = try? FfiConverterTypeEventHandler.handleMap.remove(handle: uniffiHandle)
             if result == nil {
@@ -841,6 +871,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func checkFda()  -> Bool
     
     /**
+     * Remove a volume slot and delete its cached index shard and manifest record.
+     */
+    func clearVolumeCache(pathOrId: String) throws  -> Bool
+    
+    /**
      * Get the current configuration as a JSON string.
      */
     func getConfigJson()  -> String
@@ -851,48 +886,86 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func getMetrics()  -> String
     
     /**
-     * Get current index statistics.
+     * Get current index statistics across primary and volume shards.
      */
     func getStats()  -> FfiIndexStats
     
     /**
-     * Initialize the file index (hot start from cache or cold start via scan).
-     * Calls event_handler callbacks for progress and completion.
+     * Snapshot current statuses of all configured mounted volume slots.
+     */
+    func getVolumeStatuses()  -> [FfiVolumeStatus]
+    
+    /**
+     * Initialize the file index (hot start from cache or cold start via scan) and
+     * reconcile configured mounted volume slots.
      * This is blocking — call from a background thread on the Swift side.
      */
     func initialize(eventHandler: EventHandler)  -> FfiStartupMode
     
     /**
-     * Check if a background scan (verify) is currently running.
+     * Check if a primary background scan or any mounted volume sync is currently running.
      */
     func isScanning()  -> Bool
     
     /**
-     * Open a file with the default application (macOS `open` command).
+     * Notify the coordinator that `mount_path` finished unmounting.
      */
-    func openFile(path: String)  -> Bool
+    func notifyVolumeDidUnmount(mountPath: String) 
     
     /**
-     * Save the index with its replay checkpoint. Call before the app quits so
-     * the next launch only replays what changed after this point.
+     * Notify the coordinator that a filesystem was mounted at `mount_path`.
+     */
+    func notifyVolumeMounted(mountPath: String) 
+    
+    /**
+     * Notify the coordinator that `mount_path` is about to unmount so scans and
+     * directory handles are cancelled immediately while preserving offline caches.
+     */
+    func notifyVolumeWillUnmount(mountPath: String) 
+    
+    /**
+     * Open a file with the default application (macOS `open` command).
+     * Returns `FfiError::IoError` immediately if the path belongs to an offline or unmounted volume.
+     */
+    func openFile(path: String) throws  -> Bool
+    
+    /**
+     * Peek whether startup needs a cold scan (true when neither primary cache nor
+     * any configured volume cache exists on disk). Uses zero blocking stat calls on volumes.
+     */
+    func peekStartupIsColdStart()  -> Bool
+    
+    /**
+     * Save the primary index checkpoint and all dirty volume shard caches/manifest.
      */
     func persistIndex() 
     
     /**
-     * Rebuild the index from scratch. Blocking — call from background thread.
-     * Caller should check `is_scanning()` first; if true, skip the rebuild.
+     * Rebuild the primary index from scratch and schedule rescans for online mounted volumes.
+     * Blocking — call from a background thread.
      */
     func rebuildIndex(eventHandler: EventHandler)  -> Bool
     
     /**
-     * Reveal a file in Finder (select it in its parent directory).
+     * Trigger an atomic background rescan for a mounted volume slot.
      */
-    func revealInFinder(path: String)  -> Bool
+    func rescanVolume(pathOrId: String) throws  -> Bool
     
     /**
-     * Search the index.
+     * Reveal a file in Finder (select it in its parent directory).
+     * Returns `FfiError::IoError` immediately if the path belongs to an offline or unmounted volume.
+     */
+    func revealInFinder(path: String) throws  -> Bool
+    
+    /**
+     * Search across primary and mounted volume shards (including offline caches by default).
      */
     func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity)  -> FfiSearchResponse
+    
+    /**
+     * Search across primary and mounted volume shards with explicit control over offline caches.
+     */
+    func searchWithOptions(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity, includeOffline: Bool)  -> FfiSearchResponse
     
     /**
      * Start the config file watcher for hot-reload.
@@ -905,19 +978,14 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func startQueryServer() 
     
     /**
-     * Start the file system watcher. Calls event_handler.on_index_updated
-     * whenever the index changes. Non-blocking (spawns a thread internally).
+     * Start the primary file system watcher and the mounted volume monitor.
+     * Non-blocking (spawns background threads internally).
      */
     func startWatcher(eventHandler: EventHandler) 
     
     /**
-     * Update configuration from a JSON string. Returns true on success.
-     * Writes to TOML file first, then syncs in-memory ConfigStore.
-     *
-     * The payload is treated as a patch over the currently effective config.
-     * The frontend models only a subset of the schema, so keys it omits must
-     * keep their existing values rather than fall back to defaults — otherwise
-     * every preference toggle would silently discard hand-edited settings.
+     * Update configuration from a JSON patch string. Returns true on success.
+     * Writes to TOML file first, then syncs ConfigStore, primary store exclusions, and VolumeCoordinator.
      */
     func updateConfigFromJson(json: String)  -> Bool
     
@@ -998,6 +1066,17 @@ open func checkFda() -> Bool  {
 }
     
     /**
+     * Remove a volume slot and delete its cached index shard and manifest record.
+     */
+open func clearVolumeCache(pathOrId: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_lokii_core_fn_method_lokiicore_clear_volume_cache(self.uniffiClonePointer(),
+        FfiConverterString.lower(pathOrId),$0
+    )
+})
+}
+    
+    /**
      * Get the current configuration as a JSON string.
      */
 open func getConfigJson() -> String  {
@@ -1018,7 +1097,7 @@ open func getMetrics() -> String  {
 }
     
     /**
-     * Get current index statistics.
+     * Get current index statistics across primary and volume shards.
      */
 open func getStats() -> FfiIndexStats  {
     return try!  FfiConverterTypeFfiIndexStats_lift(try! rustCall() {
@@ -1028,8 +1107,18 @@ open func getStats() -> FfiIndexStats  {
 }
     
     /**
-     * Initialize the file index (hot start from cache or cold start via scan).
-     * Calls event_handler callbacks for progress and completion.
+     * Snapshot current statuses of all configured mounted volume slots.
+     */
+open func getVolumeStatuses() -> [FfiVolumeStatus]  {
+    return try!  FfiConverterSequenceTypeFfiVolumeStatus.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_get_volume_statuses(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Initialize the file index (hot start from cache or cold start via scan) and
+     * reconcile configured mounted volume slots.
      * This is blocking — call from a background thread on the Swift side.
      */
 open func initialize(eventHandler: EventHandler) -> FfiStartupMode  {
@@ -1041,7 +1130,7 @@ open func initialize(eventHandler: EventHandler) -> FfiStartupMode  {
 }
     
     /**
-     * Check if a background scan (verify) is currently running.
+     * Check if a primary background scan or any mounted volume sync is currently running.
      */
 open func isScanning() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1051,10 +1140,42 @@ open func isScanning() -> Bool  {
 }
     
     /**
-     * Open a file with the default application (macOS `open` command).
+     * Notify the coordinator that `mount_path` finished unmounting.
      */
-open func openFile(path: String) -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
+open func notifyVolumeDidUnmount(mountPath: String)  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_notify_volume_did_unmount(self.uniffiClonePointer(),
+        FfiConverterString.lower(mountPath),$0
+    )
+}
+}
+    
+    /**
+     * Notify the coordinator that a filesystem was mounted at `mount_path`.
+     */
+open func notifyVolumeMounted(mountPath: String)  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_notify_volume_mounted(self.uniffiClonePointer(),
+        FfiConverterString.lower(mountPath),$0
+    )
+}
+}
+    
+    /**
+     * Notify the coordinator that `mount_path` is about to unmount so scans and
+     * directory handles are cancelled immediately while preserving offline caches.
+     */
+open func notifyVolumeWillUnmount(mountPath: String)  {try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_notify_volume_will_unmount(self.uniffiClonePointer(),
+        FfiConverterString.lower(mountPath),$0
+    )
+}
+}
+    
+    /**
+     * Open a file with the default application (macOS `open` command).
+     * Returns `FfiError::IoError` immediately if the path belongs to an offline or unmounted volume.
+     */
+open func openFile(path: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_lokii_core_fn_method_lokiicore_open_file(self.uniffiClonePointer(),
         FfiConverterString.lower(path),$0
     )
@@ -1062,8 +1183,18 @@ open func openFile(path: String) -> Bool  {
 }
     
     /**
-     * Save the index with its replay checkpoint. Call before the app quits so
-     * the next launch only replays what changed after this point.
+     * Peek whether startup needs a cold scan (true when neither primary cache nor
+     * any configured volume cache exists on disk). Uses zero blocking stat calls on volumes.
+     */
+open func peekStartupIsColdStart() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_peek_startup_is_cold_start(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Save the primary index checkpoint and all dirty volume shard caches/manifest.
      */
 open func persistIndex()  {try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_persist_index(self.uniffiClonePointer(),$0
@@ -1072,8 +1203,8 @@ open func persistIndex()  {try! rustCall() {
 }
     
     /**
-     * Rebuild the index from scratch. Blocking — call from background thread.
-     * Caller should check `is_scanning()` first; if true, skip the rebuild.
+     * Rebuild the primary index from scratch and schedule rescans for online mounted volumes.
+     * Blocking — call from a background thread.
      */
 open func rebuildIndex(eventHandler: EventHandler) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1084,10 +1215,22 @@ open func rebuildIndex(eventHandler: EventHandler) -> Bool  {
 }
     
     /**
-     * Reveal a file in Finder (select it in its parent directory).
+     * Trigger an atomic background rescan for a mounted volume slot.
      */
-open func revealInFinder(path: String) -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
+open func rescanVolume(pathOrId: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_lokii_core_fn_method_lokiicore_rescan_volume(self.uniffiClonePointer(),
+        FfiConverterString.lower(pathOrId),$0
+    )
+})
+}
+    
+    /**
+     * Reveal a file in Finder (select it in its parent directory).
+     * Returns `FfiError::IoError` immediately if the path belongs to an offline or unmounted volume.
+     */
+open func revealInFinder(path: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_lokii_core_fn_method_lokiicore_reveal_in_finder(self.uniffiClonePointer(),
         FfiConverterString.lower(path),$0
     )
@@ -1095,7 +1238,7 @@ open func revealInFinder(path: String) -> Bool  {
 }
     
     /**
-     * Search the index.
+     * Search across primary and mounted volume shards (including offline caches by default).
      */
 open func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity) -> FfiSearchResponse  {
     return try!  FfiConverterTypeFfiSearchResponse_lift(try! rustCall() {
@@ -1103,6 +1246,20 @@ open func search(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSen
         FfiConverterString.lower(query),
         FfiConverterTypeFfiSearchMode_lower(mode),
         FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),$0
+    )
+})
+}
+    
+    /**
+     * Search across primary and mounted volume shards with explicit control over offline caches.
+     */
+open func searchWithOptions(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity, includeOffline: Bool) -> FfiSearchResponse  {
+    return try!  FfiConverterTypeFfiSearchResponse_lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_search_with_options(self.uniffiClonePointer(),
+        FfiConverterString.lower(query),
+        FfiConverterTypeFfiSearchMode_lower(mode),
+        FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),
+        FfiConverterBool.lower(includeOffline),$0
     )
 })
 }
@@ -1127,8 +1284,8 @@ open func startQueryServer()  {try! rustCall() {
 }
     
     /**
-     * Start the file system watcher. Calls event_handler.on_index_updated
-     * whenever the index changes. Non-blocking (spawns a thread internally).
+     * Start the primary file system watcher and the mounted volume monitor.
+     * Non-blocking (spawns background threads internally).
      */
 open func startWatcher(eventHandler: EventHandler)  {try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_start_watcher(self.uniffiClonePointer(),
@@ -1138,13 +1295,8 @@ open func startWatcher(eventHandler: EventHandler)  {try! rustCall() {
 }
     
     /**
-     * Update configuration from a JSON string. Returns true on success.
-     * Writes to TOML file first, then syncs in-memory ConfigStore.
-     *
-     * The payload is treated as a patch over the currently effective config.
-     * The frontend models only a subset of the schema, so keys it omits must
-     * keep their existing values rather than fall back to defaults — otherwise
-     * every preference toggle would silently discard hand-edited settings.
+     * Update configuration from a JSON patch string. Returns true on success.
+     * Writes to TOML file first, then syncs ConfigStore, primary store exclusions, and VolumeCoordinator.
      */
 open func updateConfigFromJson(json: String) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1474,10 +1626,12 @@ public struct FfiSearchResult {
     public var matchPositions: [FfiMatchRange]
     public var parentMatchPositions: [FfiMatchRange]
     public var searchMode: FfiSearchMode
+    public var isOffline: Bool
+    public var volumeName: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, path: String, isDir: Bool, size: UInt64, modified: UInt64, created: UInt64, `extension`: String, score: Double, matchPositions: [FfiMatchRange], parentMatchPositions: [FfiMatchRange], searchMode: FfiSearchMode) {
+    public init(name: String, path: String, isDir: Bool, size: UInt64, modified: UInt64, created: UInt64, `extension`: String, score: Double, matchPositions: [FfiMatchRange], parentMatchPositions: [FfiMatchRange], searchMode: FfiSearchMode, isOffline: Bool, volumeName: String?) {
         self.name = name
         self.path = path
         self.isDir = isDir
@@ -1489,6 +1643,8 @@ public struct FfiSearchResult {
         self.matchPositions = matchPositions
         self.parentMatchPositions = parentMatchPositions
         self.searchMode = searchMode
+        self.isOffline = isOffline
+        self.volumeName = volumeName
     }
 }
 
@@ -1532,6 +1688,12 @@ extension FfiSearchResult: Equatable, Hashable {
         if lhs.searchMode != rhs.searchMode {
             return false
         }
+        if lhs.isOffline != rhs.isOffline {
+            return false
+        }
+        if lhs.volumeName != rhs.volumeName {
+            return false
+        }
         return true
     }
 
@@ -1547,6 +1709,8 @@ extension FfiSearchResult: Equatable, Hashable {
         hasher.combine(matchPositions)
         hasher.combine(parentMatchPositions)
         hasher.combine(searchMode)
+        hasher.combine(isOffline)
+        hasher.combine(volumeName)
     }
 }
 
@@ -1569,7 +1733,9 @@ public struct FfiConverterTypeFfiSearchResult: FfiConverterRustBuffer {
                 score: FfiConverterDouble.read(from: &buf), 
                 matchPositions: FfiConverterSequenceTypeFfiMatchRange.read(from: &buf), 
                 parentMatchPositions: FfiConverterSequenceTypeFfiMatchRange.read(from: &buf), 
-                searchMode: FfiConverterTypeFfiSearchMode.read(from: &buf)
+                searchMode: FfiConverterTypeFfiSearchMode.read(from: &buf), 
+                isOffline: FfiConverterBool.read(from: &buf), 
+                volumeName: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1585,6 +1751,8 @@ public struct FfiConverterTypeFfiSearchResult: FfiConverterRustBuffer {
         FfiConverterSequenceTypeFfiMatchRange.write(value.matchPositions, into: &buf)
         FfiConverterSequenceTypeFfiMatchRange.write(value.parentMatchPositions, into: &buf)
         FfiConverterTypeFfiSearchMode.write(value.searchMode, into: &buf)
+        FfiConverterBool.write(value.isOffline, into: &buf)
+        FfiConverterOptionString.write(value.volumeName, into: &buf)
     }
 }
 
@@ -1601,6 +1769,135 @@ public func FfiConverterTypeFfiSearchResult_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiSearchResult_lower(_ value: FfiSearchResult) -> RustBuffer {
     return FfiConverterTypeFfiSearchResult.lower(value)
+}
+
+
+/**
+ * Status snapshot for a configured mounted volume slot.
+ */
+public struct FfiVolumeStatus {
+    public var volumeId: String
+    public var configuredPath: String
+    public var activePath: String?
+    public var displayName: String
+    public var kind: String
+    public var state: FfiVolumeState
+    public var entryCount: UInt64
+    public var lastSyncAt: UInt64?
+    public var isRemounted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(volumeId: String, configuredPath: String, activePath: String?, displayName: String, kind: String, state: FfiVolumeState, entryCount: UInt64, lastSyncAt: UInt64?, isRemounted: Bool) {
+        self.volumeId = volumeId
+        self.configuredPath = configuredPath
+        self.activePath = activePath
+        self.displayName = displayName
+        self.kind = kind
+        self.state = state
+        self.entryCount = entryCount
+        self.lastSyncAt = lastSyncAt
+        self.isRemounted = isRemounted
+    }
+}
+
+#if compiler(>=6)
+extension FfiVolumeStatus: Sendable {}
+#endif
+
+
+extension FfiVolumeStatus: Equatable, Hashable {
+    public static func ==(lhs: FfiVolumeStatus, rhs: FfiVolumeStatus) -> Bool {
+        if lhs.volumeId != rhs.volumeId {
+            return false
+        }
+        if lhs.configuredPath != rhs.configuredPath {
+            return false
+        }
+        if lhs.activePath != rhs.activePath {
+            return false
+        }
+        if lhs.displayName != rhs.displayName {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.entryCount != rhs.entryCount {
+            return false
+        }
+        if lhs.lastSyncAt != rhs.lastSyncAt {
+            return false
+        }
+        if lhs.isRemounted != rhs.isRemounted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(volumeId)
+        hasher.combine(configuredPath)
+        hasher.combine(activePath)
+        hasher.combine(displayName)
+        hasher.combine(kind)
+        hasher.combine(state)
+        hasher.combine(entryCount)
+        hasher.combine(lastSyncAt)
+        hasher.combine(isRemounted)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVolumeStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVolumeStatus {
+        return
+            try FfiVolumeStatus(
+                volumeId: FfiConverterString.read(from: &buf), 
+                configuredPath: FfiConverterString.read(from: &buf), 
+                activePath: FfiConverterOptionString.read(from: &buf), 
+                displayName: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                state: FfiConverterTypeFfiVolumeState.read(from: &buf), 
+                entryCount: FfiConverterUInt64.read(from: &buf), 
+                lastSyncAt: FfiConverterOptionUInt64.read(from: &buf), 
+                isRemounted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiVolumeStatus, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.volumeId, into: &buf)
+        FfiConverterString.write(value.configuredPath, into: &buf)
+        FfiConverterOptionString.write(value.activePath, into: &buf)
+        FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterTypeFfiVolumeState.write(value.state, into: &buf)
+        FfiConverterUInt64.write(value.entryCount, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastSyncAt, into: &buf)
+        FfiConverterBool.write(value.isRemounted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVolumeStatus_lift(_ buf: RustBuffer) throws -> FfiVolumeStatus {
+    return try FfiConverterTypeFfiVolumeStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVolumeStatus_lower(_ value: FfiVolumeStatus) -> RustBuffer {
+    return FfiConverterTypeFfiVolumeStatus.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -1676,6 +1973,85 @@ public func FfiConverterTypeFfiCaseSensitivity_lower(_ value: FfiCaseSensitivity
 extension FfiCaseSensitivity: Equatable, Hashable {}
 
 
+
+
+
+
+
+/**
+ * Errors surfaced across the UniFFI boundary.
+ */
+public enum FfiError: Swift.Error {
+
+    
+    
+    case IoError(message: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
+    typealias SwiftType = FfiError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .IoError(
+            message: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .IoError(message):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiError_lift(_ buf: RustBuffer) throws -> FfiError {
+    return try FfiConverterTypeFfiError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiError_lower(_ value: FfiError) -> RustBuffer {
+    return FfiConverterTypeFfiError.lower(value)
+}
+
+
+extension FfiError: Equatable, Hashable {}
+
+
+
+
+extension FfiError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
 
 
 
@@ -1962,6 +2338,114 @@ extension FfiStartupMode: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiVolumeState {
+    
+    case online
+    case syncing
+    case offline
+    case missing
+}
+
+
+#if compiler(>=6)
+extension FfiVolumeState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVolumeState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVolumeState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVolumeState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .online
+        
+        case 2: return .syncing
+        
+        case 3: return .offline
+        
+        case 4: return .missing
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiVolumeState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .online:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .syncing:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .offline:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .missing:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVolumeState_lift(_ buf: RustBuffer) throws -> FfiVolumeState {
+    return try FfiConverterTypeFfiVolumeState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVolumeState_lower(_ value: FfiVolumeState) -> RustBuffer {
+    return FfiConverterTypeFfiVolumeState.lower(value)
+}
+
+
+extension FfiVolumeState: Equatable, Hashable {}
+
+
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2036,6 +2520,31 @@ fileprivate struct FfiConverterSequenceTypeFfiSearchResult: FfiConverterRustBuff
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiVolumeStatus: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiVolumeStatus]
+
+    public static func write(_ value: [FfiVolumeStatus], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiVolumeStatus.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiVolumeStatus] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiVolumeStatus]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiVolumeStatus.read(from: &buf))
+        }
+        return seq
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -2066,7 +2575,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_eventhandler_on_config_reloaded() != 39587) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lokii_core_checksum_method_eventhandler_on_volume_statuses_changed() != 1749) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lokii_core_checksum_method_lokiicore_check_fda() != 35374) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_clear_volume_cache() != 60623) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_get_config_json() != 54941) {
@@ -2075,28 +2590,49 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_get_metrics() != 746) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_get_stats() != 19023) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_get_stats() != 2156) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_initialize() != 40909) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_get_volume_statuses() != 62495) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_is_scanning() != 11801) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_initialize() != 63244) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_open_file() != 16752) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_is_scanning() != 16523) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_persist_index() != 24654) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_notify_volume_did_unmount() != 43716) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_rebuild_index() != 27709) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_notify_volume_mounted() != 15339) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_reveal_in_finder() != 23865) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_notify_volume_will_unmount() != 53271) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_search() != 32566) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_open_file() != 57515) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_peek_startup_is_cold_start() != 51643) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_persist_index() != 18870) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_rebuild_index() != 7923) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_rescan_volume() != 38967) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_reveal_in_finder() != 33522) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_search() != 29187) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_search_with_options() != 35406) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher() != 32031) {
@@ -2105,10 +2641,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_start_query_server() != 3760) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_start_watcher() != 17814) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_start_watcher() != 39967) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 16092) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 11500) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_constructor_lokiicore_new() != 44128) {

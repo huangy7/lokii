@@ -63,7 +63,9 @@ pub fn search_index(
             if !filter.matches_record_in(read, record, Some(name)) {
                 continue;
             }
-            top.offer(ordinal, record.modified, name);
+            if let Some(view) = read.view(crate::compact_index::EntryId(ordinal)) {
+                top.offer_path(ordinal, record.modified, view);
+            }
         }
         return top
             .finish()

@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, ConfigStore};
+use crate::config::{AppConfig, ConfigStore, IndexConfig};
 use crate::filter::{CompiledFilter, ScopeDecision};
 use crate::indexer::{FileEntry, IndexStore};
 use crate::metrics::WatcherMetrics;
@@ -74,7 +74,7 @@ pub fn process_event_batch(
     })
 }
 
-fn apply_batch(
+pub(crate) fn apply_batch(
     mut batch: EventBatch,
     renames: Vec<(String, String)>,
     store: &IndexStore,
@@ -165,7 +165,7 @@ fn apply_batch(
 }
 
 /// 无新事件多久后落一批。
-const DEFAULT_DEBOUNCE_MS: u64 = 500;
+pub(crate) const DEFAULT_DEBOUNCE_MS: u64 = 500;
 
 // ── Safe Watch Paths ───────────────────────────────────────────────────────
 
@@ -175,11 +175,17 @@ fn collect_safe_watch_paths(
     protected: &[PathBuf],
     out: &mut Vec<PathBuf>,
 ) {
-    if !path.exists() {
+    // Evaluate pure in-memory exclusion and TCC checks before statting the path
+    // so excluded mount subtrees or ungranted directories are never touched on disk.
+    if filter.is_excluded(path) {
         return;
     }
 
     if scanner::is_protected_or_descendant(path, protected) {
+        return;
+    }
+
+    if !path.exists() {
         return;
     }
 
@@ -218,9 +224,10 @@ fn safe_watch_paths(
     out
 }
 
-/// FDA 状态、需丢弃事件的受保护路径，以及可安全挂监听的根目录。
-fn watch_scope(config: &AppConfig, filter: &CompiledFilter) -> (bool, Vec<PathBuf>, Vec<PathBuf>) {
-    let paths = config.resolve_paths();
+fn watch_scope_for_paths(
+    paths: Vec<PathBuf>,
+    filter: &CompiledFilter,
+) -> (bool, Vec<PathBuf>, Vec<PathBuf>) {
     let has_fda = has_full_disk_access();
     let protected = if has_fda {
         vec![]
@@ -233,6 +240,11 @@ fn watch_scope(config: &AppConfig, filter: &CompiledFilter) -> (bool, Vec<PathBu
         safe_watch_paths(&paths, filter, &protected)
     };
     (has_fda, protected, watch_paths)
+}
+
+/// FDA 状态、需丢弃事件的受保护路径，以及可安全挂监听的根目录。
+fn watch_scope(config: &AppConfig, filter: &CompiledFilter) -> (bool, Vec<PathBuf>, Vec<PathBuf>) {
+    watch_scope_for_paths(config.resolve_paths(), filter)
 }
 
 // ── Resolving Changes ──────────────────────────────────────────────────────
@@ -303,7 +315,7 @@ fn pair_dir_renames(changes: &HashMap<PathBuf, Change>) -> Vec<(PathBuf, PathBuf
 ///
 /// 原地改写只搬得动索引里已有的子项：旧目录在索引中没有子项（如未被索引的隐藏临时目录），
 /// 或本批里旧目录下还有别的变更（改名前刚写入、已无法按旧路径 stat）时，改为回扫新目录。
-fn resolve_changes(
+pub(crate) fn resolve_changes(
     mut changes: HashMap<PathBuf, Change>,
     store: &IndexStore,
 ) -> (EventBatch, Vec<(String, String)>) {
@@ -337,15 +349,15 @@ fn resolve_changes(
 // ── Index Service ──────────────────────────────────────────────────────────
 
 /// 连续事件最长合并窗口，与一批最多容纳的路径数。
-const MAX_DEBOUNCE: Duration = Duration::from_millis(2000);
-const MAX_BATCH_SIZE: usize = 10_000;
+pub(crate) const MAX_DEBOUNCE: Duration = Duration::from_millis(2000);
+pub(crate) const MAX_BATCH_SIZE: usize = 10_000;
 /// 仅用户态丢事件时，静默这么久后从已应用位置重开流重放；连续这么多次仍丢则改为全量对账。
 const GAP_QUIET: Duration = Duration::from_secs(2);
 const GAP_REPLAYS: u32 = 3;
 /// 兜底：变更再少也最多隔这么久落一次盘，避免检查点比 FSEvents 历史还旧。
-const PERSIST_EVERY: Duration = Duration::from_secs(12 * 3600);
+pub(crate) const PERSIST_EVERY: Duration = Duration::from_secs(12 * 3600);
 /// 未落盘的索引事件达到这么多条就先落一次盘：与启动回放要处理的事件数一一对应；取 REPLAY_PATH_LIMIT 的 1/4 留余量。
-const PERSIST_EVENTS: usize = 50_000;
+pub(crate) const PERSIST_EVENTS: usize = 50_000;
 /// 全量对账拿不到扫描锁（重建进行中）时的重试间隔，与扫描出错后的退避。
 const RECONCILE_RETRY: Duration = Duration::from_secs(2);
 const RECONCILE_BACKOFF: Duration = Duration::from_secs(60);
@@ -432,6 +444,7 @@ struct Scope {
     watch_paths: Vec<PathBuf>,
     /// 全量对账扫描的根。
     scan_paths: Vec<PathBuf>,
+    excluded_mount_roots: Vec<PathBuf>,
     include_hidden: bool,
     /// 非本地卷上的根多久整棵重扫一次（`None` 表示不重扫）。
     network_rescan: Option<Duration>,
@@ -450,8 +463,34 @@ impl Scope {
             protected,
             watch_paths,
             scan_paths: config.resolve_paths(),
+            excluded_mount_roots: Vec::new(),
             include_hidden: config.index.include_hidden,
             network_rescan: network_rescan(config),
+        }
+    }
+
+    fn new_primary(config: &AppConfig, volumes_dir: &Path) -> Self {
+        let (primary_paths, excluded_mount_roots) = primary_scope_inputs(config, volumes_dir);
+        let filter =
+            CompiledFilter::from_primary_config(config, &primary_paths, &excluded_mount_roots);
+        let (has_fda, protected, watch_paths) =
+            watch_scope_for_paths(primary_paths.clone(), &filter);
+        Self {
+            fingerprint: crate::startup::primary_scope_fingerprint(
+                config,
+                &primary_paths,
+                &excluded_mount_roots,
+            ),
+            exclude: config.index.exclude.clone(),
+            exclude_paths: config.resolve_exclude_paths(),
+            filter,
+            has_fda,
+            protected,
+            watch_paths,
+            scan_paths: primary_paths,
+            excluded_mount_roots,
+            include_hidden: config.index.include_hidden,
+            network_rescan: None,
         }
     }
 
@@ -467,21 +506,57 @@ impl Scope {
     /// 新范围是否只是在旧范围上追加了排除路径（或失去 FDA）：索引就地剔除即可，无需重扫。
     fn narrows(&self, previous: &Scope) -> bool {
         self.scan_paths == previous.scan_paths
-            && self.include_hidden == previous.include_hidden
+            && self.filter.same_scan_options(&previous.filter)
             && self.exclude == previous.exclude
             && previous.exclude_paths.iter().all(|path| self.exclude_paths.contains(path))
+            && previous
+                .excluded_mount_roots
+                .iter()
+                .all(|path| self.excluded_mount_roots.contains(path))
             && (self.has_fda == previous.has_fda || !self.has_fda)
     }
 
     /// 只多了 FDA：补扫原受保护目录即可。
     fn only_gains_fda(&self, previous: &Scope) -> bool {
         self.scan_paths == previous.scan_paths
-            && self.include_hidden == previous.include_hidden
+            && self.filter.same_scan_options(&previous.filter)
             && self.exclude == previous.exclude
             && self.exclude_paths == previous.exclude_paths
+            && self.excluded_mount_roots == previous.excluded_mount_roots
             && self.has_fda
             && !previous.has_fda
     }
+}
+
+pub(crate) fn primary_scope_inputs(
+    config: &AppConfig,
+    volumes_dir: &Path,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let manifest = crate::volumes::VolumeManifest::load_from_dir(volumes_dir);
+    let mounts = crate::volumes::list_mounted_volumes();
+    let partition = crate::volumes::partition_index_paths(config, &manifest, &mounts);
+    // Excluded mount roots track stable configured mount targets; active mount points are added
+    // only when nested under a primary root so unmounts or -1 mount drift do not churn the primary
+    // domain fingerprint.
+    let mut excluded_mount_roots: Vec<PathBuf> = Vec::new();
+    for target in &partition.mounted_targets {
+        if !excluded_mount_roots.contains(&target.configured_path) {
+            excluded_mount_roots.push(target.configured_path.clone());
+        }
+        if let Some(ref resolved) = target.mounted {
+            if partition
+                .primary_paths
+                .iter()
+                .any(|root| crate::path_utils::path_starts_with_ci(&resolved.mount_root, root))
+                && !excluded_mount_roots.contains(&resolved.mount_root)
+            {
+                excluded_mount_roots.push(resolved.mount_root.clone());
+            }
+        }
+    }
+    excluded_mount_roots.sort();
+    excluded_mount_roots.dedup();
+    (partition.primary_paths, excluded_mount_roots)
 }
 
 fn network_rescan(config: &AppConfig) -> Option<Duration> {
@@ -545,6 +620,10 @@ struct Service<F, P> {
     persist: P,
     scope: Scope,
     scope_checked: Instant,
+    /// 上次低频复核本地根目录存在性与嵌套挂载点排除集合的时刻
+    scope_refreshed: Instant,
+    /// 上次探测完全磁盘访问权限的时刻，避免每 500ms 高频打开系统 TCC.db
+    fda_checked: Instant,
     stream: Option<crate::fsevents::Stream>,
     events: mpsc::Receiver<Vec<crate::fsevents::Event>>,
     control: mpsc::Receiver<Control>,
@@ -579,6 +658,9 @@ struct Service<F, P> {
     unpersisted_events: usize,
     network_scanned: Option<Instant>,
     network_scanning: Arc<std::sync::atomic::AtomicBool>,
+    primary_volumes_dir: Option<PathBuf>,
+    last_index_config: IndexConfig,
+    on_config_updated: Option<Arc<dyn Fn(&AppConfig) + Send + Sync>>,
 }
 
 impl<F, P> Service<F, P>
@@ -881,6 +963,9 @@ where
 
     /// 非本地卷上的根按配置间隔整棵重扫；启动后先扫一次，补上关闭期间的远端改动。
     fn poll_network(&mut self) {
+        if self.primary_volumes_dir.is_some() {
+            return;
+        }
         let Some(every) = self.scope.network_rescan else {
             return;
         };
@@ -910,32 +995,93 @@ where
             return;
         }
         self.scope_checked = Instant::now();
-        let config = self.config_store.read().clone();
-        if crate::startup::scope_fingerprint(&config) != self.scope.fingerprint {
-            let previous = std::mem::replace(&mut self.scope, Scope::new(&config));
-            let index_matched_previous =
-                self.fingerprint.load(Ordering::Acquire) == previous.fingerprint;
-            self.restart(self.applied.load(Ordering::Acquire));
-            // 索引原本就落后于旧范围时，交给全量对账（reconcile_pending 会发现指纹不符）。
-            if index_matched_previous && self.scope.narrows(&previous) {
-                let added: Vec<String> = self
-                    .scope
-                    .exclude_paths
-                    .iter()
-                    .filter(|path| !previous.exclude_paths.contains(path))
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect();
-                self.store.exclude_paths(&added);
-                self.fingerprint.store(self.scope.fingerprint, Ordering::Release);
-                self.dirty = true;
-            } else if index_matched_previous && self.scope.only_gains_fda(&previous) {
-                self.rescans
-                    .extend(newly_readable(&previous.protected, &self.scope));
-                self.pending_fingerprint = Some(self.scope.fingerprint);
-                self.first_pending.get_or_insert_with(Instant::now);
+
+        let changed_config = {
+            let guard = self.config_store.read();
+            if guard.index != self.last_index_config {
+                Some(guard.clone())
+            } else {
+                None
             }
+        };
+        let index_changed = changed_config.is_some();
+        if let Some(ref config) = changed_config {
+            self.last_index_config = config.index.clone();
+            if let Some(ref callback) = self.on_config_updated {
+                callback(config);
+            }
+        }
+
+        // 已获 FDA 时放宽至 30s 探测一次，未获权时保持 2s 轮询以兼顾授权即时生效与低系统调用开销
+        let fda_poll_interval = if self.scope.has_fda {
+            Duration::from_secs(30)
         } else {
-            self.scope.network_rescan = network_rescan(&config);
+            Duration::from_secs(2)
+        };
+        let fda_changed = if self.fda_checked.elapsed() >= fda_poll_interval {
+            self.fda_checked = Instant::now();
+            has_full_disk_access() != self.scope.has_fda
+        } else {
+            false
+        };
+
+        // 每 15 秒低频复核一次本地目录存在性与嵌套挂载排除集合，兼顾新建索引根/后挂载嵌套卷的自动感知与低空转开销
+        let periodic_scope_refresh = self.scope_refreshed.elapsed() >= Duration::from_secs(15);
+        if periodic_scope_refresh {
+            self.scope_refreshed = Instant::now();
+        }
+
+        let scope_changed = if self.primary_volumes_dir.is_some() {
+            index_changed || fda_changed || periodic_scope_refresh
+        } else if index_changed || fda_changed || periodic_scope_refresh {
+            let config = changed_config
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| self.config_store.read().clone());
+            crate::startup::scope_fingerprint(&config) != self.scope.fingerprint
+        } else {
+            false
+        };
+        if scope_changed {
+            let config = changed_config.unwrap_or_else(|| self.config_store.read().clone());
+            let next_scope = match &self.primary_volumes_dir {
+                Some(volumes_dir) => Scope::new_primary(&config, volumes_dir),
+                None => Scope::new(&config),
+            };
+            if next_scope.fingerprint != self.scope.fingerprint {
+                let previous = std::mem::replace(&mut self.scope, next_scope);
+                let index_matched_previous =
+                    self.fingerprint.load(Ordering::Acquire) == previous.fingerprint;
+                self.restart(self.applied.load(Ordering::Acquire));
+                // 索引原本就落后于旧范围时，交给全量对账（reconcile_pending 会发现指纹不符）。
+                if index_matched_previous && self.scope.narrows(&previous) {
+                    let added: Vec<String> = self
+                        .scope
+                        .exclude_paths
+                        .iter()
+                        .filter(|path| !previous.exclude_paths.contains(path))
+                        .chain(
+                            self.scope
+                                .excluded_mount_roots
+                                .iter()
+                                .filter(|path| !previous.excluded_mount_roots.contains(path)),
+                        )
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect();
+                    self.store.exclude_paths(&added);
+                    self.fingerprint.store(self.scope.fingerprint, Ordering::Release);
+                    self.dirty = true;
+                } else if index_matched_previous && self.scope.only_gains_fda(&previous) {
+                    self.rescans
+                        .extend(newly_readable(&previous.protected, &self.scope));
+                    self.pending_fingerprint = Some(self.scope.fingerprint);
+                    self.first_pending.get_or_insert_with(Instant::now);
+                }
+            }
+        } else if self.primary_volumes_dir.is_none() {
+            if let Some(ref config) = changed_config {
+                self.scope.network_rescan = network_rescan(config);
+            }
         }
     }
 
@@ -974,13 +1120,80 @@ where
     F: Fn(usize) + Send + 'static,
     P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
 {
+    start_watcher_with_options(
+        store,
+        config_store,
+        metrics,
+        resume,
+        scan_lock,
+        None,
+        on_batch,
+        persist,
+    )
+}
+
+/// 主卷监听的隔离与配置回调选项。
+pub struct WatcherOptions {
+    pub cache_dir: PathBuf,
+    pub on_config_updated: Option<Arc<dyn Fn(&AppConfig) + Send + Sync>>,
+}
+
+/// 仅监听并维护本地主索引根；挂载卷目录被隔离交由卷协调器接管，并在配置变更时触发回调。
+pub fn start_primary_watcher<F, P>(
+    store: IndexStore,
+    config_store: ConfigStore,
+    metrics: Arc<WatcherMetrics>,
+    resume: Resume,
+    scan_lock: Arc<std::sync::Mutex<()>>,
+    options: WatcherOptions,
+    on_batch: F,
+    persist: P,
+) -> WatcherHandle
+where
+    F: Fn(usize) + Send + 'static,
+    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
+{
+    start_watcher_with_options(
+        store,
+        config_store,
+        metrics,
+        resume,
+        scan_lock,
+        Some(options),
+        on_batch,
+        persist,
+    )
+}
+
+fn start_watcher_with_options<F, P>(
+    store: IndexStore,
+    config_store: ConfigStore,
+    metrics: Arc<WatcherMetrics>,
+    resume: Resume,
+    scan_lock: Arc<std::sync::Mutex<()>>,
+    options: Option<WatcherOptions>,
+    on_batch: F,
+    persist: P,
+) -> WatcherHandle
+where
+    F: Fn(usize) + Send + 'static,
+    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
+{
     let (control_tx, control) = mpsc::channel();
     let service_tx = control_tx.clone();
     let applied = Arc::new(AtomicU64::new(match resume {
         Resume::From(id) => id,
         Resume::Verify => 0,
     }));
-    let scope = Scope::new(&config_store.read());
+    let initial_config = config_store.read().clone();
+    let (primary_volumes_dir, on_config_updated) = match options {
+        Some(opts) => (Some(opts.cache_dir.join("volumes")), opts.on_config_updated),
+        None => (None, None),
+    };
+    let scope = match &primary_volumes_dir {
+        Some(volumes_dir) => Scope::new_primary(&initial_config, volumes_dir),
+        None => Scope::new(&initial_config),
+    };
     // 追赶或冷启动的索引都对应当前范围；无检查点时 applied 为 0，指纹不会被用到。
     let fingerprint = Arc::new(AtomicU64::new(scope.fingerprint));
     let handle = WatcherHandle {
@@ -998,6 +1211,8 @@ where
             persist,
             scope,
             scope_checked: Instant::now(),
+            scope_refreshed: Instant::now(),
+            fda_checked: Instant::now(),
             stream: None,
             events: mpsc::channel().1,
             control,
@@ -1022,6 +1237,9 @@ where
             unpersisted_events: 0,
             network_scanned: None,
             network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            primary_volumes_dir,
+            last_index_config: initial_config.index,
+            on_config_updated,
         };
         service.run(resume);
     });
@@ -1272,6 +1490,8 @@ mod tests {
             persist,
             scope: Scope::new(&config),
             scope_checked: Instant::now(),
+            scope_refreshed: Instant::now(),
+            fda_checked: Instant::now(),
             stream: None,
             events: mpsc::channel().1,
             control,
@@ -1296,6 +1516,9 @@ mod tests {
             unpersisted_events: 0,
             network_scanned: None,
             network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            primary_volumes_dir: None,
+            last_index_config: config.index,
+            on_config_updated: None,
         }
     }
 
@@ -2324,6 +2547,84 @@ mod tests {
         assert_eq!(store.len(), 1);
         let entries = store.entries();
         assert_eq!(entries[0].path, "/tmp/barista/y.txt");
+    }
+
+    #[test]
+    fn primary_watcher_isolates_volumes_and_forwards_config_updates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let primary_dir = root.join("local");
+        std::fs::create_dir_all(&primary_dir).unwrap();
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            primary_dir.to_string_lossy().to_string(),
+            "/Volumes/ExternalUSB".to_string(),
+        ];
+        cfg.index.include_hidden = true;
+        let config_store = ConfigStore::new(cfg.clone());
+        let store = IndexStore::new();
+        let metrics = Arc::new(WatcherMetrics::default());
+        let scan_lock = Arc::new(std::sync::Mutex::new(()));
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count_clone = Arc::clone(&callback_count);
+
+        let _handle = start_primary_watcher(
+            store.clone(),
+            config_store.clone(),
+            metrics,
+            Resume::From(crate::fsevents::current_event_id()),
+            scan_lock,
+            WatcherOptions {
+                cache_dir,
+                on_config_updated: Some(Arc::new(move |_| {
+                    callback_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+            },
+            |_| {},
+            |_, _| {},
+        );
+
+        let local_file = primary_dir.join("hello.txt");
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&local_file, "hi").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if store
+                .entries()
+                .iter()
+                .any(|e| e.path == local_file.to_string_lossy())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            store
+                .entries()
+                .iter()
+                .any(|e| e.path == local_file.to_string_lossy()),
+            "primary watcher should index local primary dir"
+        );
+
+        // Mutate config and wait for poll_scope to forward the update
+        let mut next = cfg.clone();
+        next.index.exclude.push("*.tmp".to_string());
+        config_store.update(next);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && callback_count.load(std::sync::atomic::Ordering::SeqCst) == 0
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            callback_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "primary watcher should forward config updates via callback"
+        );
     }
 
 }

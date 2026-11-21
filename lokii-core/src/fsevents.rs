@@ -15,6 +15,26 @@ pub(crate) fn current_event_id() -> u64 {
     unsafe { fs::FSEventsGetCurrentEventId() }
 }
 
+/// 查询路径所在设备的 FSEvents 日志 UUID；设备不支持或路径不可访问时返回 `None`。
+pub(crate) fn journal_uuid_for_path(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev() as libc::dev_t;
+    unsafe {
+        let uuid_ref = FSEventsCopyUUIDForDevice(dev);
+        if uuid_ref.is_null() {
+            return None;
+        }
+        let str_ref = CFUUIDCreateString(cf::kCFAllocatorDefault, uuid_ref);
+        cf::CFRelease(uuid_ref);
+        if str_ref.is_null() {
+            return None;
+        }
+        let bytes = cf_string_bytes(str_ref);
+        cf::CFRelease(str_ref);
+        bytes.and_then(|b| String::from_utf8(b).ok())
+    }
+}
+
 
 
 pub(crate) const MUST_SCAN_SUBDIRS: u32 = fs::kFSEventStreamEventFlagMustScanSubDirs;
@@ -41,6 +61,7 @@ const QOS_CLASS_USER_INITIATED: u32 = 0x19;
 #[link(name = "CoreServices", kind = "framework")]
 extern "C" {
     fn FSEventStreamSetDispatchQueue(stream: fs::FSEventStreamRef, queue: *mut c_void);
+    fn FSEventsCopyUUIDForDevice(dev: libc::dev_t) -> cf::CFRef;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -49,6 +70,7 @@ extern "C" {
     fn CFNumberGetValue(number: cf::CFRef, kind: isize, value: *mut c_void) -> u8;
     fn CFStringGetLength(string: cf::CFRef) -> cf::CFIndex;
     fn CFStringGetMaximumSizeForEncoding(length: cf::CFIndex, encoding: u32) -> cf::CFIndex;
+    fn CFUUIDCreateString(allocator: cf::CFAllocatorRef, uuid: cf::CFRef) -> cf::CFStringRef;
 }
 
 extern "C" {
@@ -78,7 +100,7 @@ fn extended_keys() -> (cf::CFRef, cf::CFRef) {
     (path as cf::CFRef, inode as cf::CFRef)
 }
 
-unsafe fn cf_string_path(string: cf::CFRef) -> Option<PathBuf> {
+unsafe fn cf_string_bytes(string: cf::CFRef) -> Option<Vec<u8>> {
     if string.is_null() {
         return None;
     }
@@ -93,8 +115,13 @@ unsafe fn cf_string_path(string: cf::CFRef) -> Option<PathBuf> {
     ) {
         return None;
     }
-    let bytes = CStr::from_bytes_until_nul(&buffer).ok()?.to_bytes();
-    Some(PathBuf::from(OsStr::from_bytes(bytes)))
+    let bytes = CStr::from_bytes_until_nul(&buffer).ok()?.to_bytes().to_vec();
+    Some(bytes)
+}
+
+unsafe fn cf_string_path(string: cf::CFRef) -> Option<PathBuf> {
+    let bytes = cf_string_bytes(string)?;
+    Some(PathBuf::from(OsStr::from_bytes(&bytes)))
 }
 
 extern "C" fn on_stream_events(
@@ -274,5 +301,17 @@ mod tests {
         let done = events.iter().position(|e| e.flags & HISTORY_DONE != 0);
         let seen = events.iter().position(|e| e.path == file);
         assert!(matches!((seen, done), (Some(s), Some(d)) if s < d), "{events:?}");
+    }
+
+    #[test]
+    fn journal_uuid_for_path_returns_uuid_for_local_dir_and_none_for_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = journal_uuid_for_path(dir.path());
+        assert!(
+            uuid.as_ref().is_some_and(|s| !s.is_empty()),
+            "expected non-empty FSEvents journal UUID for local temp dir, got {uuid:?}"
+        );
+        let missing = dir.path().join("definitely_missing_123456");
+        assert_eq!(journal_uuid_for_path(&missing), None);
     }
 }

@@ -51,6 +51,8 @@ public struct FfiSearchResult: Equatable, Hashable {
     public var modified: Int64
     public var matchPositions: [FfiMatchRange]
     public var parentMatchPositions: [FfiMatchRange]
+    public var isOffline: Bool
+    public var volumeName: String?
 
     public init(
         name: String,
@@ -61,7 +63,9 @@ public struct FfiSearchResult: Equatable, Hashable {
         created: Int64,
         modified: Int64,
         matchPositions: [FfiMatchRange] = [],
-        parentMatchPositions: [FfiMatchRange] = []
+        parentMatchPositions: [FfiMatchRange] = [],
+        isOffline: Bool = false,
+        volumeName: String? = nil
     ) {
         self.name = name
         self.path = path
@@ -72,6 +76,8 @@ public struct FfiSearchResult: Equatable, Hashable {
         self.modified = modified
         self.matchPositions = matchPositions
         self.parentMatchPositions = parentMatchPositions
+        self.isOffline = isOffline
+        self.volumeName = volumeName
     }
 }
 """
@@ -675,7 +681,218 @@ let movedPathCell = controller.tableView(controller.tableView, viewFor: testPath
 assertEqual(movedPathCell?.textField?.alignment, .left, "路径列移至末列单元格仍应保持左对齐")
 assertEqual(modifiedCol.headerCell.alignment, .left, "修改时间列离开末列后应恢复为左对齐")
 
-print("测试全部通过：12/12 项断言成功。")
+print("[13/14] 测试离线搜索结果渲染样式、零磁盘 I/O 图标与操作拦截...")
+var workspaceIconCalls: [String] = []
+controller.workspaceIconProvider = { path in
+    workspaceIconCalls.append(path)
+    return NSImage()
+}
+let offlineDelegate = MockDelegate()
+controller.delegate = offlineDelegate
+var offlineRevealCalls = 0
+var offlineTerminalCalls = 0
+var offlineTrashCalls = 0
+controller.revealFilesHandler = { _ in offlineRevealCalls += 1 }
+controller.openInTerminalHandler = { _ in offlineTerminalCalls += 1 }
+controller.trashItemHandler = { url in
+    offlineTrashCalls += 1
+    return url
+}
+
+let offlineItem = FfiSearchResult(
+    name: "budget.xlsx",
+    path: "/Volumes/OfflineNAS/finance/budget.xlsx",
+    extension: "xlsx",
+    isDir: false,
+    size: 4096,
+    created: 1000,
+    modified: 2000,
+    isOffline: true,
+    volumeName: "OfflineNAS"
+)
+let onlineItem = FfiSearchResult(
+    name: "notes.txt",
+    path: "/tmp/local_notes.txt",
+    extension: "txt",
+    isDir: false,
+    size: 128,
+    created: 1000,
+    modified: 2000,
+    isOffline: false,
+    volumeName: nil
+)
+controller.displayResults([offlineItem, onlineItem], preserveSelection: false)
+controller.updateStatusText("2 items")
+
+let offlineNameCell = controller.tableView(controller.tableView, viewFor: testNameCol, row: 0) as? SearchNameTableCellView
+let offlinePathCell = controller.tableView(controller.tableView, viewFor: testPathCol, row: 0) as? SearchPathTableCellView
+assertTrue(!workspaceIconCalls.contains(offlineItem.path), "离线项绝不可触发 NSWorkspace.shared.icon(forFile:)")
+assertTrue((offlineNameCell?.textField?.alphaValue ?? 1.0) < 0.9, "离线名称单元格应呈淡化透明度")
+assertTrue(offlinePathCell?.textField?.stringValue.contains(L("search.result.offline")) == true, "离线路径单元格应附带离线状态标记")
+
+let onlineNameCell = controller.tableView(controller.tableView, viewFor: testNameCol, row: 1) as? SearchNameTableCellView
+let onlinePathCell = controller.tableView(controller.tableView, viewFor: testPathCol, row: 1) as? SearchPathTableCellView
+assertEqual(onlineNameCell?.textField?.alphaValue, 1.0, "在线名称单元格应维持正常不透明状态")
+assertTrue(onlinePathCell?.textField?.stringValue.contains(L("search.result.offline")) == false, "在线路径单元格不应显示离线标记")
+
+// 校验拖拽与右键/快捷操作对离线项的完整拦截
+assertTrue(controller.tableView(controller.tableView, pasteboardWriterForRow: 0) == nil, "离线行不可提供 fileURL 拖拽写入器")
+assertTrue(controller.tableView(controller.tableView, pasteboardWriterForRow: 1) != nil, "在线行应正常提供拖拽写入器")
+
+controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+assertEqual(controller.acceptsPreviewPanelControl(QLPreviewPanel.shared()), false, "仅选中离线项时应拒绝 QuickLook 接管")
+assertEqual(controller.numberOfPreviewItems(in: QLPreviewPanel.shared()), 0, "离线选中项 QuickLook 条目数应为 0")
+
+controller.openSelected()
+controller.revealSelected()
+controller.openInTerminalSelected()
+controller.quickLookSelected()
+controller.showInfoSelected()
+controller.copyFile()
+controller.moveToTrashSelected()
+
+assertEqual(offlineDelegate.doubleClickCallCount, 0, "离线项 openSelected 不得触发打开回调")
+assertEqual(offlineRevealCalls, 0, "离线项 revealSelected 不得触发访达回调")
+assertEqual(offlineTerminalCalls, 0, "离线项 openInTerminalSelected 不得触发终端回调")
+assertEqual(offlineTrashCalls, 0, "离线项 moveToTrashSelected 不得触发废纸篓 I/O")
+assertEqual(controller.statusLabel.stringValue, L("search.offline.actionBlocked"), "拦截离线操作后应更新底栏提示")
+
+// 校验菜单禁用与复制路径/文件名放行
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Open", action: #selector(SearchResultsViewController.openSelected(_:)), keyEquivalent: "")), false, "离线项应禁用打开菜单项")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Reveal", action: #selector(SearchResultsViewController.revealSelected(_:)), keyEquivalent: "")), false, "离线项应禁用访达定位菜单项")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Copy File", action: #selector(SearchResultsViewController.copyFile(_:)), keyEquivalent: "")), false, "离线项应禁用拷贝文件菜单项")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Trash", action: #selector(SearchResultsViewController.moveToTrashSelected(_:)), keyEquivalent: "")), false, "离线项应禁用移到废纸篓菜单项")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Copy Path", action: #selector(SearchResultsViewController.copyPath(_:)), keyEquivalent: "")), true, "离线项仍允许拷贝路径")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Copy Name", action: #selector(SearchResultsViewController.copyName(_:)), keyEquivalent: "")), true, "离线项仍允许拷贝名称")
+
+let offlineBreadcrumbReveal = NSMenuItem(title: "Reveal", action: NSSelectorFromString("breadcrumbRevealInFinder:"), keyEquivalent: "")
+offlineBreadcrumbReveal.representedObject = URL(fileURLWithPath: "/Volumes/OfflineNAS/finance")
+assertEqual(controller.validateMenuItem(offlineBreadcrumbReveal), false, "离线父级面包屑应直接禁用并跳过磁盘探测")
+
+// 校验 NSFilenamesPboardType 在离线选区下同样被 validRequestor 阻断
+let filenamesPboardType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+assertTrue(controller.validRequestor(forSendType: filenamesPboardType, returnType: nil) == nil, "离线选区下 validRequestor 应拦截 NSFilenamesPboardType")
+
+controller.copyPath()
+assertEqual(NSPasteboard.general.string(forType: .string), offlineItem.path, "离线项拷贝路径应写入完整路径字符串")
+controller.copyName()
+assertEqual(NSPasteboard.general.string(forType: .string), offlineItem.name, "离线项拷贝名称应写入文件名字符串")
+controller.cancelTemporaryStatus()
+assertEqual(controller.statusLabel.stringValue, "2 items", "取消临时提示后应恢复持久状态栏文本")
+
+// 验证离线面包屑控件不写入 pathBar.url 且不挂接磁盘 URL 探测
+controller.updateBottomPath(with: offlineItem.path)
+assertEqual(controller.pathBar.isOfflinePathMode, true, "选中离线项时底栏面包屑应进入纯内存离线模式")
+assertTrue(controller.pathBar.url == nil, "离线面包屑模式绝不可向 pathBar.url 写入路径")
+
+// 校验离线选中状态下根路径 "/" 面包屑同样禁用访达操作，而切换至在线项后 "/" 与 "/Volumes" 正常可用
+let rootBreadcrumbReveal = NSMenuItem(title: "Reveal Root", action: NSSelectorFromString("breadcrumbRevealInFinder:"), keyEquivalent: "")
+rootBreadcrumbReveal.representedObject = URL(fileURLWithPath: "/")
+assertEqual(controller.validateMenuItem(rootBreadcrumbReveal), false, "选中离线行 (isOfflinePathMode=true) 时根路径面包屑应禁用访达定位")
+
+assertEqual(controller.isPathOffline("/"), false, "存在离线结果时根路径 / 绝不可被误判为离线")
+assertEqual(controller.isPathOffline("/Volumes"), false, "存在离线结果时 /Volumes 容器目录绝不可被误判为离线")
+
+controller.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+controller.updateBottomPath(with: onlineItem.path)
+assertEqual(controller.pathBar.isOfflinePathMode, false, "选中在线行时底栏应退出离线面包屑模式")
+assertEqual(controller.validateMenuItem(rootBreadcrumbReveal), true, "选中在线行时根路径 / 面包屑访达定位应保持启用")
+
+// 校验 excludeDirectorySelected 对离线目录与离线文件的纯内存路径推导（不将离线目录降级为父目录）
+var excludedPaths: [String] = []
+controller.onExcludeDirectory = { path in
+    excludedPaths.append(path)
+}
+let offlineDirItem = FfiSearchResult(
+    name: "docs",
+    path: "/Volumes/OfflineNAS/docs",
+    extension: "",
+    isDir: true,
+    size: 0,
+    created: 1000,
+    modified: 2000,
+    isOffline: true,
+    volumeName: "OfflineNAS"
+)
+let offlineFileInRoot = FfiSearchResult(
+    name: "readme.md",
+    path: "/Volumes/OfflineNAS/readme.md",
+    extension: "md",
+    isDir: false,
+    size: 512,
+    created: 1000,
+    modified: 2000,
+    isOffline: true,
+    volumeName: "OfflineNAS"
+)
+controller.displayResults([offlineDirItem, offlineFileInRoot, onlineItem], preserveSelection: false)
+controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+controller.excludeDirectorySelected()
+assertEqual(excludedPaths.last, "/Volumes/OfflineNAS/docs", "对离线目录执行排除目录必须直接传入该离线目录本身而非父目录")
+
+controller.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+controller.excludeDirectorySelected()
+assertEqual(excludedPaths.last, "/Volumes/OfflineNAS", "对离线普通文件执行排除目录必须传入其所在父目录")
+
+controller.displayResults([offlineItem, onlineItem], preserveSelection: false)
+
+print("[14/15] 测试混合选区（在线 + 离线）全链路统一拦截...")
+controller.tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+controller.openSelected()
+controller.revealSelected()
+controller.openInTerminalSelected()
+controller.quickLookSelected()
+controller.showInfoSelected()
+controller.copyFile()
+controller.moveToTrashSelected()
+let fakeOpenWithItem = NSMenuItem(title: "TextEdit", action: #selector(SearchResultsViewController.openWithApp(_:)), keyEquivalent: "")
+fakeOpenWithItem.representedObject = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+controller.openWithApp(fakeOpenWithItem)
+controller.chooseOtherAppToOpen()
+
+assertEqual(offlineDelegate.doubleClickCallCount, 0, "混合选区中包含离线项时 openSelected 必须拦截")
+assertEqual(offlineRevealCalls, 0, "混合选区中包含离线项时 revealSelected 必须拦截")
+assertEqual(offlineTerminalCalls, 0, "混合选区中包含离线项时 openInTerminalSelected 必须拦截")
+assertEqual(offlineTrashCalls, 0, "混合选区中包含离线项时 moveToTrashSelected 必须拦截")
+assertEqual(controller.statusLabel.stringValue, L("search.offline.actionBlocked"), "混合选区被拦截时应展示离线阻断提示")
+assertEqual(controller.acceptsPreviewPanelControl(QLPreviewPanel.shared()), false, "混合选区中包含离线项时 QuickLook 必须拒绝接管")
+assertEqual(controller.numberOfPreviewItems(in: QLPreviewPanel.shared()), 0, "混合选区 QuickLook 预览数应为 0")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Open", action: #selector(SearchResultsViewController.openSelected(_:)), keyEquivalent: "")), false, "混合选区应禁用打开菜单")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Terminal", action: #selector(SearchResultsViewController.openInTerminalSelected(_:)), keyEquivalent: "")), false, "混合选区应禁用终端打开菜单")
+assertEqual(controller.validateMenuItem(NSMenuItem(title: "Open With", action: #selector(SearchResultsViewController.openWithApp(_:)), keyEquivalent: "")), false, "混合选区应禁用打开方式菜单")
+controller.cancelTemporaryStatus()
+
+print("[15/15] 测试引擎离线路径回调动态降级 (isPathOfflineHandler) 与即时重绘 (refreshOfflineStates)...")
+workspaceIconCalls.removeAll()
+var dynamicOfflineEnabled = false
+controller.isPathOfflineHandler = { path in
+    dynamicOfflineEnabled && path.hasPrefix("/Volumes/DisconnectedDisk")
+}
+let dynamicallyOffline = FfiSearchResult(
+    name: "archive.tar",
+    path: "/Volumes/DisconnectedDisk/archive.tar",
+    extension: "tar",
+    isDir: false,
+    size: 512,
+    created: 1000,
+    modified: 2000,
+    isOffline: false,
+    volumeName: nil
+)
+controller.displayResults([dynamicallyOffline], preserveSelection: false)
+controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+assertTrue(controller.tableView(controller.tableView, pasteboardWriterForRow: 0) != nil, "卷仍在线时应允许文件拖拽")
+
+// 模拟卷在未重新查询的情况下突然断开并刷新视觉与拦截状态
+dynamicOfflineEnabled = true
+controller.refreshOfflineStates()
+let refreshedPathCell = controller.tableView(controller.tableView, viewFor: testPathCol, row: 0) as? SearchPathTableCellView
+assertTrue(refreshedPathCell?.textField?.stringValue.contains(L("search.result.offline")) == true, "refreshOfflineStates 后应立即显现离线标记")
+assertTrue(!workspaceIconCalls.contains(dynamicallyOffline.path), "动态降级离线后 iconForFile 绝不可调用 NSWorkspace")
+assertTrue(controller.tableView(controller.tableView, pasteboardWriterForRow: 0) == nil, "动态命中离线路径的行不应允许文件拖拽")
+assertEqual(controller.pathBar.isOfflinePathMode, true, "refreshOfflineStates 应同步将底栏切换至离线模式")
+
+print("测试全部通过：15/15 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

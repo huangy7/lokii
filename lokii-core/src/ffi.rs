@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -5,10 +8,13 @@ use crate::cache;
 use crate::config::{self, AppConfig, ConfigStore};
 use crate::indexer::IndexStore;
 use crate::metrics::WatcherMetrics;
+use crate::path_utils::path_starts_with_ci;
 use crate::permissions;
 use crate::scanner;
-use crate::search::{self, AdvancedSearchResult, SearchMode};
+use crate::search::{self, MultiSearchResult, SearchMode};
 use crate::startup;
+use crate::volume_manager::{VolumeCoordinator, VolumeState, VolumeStatusInfo};
+use crate::volumes::{self, VolumeKind};
 use crate::watcher;
 
 // ── UniFFI Records ──────────────────────────────────────────────────────
@@ -27,6 +33,8 @@ pub struct FfiSearchResult {
     pub match_positions: Vec<FfiMatchRange>,
     pub parent_match_positions: Vec<FfiMatchRange>,
     pub search_mode: FfiSearchMode,
+    pub is_offline: bool,
+    pub volume_name: Option<String>,
 }
 
 /// A byte range for match highlighting.
@@ -54,7 +62,37 @@ pub struct FfiSearchResponse {
     pub hint: Option<String>,
 }
 
-// ── UniFFI Enums ────────────────────────────────────────────────────────
+/// Status snapshot for a configured mounted volume slot.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiVolumeStatus {
+    pub volume_id: String,
+    pub configured_path: String,
+    pub active_path: Option<String>,
+    pub display_name: String,
+    pub kind: String,
+    pub state: FfiVolumeState,
+    pub entry_count: u64,
+    pub last_sync_at: Option<u64>,
+    pub is_remounted: bool,
+}
+
+// ── UniFFI Enums & Errors ───────────────────────────────────────────────
+
+/// Errors surfaced across the UniFFI boundary.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
+pub enum FfiError {
+    IoError { message: String },
+}
+
+impl std::fmt::Display for FfiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FfiError::IoError { message } => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for FfiError {}
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfiFileType {
@@ -83,6 +121,14 @@ pub enum FfiSearchMode {
     Fuzzy,
 }
 
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiVolumeState {
+    Online,
+    Syncing,
+    Offline,
+    Missing,
+}
+
 #[derive(uniffi::Enum)]
 pub enum FfiStartupMode {
     HotStart { cached_count: u64 },
@@ -92,7 +138,7 @@ pub enum FfiStartupMode {
 
 // ── Callback Interface ──────────────────────────────────────────────────
 
-/// Callback interface for Rust → Swift event notifications.
+/// Callback interface for Rust -> Swift event notifications.
 #[uniffi::export(with_foreign)]
 pub trait EventHandler: Send + Sync {
     fn on_index_progress(&self, phase: String, scanned_files: u64);
@@ -100,6 +146,7 @@ pub trait EventHandler: Send + Sync {
     fn on_index_updated(&self, new_total: u64);
     fn on_watcher_error(&self, msg: String);
     fn on_config_reloaded(&self);
+    fn on_volume_statuses_changed(&self);
 }
 
 // ── Conversion helpers ──────────────────────────────────────────────────
@@ -138,26 +185,62 @@ impl From<FfiCaseSensitivity> for search::CaseSensitivity {
     }
 }
 
-fn convert_results(results: Vec<AdvancedSearchResult>) -> Vec<FfiSearchResult> {
+impl From<VolumeState> for FfiVolumeState {
+    fn from(state: VolumeState) -> Self {
+        match state {
+            VolumeState::Online => FfiVolumeState::Online,
+            VolumeState::Syncing => FfiVolumeState::Syncing,
+            VolumeState::Offline => FfiVolumeState::Offline,
+            VolumeState::Missing => FfiVolumeState::Missing,
+        }
+    }
+}
+
+fn volume_kind_str(kind: VolumeKind) -> String {
+    match kind {
+        VolumeKind::LocalExternal => "local_external".to_string(),
+        VolumeKind::Network => "network".to_string(),
+    }
+}
+
+impl From<VolumeStatusInfo> for FfiVolumeStatus {
+    fn from(info: VolumeStatusInfo) -> Self {
+        Self {
+            volume_id: info.volume_id,
+            configured_path: info.configured_path,
+            active_path: info.active_path,
+            display_name: info.display_name,
+            kind: volume_kind_str(info.kind),
+            state: info.state.into(),
+            entry_count: info.entry_count,
+            last_sync_at: info.last_sync_at,
+            is_remounted: info.is_remounted,
+        }
+    }
+}
+
+fn convert_multi_results(results: Vec<MultiSearchResult>) -> Vec<FfiSearchResult> {
     results
         .into_iter()
-        .map(|r| FfiSearchResult {
-            name: r.entry.name,
-            path: r.entry.path,
-            is_dir: r.entry.is_dir,
-            size: r.entry.size,
-            modified: r.entry.modified,
-            created: r.entry.created_at,
-            extension: r.entry.extension,
-            score: r.score,
-            match_positions: convert_ranges(r.match_positions),
-            parent_match_positions: convert_ranges(r.parent_match_positions),
-            search_mode: r.search_mode.into(),
+        .map(|item| FfiSearchResult {
+            name: item.result.entry.name,
+            path: item.result.entry.path,
+            is_dir: item.result.entry.is_dir,
+            size: item.result.entry.size,
+            modified: item.result.entry.modified,
+            created: item.result.entry.created_at,
+            extension: item.result.entry.extension,
+            score: item.result.score,
+            match_positions: convert_ranges(item.result.match_positions),
+            parent_match_positions: convert_ranges(item.result.parent_match_positions),
+            search_mode: item.result.search_mode.into(),
+            is_offline: item.is_offline,
+            volume_name: item.volume_name,
         })
         .collect()
 }
 
-/// 把搜索核心的字节区间转换为 FFI 记录形态。
+/// Convert search byte ranges to FFI match range records.
 fn convert_ranges(ranges: Vec<(usize, usize)>) -> Vec<FfiMatchRange> {
     ranges
         .into_iter()
@@ -168,6 +251,345 @@ fn convert_ranges(ranges: Vec<(usize, usize)>) -> Vec<FfiMatchRange> {
         .collect()
 }
 
+const MAX_LOCAL_SYMLINK_HOPS: usize = 40;
+const MAX_VOLUME_GUARD_HOPS: usize = 8;
+
+#[derive(Clone, Debug)]
+enum LexComp {
+    Root,
+    Parent,
+    Normal(OsString),
+}
+
+fn push_path_components_front(queue: &mut VecDeque<LexComp>, path: &Path) {
+    let mut comps = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::RootDir => comps.push(LexComp::Root),
+            Component::ParentDir => comps.push(LexComp::Parent),
+            Component::Normal(s) => comps.push(LexComp::Normal(s.to_os_string())),
+            Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    for c in comps.into_iter().rev() {
+        queue.push_front(c);
+    }
+}
+
+/// Normalize `.` and `..` lexically without querying the filesystem.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir) | Some(Component::ParentDir)
+                ) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn assemble_normalized(prefix: &Path, remaining: &VecDeque<LexComp>) -> PathBuf {
+    let mut combined = prefix.to_path_buf();
+    for comp in remaining {
+        match comp {
+            LexComp::Root => combined = PathBuf::from("/"),
+            LexComp::Parent => {
+                combined.push("..");
+            }
+            LexComp::Normal(s) => combined.push(s),
+        }
+    }
+    normalize_lexical(&combined)
+}
+
+/// Extract `(<first_component>, <remaining_subpath>)` if `path` lies inside `/Volumes/<entry>`.
+fn volumes_first_component(path: &Path) -> Option<(&std::ffi::OsStr, PathBuf)> {
+    let mut comps = path.components();
+    if !matches!(comps.next(), Some(Component::RootDir)) {
+        return None;
+    }
+    let Some(Component::Normal(volumes_dir)) = comps.next() else {
+        return None;
+    };
+    if !volumes_dir.to_string_lossy().eq_ignore_ascii_case("Volumes") {
+        return None;
+    }
+    let Some(Component::Normal(first_entry)) = comps.next() else {
+        return None;
+    };
+    let mut rest = PathBuf::new();
+    for comp in comps {
+        rest.push(comp.as_os_str());
+    }
+    Some((first_entry, rest))
+}
+
+fn find_matching_slot<'a>(
+    candidate: &Path,
+    statuses: &'a [VolumeStatusInfo],
+) -> Option<&'a VolumeStatusInfo> {
+    let mut best_match: Option<(usize, &VolumeStatusInfo)> = None;
+    for status in statuses {
+        for slot_path in [
+            Some(status.configured_path.as_str()),
+            status.active_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path_starts_with_ci(candidate, Path::new(slot_path)) {
+                let depth = slot_path.len();
+                if best_match.is_none_or(|(best_len, _)| depth > best_len) {
+                    best_match = Some((depth, status));
+                }
+            }
+        }
+    }
+    best_match.map(|(_, status)| status)
+}
+
+fn matches_live_non_system_mount(
+    candidate: &Path,
+    live_mounts: &[volumes::MountedFsInfo],
+) -> bool {
+    live_mounts.iter().any(|m| {
+        !volumes::is_system_mount_point(&m.mount_point)
+            && path_starts_with_ci(candidate, Path::new(&m.mount_point))
+    })
+}
+
+fn has_volume_or_slot_boundary(
+    candidate: &Path,
+    statuses: &[VolumeStatusInfo],
+    live_mounts: &[volumes::MountedFsInfo],
+) -> bool {
+    find_matching_slot(candidate, statuses).is_some()
+        || matches_live_non_system_mount(candidate, live_mounts)
+        || volumes_first_component(candidate).is_some()
+}
+
+/// Inspect a top-level `/Volumes/<entry>` entry only when neither configured slots nor kernel
+/// mounts match it, so macOS boot volume symlinks (e.g. `/Volumes/Macintosh HD -> /`) can be
+/// resolved without ever calling `lstat`/`stat` on mounted or hung network mountpoints.
+fn read_volumes_boot_symlink(
+    top_entry: &Path,
+    live_mounts: &[volumes::MountedFsInfo],
+) -> Option<PathBuf> {
+    if matches_live_non_system_mount(top_entry, live_mounts) {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(top_entry).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    std::fs::read_link(top_entry).ok()
+}
+
+enum VolumeGuard {
+    Allow,
+    Deny(String),
+    FollowBootSymlink(PathBuf),
+    LocalPath,
+}
+
+fn check_volume_guard_with(
+    candidate: &Path,
+    statuses: &[VolumeStatusInfo],
+    live_mounts: &[volumes::MountedFsInfo],
+    read_boot_symlink: &impl Fn(&Path) -> Option<PathBuf>,
+) -> VolumeGuard {
+    if let Some(status) = find_matching_slot(candidate, statuses) {
+        if matches!(status.state, VolumeState::Online | VolumeState::Syncing) {
+            return VolumeGuard::Allow;
+        }
+        return VolumeGuard::Deny(format!("Volume '{}' is offline", status.display_name));
+    }
+
+    if matches_live_non_system_mount(candidate, live_mounts) {
+        return VolumeGuard::Allow;
+    }
+
+    if let Some((first_entry, rest)) = volumes_first_component(candidate) {
+        let top_entry = Path::new("/Volumes").join(first_entry);
+        if let Some(target) = read_boot_symlink(&top_entry) {
+            let base = if target.is_absolute() {
+                target
+            } else {
+                Path::new("/Volumes").join(target)
+            };
+            let remapped = normalize_lexical(&base.join(rest));
+            return VolumeGuard::FollowBootSymlink(remapped);
+        }
+        return VolumeGuard::Deny(format!(
+            "Volume for path '{}' is not mounted",
+            candidate.to_string_lossy()
+        ));
+    }
+
+    VolumeGuard::LocalPath
+}
+
+/// Walk local path components safely to detect symlinks targeting offline or unmounted
+/// volumes, stopping immediately before querying metadata on any volume boundary.
+fn resolve_local_symlinks_safely(
+    normalized: &Path,
+    statuses: &[VolumeStatusInfo],
+    live_mounts: &[volumes::MountedFsInfo],
+) -> Result<PathBuf, FfiError> {
+    let mut queue = VecDeque::new();
+    push_path_components_front(&mut queue, normalized);
+    let mut resolved = PathBuf::new();
+    let mut symlink_hops = 0usize;
+
+    while let Some(comp) = queue.pop_front() {
+        match comp {
+            LexComp::Root => {
+                resolved = PathBuf::from("/");
+                continue;
+            }
+            LexComp::Parent => {
+                if !matches!(
+                    resolved.components().next_back(),
+                    None | Some(Component::RootDir) | Some(Component::ParentDir)
+                ) {
+                    resolved.pop();
+                } else if !resolved.has_root() {
+                    resolved.push("..");
+                }
+                continue;
+            }
+            LexComp::Normal(seg) => {
+                resolved.push(&seg);
+            }
+        }
+
+        if has_volume_or_slot_boundary(&resolved, statuses, live_mounts) {
+            return Ok(assemble_normalized(&resolved, &queue));
+        }
+
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                symlink_hops += 1;
+                if symlink_hops > MAX_LOCAL_SYMLINK_HOPS {
+                    return Err(FfiError::IoError {
+                        message: format!(
+                            "Too many symbolic links while resolving '{}'",
+                            normalized.to_string_lossy()
+                        ),
+                    });
+                }
+                if let Ok(target) = std::fs::read_link(&resolved) {
+                    if target.is_absolute() {
+                        resolved.clear();
+                    } else {
+                        resolved.pop();
+                    }
+                    push_path_components_front(&mut queue, &target);
+                    let rewritten = assemble_normalized(&resolved, &queue);
+                    if has_volume_or_slot_boundary(&rewritten, statuses, live_mounts) {
+                        return Ok(rewritten);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Ok(assemble_normalized(&resolved, &queue));
+            }
+        }
+    }
+
+    Ok(normalize_lexical(&resolved))
+}
+
+fn ensure_path_accessible_with(
+    path: &str,
+    statuses: &[VolumeStatusInfo],
+    live_mounts: &[volumes::MountedFsInfo],
+    read_boot_symlink: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(), FfiError> {
+    let mut current = normalize_lexical(Path::new(path));
+
+    for _hop in 0..MAX_VOLUME_GUARD_HOPS {
+        match check_volume_guard_with(&current, statuses, live_mounts, read_boot_symlink) {
+            VolumeGuard::Allow => return Ok(()),
+            VolumeGuard::Deny(message) => return Err(FfiError::IoError { message }),
+            VolumeGuard::FollowBootSymlink(remapped) => {
+                current = remapped;
+            }
+            VolumeGuard::LocalPath => {
+                let resolved = resolve_local_symlinks_safely(&current, statuses, live_mounts)?;
+                if resolved == current {
+                    return Ok(());
+                }
+                current = resolved;
+            }
+        }
+    }
+
+    Err(FfiError::IoError {
+        message: format!("Too many symlink redirects while checking path '{path}'"),
+    })
+}
+
+/// RAII progress polling guard that emits live scan counts every 50ms and cleanly
+/// joins its background thread when the scan completes or unwinds.
+struct ProgressPoller {
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPoller {
+    fn start(
+        phase: &'static str,
+        progress: Arc<AtomicUsize>,
+        event_handler: Arc<dyn EventHandler>,
+    ) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let poll_done = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            while !poll_done.load(Ordering::Relaxed) {
+                let count = progress.load(Ordering::Relaxed);
+                event_handler.on_index_progress(phase.to_string(), count as u64);
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ProgressPoller {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 // ── LokiiCore Object ───────────────────────────────────────────────────
 
 /// Main entry point for the Lokii Rust core, exposed to Swift via UniFFI.
@@ -175,6 +597,8 @@ fn convert_ranges(ranges: Vec<(usize, usize)>) -> Vec<FfiMatchRange> {
 pub struct LokiiCore {
     store: IndexStore,
     config_store: ConfigStore,
+    volumes: Arc<VolumeCoordinator>,
+    cache_dir: PathBuf,
     /// Where the index service picks up once started: set by initialization.
     resume: Mutex<Option<watcher::Resume>>,
     /// The running index service, once `start_watcher` has been called.
@@ -183,6 +607,8 @@ pub struct LokiiCore {
     scan_lock: Arc<Mutex<()>>,
     /// Watcher diagnostics metrics.
     metrics: Arc<WatcherMetrics>,
+    /// True once initial startup has completed and `on_index_ready` has been emitted.
+    initialized: Arc<AtomicBool>,
 }
 
 #[uniffi::export]
@@ -191,51 +617,133 @@ impl LokiiCore {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         let (config, _error) = config::load_or_create_config();
+        let cache_dir = AppConfig::config_dir();
         let config_store = ConfigStore::new(config);
         let store = IndexStore::new();
+        let volumes = Arc::new(VolumeCoordinator::new(cache_dir.clone()));
         Arc::new(Self {
             store,
             config_store,
+            volumes,
+            cache_dir,
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
             metrics: Arc::new(WatcherMetrics::new()),
+            initialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Initialize the file index (hot start from cache or cold start via scan).
-    /// Calls event_handler callbacks for progress and completion.
+    /// Peek whether startup needs a cold scan (true when neither primary cache nor
+    /// any configured volume cache exists on disk). Uses zero blocking stat calls on volumes.
+    pub fn peek_startup_is_cold_start(&self) -> bool {
+        let config = self.config_store.read().clone();
+        !self.volumes.peek_has_any_cache(&config)
+    }
+
+    /// Initialize the file index (hot start from cache or cold start via scan) and
+    /// reconcile configured mounted volume slots.
     /// This is blocking — call from a background thread on the Swift side.
     pub fn initialize(&self, event_handler: Arc<dyn EventHandler>) -> FfiStartupMode {
+        self.initialized.store(false, Ordering::SeqCst);
+        let config = self.config_store.read().clone();
+        let cache_file = self.cache_dir.join("index.cache");
+        let volumes_dir = self.cache_dir.join("volumes");
+        let (primary_roots, excluded_mount_roots) =
+            watcher::primary_scope_inputs(&config, &volumes_dir);
+
         let progress = Arc::new(AtomicUsize::new(0));
-        let cache_file = AppConfig::config_dir().join("index.cache");
-
-        // Spawn progress poller
-        let poll_progress = Arc::clone(&progress);
-        let poll_handler = Arc::clone(&event_handler);
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let poll_done = Arc::clone(&done);
-
-        let poller = std::thread::spawn(move || {
-            let phase = "scanning".to_string();
-            while !poll_done.load(Ordering::Relaxed) {
-                let count = poll_progress.load(Ordering::Relaxed);
-                poll_handler.on_index_progress(phase.clone(), count as u64);
-                std::thread::park_timeout(std::time::Duration::from_millis(50));
-            }
+        let poller = (!primary_roots.is_empty() && !cache_file.exists()).then(|| {
+            ProgressPoller::start(
+                "scanning",
+                Arc::clone(&progress),
+                Arc::clone(&event_handler),
+            )
         });
 
-        let config = self.config_store.read().clone();
-        let mode = startup::initialize_index(&self.store, &config, progress, &cache_file);
+        let mut on_progress = |phase: &str, count: u64| {
+            event_handler.on_index_progress(phase.to_string(), count);
+        };
 
-        done.store(true, Ordering::Relaxed);
-        poller.thread().unpark();
-        let _ = poller.join();
+        let mode = match startup::initialize_primary_index_with_progress(
+            &self.store,
+            &config,
+            &primary_roots,
+            &excluded_mount_roots,
+            progress,
+            &mut on_progress,
+            &cache_file,
+        ) {
+            Ok(mode) => mode,
+            Err(startup::InitError::Index(error)) => startup::StartupMode::Failed(error),
+            Err(startup::InitError::Io(message)) => {
+                drop(poller);
+                return FfiStartupMode::Failed {
+                    message: format!("Index initialization failed: {message}"),
+                };
+            }
+        };
+        drop(poller);
+
         self.finish_initialization(mode, event_handler)
     }
 }
 
 impl LokiiCore {
+    #[cfg(test)]
+    fn for_test(
+        cache_dir: PathBuf,
+        config: AppConfig,
+        mount_lister: Arc<dyn Fn() -> Vec<volumes::MountedFsInfo> + Send + Sync>,
+    ) -> Self {
+        Self {
+            store: IndexStore::new(),
+            config_store: ConfigStore::new(config),
+            volumes: Arc::new(VolumeCoordinator::with_mount_lister(
+                cache_dir.clone(),
+                mount_lister,
+            )),
+            cache_dir,
+            resume: Mutex::new(None),
+            watcher: Mutex::new(None),
+            scan_lock: Arc::new(Mutex::new(())),
+            metrics: Arc::new(WatcherMetrics::new()),
+            initialized: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn make_status_callback(
+        &self,
+        event_handler: Arc<dyn EventHandler>,
+        status_notified: Option<Arc<AtomicBool>>,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        // Capture Weak<VolumeCoordinator> so storing this callback inside VolumeCoordinator
+        // cannot form a retain cycle that keeps threads alive after LokiiCore drops.
+        let weak_volumes = Arc::downgrade(&self.volumes);
+        let store = self.store.clone();
+        let initialized = Arc::clone(&self.initialized);
+        Arc::new(move || {
+            let total_if_initialized = {
+                let Some(volumes) = weak_volumes.upgrade() else {
+                    return;
+                };
+                if initialized.load(Ordering::SeqCst) {
+                    Some(volumes.total_entry_count(&store))
+                } else {
+                    None
+                }
+            };
+            // 先释放强引用 Arc<VolumeCoordinator> 再进入跨 FFI 回调，避免外层析构竞态时在后台线程自 join 死锁
+            if let Some(ref flag) = status_notified {
+                flag.store(true, Ordering::Release);
+            }
+            event_handler.on_volume_statuses_changed();
+            if let Some(total) = total_if_initialized {
+                event_handler.on_index_updated(total);
+            }
+        })
+    }
+
     fn finish_initialization(
         &self,
         mode: startup::StartupMode,
@@ -246,15 +754,30 @@ impl LokiiCore {
                 message: format!("Index initialization failed: {error}"),
             };
         }
-        event_handler.on_index_ready(self.store.len() as u64);
 
-        // 先让首屏可用，再在后台把查询侧 CSR/签名/排序表建好；
-        // 用户第一次按键通常已经命中预热结果。
+        let config = self.config_store.read().clone();
+        let status_notified = Arc::new(AtomicBool::new(false));
+        let status_cb =
+            self.make_status_callback(Arc::clone(&event_handler), Some(Arc::clone(&status_notified)));
+        self.volumes.initialize(&config, status_cb);
+
+        if !self.volumes.statuses().is_empty() && !status_notified.load(Ordering::Acquire) {
+            event_handler.on_volume_statuses_changed();
+        }
+
+        // Publish initialization completion before reading total_entry_count so concurrent
+        // volume scans never miss delivering on_index_updated after on_index_ready.
+        self.initialized.store(true, Ordering::SeqCst);
+        let total = self.volumes.total_entry_count(&self.store);
+        event_handler.on_index_ready(total);
+
+        // Build query-side CSR/signature/sort tables in the background after first paint so
+        // the UI becomes interactive immediately.
         let warm_store = self.store.clone();
         std::thread::spawn(move || warm_store.warm_query_index());
 
-        // 索引服务启动后从这里接上：有检查点就回放追赶，没有就先全量校验。
-        *self.resume.lock().unwrap() = Some(match mode {
+        // Hand off the replay checkpoint to the primary watcher service.
+        *self.resume.lock().unwrap_or_else(|e| e.into_inner()) = Some(match mode {
             startup::StartupMode::HotStart {
                 checkpoint: Some(checkpoint),
                 ..
@@ -265,53 +788,101 @@ impl LokiiCore {
         });
 
         match mode {
-            startup::StartupMode::HotStart { cached_count, .. } => FfiStartupMode::HotStart {
-                cached_count: cached_count as u64,
+            startup::StartupMode::HotStart { .. } => FfiStartupMode::HotStart {
+                cached_count: total,
             },
-            startup::StartupMode::ColdStart { scanned_count, .. } => FfiStartupMode::ColdStart {
-                scanned_count: scanned_count as u64,
+            startup::StartupMode::ColdStart { .. } => FfiStartupMode::ColdStart {
+                scanned_count: total,
             },
             startup::StartupMode::Failed(_) => unreachable!("failed startup returned before ready"),
         }
+    }
+
+    /// Guard file/Finder actions against offline or unmounted volume paths so we never
+    /// wake Finder or stall on a disconnected share.
+    fn ensure_path_accessible(&self, path: &str) -> Result<(), FfiError> {
+        let statuses = self.volumes.statuses();
+        let live_mounts = self.volumes.mounted_volumes();
+        ensure_path_accessible_with(path, &statuses, &live_mounts, &|top_entry| {
+            read_volumes_boot_symlink(top_entry, &live_mounts)
+        })
+    }
+
+    fn run_open_command(&self, args: &[&str], target_path: &str) -> Result<bool, FfiError> {
+        self.ensure_path_accessible(target_path)?;
+        std::process::Command::new("open")
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .map_err(|e| FfiError::IoError {
+                message: format!("Failed to invoke open for '{target_path}': {e}"),
+            })
     }
 }
 
 #[uniffi::export]
 impl LokiiCore {
-    /// Start the file system watcher. Calls event_handler.on_index_updated
-    /// whenever the index changes. Non-blocking (spawns a thread internally).
+    /// Start the primary file system watcher and the mounted volume monitor.
+    /// Non-blocking (spawns background threads internally).
     pub fn start_watcher(&self, event_handler: Arc<dyn EventHandler>) {
         let resume = self
             .resume
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .unwrap_or_else(watcher::Resume::now);
-        let handler = Arc::clone(&event_handler);
-        let handle = watcher::start_watcher(
+        let batch_handler = Arc::clone(&event_handler);
+        let weak_volumes_for_batch = Arc::downgrade(&self.volumes);
+        let store_for_batch = self.store.clone();
+        let weak_volumes_for_cfg = Arc::downgrade(&self.volumes);
+        let cache_dir_for_persist = self.cache_dir.clone();
+
+        let options = watcher::WatcherOptions {
+            cache_dir: self.cache_dir.clone(),
+            on_config_updated: Some(Arc::new(move |new_config| {
+                if let Some(volumes) = weak_volumes_for_cfg.upgrade() {
+                    volumes.on_config_updated(new_config);
+                }
+            })),
+        };
+
+        let handle = watcher::start_primary_watcher(
             self.store.clone(),
             self.config_store.clone(),
             Arc::clone(&self.metrics),
             resume,
             Arc::clone(&self.scan_lock),
-            move |new_total| {
-                handler.on_index_updated(new_total as u64);
+            options,
+            move |_primary_total| {
+                let Some(volumes) = weak_volumes_for_batch.upgrade() else {
+                    return;
+                };
+                let total = volumes.total_entry_count(&store_for_batch);
+                batch_handler.on_index_updated(total);
             },
-            |index, checkpoint| {
-                let cache_file = AppConfig::config_dir().join("index.cache");
+            move |index, checkpoint| {
+                let cache_file = cache_dir_for_persist.join("index.cache");
                 startup::save_index(index, checkpoint, &cache_file);
             },
         );
-        *self.watcher.lock().unwrap() = Some(handle);
+        *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+
+        let status_cb = self.make_status_callback(event_handler, None);
+        self.volumes
+            .start_monitor(self.config_store.clone(), status_cb);
     }
 
     /// Start the config file watcher for hot-reload.
     pub fn start_config_watcher(&self, event_handler: Arc<dyn EventHandler>) {
         let handler = Arc::clone(&event_handler);
+        let weak_volumes = Arc::downgrade(&self.volumes);
 
         if let Err(e) = config::start_config_watcher(
             self.config_store.clone(),
-            move |_| {
+            move |new_config| {
+                if let Some(volumes) = weak_volumes.upgrade() {
+                    volumes.on_config_updated(new_config);
+                }
                 handler.on_config_reloaded();
             },
             move |msg| {
@@ -324,26 +895,42 @@ impl LokiiCore {
 
     /// Start the local query socket used by the `lokii` CLI and external scripts.
     pub fn start_query_server(&self) {
-        if let Err(e) = crate::query_server::start(self.store.clone(), self.config_store.clone()) {
+        if let Err(e) = crate::query_server::start_with_coordinator(
+            self.store.clone(),
+            Some(Arc::clone(&self.volumes)),
+            self.config_store.clone(),
+        ) {
             eprintln!("[Lokii] Failed to start query server: {e}");
         }
     }
 
-    /// Search the index.
+    /// Search across primary and mounted volume shards (including offline caches by default).
     pub fn search(
         &self,
         query: String,
         mode: FfiSearchMode,
         case_sensitivity: FfiCaseSensitivity,
     ) -> FfiSearchResponse {
+        self.search_with_options(query, mode, case_sensitivity, true)
+    }
+
+    /// Search across primary and mounted volume shards with explicit control over offline caches.
+    pub fn search_with_options(
+        &self,
+        query: String,
+        mode: FfiSearchMode,
+        case_sensitivity: FfiCaseSensitivity,
+        include_offline: bool,
+    ) -> FfiSearchResponse {
         let max_results = self.config_store.read().index.max_results;
         let search_mode = SearchMode::from(&mode);
-        let (results, is_case_sensitive, error, effective_mode) = search::dispatch_with_details(
+        let (results, is_case_sensitive, error, effective_mode) = self.volumes.search(
             &self.store,
             &query,
             search_mode,
             case_sensitivity.into(),
             max_results,
+            include_offline,
         );
 
         let hint = if results.is_empty() {
@@ -353,7 +940,7 @@ impl LokiiCore {
         };
 
         FfiSearchResponse {
-            results: convert_results(results),
+            results: convert_multi_results(results),
             error,
             is_case_sensitive,
             effective_mode: effective_mode.into(),
@@ -361,110 +948,121 @@ impl LokiiCore {
         }
     }
 
-    /// Get current index statistics.
+    /// Get current index statistics across primary and volume shards.
     pub fn get_stats(&self) -> FfiIndexStats {
+        let total_count = self.volumes.total_entry_count(&self.store);
         FfiIndexStats {
-            total_count: self.store.len() as u64,
-            is_ready: !self.store.is_empty(),
+            total_count,
+            is_ready: total_count > 0 || self.initialized.load(Ordering::Acquire),
         }
     }
 
-    /// Check if a background scan (verify) is currently running.
+    /// Check if a primary background scan or any mounted volume sync is currently running.
     pub fn is_scanning(&self) -> bool {
-        match self.scan_lock.try_lock() {
-            Ok(_guard) => false, // Lock acquired = no scan running
+        let primary_scanning = match self.scan_lock.try_lock() {
+            Ok(_guard) => false,
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(_)) => false,
-        }
+        };
+        primary_scanning
+            || self
+                .volumes
+                .statuses()
+                .iter()
+                .any(|s| matches!(s.state, VolumeState::Syncing))
     }
 
-    /// Rebuild the index from scratch. Blocking — call from background thread.
-    /// Caller should check `is_scanning()` first; if true, skip the rebuild.
+    /// Rebuild the primary index from scratch and schedule rescans for online mounted volumes.
+    /// Blocking — call from a background thread.
     pub fn rebuild_index(&self, event_handler: Arc<dyn EventHandler>) -> bool {
-        // Try to acquire scan lock — if the index service is reconciling, skip.
         let guard = match self.scan_lock.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::WouldBlock) => {
-                // A full scan is already running — skip.
                 return false;
             }
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         };
 
-        let progress = Arc::new(AtomicUsize::new(0));
-
-        // Spawn progress poller
-        let poll_progress = Arc::clone(&progress);
-        let poll_handler = Arc::clone(&event_handler);
-        let done = Arc::new(AtomicBool::new(false));
-        let poll_done = Arc::clone(&done);
-
-        std::thread::spawn(move || {
-            let phase = "rebuilding".to_string();
-            loop {
-                let count = poll_progress.load(Ordering::Relaxed);
-                poll_handler.on_index_progress(phase.clone(), count as u64);
-                if poll_done.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
-
         let config = self.config_store.read().clone();
-        let checkpoint = startup::checkpoint(&config);
-        let paths = config.resolve_paths();
+        self.volumes.on_config_updated(&config);
+        for status in self.volumes.statuses() {
+            if !matches!(status.state, VolumeState::Syncing) {
+                let _ = self.volumes.rescan_volume(&status.volume_id);
+            }
+        }
 
-        let filter = Arc::new(crate::filter::CompiledFilter::from_config(&config));
-        let fresh =
-            match scanner::scan_compact(&paths, filter, config.index.include_hidden, progress) {
-                Ok(fresh) => fresh,
-                Err(error) => {
-                    done.store(true, Ordering::Relaxed);
-                    event_handler.on_watcher_error(format!("Index rebuild failed: {error}"));
-                    return false;
-                }
-            };
+        let volumes_dir = self.cache_dir.join("volumes");
+        let (primary_roots, excluded_mount_roots) =
+            watcher::primary_scope_inputs(&config, &volumes_dir);
+        let checkpoint = cache::Checkpoint {
+            event_id: crate::fsevents::current_event_id(),
+            fingerprint: startup::primary_scope_fingerprint(
+                &config,
+                &primary_roots,
+                &excluded_mount_roots,
+            ),
+        };
 
-        done.store(true, Ordering::Relaxed);
+        let progress = Arc::new(AtomicUsize::new(0));
+        let poller = ProgressPoller::start(
+            "rebuilding",
+            Arc::clone(&progress),
+            Arc::clone(&event_handler),
+        );
 
-        // Save cache before publishing the index: encoding a multi-million
-        // entry index must not happen while holding the store lock.
-        let cache_file = AppConfig::config_dir().join("index.cache");
+        let filter = Arc::new(crate::filter::CompiledFilter::from_primary_config(
+            &config,
+            &primary_roots,
+            &excluded_mount_roots,
+        ));
+        let scan_res = scanner::scan_compact(
+            &primary_roots,
+            filter,
+            config.index.include_hidden,
+            progress,
+        );
+        drop(poller);
+
+        let fresh = match scan_res {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                event_handler.on_watcher_error(format!("Index rebuild failed: {error}"));
+                return false;
+            }
+        };
+
+        // Save cache before publishing so multi-million entry encoding never holds the store lock.
+        let cache_file = self.cache_dir.join("index.cache");
         let _ = cache::save_compact(&fresh, Some(checkpoint), &cache_file);
 
-        // 交给索引服务换入：它会从扫描前的事件 ID 重放，补上扫描期间写入旧索引的变更。
-        // 不持着 watcher 锁等待，免得退出时的存盘被卡住。
-        let watcher = self.watcher.lock().unwrap().clone();
+        let watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let unswapped = match watcher {
             Some(watcher) => watcher.replace(fresh, checkpoint).err(),
             None => Some(fresh),
         };
         if let Some(fresh) = unswapped {
-            // 服务已不在：它的检查点不再对应索引，退出时不能拿来存盘。
-            *self.watcher.lock().unwrap() = None;
+            *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.store.replace_compact(fresh);
             let warm_store = self.store.clone();
             std::thread::spawn(move || warm_store.warm_query_index());
         }
 
         drop(guard);
-        event_handler.on_index_ready(self.store.len() as u64);
+        event_handler.on_index_ready(self.volumes.total_entry_count(&self.store));
         true
     }
 
-    /// Save the index with its replay checkpoint. Call before the app quits so
-    /// the next launch only replays what changed after this point.
+    /// Save the primary index checkpoint and all dirty volume shard caches/manifest.
     pub fn persist_index(&self) {
-        let Some(watcher) = self.watcher.lock().unwrap().clone() else {
-            return;
-        };
-        // 先锁索引再读检查点：服务换入新索引时检查点先降、指纹后升，这样读到的不会比索引新。
-        let index = self.store.read();
-        if let Some(checkpoint) = watcher.checkpoint() {
-            let cache_file = AppConfig::config_dir().join("index.cache");
-            startup::save_index(&index, checkpoint, &cache_file);
+        if let Some(watcher) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            // Lock index before reading checkpoint so checkpoint never leads the locked snapshot.
+            let index = self.store.read();
+            if let Some(checkpoint) = watcher.checkpoint() {
+                let cache_file = self.cache_dir.join("index.cache");
+                startup::save_index(&index, checkpoint, &cache_file);
+            }
         }
+        self.volumes.persist_all();
     }
 
     /// Check if macOS Full Disk Access is granted.
@@ -473,22 +1071,15 @@ impl LokiiCore {
     }
 
     /// Open a file with the default application (macOS `open` command).
-    pub fn open_file(&self, path: String) -> bool {
-        std::process::Command::new("open")
-            .arg(&path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    /// Returns `FfiError::IoError` immediately if the path belongs to an offline or unmounted volume.
+    pub fn open_file(&self, path: String) -> Result<bool, FfiError> {
+        self.run_open_command(&[&path], &path)
     }
 
     /// Reveal a file in Finder (select it in its parent directory).
-    pub fn reveal_in_finder(&self, path: String) -> bool {
-        std::process::Command::new("open")
-            .arg("-R")
-            .arg(&path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    /// Returns `FfiError::IoError` immediately if the path belongs to an offline or unmounted volume.
+    pub fn reveal_in_finder(&self, path: String) -> Result<bool, FfiError> {
+        self.run_open_command(&["-R", &path], &path)
     }
 
     /// Get the current configuration as a JSON string.
@@ -503,13 +1094,8 @@ impl LokiiCore {
         self.metrics.snapshot_json()
     }
 
-    /// Update configuration from a JSON string. Returns true on success.
-    /// Writes to TOML file first, then syncs in-memory ConfigStore.
-    ///
-    /// The payload is treated as a patch over the currently effective config.
-    /// The frontend models only a subset of the schema, so keys it omits must
-    /// keep their existing values rather than fall back to defaults — otherwise
-    /// every preference toggle would silently discard hand-edited settings.
+    /// Update configuration from a JSON patch string. Returns true on success.
+    /// Writes to TOML file first, then syncs ConfigStore, primary store exclusions, and VolumeCoordinator.
     pub fn update_config_from_json(&self, json: String) -> bool {
         let current = self.config_store.read().clone();
         let new_config = match merge_config_patch(&current, &json) {
@@ -520,8 +1106,8 @@ impl LokiiCore {
             }
         };
 
-        // Write to TOML file
-        let config_path = AppConfig::config_dir().join("config.toml");
+        let _ = std::fs::create_dir_all(&self.cache_dir);
+        let config_path = self.cache_dir.join("config.toml");
         let toml_str = match toml::to_string_pretty(&new_config) {
             Ok(s) => s,
             Err(e) => {
@@ -535,7 +1121,7 @@ impl LokiiCore {
             return false;
         }
 
-        // 识别新增的排除目录，就地从当前内存倒排索引中立即剔除条目
+        // Evict newly excluded paths from the primary in-memory index immediately.
         let current_resolved: std::collections::HashSet<String> = current
             .resolve_exclude_paths()
             .into_iter()
@@ -552,9 +1138,55 @@ impl LokiiCore {
             self.store.exclude_paths(&new_resolved);
         }
 
-        // Sync memory directly (don't wait for file watcher)
-        self.config_store.update(new_config);
+        let index_changed = current.index != new_config.index;
+        self.config_store.update(new_config.clone());
+        // 仅当索引相关配置变更时同步卷协调器，避免修改通用/窗口设置时触发挂载表探测与卷缓存对账
+        if index_changed {
+            self.volumes.on_config_updated(&new_config);
+        }
         true
+    }
+
+    /// Snapshot current statuses of all configured mounted volume slots.
+    pub fn get_volume_statuses(&self) -> Vec<FfiVolumeStatus> {
+        self.volumes
+            .statuses()
+            .into_iter()
+            .map(FfiVolumeStatus::from)
+            .collect()
+    }
+
+    /// Remove a volume slot and delete its cached index shard and manifest record.
+    pub fn clear_volume_cache(&self, path_or_id: String) -> Result<bool, FfiError> {
+        self.volumes
+            .clear_volume_cache(&path_or_id)
+            .map_err(|message| FfiError::IoError { message })
+    }
+
+    /// Trigger an atomic background rescan for a mounted volume slot.
+    pub fn rescan_volume(&self, path_or_id: String) -> Result<bool, FfiError> {
+        self.volumes
+            .rescan_volume(&path_or_id)
+            .map_err(|message| FfiError::IoError { message })
+    }
+
+    /// Notify the coordinator that a filesystem was mounted at `mount_path`.
+    pub fn notify_volume_mounted(&self, mount_path: String) {
+        self.volumes
+            .notify_volume_mounted(Path::new(&mount_path));
+    }
+
+    /// Notify the coordinator that `mount_path` is about to unmount so scans and
+    /// directory handles are cancelled immediately while preserving offline caches.
+    pub fn notify_volume_will_unmount(&self, mount_path: String) {
+        self.volumes
+            .notify_volume_will_unmount(Path::new(&mount_path));
+    }
+
+    /// Notify the coordinator that `mount_path` finished unmounting.
+    pub fn notify_volume_did_unmount(&self, mount_path: String) {
+        self.volumes
+            .notify_volume_did_unmount(Path::new(&mount_path));
     }
 }
 
@@ -593,10 +1225,12 @@ fn deep_merge(base: serde_json::Value, patch: serde_json::Value) -> serde_json::
 mod tests {
     use super::*;
     use crate::compact_index::IndexError;
+    use crate::volumes::VolumeManifest;
 
     #[derive(Default)]
     struct RecordingHandler {
         events: Mutex<Vec<String>>,
+        volume_status_changes: std::sync::atomic::AtomicUsize,
     }
 
     impl EventHandler for RecordingHandler {
@@ -623,17 +1257,103 @@ mod tests {
         }
 
         fn on_config_reloaded(&self) {}
+
+        fn on_volume_statuses_changed(&self) {
+            self.volume_status_changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
-    fn core() -> LokiiCore {
-        LokiiCore {
-            store: IndexStore::new(),
-            config_store: ConfigStore::new(AppConfig::default()),
-            resume: Mutex::new(None),
-            watcher: Mutex::new(None),
-            scan_lock: Arc::new(Mutex::new(())),
-            metrics: Arc::new(WatcherMetrics::new()),
+    struct TestCore {
+        _dir: tempfile::TempDir,
+        inner: LokiiCore,
+    }
+
+    impl std::ops::Deref for TestCore {
+        type Target = LokiiCore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
         }
+    }
+
+    fn core() -> TestCore {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = LokiiCore::for_test(
+            dir.path().to_path_buf(),
+            AppConfig::default(),
+            Arc::new(Vec::new),
+        );
+        TestCore { _dir: dir, inner }
+    }
+
+    fn make_entry(name: &str, path: &str) -> crate::indexer::FileEntry {
+        crate::indexer::FileEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir: false,
+            size: 16,
+            modified: 1_700_000_000,
+            created_at: 1_700_000_000,
+            extension: std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    fn seed_volume_cache(
+        volumes_dir: &std::path::Path,
+        configured_path: &str,
+        active_configured_path: &str,
+        active_mount_root: Option<&str>,
+        display_name: &str,
+        kind: VolumeKind,
+        entries: Vec<crate::indexer::FileEntry>,
+    ) -> crate::volumes::VolumeRecord {
+        use crate::compact_index::CompactIndex;
+        use crate::volumes::{VolumeIdentity, VolumeManifest, VolumeRecord};
+
+        let identity = match kind {
+            VolumeKind::Network => VolumeIdentity::Network {
+                fstype: "smbfs".to_string(),
+                normalized_source: format!("//nas.local/{display_name}"),
+                subpath: String::new(),
+            },
+            VolumeKind::LocalExternal => VolumeIdentity::LocalUuid {
+                uuid: format!("UUID-{display_name}"),
+                subpath: String::new(),
+            },
+        };
+        let vid = identity.volume_id();
+        let entry_count = entries.len() as u64;
+        let compact = CompactIndex::from_entries(entries).unwrap();
+        cache::save_compact(&compact, None, &volumes_dir.join(format!("{vid}.cache"))).unwrap();
+        let record = VolumeRecord {
+            volume_id: vid,
+            configured_path: configured_path.to_string(),
+            active_configured_path: active_configured_path.to_string(),
+            active_mount_root: active_mount_root.map(str::to_string),
+            subpath: String::new(),
+            display_name: display_name.to_string(),
+            kind,
+            fstype: if kind == VolumeKind::Network {
+                "smbfs".to_string()
+            } else {
+                "apfs".to_string()
+            },
+            identity,
+            last_sync_at: Some(1_700_000_000),
+            last_event_id: None,
+            journal_uuid: None,
+            entry_count,
+            dirty_filter: false,
+        };
+        let mut manifest = VolumeManifest::load_from_dir(volumes_dir);
+        manifest.upsert(record.clone());
+        manifest.save_atomic(volumes_dir).unwrap();
+        record
     }
 
     #[test]
@@ -805,5 +1525,844 @@ mod tests {
         assert_eq!(res_regex_locked.results.len(), 1);
         assert_eq!(res_regex_locked.effective_mode, FfiSearchMode::Regex);
         assert!(res_regex_locked.is_case_sensitive);
+    }
+
+    #[test]
+    fn offline_path_open_and_reveal_rejected_with_ffi_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes_dir = dir.path().join("volumes");
+        seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/OfflineNAS/Projects",
+            "/Volumes/OfflineNAS/Projects",
+            Some("/Volumes/OfflineNAS"),
+            "OfflineNAS/Projects",
+            VolumeKind::Network,
+            vec![make_entry(
+                "spec.md",
+                "/Volumes/OfflineNAS/Projects/spec.md",
+            )],
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec!["/Volumes/OfflineNAS/Projects".to_string()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler);
+
+        // Configured offline slot must be rejected immediately with FfiError::IoError.
+        let open_err = core
+            .open_file("/Volumes/OfflineNAS/Projects/spec.md".to_string())
+            .expect_err("offline slot open_file must return FfiError");
+        assert!(matches!(open_err, FfiError::IoError { .. }));
+
+        let reveal_err = core
+            .reveal_in_finder("/Volumes/OfflineNAS/Projects/spec.md".to_string())
+            .expect_err("offline slot reveal_in_finder must return FfiError");
+        assert!(matches!(reveal_err, FfiError::IoError { .. }));
+
+        // Unconfigured /Volumes/Disconnected/... must also be rejected immediately without invoking Finder.
+        let disc_open = core
+            .open_file("/Volumes/Disconnected/report.pdf".to_string())
+            .expect_err("unmounted /Volumes path must return FfiError");
+        assert!(matches!(disc_open, FfiError::IoError { .. }));
+
+        let disc_reveal = core
+            .reveal_in_finder("/Volumes/Disconnected/report.pdf".to_string())
+            .expect_err("unmounted /Volumes path reveal_in_finder must return FfiError");
+        assert!(matches!(disc_reveal, FfiError::IoError { .. }));
+    }
+
+    #[test]
+    fn peek_startup_is_cold_start_respects_volume_cache_and_primary_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes_dir = dir.path().join("volumes");
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec!["/Volumes/Archive/Docs".to_string()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(dir.path().to_path_buf(), cfg.clone(), Arc::new(Vec::new));
+        assert!(
+            core.peek_startup_is_cold_start(),
+            "fresh cache dir with no primary or volume cache must report cold start"
+        );
+
+        // Seed only volumes/manifest.json + <volume_id>.cache (no index.cache).
+        seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/Archive/Docs",
+            "/Volumes/Archive/Docs",
+            Some("/Volumes/Archive"),
+            "Archive/Docs",
+            VolumeKind::Network,
+            vec![make_entry("notes.txt", "/Volumes/Archive/Docs/notes.txt")],
+        );
+        assert!(
+            !core.peek_startup_is_cold_start(),
+            "existing configured volume cache must prevent cold start"
+        );
+
+        // Unconfigured manifest record does not satisfy current config.
+        let mut other_cfg = cfg;
+        other_cfg.index.index_paths = vec!["/Volumes/Other".to_string()];
+        let core_other =
+            LokiiCore::for_test(dir.path().to_path_buf(), other_cfg, Arc::new(Vec::new));
+        assert!(core_other.peek_startup_is_cold_start());
+    }
+
+    #[test]
+    fn cold_and_warm_startup_with_coordinator_and_status_mapping() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let primary_dir = tempfile::tempdir().unwrap();
+        // Use a non-hidden directory inside TempDir so default `include_hidden = false` scans it cleanly.
+        let primary_root = primary_dir.path().join("workspace");
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::write(primary_root.join("local_a.txt"), "a").unwrap();
+        std::fs::write(primary_root.join("local_b.txt"), "b").unwrap();
+
+        let volumes_dir = cache_dir.path().join("volumes");
+        let rec = seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/Share/Work",
+            "/Volumes/Share-1/Work",
+            Some("/Volumes/Share-1"),
+            "Share/Work",
+            VolumeKind::Network,
+            vec![
+                make_entry("vol_1.txt", "/Volumes/Share-1/Work/vol_1.txt"),
+                make_entry("vol_2.txt", "/Volumes/Share-1/Work/vol_2.txt"),
+                make_entry("vol_3.txt", "/Volumes/Share-1/Work/vol_3.txt"),
+            ],
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            primary_root.to_string_lossy().to_string(),
+            "/Volumes/Share/Work".to_string(),
+        ];
+        cfg.index.exclude_paths = vec![];
+
+        // Cold primary start + pre-existing offline volume cache (3 primary entries + 3 volume entries = 6).
+        let cold_core = LokiiCore::for_test(
+            cache_dir.path().to_path_buf(),
+            cfg.clone(),
+            Arc::new(Vec::new),
+        );
+        let cold_handler = Arc::new(RecordingHandler::default());
+        let cold_mode = cold_core.initialize(cold_handler.clone());
+        let FfiStartupMode::ColdStart { scanned_count } = cold_mode else {
+            panic!("expected ColdStart when index.cache is missing");
+        };
+        assert_eq!(scanned_count, 6);
+        assert!(cold_handler
+            .volume_status_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1);
+        assert!(cold_handler
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == "ready:6"));
+
+        let stats = cold_core.get_stats();
+        assert_eq!(stats.total_count, 6);
+        assert!(stats.is_ready);
+
+        let statuses = cold_core.get_volume_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].volume_id, rec.volume_id);
+        assert_eq!(statuses[0].configured_path, "/Volumes/Share/Work");
+        assert_eq!(statuses[0].active_path, None);
+        assert_eq!(statuses[0].display_name, "Share/Work");
+        assert_eq!(statuses[0].kind, "network");
+        assert_eq!(statuses[0].state, FfiVolumeState::Offline);
+        assert_eq!(statuses[0].entry_count, 3);
+        assert_eq!(statuses[0].last_sync_at, Some(1_700_000_000));
+        assert!(!statuses[0].is_remounted);
+
+        // Subsequent launch with index.cache present must perform HotStart with combined count.
+        let warm_core = LokiiCore::for_test(
+            cache_dir.path().to_path_buf(),
+            cfg,
+            Arc::new(Vec::new),
+        );
+        let warm_handler = Arc::new(RecordingHandler::default());
+        let warm_mode = warm_core.initialize(warm_handler.clone());
+        let FfiStartupMode::HotStart { cached_count } = warm_mode else {
+            panic!("expected HotStart when index.cache exists");
+        };
+        assert_eq!(cached_count, 6);
+        assert!(warm_handler
+            .volume_status_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1);
+        assert!(warm_handler
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == "ready:6"));
+    }
+
+    #[test]
+    fn search_maps_offline_metadata_and_honors_include_offline_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes_dir = dir.path().join("volumes");
+        seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/Docs",
+            "/Volumes/Docs",
+            Some("/Volumes/Docs"),
+            "Docs",
+            VolumeKind::Network,
+            vec![make_entry("nas_report.txt", "/Volumes/Docs/nas_report.txt")],
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec!["/Volumes/Docs".to_string()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler);
+        core.store.replace(vec![make_entry(
+            "local_report.txt",
+            "/Users/me/local_report.txt",
+        )]);
+
+        let all = core.search(
+            "report".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(all.results.len(), 2);
+        let local = all
+            .results
+            .iter()
+            .find(|r| r.name == "local_report.txt")
+            .expect("local result must exist");
+        assert!(!local.is_offline);
+        assert_eq!(local.volume_name, None);
+
+        let offline = all
+            .results
+            .iter()
+            .find(|r| r.name == "nas_report.txt")
+            .expect("offline volume result must exist");
+        assert!(offline.is_offline);
+        assert_eq!(offline.volume_name.as_deref(), Some("Docs"));
+
+        let online_only = core.search_with_options(
+            "report".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+            false,
+        );
+        assert_eq!(online_only.results.len(), 1);
+        assert_eq!(online_only.results[0].name, "local_report.txt");
+    }
+
+    #[test]
+    fn volume_lifecycle_notifications_rescan_and_clear_cache() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vol_root = tempfile::tempdir().unwrap();
+        let vol_path = vol_root.path().to_string_lossy().to_string();
+        std::fs::write(vol_root.path().join("initial_file.txt"), "hello").unwrap();
+
+        let volumes_dir = cache_dir.path().join("volumes");
+        let seeded = seed_volume_cache(
+            &volumes_dir,
+            &vol_path,
+            &vol_path,
+            Some(&vol_path),
+            "ExtDisk",
+            VolumeKind::Network,
+            vec![make_entry(
+                "initial_file.txt",
+                &format!("{vol_path}/initial_file.txt"),
+            )],
+        );
+
+        let mounted_list = Arc::new(Mutex::new(vec![crate::volumes::MountedFsInfo {
+            mount_point: vol_path.clone(),
+            fstype: "smbfs".to_string(),
+            from_name: "//nas.local/ExtDisk".to_string(),
+            is_local: false,
+            uuid: None,
+            total_bytes: 1_000_000,
+            volume_name: "ExtDisk".to_string(),
+        }]));
+        let mount_reader = Arc::clone(&mounted_list);
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![vol_path.clone()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(
+            cache_dir.path().to_path_buf(),
+            cfg,
+            Arc::new(move || mount_reader.lock().unwrap().clone()),
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler.clone());
+
+        // Wait for background scan to settle Online.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let st = core.get_volume_statuses();
+            if st.len() == 1 && st[0].state == FfiVolumeState::Online {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let online_statuses = core.get_volume_statuses();
+        assert_eq!(online_statuses.len(), 1);
+        assert_eq!(online_statuses[0].state, FfiVolumeState::Online);
+        assert_eq!(online_statuses[0].active_path.as_deref(), Some(vol_path.as_str()));
+
+        // Add a new file and trigger rescan_volume -> new file becomes searchable.
+        std::fs::write(vol_root.path().join("rescanned_asset.txt"), "new").unwrap();
+        let before_rescan_events = handler
+            .volume_status_changes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(core.rescan_volume(vol_path.clone()).unwrap());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let st = core.get_volume_statuses();
+            if st[0].state == FfiVolumeState::Online && st[0].entry_count >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            handler
+                .volume_status_changes
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > before_rescan_events
+        );
+        let hit = core.search(
+            "rescanned_asset".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(hit.results.len(), 1);
+        assert!(!hit.results[0].is_offline);
+
+        // Simulate willUnmount -> immediately goes Offline while keeping cached results searchable.
+        mounted_list.lock().unwrap().clear();
+        core.notify_volume_will_unmount(vol_path.clone());
+        let offline_statuses = core.get_volume_statuses();
+        assert_eq!(offline_statuses[0].state, FfiVolumeState::Offline);
+        assert_eq!(offline_statuses[0].active_path, None);
+        let offline_hit = core.search(
+            "rescanned_asset".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(offline_hit.results.len(), 1);
+        assert!(offline_hit.results[0].is_offline);
+
+        // Simulate didUnmount and remount -> transitions back online.
+        core.notify_volume_did_unmount(vol_path.clone());
+        *mounted_list.lock().unwrap() = vec![crate::volumes::MountedFsInfo {
+            mount_point: vol_path.clone(),
+            fstype: "smbfs".to_string(),
+            from_name: "//nas.local/ExtDisk".to_string(),
+            is_local: false,
+            uuid: None,
+            total_bytes: 1_000_000,
+            volume_name: "ExtDisk".to_string(),
+        }];
+        core.notify_volume_mounted(vol_path.clone());
+        assert_ne!(core.get_volume_statuses()[0].state, FfiVolumeState::Offline);
+
+        // Clear volume cache -> removes slot, deletes .cache, and updates manifest.
+        let cache_file = volumes_dir.join(format!("{}.cache", seeded.volume_id));
+        assert!(cache_file.exists());
+        assert!(core.clear_volume_cache(seeded.volume_id.clone()).unwrap());
+        assert!(core.get_volume_statuses().is_empty());
+        assert!(!cache_file.exists());
+        assert!(!core.clear_volume_cache(seeded.volume_id).unwrap());
+    }
+
+    #[test]
+    fn update_config_from_json_forwards_changes_to_volume_coordinator() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let volumes_dir = cache_dir.path().join("volumes");
+
+        let keep_rec = seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/KeepVol",
+            "/Volumes/KeepVol",
+            Some("/Volumes/KeepVol"),
+            "KeepVol",
+            VolumeKind::Network,
+            vec![make_entry("keep.txt", "/Volumes/KeepVol/keep.txt")],
+        );
+        let drop_rec = seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/DropVol",
+            "/Volumes/DropVol",
+            Some("/Volumes/DropVol"),
+            "DropVol",
+            VolumeKind::Network,
+            vec![make_entry("drop.txt", "/Volumes/DropVol/drop.txt")],
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            "/Volumes/KeepVol".to_string(),
+            "/Volumes/DropVol".to_string(),
+        ];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler);
+        assert_eq!(core.get_volume_statuses().len(), 2);
+
+        // Replace index_paths to drop DropVol and add AddedVol, plus append an exclude rule.
+        let patch = r#"{
+            "index": {
+                "index_paths": ["/Volumes/KeepVol", "/Volumes/AddedVol"],
+                "exclude": ["node_modules", "secret_folder"]
+            }
+        }"#;
+        assert!(core.update_config_from_json(patch.to_string()));
+
+        let statuses = core.get_volume_statuses();
+        let paths: Vec<&str> = statuses
+            .iter()
+            .map(|s| s.configured_path.as_str())
+            .collect();
+        assert!(paths.contains(&"/Volumes/KeepVol"));
+        assert!(paths.contains(&"/Volumes/AddedVol"));
+        assert!(!paths.contains(&"/Volumes/DropVol"));
+
+        assert!(!volumes_dir
+            .join(format!("{}.cache", drop_rec.volume_id))
+            .exists());
+        let manifest = VolumeManifest::load_from_dir(&volumes_dir);
+        let keep_manifest = manifest
+            .find_by_path("/Volumes/KeepVol")
+            .expect("KeepVol must remain in manifest");
+        assert_eq!(keep_manifest.volume_id, keep_rec.volume_id);
+        assert!(
+            keep_manifest.dirty_filter,
+            "filter change while offline must mark KeepVol dirty_filter=true"
+        );
+    }
+
+    #[test]
+    fn rebuild_index_rescans_primary_and_preserves_offline_volume_cache() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_root = primary_dir.path().join("workspace");
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::write(primary_root.join("alpha.txt"), "a").unwrap();
+
+        let volumes_dir = cache_dir.path().join("volumes");
+        let rec = seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/OfflineVault",
+            "/Volumes/OfflineVault",
+            Some("/Volumes/OfflineVault"),
+            "OfflineVault",
+            VolumeKind::Network,
+            vec![make_entry("vault_item.txt", "/Volumes/OfflineVault/vault_item.txt")],
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            primary_root.to_string_lossy().to_string(),
+            "/Volumes/OfflineVault".to_string(),
+        ];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler.clone());
+        assert_eq!(core.get_stats().total_count, 3); // workspace + alpha.txt + vault_item.txt
+        assert!(!core.is_scanning());
+
+        std::fs::write(primary_root.join("beta.txt"), "b").unwrap();
+        assert!(core.rebuild_index(handler.clone()));
+        assert_eq!(core.get_stats().total_count, 4);
+        assert!(!core.is_scanning());
+
+        let hit_beta = core.search(
+            "beta.txt".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(hit_beta.results.len(), 1);
+        assert!(!hit_beta.results[0].is_offline);
+
+        let hit_vault = core.search(
+            "vault_item.txt".to_string(),
+            FfiSearchMode::Substring,
+            FfiCaseSensitivity::Auto,
+        );
+        assert_eq!(hit_vault.results.len(), 1);
+        assert!(hit_vault.results[0].is_offline);
+
+        core.persist_index();
+        assert!(volumes_dir.join(format!("{}.cache", rec.volume_id)).exists());
+        assert!(cache_dir.path().join("index.cache").exists());
+    }
+
+    #[test]
+    fn dropping_core_releases_volume_coordinator_without_cycle() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_root = primary_dir.path().join("workspace");
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::write(primary_root.join("note.txt"), "hello").unwrap();
+
+        let volumes_dir = cache_dir.path().join("volumes");
+        seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/OfflineShare",
+            "/Volumes/OfflineShare",
+            Some("/Volumes/OfflineShare"),
+            "OfflineShare",
+            VolumeKind::Network,
+            vec![make_entry("doc.txt", "/Volumes/OfflineShare/doc.txt")],
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            primary_root.to_string_lossy().to_string(),
+            "/Volumes/OfflineShare".to_string(),
+        ];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler.clone());
+        core.start_watcher(handler);
+
+        let weak_volumes = Arc::downgrade(&core.volumes);
+        assert!(
+            weak_volumes.upgrade().is_some(),
+            "VolumeCoordinator must be alive while LokiiCore owns it"
+        );
+
+        drop(core);
+        assert!(
+            weak_volumes.upgrade().is_none(),
+            "Dropping LokiiCore must release VolumeCoordinator with no Arc cycle"
+        );
+    }
+
+    #[test]
+    fn progress_poller_and_cold_start_emit_scanning_progress() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_root = primary_dir.path().join("workspace");
+        std::fs::create_dir_all(&primary_root).unwrap();
+        for i in 0..10 {
+            std::fs::write(primary_root.join(format!("item_{i}.txt")), "x").unwrap();
+        }
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![primary_root.to_string_lossy().to_string()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        let handler = Arc::new(RecordingHandler::default());
+        let mode = core.initialize(handler.clone());
+        assert!(matches!(
+            mode,
+            FfiStartupMode::ColdStart { scanned_count: 11 }
+        ));
+
+        let events = handler.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.starts_with("scanning:")),
+            "Cold start must emit scanning progress events, got: {:?}",
+            *events
+        );
+        assert!(
+            events.iter().any(|e| e == "scanned:11"),
+            "Cold start must emit final scanned count, got: {:?}",
+            *events
+        );
+
+        // Verify ProgressPoller observes live atomic increments while active.
+        let poll_handler = Arc::new(RecordingHandler::default());
+        let live_progress = Arc::new(AtomicUsize::new(7));
+        let poller = ProgressPoller::start(
+            "scanning",
+            Arc::clone(&live_progress),
+            poll_handler.clone(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if poll_handler
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "scanning:42")
+            {
+                break;
+            }
+            live_progress.store(42, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        drop(poller);
+        assert!(poll_handler
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == "scanning:42"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_path_accessible_guards_non_ascii_traversal_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_workspace = local_dir.path().join("local_ws");
+        std::fs::create_dir_all(&local_workspace).unwrap();
+        let local_file = local_workspace.join("local.txt");
+        std::fs::write(&local_file, "ok").unwrap();
+
+        let volumes_dir = cache_dir.path().join("volumes");
+        seed_volume_cache(
+            &volumes_dir,
+            "/Volumes/OfflineNAS/Projects",
+            "/Volumes/OfflineNAS/Projects",
+            Some("/Volumes/OfflineNAS"),
+            "OfflineNAS/Projects",
+            VolumeKind::Network,
+            vec![make_entry(
+                "spec.md",
+                "/Volumes/OfflineNAS/Projects/spec.md",
+            )],
+        );
+
+        let online_vol_root = tempfile::tempdir().unwrap();
+        let _ = online_vol_root; // Only mocked as mounted non-ASCII share path
+        let mounted_list = vec![crate::volumes::MountedFsInfo {
+            mount_point: "/Volumes/共享盘".to_string(),
+            fstype: "smbfs".to_string(),
+            from_name: "//nas.local/共享盘".to_string(),
+            is_local: false,
+            uuid: None,
+            total_bytes: 1_000_000,
+            volume_name: "共享盘".to_string(),
+        }];
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            local_workspace.to_string_lossy().to_string(),
+            "/Volumes/OfflineNAS/Projects".to_string(),
+        ];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(
+            cache_dir.path().to_path_buf(),
+            cfg,
+            Arc::new(move || mounted_list.clone()),
+        );
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler);
+
+        // Non-ASCII mounted volume passes; sibling prefix boundary fails.
+        assert!(core
+            .ensure_path_accessible("/Volumes/共享盘/项目/报告.pdf")
+            .is_ok());
+        assert!(matches!(
+            core.ensure_path_accessible("/Volumes/共享盘2/报告.pdf"),
+            Err(FfiError::IoError { .. })
+        ));
+
+        // Lexical `..` traversal into offline or unmounted volumes is rejected.
+        assert!(matches!(
+            core.ensure_path_accessible("/Volumes/共享盘/../OfflineNAS/Projects/spec.md"),
+            Err(FfiError::IoError { .. })
+        ));
+        assert!(matches!(
+            core.ensure_path_accessible("/Users/me/../../Volumes/OfflineNAS/Projects/spec.md"),
+            Err(FfiError::IoError { .. })
+        ));
+
+        // Local symlink targeting offline volume (even non-existent subpath) is rejected.
+        let offline_link = local_workspace.join("shortcut_offline");
+        symlink("/Volumes/OfflineNAS/Projects", &offline_link).unwrap();
+        let via_symlink = offline_link.join("missing_nested/spec.md");
+        assert!(matches!(
+            core.open_file(via_symlink.to_string_lossy().to_string()),
+            Err(FfiError::IoError { .. })
+        ));
+
+        // Local symlink targeting online mounted non-ASCII volume passes.
+        let online_link = local_workspace.join("shortcut_online");
+        symlink("/Volumes/共享盘/项目", &online_link).unwrap();
+        assert!(core
+            .ensure_path_accessible(&online_link.join("报告.pdf").to_string_lossy())
+            .is_ok());
+
+        // Local symlink to ordinary local file passes.
+        let local_link = local_workspace.join("shortcut_local.txt");
+        symlink(&local_file, &local_link).unwrap();
+        assert!(core
+            .ensure_path_accessible(&local_link.to_string_lossy())
+            .is_ok());
+
+        // Cyclic symlink returns Err cleanly without hanging.
+        let loop_a = local_workspace.join("loop_a");
+        let loop_b = local_workspace.join("loop_b");
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        assert!(matches!(
+            core.ensure_path_accessible(&loop_a.join("file.txt").to_string_lossy()),
+            Err(FfiError::IoError { .. })
+        ));
+
+        // Boot volume symlink `/Volumes/Macintosh HD -> /` passes for local paths and still
+        // catches local symlinks pointing back to offline volumes.
+        let statuses = core.volumes.statuses();
+        let mounts = core.volumes.mounted_volumes();
+        let boot_reader = |entry: &Path| {
+            if entry == Path::new("/Volumes/Macintosh HD") {
+                Some(PathBuf::from("/"))
+            } else {
+                None
+            }
+        };
+        let via_boot_local = format!("/Volumes/Macintosh HD{}", local_file.to_string_lossy());
+        assert!(ensure_path_accessible_with(
+            &via_boot_local,
+            &statuses,
+            &mounts,
+            &boot_reader
+        )
+        .is_ok());
+        let via_boot_to_offline = format!(
+            "/Volumes/Macintosh HD{}/spec.md",
+            offline_link.to_string_lossy()
+        );
+        assert!(matches!(
+            ensure_path_accessible_with(
+                &via_boot_to_offline,
+                &statuses,
+                &mounts,
+                &boot_reader
+            ),
+            Err(FfiError::IoError { .. })
+        ));
+    }
+
+    #[test]
+    fn is_scanning_reports_true_while_volume_is_syncing() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vol_root = tempfile::tempdir().unwrap();
+        let vol_path = vol_root.path().to_string_lossy().to_string();
+        std::fs::write(vol_root.path().join("asset.txt"), "data").unwrap();
+
+        // Gate inside mount_lister lets the test hold a background rescan worker deterministically
+        // without blocking foreground `rescan_volume` calls on the test thread.
+        let main_thread = std::thread::current().id();
+        let gate = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+        let gate_reader = Arc::clone(&gate);
+        let vol_path_clone = vol_path.clone();
+
+        let mount_lister: Arc<dyn Fn() -> Vec<crate::volumes::MountedFsInfo> + Send + Sync> =
+            Arc::new(move || {
+                if std::thread::current().id() != main_thread {
+                    let (lock, cvar) = &*gate_reader;
+                    let mut state = lock.lock().unwrap();
+                    if state.0 {
+                        state.1 = true;
+                        cvar.notify_all();
+                        while state.0 {
+                            state = cvar.wait(state).unwrap();
+                        }
+                    }
+                }
+                vec![crate::volumes::MountedFsInfo {
+                    mount_point: vol_path_clone.clone(),
+                    fstype: "smbfs".to_string(),
+                    from_name: "//nas.local/HoldVol".to_string(),
+                    is_local: false,
+                    uuid: None,
+                    total_bytes: 1_000_000,
+                    volume_name: "HoldVol".to_string(),
+                }]
+            });
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![vol_path.clone()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg, mount_lister);
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler);
+
+        // Wait for initial online scan to finish before arming gate.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !core.is_scanning()
+                && core
+                    .get_volume_statuses()
+                    .first()
+                    .is_some_and(|s| s.state == FfiVolumeState::Online)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(!core.is_scanning());
+
+        // Arm gate, trigger rescan_volume, wait for worker to pause inside Syncing scan.
+        {
+            let (lock, _cvar) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = true;
+            state.1 = false;
+        }
+        assert!(core.rescan_volume(vol_path).unwrap());
+
+        {
+            let (lock, cvar) = &*gate;
+            let mut state = lock.lock().unwrap();
+            while !state.1 {
+                state = cvar.wait(state).unwrap();
+            }
+        }
+
+        let statuses = core.get_volume_statuses();
+        assert_eq!(statuses[0].state, FfiVolumeState::Syncing);
+        assert!(
+            core.is_scanning(),
+            "is_scanning must return true while any volume is in Syncing state"
+        );
+
+        // Release gate and confirm is_scanning returns false once scan completes.
+        {
+            let (lock, cvar) = &*gate;
+            let mut state = lock.lock().unwrap();
+            state.0 = false;
+            cvar.notify_all();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !core.is_scanning() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(!core.is_scanning());
     }
 }

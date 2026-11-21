@@ -101,11 +101,20 @@ pub fn search_index_tokens(
         max_results,
         case_sensitive,
         explicit_lock,
+        None,
     )
     .0
 }
 
+pub(crate) fn single_inferred_extension(tokens: &[QueryToken]) -> Option<String> {
+    let [token] = tokens else { return None };
+    let single = token.text.trim();
+    (!token.quoted && single.starts_with('.') && !single.contains(' ') && !is_dotfile_query(single))
+        .then(|| crate::cjk::fold_str(&single[1..]))
+}
+
 /// 在纯文件名子串检索未填满 `max_results` 时，按相邻切分追加 `parent_term + filename_term` 混合召回。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search_index_tokens_with_hybrid(
     read: &CompactIndex,
     positive_tokens: &[QueryToken],
@@ -114,6 +123,7 @@ pub(crate) fn search_index_tokens_with_hybrid(
     case_sensitive: bool,
     case_sensitivity: CaseSensitivity,
     explicit_lock: bool,
+    inferred_extension_exists: Option<bool>,
 ) -> Vec<AdvancedSearchResult> {
     let (mut results, matched_ordinals) = search_index_tokens_with_ordinals(
         read,
@@ -122,6 +132,7 @@ pub(crate) fn search_index_tokens_with_hybrid(
         max_results,
         case_sensitive,
         explicit_lock,
+        inferred_extension_exists,
     );
     let remaining = max_results.saturating_sub(results.len());
     if remaining == 0 || positive_tokens.len() < 2 {
@@ -147,16 +158,15 @@ fn search_index_tokens_with_ordinals(
     max_results: usize,
     case_sensitive: bool,
     explicit_lock: bool,
+    inferred_extension_exists: Option<bool>,
 ) -> (Vec<AdvancedSearchResult>, Vec<usize>) {
     if max_results == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut extension = if positive_tokens.len() == 1 && !positive_tokens[0].quoted {
-        let single = positive_tokens[0].text.trim();
-        (!is_dotfile_query(single) && single.starts_with('.') && !single.contains(' '))
-            .then(|| crate::cjk::fold_str(&single[1..]))
-    } else {
+    let mut extension = if inferred_extension_exists == Some(false) {
         None
+    } else {
+        single_inferred_extension(positive_tokens)
     };
 
     // 扩展名回退机制（Fallback Guard）：
@@ -168,6 +178,9 @@ fn search_index_tokens_with_ordinals(
         .as_deref()
         .and_then(|ext| ExtMatcher::compile(read, ext));
     if extension.is_some() && compiled_ext.is_none() {
+        if inferred_extension_exists == Some(true) {
+            return (Vec::new(), Vec::new());
+        }
         extension = None;
     }
     let keywords: Vec<String> = positive_tokens

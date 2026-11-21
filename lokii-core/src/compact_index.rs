@@ -710,7 +710,7 @@ impl<'a> From<&'a FileEntry> for BorrowedFileEntry<'a> {
 }
 
 #[derive(Default)]
-struct InternHints {
+pub(crate) struct InternHints {
     name: Option<u32>,
     extension: Option<u32>,
     parent: Option<u32>,
@@ -944,6 +944,35 @@ impl CompactIndex {
 
     pub fn push(&mut self, entry: FileEntry) -> Result<(), IndexError> {
         let record = self.acquire(&entry)?;
+        let base_ordinal = self.records.len();
+        self.records.push(record);
+        self.on_records_appended(base_ordinal, std::slice::from_ref(&record));
+        Ok(())
+    }
+
+    /// 流式借用写入单条记录，复用同目录 InternHints 避免构建中间 FileEntry 堆分配与重复父目录哈希查找。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_borrowed_with_hints(
+        &mut self,
+        name: &str,
+        path: &str,
+        is_dir: bool,
+        size: u64,
+        modified: u64,
+        created_at: u64,
+        extension: &str,
+        hints: &mut InternHints,
+    ) -> Result<(), IndexError> {
+        let entry = BorrowedFileEntry {
+            name,
+            path,
+            is_dir,
+            size,
+            modified,
+            created_at,
+            extension,
+        };
+        let record = self.acquire_borrowed_with_hints(&entry, hints)?;
         let base_ordinal = self.records.len();
         self.records.push(record);
         self.on_records_appended(base_ordinal, std::slice::from_ref(&record));
@@ -1236,6 +1265,158 @@ impl CompactIndex {
                 if let Some(index) = query_index.get_mut() {
                     index.register_records(std::slice::from_ref(&record), names);
                 }
+            }
+        }
+        Ok(count)
+    }
+
+    /// 将属于 `old_root` 挂载域的所有条目原子重锚定至 `new_root`。
+    ///
+    /// 步骤包括：
+    /// 1. 规范化路径并构建带尾随斜杠的目录边界前缀；
+    /// 2. 重映射 `parents` 与 `raw_paths` 字符串池并重建哈希表与冲突链；
+    /// 3. 若存在挂载根本身条目（其 parent 通常为上级目录如 "/Volumes/"），改写其文件名；
+    /// 4. 重置查询反表缓存以确保后续检索即时使用新结构；
+    /// 5. 若在极罕见碰撞场景下无法原地完成，无损回退至全量物化重构，确保 100% 满足校验不变量。
+    pub fn rebase_mount_root(&mut self, old_root: &str, new_root: &str) -> Result<usize, IndexError> {
+        let old_clean = old_root.trim_end_matches('/');
+        let new_clean = new_root.trim_end_matches('/');
+        if old_clean == new_clean {
+            return Ok(0);
+        }
+
+        let res = self.rebase_in_place(old_clean, new_clean);
+        match res {
+            Ok(count) => {
+                if self.validate().is_ok() {
+                    return Ok(count);
+                }
+            }
+            Err(_) => {}
+        }
+
+        self.rebase_fallback(old_clean, new_clean)
+    }
+
+    fn rebase_in_place(&mut self, old_clean: &str, new_clean: &str) -> Result<usize, IndexError> {
+        let case_insensitive = cfg!(target_os = "macos");
+        let old_prefix = format!("{old_clean}/");
+        let new_prefix = format!("{new_clean}/");
+
+        // 先处理体量极小的 raw_paths 再处理 parents，降低碰撞回退时的部分变更概率
+        self.raw_paths
+            .remap_prefix(old_clean, new_clean, case_insensitive)?;
+        self.parents
+            .remap_prefix(&old_prefix, &new_prefix, case_insensitive)?;
+
+        let (old_parent, old_leaf) = split_path(old_clean);
+        let (new_parent, new_leaf) = split_path(new_clean);
+
+        let is_match = |a: &str, b: &str| {
+            if case_insensitive {
+                a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
+            } else {
+                a == b
+            }
+        };
+
+        for ord in 0..self.records.len() {
+            let record = self.records[ord];
+            if !record.raw_path {
+                let parent_text = self.parents.get(record.path).unwrap_or("");
+                let name_text = self.names.get(record.name).unwrap_or("");
+                if is_match(parent_text, old_parent) && is_match(name_text, old_leaf) {
+                    if old_leaf != new_leaf {
+                        let old_name = record.name;
+                        let new_name = self.names.intern(new_leaf)?;
+                        self.records[ord].name = new_name;
+                        self.names.release(old_name);
+                    }
+                    if old_parent != new_parent {
+                        let old_p = record.path;
+                        let new_p = self.parents.intern(new_parent)?;
+                        self.records[ord].path = new_p;
+                        self.parents.release(old_p);
+                    }
+                }
+            }
+        }
+
+        self.query_index = std::sync::OnceLock::new();
+
+        let mut count = 0;
+        for ord in 0..self.records.len() {
+            let view = self.view(EntryId(ord)).ok_or(IndexError::InvalidReference)?;
+            if view.path_equals(new_clean) || view.path_starts_with(&new_prefix) {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    fn rebase_fallback(&mut self, old_clean: &str, new_clean: &str) -> Result<usize, IndexError> {
+        let old_prefix = format!("{old_clean}/");
+        let new_prefix = format!("{new_clean}/");
+        let mut entries = Vec::with_capacity(self.records.len());
+        let old_path = std::path::Path::new(old_clean);
+        let old_comps: Vec<String> = old_path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        for (_id, view) in self.iter() {
+            let mut entry = view.materialize();
+            let entry_path = std::path::Path::new(&entry.path);
+            if view.path_equals(old_clean)
+                || (cfg!(target_os = "macos")
+                    && (entry.path.eq_ignore_ascii_case(old_clean)
+                        || entry_path
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                            .eq(old_comps.iter().cloned())))
+            {
+                entry.path = new_clean.to_string();
+                if let Some(name) = std::path::Path::new(new_clean).file_name() {
+                    entry.name = name.to_string_lossy().into_owned();
+                }
+            } else if let Some(suffix) = entry.path.strip_prefix(&old_prefix) {
+                entry.path = format!("{new_clean}/{suffix}");
+            } else if cfg!(target_os = "macos")
+                && entry
+                    .path
+                    .as_bytes()
+                    .get(..old_prefix.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(old_prefix.as_bytes()))
+            {
+                // 字节前缀已与有效 UTF-8 串 old_prefix 按 ASCII 忽略大小写完全匹配，
+                // 因此 old_prefix.len() 必然落在 UTF-8 字符边界上，不会触发切片越界 panic。
+                let suffix = &entry.path[old_prefix.len()..];
+                entry.path = format!("{new_clean}/{suffix}");
+            } else if cfg!(target_os = "macos") {
+                let entry_comps: Vec<_> = entry_path.components().collect();
+                if entry_comps.len() > old_comps.len()
+                    && entry_comps
+                        .iter()
+                        .take(old_comps.len())
+                        .zip(old_comps.iter())
+                        .all(|(c, target)| c.as_os_str().to_string_lossy().to_lowercase() == *target)
+                {
+                    let mut rebuilt = std::path::PathBuf::from(new_clean);
+                    for comp in entry_comps.into_iter().skip(old_comps.len()) {
+                        rebuilt.push(comp.as_os_str());
+                    }
+                    entry.path = rebuilt.to_string_lossy().into_owned();
+                }
+            }
+            entries.push(entry);
+        }
+        *self = Self::from_entries(entries)?;
+
+        let mut count = 0;
+        for ord in 0..self.records.len() {
+            let view = self.view(EntryId(ord)).ok_or(IndexError::InvalidReference)?;
+            if view.path_equals(new_clean) || view.path_starts_with(&new_prefix) {
+                count += 1;
             }
         }
         Ok(count)
@@ -1776,5 +1957,216 @@ mod tests {
                 Err(IndexError::InvalidReference)
             ));
         }
+    }
+
+    #[test]
+    fn rebase_mount_root_handles_root_entry_subpaths_and_cache_roundtrip() {
+        let entries = vec![
+            FileEntry {
+                name: "Share".into(),
+                path: "/Volumes/Share".into(),
+                is_dir: true,
+                size: 0,
+                modified: 10,
+                created_at: 1,
+                extension: "".into(),
+            },
+            FileEntry {
+                name: "a.txt".into(),
+                path: "/Volumes/Share/a.txt".into(),
+                is_dir: false,
+                size: 5,
+                modified: 20,
+                created_at: 2,
+                extension: "txt".into(),
+            },
+            FileEntry {
+                name: "b.rs".into(),
+                path: "/Volumes/Share/sub/b.rs".into(),
+                is_dir: false,
+                size: 9,
+                modified: 30,
+                created_at: 3,
+                extension: "rs".into(),
+            },
+        ];
+        let mut index = CompactIndex::from_entries(entries).unwrap();
+        index.rebase_mount_root("/Volumes/Share", "/Volumes/Share-1").unwrap();
+        let encoded = index.encode_cache();
+        let cache: CacheIndex = bitcode::decode(&encoded).unwrap();
+        let reloaded = CompactIndex::from_cache(cache).unwrap();
+        let paths: Vec<String> = (0..reloaded.len())
+            .map(|i| reloaded.view(EntryId(i)).unwrap().materialize().path)
+            .collect();
+        assert!(paths.contains(&"/Volumes/Share-1".to_string()));
+        assert!(paths.contains(&"/Volumes/Share-1/a.txt".to_string()));
+        assert!(paths.contains(&"/Volumes/Share-1/sub/b.rs".to_string()));
+        let hit_paths: Vec<String> = crate::search::path_search::search_index(
+            &reloaded,
+            &crate::search::path_query::PathQuery::parse_with_case("in:/Volumes/Share-1 b.rs", false).unwrap(),
+            &crate::search::CompiledRecordFilter::default(),
+            10,
+            false,
+            false,
+        )
+        .into_iter()
+        .map(|r| r.entry.path)
+        .collect();
+        assert_eq!(hit_paths, vec!["/Volumes/Share-1/sub/b.rs"]);
+    }
+
+    #[test]
+    fn rebase_mount_root_reverse_and_boundary_safety() {
+        let entries = vec![
+            FileEntry {
+                name: "Share".into(),
+                path: "/Volumes/Share".into(),
+                is_dir: true,
+                size: 0,
+                modified: 10,
+                created_at: 1,
+                extension: "".into(),
+            },
+            FileEntry {
+                name: "a.txt".into(),
+                path: "/Volumes/Share/a.txt".into(),
+                is_dir: false,
+                size: 5,
+                modified: 20,
+                created_at: 2,
+                extension: "txt".into(),
+            },
+            FileEntry {
+                name: "b.rs".into(),
+                path: "/Volumes/Share/sub/b.rs".into(),
+                is_dir: false,
+                size: 9,
+                modified: 30,
+                created_at: 3,
+                extension: "rs".into(),
+            },
+            FileEntry {
+                name: "other.txt".into(),
+                path: "/Volumes/ShareExtra/other.txt".into(),
+                is_dir: false,
+                size: 3,
+                modified: 40,
+                created_at: 4,
+                extension: "txt".into(),
+            },
+        ];
+        let mut index = CompactIndex::from_entries(entries).unwrap();
+        let count = index.rebase_mount_root("/Volumes/Share", "/Volumes/Share-1").unwrap();
+        assert_eq!(count, 3);
+
+        // Boundary check: /Volumes/ShareExtra/other.txt must NOT be modified
+        let paths: Vec<String> = (0..index.len())
+            .map(|i| index.view(EntryId(i)).unwrap().materialize().path)
+            .collect();
+        assert!(paths.contains(&"/Volumes/ShareExtra/other.txt".to_string()));
+        assert!(!paths.contains(&"/Volumes/Share-1Extra/other.txt".to_string()));
+        assert!(paths.contains(&"/Volumes/Share-1".to_string()));
+        assert!(paths.contains(&"/Volumes/Share-1/a.txt".to_string()));
+        assert!(paths.contains(&"/Volumes/Share-1/sub/b.rs".to_string()));
+
+        // Invariants must strictly hold
+        index.validate().unwrap();
+
+        // Reverse rebase back to /Volumes/Share
+        let reverse_count = index.rebase_mount_root("/Volumes/Share-1", "/Volumes/Share").unwrap();
+        assert_eq!(reverse_count, 3);
+
+        let restored_paths: Vec<String> = (0..index.len())
+            .map(|i| index.view(EntryId(i)).unwrap().materialize().path)
+            .collect();
+        assert!(restored_paths.contains(&"/Volumes/Share".to_string()));
+        assert!(restored_paths.contains(&"/Volumes/Share/a.txt".to_string()));
+        assert!(restored_paths.contains(&"/Volumes/Share/sub/b.rs".to_string()));
+        assert!(restored_paths.contains(&"/Volumes/ShareExtra/other.txt".to_string()));
+
+        index.validate().unwrap();
+        let encoded = index.encode_cache();
+        let cache: CacheIndex = bitcode::decode(&encoded).unwrap();
+        let reloaded = CompactIndex::from_cache(cache).unwrap();
+        assert_eq!(reloaded.len(), 4);
+    }
+
+    #[test]
+    fn rebase_fallback_accurate_count_on_rebuilt_records() {
+        let entries = vec![
+            FileEntry {
+                name: "Share".into(),
+                path: "/Volumes/Share".into(),
+                is_dir: true,
+                size: 0,
+                modified: 10,
+                created_at: 1,
+                extension: "".into(),
+            },
+            FileEntry {
+                name: "a.txt".into(),
+                path: "/Volumes/Share/a.txt".into(),
+                is_dir: false,
+                size: 5,
+                modified: 20,
+                created_at: 2,
+                extension: "txt".into(),
+            },
+            FileEntry {
+                name: "other.txt".into(),
+                path: "/Volumes/Other/other.txt".into(),
+                is_dir: false,
+                size: 3,
+                modified: 40,
+                created_at: 4,
+                extension: "txt".into(),
+            },
+        ];
+        let mut index = CompactIndex::from_entries(entries).unwrap();
+        let count = index.rebase_fallback("/Volumes/Share", "/Volumes/Share-1").unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(index.len(), 3);
+        index.validate().unwrap();
+
+        let paths: Vec<String> = (0..index.len())
+            .map(|i| index.view(EntryId(i)).unwrap().materialize().path)
+            .collect();
+        assert!(paths.contains(&"/Volumes/Share-1".to_string()));
+        assert!(paths.contains(&"/Volumes/Share-1/a.txt".to_string()));
+        assert!(paths.contains(&"/Volumes/Other/other.txt".to_string()));
+    }
+
+    #[test]
+    fn rebase_fallback_handles_multibyte_utf8_at_prefix_length_without_panic() {
+        let entries = vec![
+            FileEntry {
+                name: "a.txt".into(),
+                path: "/Volumes/Disk/a.txt".into(),
+                is_dir: false,
+                size: 5,
+                modified: 20,
+                created_at: 2,
+                extension: "txt".into(),
+            },
+            FileEntry {
+                name: "b.txt".into(),
+                // "/Volumes/Disk/" 长度为 14 字节，此处第 14 字节正好落在 '享' 的多字节 UTF-8 编码内部
+                path: "/Volumes/共享盘/b.txt".into(),
+                is_dir: false,
+                size: 8,
+                modified: 30,
+                created_at: 3,
+                extension: "txt".into(),
+            },
+        ];
+        let mut index = CompactIndex::from_entries(entries).unwrap();
+        let count = index.rebase_fallback("/Volumes/Disk", "/Volumes/Disk-1").unwrap();
+        assert_eq!(count, 1);
+        index.validate().unwrap();
+        let paths: Vec<String> = (0..index.len())
+            .map(|i| index.view(EntryId(i)).unwrap().materialize().path)
+            .collect();
+        assert!(paths.contains(&"/Volumes/Disk-1/a.txt".to_string()));
+        assert!(paths.contains(&"/Volumes/共享盘/b.txt".to_string()));
     }
 }

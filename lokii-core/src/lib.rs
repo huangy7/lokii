@@ -14,6 +14,8 @@ pub mod query_server;
 pub mod scanner;
 pub mod search;
 pub mod startup;
+pub mod volume_manager;
+pub mod volumes;
 pub mod watcher;
 
 mod ffi;

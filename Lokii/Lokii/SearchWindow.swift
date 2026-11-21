@@ -170,6 +170,9 @@ final class SearchWindow: NSWindowController {
         searchResultsViewController.onOpenFDAGuide = {
             FDAGuideWindowController.show()
         }
+        searchResultsViewController.isPathOfflineHandler = { [weak engine] path in
+            engine?.isPathOffline(path) ?? false
+        }
         searchResultsViewController.onExcludeDirectory = { [weak self, weak engine] dirPath in
             guard let self = self, let engine = engine else { return }
             guard var config = engine.getConfig() else { return }
@@ -544,6 +547,8 @@ final class SearchWindow: NSWindowController {
                        name: SearchEngine.initializationFailedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onConfigReloaded(_:)),
                        name: SearchEngine.configReloadedNotification, object: nil)
+        nc.addObserver(self, selector: #selector(onVolumeStatusesChanged),
+                       name: SearchEngine.volumeStatusesChangedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onAppDidBecomeActive),
                        name: NSApplication.didBecomeActiveNotification, object: nil)
     }
@@ -929,15 +934,22 @@ final class SearchWindow: NSWindowController {
     }
 
     private var isSearching = false
+    private var pendingVolumeRefresh = false
 
     /// 搜索框为空时自动呈现全量索引文件与目录树（按文件名自然字母顺序排列，且清除匹配高亮）
     private func loadDefaultResults() {
-        guard indexingState != .failed, !isSearching else { return }
+        guard indexingState != .failed else { return }
+        if isSearching {
+            pendingVolumeRefresh = true
+            return
+        }
         isSearching = true
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.engine.search(query: "*", mode: .wildcard)
+            // 循环外一次性读取卷状态快照，避免 500~1000 条结果逐条加锁拷贝数组
+            let volumeStatuses = self.engine.getVolumeStatuses()
             // 默认未检索状态下按修改时间倒序排列（最近活跃优先），时间相同时按文件名自然字母顺序排列
             let items: [FfiSearchResult] = response.results
                 .sorted {
@@ -947,7 +959,12 @@ final class SearchWindow: NSWindowController {
                     return $0.name.localizedStandardCompare($1.name) == .orderedAscending
                 }
                 .map { item in
-                    FfiSearchResult(
+                    let matchedStatus = volumeStatuses.isEmpty
+                        ? nil
+                        : SearchEngine.matchVolumeStatus(forPath: item.path, in: volumeStatuses)
+                    let offline = item.isOffline || (matchedStatus.map { $0.state == .offline || $0.state == .missing } ?? false)
+                    let resolvedVolumeName = item.volumeName ?? matchedStatus?.displayName
+                    return FfiSearchResult(
                         name: item.name,
                         path: item.path,
                         isDir: item.isDir,
@@ -958,7 +975,9 @@ final class SearchWindow: NSWindowController {
                         score: item.score,
                         matchPositions: [],
                         parentMatchPositions: [],
-                        searchMode: item.searchMode
+                        searchMode: item.searchMode,
+                        isOffline: offline,
+                        volumeName: resolvedVolumeName
                     )
                 }
             let tree: ResultDirectoryTree? = items.isEmpty ? nil : ResultDirectoryTree.build(from: items)
@@ -968,10 +987,17 @@ final class SearchWindow: NSWindowController {
                 guard self.indexingState != .failed else { return }
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
 
+                let needsVolumeRefresh = self.pendingVolumeRefresh
+                self.pendingVolumeRefresh = false
+
                 let currentText = self.searchField.stringValue
                 if !currentText.isEmpty {
                     self.lastQuery = currentText
                     self.performSearch(query: currentText)
+                    return
+                }
+                if needsVolumeRefresh {
+                    self.loadDefaultResults()
                     return
                 }
                 self.lastExclusionHint = nil
@@ -979,12 +1005,17 @@ final class SearchWindow: NSWindowController {
                 self.splitViewController.updateSearchResults(rawResults: items, tree: tree)
                 self.searchMatchText = nil
                 self.updateStatusLabel()
+                self.searchResultsViewController.updateBottomPath(with: self.searchResultsViewController.selectedResult?.path)
             }
         }
     }
 
     private func performSearch(query: String) {
-        guard indexingState != .failed, !isSearching else { return }
+        guard indexingState != .failed else { return }
+        if isSearching {
+            pendingVolumeRefresh = true
+            return
+        }
         isSearching = true
         searchMatchText = .key("search.searching")
 
@@ -1017,9 +1048,11 @@ final class SearchWindow: NSWindowController {
                     }
                 }
 
-                // 检索期间若输入内容变动或检索模式/大小写敏感发生切换，在此重新调度
+                // 检索期间若输入内容变动、检索模式/大小写敏感切换或卷状态更新，在此重新调度
+                let needsVolumeRefresh = self.pendingVolumeRefresh
+                self.pendingVolumeRefresh = false
                 let currentText = self.searchField.stringValue
-                if (currentText != query && !currentText.isEmpty) || self.currentMode != mode || self.currentCaseSensitivity != caseSensitivity {
+                if needsVolumeRefresh || (currentText != query && !currentText.isEmpty) || self.currentMode != mode || self.currentCaseSensitivity != caseSensitivity {
                     if currentText.isEmpty {
                         self.searchResultsViewController.updateBottomPath(with: nil)
                         self.loadDefaultResults()
@@ -1030,6 +1063,8 @@ final class SearchWindow: NSWindowController {
                 } else if currentText.isEmpty && currentText != query {
                     self.searchResultsViewController.updateBottomPath(with: nil)
                     self.loadDefaultResults()
+                } else {
+                    self.searchResultsViewController.updateBottomPath(with: self.searchResultsViewController.selectedResult?.path)
                 }
             }
         }
@@ -1045,8 +1080,42 @@ final class SearchWindow: NSWindowController {
         recordCurrentSearchQueryIfNeeded()
         let selected = selectedResults
         guard !selected.isEmpty else { return }
+        if selected.contains(where: { $0.isOffline || engine.isPathOffline($0.path) }) {
+            searchResultsViewController.showBlockedActionFeedback()
+            return
+        }
         for item in selected {
-            engine.openFile(path: item.path)
+            openResultWithFeedback(item)
+        }
+    }
+
+    private func openResultWithFeedback(_ item: FfiSearchResult) {
+        if item.isOffline || engine.isPathOffline(item.path) {
+            searchResultsViewController.showBlockedActionFeedback()
+            return
+        }
+        engine.openFileAsync(path: item.path) { [weak self] outcome in
+            guard let self, !outcome.succeeded else { return }
+            let message = outcome.errorMessage ?? L("search.offline.actionBlocked")
+            self.searchResultsViewController.showBlockedActionFeedback(message)
+            if let window = self.window {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = L("search.offline.openFailedTitle")
+                alert.informativeText = message
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    @objc private func onVolumeStatusesChanged() {
+        searchResultsViewController.refreshOfflineStates()
+        guard indexingState != .failed, engine.stats.isReady else { return }
+        let currentText = searchField.stringValue
+        if currentText.isEmpty {
+            loadDefaultResults()
+        } else {
+            performSearch(query: currentText)
         }
     }
 
@@ -1460,7 +1529,7 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
 
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {
         recordCurrentSearchQueryIfNeeded()
-        engine.openFile(path: result.path)
+        openResultWithFeedback(result)
     }
 
     func searchMainSplitViewDidConsumeResult() {

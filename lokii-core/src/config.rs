@@ -37,7 +37,7 @@ impl Default for GeneralConfig {
 }
 
 /// Index-related configuration: which directories to scan, what to exclude.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
     /// Directories to index (supports "~" for home directory).
@@ -146,7 +146,7 @@ impl Default for IndexConfig {
                 ".msmtprc".to_string(),
             ],
             max_results: 500,
-            network_rescan_minutes: 5,
+            network_rescan_minutes: 30,
         }
     }
 }
@@ -217,25 +217,30 @@ impl Default for AppConfig {
     }
 }
 
+/// Expands leading `~` or `~/...` to the user's home directory.
+/// If `dirs::home_dir()` returns None, falls back to `/`.
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(rest)
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
 impl AppConfig {
     /// Resolve index paths, expanding "~" to the user's home directory.
     /// Silently skips paths that don't exist on disk.
     pub fn resolve_paths(&self) -> Vec<PathBuf> {
-        let home = dirs::home_dir();
         let mut paths: Vec<PathBuf> = self
             .index
             .index_paths
             .iter()
             .filter_map(|p| {
-                let resolved = if p == "~" {
-                    home.clone().unwrap_or_else(|| PathBuf::from("/"))
-                } else if let Some(rest) = p.strip_prefix("~/") {
-                    home.clone()
-                        .unwrap_or_else(|| PathBuf::from("/"))
-                        .join(rest)
-                } else {
-                    PathBuf::from(p)
-                };
+                let resolved = expand_tilde(p);
                 if resolved.exists() {
                     Some(resolved)
                 } else {
@@ -244,34 +249,29 @@ impl AppConfig {
             })
             .collect();
         // 应用开关追加的根不写回用户配置，关闭后自然消失
-        if self.index.index_apps {
-            for root in APP_INDEX_ROOTS {
-                let path = PathBuf::from(root);
-                if path.exists() && !paths.contains(&path) {
-                    paths.push(path);
-                }
+        for path in self.resolve_app_roots() {
+            if !paths.contains(&path) {
+                paths.push(path);
             }
         }
         paths
     }
 
+    pub(crate) fn resolve_app_roots(&self) -> impl Iterator<Item = PathBuf> {
+        let enabled = self.index.index_apps;
+        APP_INDEX_ROOTS
+            .into_iter()
+            .filter(move |_| enabled)
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+    }
+
     /// Resolve exclude paths, expanding "~" to the user's home directory.
     pub fn resolve_exclude_paths(&self) -> Vec<PathBuf> {
-        let home = dirs::home_dir();
         self.index
             .exclude_paths
             .iter()
-            .map(|p| {
-                if p == "~" {
-                    home.clone().unwrap_or_else(|| PathBuf::from("/"))
-                } else if let Some(rest) = p.strip_prefix("~/") {
-                    home.clone()
-                        .unwrap_or_else(|| PathBuf::from("/"))
-                        .join(rest)
-                } else {
-                    PathBuf::from(p)
-                }
-            })
+            .map(|p| expand_tilde(p))
             .collect()
     }
 
@@ -332,7 +332,7 @@ sensitive_names = [".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-stor
 max_results = 500
 
 # 网络共享等非本地卷上的索引目录，每隔多少分钟整体重扫一次（0 表示不重扫）
-network_rescan_minutes = 5
+network_rescan_minutes = 30
 
 [window]
 # 窗口失去焦点时是否自动隐藏

@@ -311,3 +311,31 @@
 "prefs.cli.error.permission" = "Administrator authorization failed";
 "prefs.cli.error.uninstallFailed" = "Failed to uninstall command line tool";
 "prefs.cli.error.notOurSymlink" = "Symlink does not belong to Lokii";
+
+/* Mounted Volumes & Offline Search */
+"search.result.offline" = "Offline";
+"search.offline.actionBlocked" = "Volume is disconnected; file operation unavailable";
+"search.offline.openFailedTitle" = "Unable to Open Item";
+"prefs.volume.status.online" = "Online (%@ entries)";
+"prefs.volume.status.syncing" = "Syncing...";
+"prefs.volume.status.offline" = "Offline · Index cached (%@ entries)";
+"prefs.volume.status.offlineNoCount" = "Offline · Index cached";
+"prefs.volume.state.offlineUncached" = "Offline · Not indexed";
+"prefs.volume.status.remounted" = "Mounted at %@";
+"prefs.volume.kind.localExternal" = "External";
+"prefs.volume.kind.network" = "Network";
+"prefs.volume.rescan" = "Rescan";
+"prefs.volume.clearCache" = "Clear Cache";
+"prefs.volume.clearCacheConfirm.title" = "Clear Offline Index Cache?";
+"prefs.volume.clearCacheConfirm.message" = "Clearing the cached index for \"%@\" will remove its offline search entries until the volume is reconnected and rescanned.";
+"prefs.volume.clearCacheConfirm.confirm" = "Clear Cache";
+"prefs.volume.errorTitle" = "Volume Operation Failed";
+"prefs.volume.actionFailed" = "Unable to complete the volume operation";
+"prefs.index.pathChecking" = "Checking...";
+"prefs.index.group.volumes" = "External & Network Volumes";
+"prefs.index.group.volumes.description" = "Each enabled volume is indexed independently and stays searchable offline after disconnect.";
+"prefs.volume.empty" = "No mounted external or network volumes detected";
+"prefs.volume.status.notIndexed" = "Not indexed";
+"prefs.volume.status.pendingSave" = "Pending save";
+"prefs.volume.includeOffline" = "Include offline volume results";
+"prefs.volume.includeOffline.description" = "Keep cached files searchable after an external or network volume disconnects.";

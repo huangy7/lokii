@@ -43,6 +43,8 @@ public struct FfiSearchResult: Equatable, Hashable {
     public var score: Double
     public var matchPositions: [FfiMatchRange]
     public var searchMode: FfiSearchMode
+    public var isOffline: Bool
+    public var volumeName: String?
 
     public init(
         name: String,
@@ -54,7 +56,9 @@ public struct FfiSearchResult: Equatable, Hashable {
         `extension`: String = "",
         score: Double = 0.0,
         matchPositions: [FfiMatchRange] = [],
-        searchMode: FfiSearchMode = .auto
+        searchMode: FfiSearchMode = .auto,
+        isOffline: Bool = false,
+        volumeName: String? = nil
     ) {
         self.name = name
         self.path = path
@@ -66,6 +70,8 @@ public struct FfiSearchResult: Equatable, Hashable {
         self.score = score
         self.matchPositions = matchPositions
         self.searchMode = searchMode
+        self.isOffline = isOffline
+        self.volumeName = volumeName
     }
 }
 """

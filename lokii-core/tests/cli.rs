@@ -57,7 +57,12 @@ fn double_dash_allows_queries_starting_with_dash_and_alfred_gets_match() {
             created_at: 0,
             extension: "rs".into(),
         };
-        let response = Response { results: vec![entry], error: None, is_case_sensitive: None };
+        let response = Response {
+            results: vec![entry],
+            error: None,
+            is_case_sensitive: None,
+            offline_indices: vec![],
+        };
         (&stream).write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes()).unwrap();
         request
     });
@@ -82,4 +87,81 @@ fn times_out_when_app_never_replies() {
     let out = lokii(home.path(), &["search", "foo"].map(OsStr::new));
     assert_eq!(out.status.code(), Some(2));
     assert!(started.elapsed() < std::time::Duration::from_secs(7));
+}
+
+#[test]
+fn online_only_flag_sends_include_offline_false() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = fake_app(home.path());
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let response = Response {
+            results: vec![],
+            error: None,
+            is_case_sensitive: Some(false),
+            offline_indices: vec![],
+        };
+        (&stream)
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .unwrap();
+        request
+    });
+
+    let out = lokii(home.path(), &["search", "--online-only", "foo"].map(OsStr::new));
+    assert_eq!(out.status.code(), Some(0));
+    let req_json: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+    assert_eq!(req_json["include_offline"], false);
+}
+
+#[test]
+fn alfred_format_omits_icon_and_prefixes_offline_subtitle_for_offline_indices() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = fake_app(home.path());
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let online_entry = FileEntry {
+            name: "online.txt".into(),
+            path: "/Users/me/online.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified: 0,
+            created_at: 0,
+            extension: "txt".into(),
+        };
+        let offline_entry = FileEntry {
+            name: "offline.txt".into(),
+            path: "/Volumes/NAS/offline.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified: 0,
+            created_at: 0,
+            extension: "txt".into(),
+        };
+        let response = Response {
+            results: vec![online_entry, offline_entry],
+            error: None,
+            is_case_sensitive: Some(false),
+            offline_indices: vec![1],
+        };
+        (&stream)
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .unwrap();
+    });
+
+    let out = lokii(home.path(), &["search", "--alfred", "txt"].map(OsStr::new));
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["subtitle"], "/Users/me/online.txt");
+    assert!(items[0].get("icon").is_some());
+    assert_eq!(items[1]["subtitle"], "[Offline] /Volumes/NAS/offline.txt");
+    assert!(
+        items[1].get("icon").is_none(),
+        "offline Alfred item must omit icon so Alfred skips stat on unmounted volumes"
+    );
 }

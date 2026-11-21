@@ -274,6 +274,8 @@ extension SearchResultsViewControllerDelegate {
 
 /// 系统服务粘贴板类型清单：注册、请求应答与剪贴板写入共用同一份定义
 enum ServicesPasteboard {
+    static let filenamesType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+
     static let directoryTypes: Set<NSPasteboard.PasteboardType> = [
         NSPasteboard.PasteboardType("public.directory"),
         NSPasteboard.PasteboardType("public.folder"),
@@ -281,7 +283,7 @@ enum ServicesPasteboard {
 
     static let generalTypes: Set<NSPasteboard.PasteboardType> = [
         .fileURL,
-        NSPasteboard.PasteboardType("NSFilenamesPboardType"),
+        filenamesType,
         .string,
         NSPasteboard.PasteboardType("public.plain-text"),
         NSPasteboard.PasteboardType("public.item"),
@@ -292,7 +294,7 @@ enum ServicesPasteboard {
     static let allTypes = directoryTypes.union(generalTypes)
 
     /// 以文件对象形式写入剪贴板的类型子集
-    static let fileObjectTypes = directoryTypes.union([.fileURL])
+    static let fileObjectTypes = directoryTypes.union([.fileURL, filenamesType])
 }
 
 private var servicesMenuKey: UInt8 = 0
@@ -367,6 +369,20 @@ final class BreadcrumbMenuDelegate: NSObject, NSMenuDelegate {
 final class BreadcrumbPathControl: NSPathControl {
     weak var actionDelegate: BreadcrumbPathControlDelegate?
     let menuDelegate = BreadcrumbMenuDelegate()
+    private(set) var isOfflinePathMode = false
+    private(set) var offlineComponentURLs: [URL] = []
+
+    func setOfflineItems(_ items: [NSPathControlItem], urls: [URL]) {
+        isOfflinePathMode = true
+        offlineComponentURLs = urls
+        url = nil
+        pathItems = items
+    }
+
+    func clearOfflineState() {
+        isOfflinePathMode = false
+        offlineComponentURLs = []
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         return true
@@ -376,9 +392,12 @@ final class BreadcrumbPathControl: NSPathControl {
         let location = convert(event.locationInWindow, from: nil)
         guard let pathCell = cell as? NSPathCell else { return nil }
 
-        for componentCell in pathCell.pathComponentCells {
+        for (index, componentCell) in pathCell.pathComponentCells.enumerated() {
             let rect = pathCell.rect(of: componentCell, withFrame: bounds, in: self)
-            if rect.contains(location), let url = componentCell.url {
+            let resolvedURL: URL? = isOfflinePathMode
+                ? (index < offlineComponentURLs.count ? offlineComponentURLs[index] : nil)
+                : componentCell.url
+            if rect.contains(location), let url = resolvedURL {
                 componentCell.isHighlighted = true
                 menuDelegate.activeComponentCell = componentCell
                 guard let menu = actionDelegate?.breadcrumbPathControl(self, menuFor: url) else {
@@ -473,6 +492,14 @@ final class SearchResultsViewController: NSViewController {
 
     /// 注入式确认弹窗闭包，默认通过主视窗弹出原生确认 Sheet，返回用户是否确认执行
     var confirmTrashHandler: ((Int, @escaping (Bool) -> Void) -> Void)?
+
+    /// In-memory offline path predicate supplied by SearchEngine; avoids disk checks on UI events.
+    var isPathOfflineHandler: ((String) -> Bool)?
+
+    /// Injectable workspace icon lookup used for online entries; bypassed completely for offline entries.
+    var workspaceIconProvider: (String) -> NSImage = { path in
+        NSWorkspace.shared.icon(forFile: path)
+    }
 
     /// 上下文作用域租约：当面包屑弹出右键菜单时临时接管有效载荷，规避与主列表选区发生交叉错位
     var activeContextMenuPayload: [URL]?
@@ -965,6 +992,100 @@ final class SearchResultsViewController: NSViewController {
         return selectedResults.map { URL(fileURLWithPath: $0.path) }
     }
 
+    private static func normalizeOfflineCheckPath(_ path: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard expanded.count > 1 else { return expanded }
+        var trimmed = expanded
+        while trimmed.count > 1 && trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        return trimmed
+    }
+
+    private static func offlineVolumeMountRoot(for path: String) -> String? {
+        let components = (path as NSString).pathComponents.filter { $0 != "/" }
+        guard components.count >= 2,
+              components[0].caseInsensitiveCompare("Volumes") == .orderedSame,
+              !components[1].isEmpty else {
+            return nil
+        }
+        return "/Volumes/" + components[1]
+    }
+
+    private static func isPath(_ target: String, insideOrEqual root: String) -> Bool {
+        if target.caseInsensitiveCompare(root) == .orderedSame {
+            return true
+        }
+        return target.lowercased().hasPrefix(root.lowercased() + "/")
+    }
+
+    /// Returns whether a search result belongs to an offline volume without querying the filesystem.
+    func isResultOffline(_ result: FfiSearchResult) -> Bool {
+        if result.isOffline { return true }
+        return isPathOfflineHandler?(result.path) ?? false
+    }
+
+    /// Returns whether a given path belongs to an offline volume without querying disk.
+    /// Root ("/") and bare "/Volumes" are never treated as offline due to descendant results.
+    func isPathOffline(_ path: String) -> Bool {
+        let normalized = Self.normalizeOfflineCheckPath(path)
+        if normalized.isEmpty || normalized == "/" || normalized.caseInsensitiveCompare("/Volumes") == .orderedSame {
+            return false
+        }
+        if let handler = isPathOfflineHandler {
+            return handler(normalized)
+        }
+        return results.contains { item in
+            guard item.isOffline else { return false }
+            let itemPath = Self.normalizeOfflineCheckPath(item.path)
+            if Self.isPath(normalized, insideOrEqual: itemPath) {
+                return true
+            }
+            if let mountRoot = Self.offlineVolumeMountRoot(for: itemPath),
+               Self.isPath(normalized, insideOrEqual: mountRoot) {
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Returns true when `items` is non-empty and all selected items are online; otherwise shows status notice.
+    private func requireAllOnline(_ items: [FfiSearchResult]) -> Bool {
+        guard !items.isEmpty else { return false }
+        if items.contains(where: { isResultOffline($0) }) {
+            showBlockedActionFeedback()
+            return false
+        }
+        return true
+    }
+
+    /// Returns true when every active contextual target (breadcrumb URL or table selection) is online.
+    private var areAllContextualTargetsOnline: Bool {
+        if let payload = activeContextMenuPayload, !payload.isEmpty {
+            if pathBar.isOfflinePathMode { return false }
+            return !payload.contains { isPathOffline($0.path) }
+        }
+        let selected = selectedResults
+        guard !selected.isEmpty else { return false }
+        return !selected.contains { isResultOffline($0) }
+    }
+
+    /// Re-render visible table cells and breadcrumb bar after volume status changes without clearing selection.
+    func refreshOfflineStates() {
+        let selected = tableView.selectedRowIndexes
+        tableView.reloadData()
+        if !selected.isEmpty {
+            let valid = IndexSet(selected.filter { $0 >= 0 && $0 < results.count })
+            if !valid.isEmpty {
+                tableView.selectRowIndexes(valid, byExtendingSelection: false)
+            }
+        }
+        updateBottomPath(with: selectedResult?.path)
+        if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
+            QLPreviewPanel.shared().reloadData()
+        }
+    }
+
     /// 更新并渲染检索结果集合
     func displayResults(_ results: [FfiSearchResult], preserveSelection: Bool) {
         let previousPath = preserveSelection ? selectedResult?.path : nil
@@ -1024,9 +1145,54 @@ final class SearchResultsViewController: NSViewController {
 
     /// 更新底栏文件路径展示并协同控制与权限提示的互斥显隐
     func updateBottomPath(with path: String?) {
-        pathBar.url = path.map { URL(fileURLWithPath: $0) }
+        let isTargetOffline: Bool = {
+            guard let path else { return false }
+            if let matched = results.first(where: { $0.path == path }), isResultOffline(matched) {
+                return true
+            }
+            return isPathOffline(path)
+        }()
+        if let path, isTargetOffline {
+            // Build offline breadcrumb items purely in memory without assigning URLs on NSPathControl
+            // or NSPathComponentCell so AppKit never stats stale mount points.
+            applyOfflinePathItems(for: path)
+        } else {
+            pathBar.clearOfflineState()
+            if path == nil {
+                pathBar.pathItems = []
+            }
+            pathBar.url = path.map { URL(fileURLWithPath: $0) }
+        }
         pathBar.toolTip = path
         updateBottomBarVisibility()
+    }
+
+    private func applyOfflinePathItems(for path: String) {
+        let folderIcon = offlineFallbackIcon(isDir: true)
+        let isTargetDir = results.first(where: { $0.path == path })?.isDir ?? false
+        let components = (path as NSString).pathComponents.filter { $0 != "/" }
+        var items: [NSPathControlItem] = []
+        var urls: [URL] = []
+
+        let rootItem = NSPathControlItem()
+        rootItem.title = "/"
+        rootItem.image = folderIcon
+        items.append(rootItem)
+        urls.append(URL(fileURLWithPath: "/", isDirectory: true))
+
+        var current = ""
+        for (idx, component) in components.enumerated() {
+            current += "/" + component
+            let isLast = idx == components.count - 1
+            let itemIsDir = isLast ? isTargetDir : true
+            let item = NSPathControlItem()
+            item.title = component
+            item.image = itemIsDir ? folderIcon : offlineFallbackIcon(isDir: false)
+            items.append(item)
+            urls.append(URL(fileURLWithPath: current, isDirectory: itemIsDir))
+        }
+
+        pathBar.setOfflineItems(items, urls: urls)
     }
 
     /// 更新当前完全磁盘访问权限状态并刷新底栏互斥展示
@@ -1039,7 +1205,8 @@ final class SearchResultsViewController: NSViewController {
     /// 根据当前路径选中状态与完全磁盘访问权限协同控制显隐让位
     private func updateBottomBarVisibility() {
         // 路径展示优先级高于权限提示：有选中路径时始终让位给路径
-        let showFDAHint = pathBar.url == nil && !hasFullDiskAccess
+        let hasBreadcrumb = pathBar.url != nil || !pathBar.pathItems.isEmpty
+        let showFDAHint = !hasBreadcrumb && !hasFullDiskAccess
         pathBar.isHidden = showFDAHint
         fdaHintButton.isHidden = !showFDAHint
     }
@@ -1065,6 +1232,27 @@ final class SearchResultsViewController: NSViewController {
         rebuildContainer.alphaValue = 1.0
         statusLabel.stringValue = persistedStatusText
         statusLabel.textColor = .secondaryLabelColor
+    }
+
+    /// Display a brief non-blocking notice in the status bar when an offline or disallowed
+    /// filesystem operation is blocked, then automatically restore persisted status.
+    func showBlockedActionFeedback(_ message: String? = nil) {
+        let displayMessage = message ?? L("search.offline.actionBlocked")
+        isShowingTemporaryStatus = true
+        statusFeedbackCapsule.stopSpin()
+        statusFeedbackCapsule.isHidden = true
+        statusFeedbackCapsule.alphaValue = 0.0
+        statusLabel.alphaValue = 1.0
+        rebuildContainer.alphaValue = 1.0
+        statusLabel.stringValue = displayMessage
+        statusLabel.textColor = .systemOrange
+
+        temporaryStatusWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.cancelTemporaryStatus()
+        }
+        temporaryStatusWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: workItem)
     }
 
     /// 当后台正在增量索引或扫描时，点击刷新按钮触发的状态栏微反馈
@@ -1196,7 +1384,15 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc private func pathBarClicked() {
+        guard !pathBar.isOfflinePathMode else {
+            showBlockedActionFeedback()
+            return
+        }
         if let url = pathBar.clickedPathItem?.url ?? pathBar.url {
+            guard !isPathOffline(url.path) else {
+                showBlockedActionFeedback()
+                return
+            }
             delegate?.searchResultsDidConsumeResult()
             revealFilesHandler([url])
         }
@@ -1248,7 +1444,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc func copyFile(_ sender: Any? = nil) {
         let selected = selectedResults
-        guard !selected.isEmpty else { return }
+        guard requireAllOnline(selected) else { return }
         delegate?.searchResultsDidConsumeResult()
         let urls = selected.map { NSURL(fileURLWithPath: $0.path) }
         let pasteboard = NSPasteboard.general
@@ -1259,7 +1455,8 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc func quickLookSelected(_ sender: Any? = nil) {
-        guard !selectedResults.isEmpty else { return }
+        let selected = selectedResults
+        guard requireAllOnline(selected) else { return }
         delegate?.searchResultsDidConsumeResult()
         let panel = QLPreviewPanel.shared()
         // 先显示，让面板经响应链接管 dataSource（显示时同步挂载 controller），再刷新
@@ -1268,15 +1465,24 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc func showInfoSelected(_ sender: Any? = nil) {
-        openFinderInfoWindow(for: selectedResults.map(\.path))
+        let selected = selectedResults
+        guard requireAllOnline(selected) else { return }
+        openFinderInfoWindow(for: selected.map(\.path))
     }
 
     private func openFinderInfoWindow(for paths: [String]) {
-        let targets = paths.prefix(10).filter { FileManager.default.fileExists(atPath: $0) }
-        guard !targets.isEmpty else { return }
+        guard !paths.contains(where: { isPathOffline($0) }) else {
+            showBlockedActionFeedback()
+            return
+        }
+        let candidatePaths = Array(paths.prefix(10))
+        guard !candidatePaths.isEmpty else { return }
         delegate?.searchResultsDidConsumeResult()
 
+        // 将 fileExists 过滤也放入后台队列，避免失联网络挂载点在点击“显示简介”时阻塞主线程
         DispatchQueue.global(qos: .userInitiated).async {
+            let targets = candidatePaths.filter { FileManager.default.fileExists(atPath: $0) }
+            guard !targets.isEmpty else { return }
             let statements = targets.map { path -> String in
                 let escaped = path
                     .replacingOccurrences(of: "\\", with: "\\\\")
@@ -1319,7 +1525,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc func openSelected(_ sender: Any? = nil) {
         let selected = selectedResults
-        guard !selected.isEmpty else { return }
+        guard requireAllOnline(selected) else { return }
         for item in selected {
             delegate?.searchResultsDidDoubleClick(result: item)
         }
@@ -1327,7 +1533,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc func revealSelected(_ sender: Any? = nil) {
         let selected = selectedResults
-        guard !selected.isEmpty else { return }
+        guard requireAllOnline(selected) else { return }
         delegate?.searchResultsDidConsumeResult()
         // 统一调用 activateFileViewerSelecting 接口，无论单选或多选、文件或文件夹，
         // 均在父级视窗中精准定位并高亮目标项，规避 selectFile(nil, ...) 导致的直接打开文档或穿透进入文件夹缺陷
@@ -1337,7 +1543,7 @@ final class SearchResultsViewController: NSViewController {
 
     @objc func openInTerminalSelected(_ sender: Any? = nil) {
         let selected = selectedResults
-        guard !selected.isEmpty else { return }
+        guard requireAllOnline(selected) else { return }
         delegate?.searchResultsDidConsumeResult()
         let urls = selected.map { URL(fileURLWithPath: $0.path) }
         openInTerminalHandler(urls)
@@ -1350,8 +1556,8 @@ final class SearchResultsViewController: NSViewController {
         }), let submenu = openWithItem.submenu else { return }
         submenu.removeAllItems()
 
-        let urls = contextualURLs
-        guard let firstURL = urls.first else {
+        // Skip NSWorkspace queries entirely when target paths are offline so Finder/LaunchServices never block.
+        guard areAllContextualTargetsOnline, let firstURL = contextualURLs.first else {
             openWithItem.isEnabled = false
             return
         }
@@ -1387,6 +1593,10 @@ final class SearchResultsViewController: NSViewController {
         guard let appURL = sender.representedObject as? URL else { return }
         let urls = contextualURLs
         guard !urls.isEmpty else { return }
+        guard areAllContextualTargetsOnline else {
+            showBlockedActionFeedback()
+            return
+        }
         delegate?.searchResultsDidConsumeResult()
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
@@ -1396,6 +1606,10 @@ final class SearchResultsViewController: NSViewController {
     @objc func chooseOtherAppToOpen(_ sender: Any? = nil) {
         let urls = contextualURLs
         guard !urls.isEmpty else { return }
+        guard areAllContextualTargetsOnline else {
+            showBlockedActionFeedback()
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1435,15 +1649,34 @@ final class SearchResultsViewController: NSViewController {
         return parent.isEmpty ? nil : parent
     }
 
+    /// 判定路径是否位于 `/Volumes/<entry>` 挂载卷命名空间内，供主线程免磁盘探测守卫使用
+    private static func isUnderVolumesNamespace(_ path: String) -> Bool {
+        let lower = path.lowercased()
+        guard lower.hasPrefix("/volumes/") else { return false }
+        let remainder = lower.dropFirst("/volumes/".count)
+        return !remainder.isEmpty && !remainder.allSatisfy { $0 == "/" }
+    }
+
+    /// Resolve target directory vs parent folder without probing disconnected or mounted `/Volumes/*` paths on disk.
+    private func resolveExcludedDirectoryURL(for url: URL) -> URL {
+        if let matched = results.first(where: { $0.path == url.path }) {
+            return matched.isDir ? url : url.deletingLastPathComponent()
+        }
+        if isPathOffline(url.path) || !areAllContextualTargetsOnline || pathBar.isOfflinePathMode || Self.isUnderVolumesNamespace(url.path) {
+            return url.hasDirectoryPath ? url : url.deletingLastPathComponent()
+        }
+        return TerminalLauncher.directoryURL(for: url)
+    }
+
     @objc func excludeDirectorySelected(_ sender: Any? = nil) {
         guard let url = contextualURLs.first else { return }
-        let dirURL = TerminalLauncher.directoryURL(for: url)
+        let dirURL = resolveExcludedDirectoryURL(for: url)
         onExcludeDirectory?(dirURL.path)
     }
 
     @objc func moveToTrashSelected(_ sender: Any? = nil) {
         let selected = selectedResults
-        guard !selected.isEmpty else { return }
+        guard requireAllOnline(selected) else { return }
 
         confirmTrashIfNeeded(count: selected.count) { [weak self] confirmed in
             guard let self = self, confirmed else { return }
@@ -1580,9 +1813,43 @@ final class SearchResultsViewController: NSViewController {
         }
     }
 
-    func iconForFile(at path: String) -> NSImage {
+    private func offlineFallbackIcon(isDir: Bool) -> NSImage {
+        let key = (isDir ? "__offline__dir__" : "__offline__file__") as NSString
+        if let cached = iconCache.object(forKey: key) { return cached }
+        let symbolName = isDir ? "folder" : "doc"
+        let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) ?? NSImage()
+        iconCache.setObject(icon, forKey: key)
+        return icon
+    }
+
+    private func nonBlockingTypeIcon(for path: String, isDir: Bool) -> NSImage {
+        if isDir {
+            let key = "__type_icon_dir__" as NSString
+            if let cached = iconCache.object(forKey: key) { return cached }
+            let icon = NSWorkspace.shared.icon(for: .folder)
+            iconCache.setObject(icon, forKey: key)
+            return icon
+        }
+        let ext = (path as NSString).pathExtension.lowercased()
+        let key = "__type_icon_ext_\(ext)" as NSString
+        if let cached = iconCache.object(forKey: key) { return cached }
+        let utType = ext.isEmpty ? UTType.data : (UTType(filenameExtension: ext) ?? .data)
+        let icon = NSWorkspace.shared.icon(for: utType)
+        iconCache.setObject(icon, forKey: key)
+        return icon
+    }
+
+    func iconForFile(at path: String, isDir: Bool = false, isOffline: Bool = false) -> NSImage {
+        if isOffline || isPathOffline(path) {
+            return offlineFallbackIcon(isDir: isDir)
+        }
+        // `/Volumes/*` 下的外置盘与网络共享严禁在主线程表格渲染期间同步调用 NSWorkspace.icon(forFile:)，
+        // 避免 SMB/NFS 逐行 stat 往返导致滚动卡顿或挂载假死时冻结界面。
+        if Self.isUnderVolumesNamespace(path) {
+            return nonBlockingTypeIcon(for: path, isDir: isDir)
+        }
         if let cached = iconCache.object(forKey: path as NSString) { return cached }
-        let icon = NSWorkspace.shared.icon(forFile: path)
+        let icon = workspaceIconProvider(path)
         iconCache.setObject(icon, forKey: path as NSString)
         return icon
     }
@@ -1605,11 +1872,25 @@ final class SearchResultsViewController: NSViewController {
             return super.validRequestor(forSendType: sendType, returnType: returnType)
         }
 
+        // File-object and directory services require all targets to be online; never query disk for offline entries.
+        if ServicesPasteboard.fileObjectTypes.contains(sendType) || ServicesPasteboard.directoryTypes.contains(sendType) {
+            guard areAllContextualTargetsOnline else {
+                return super.validRequestor(forSendType: sendType, returnType: returnType)
+            }
+        }
+
         // 若服务请求特定于目录容器类型，精准校验目标载荷是否包含实际目录实体
         if ServicesPasteboard.directoryTypes.contains(sendType) {
             let containsDirectory: Bool
             if let payload = activeContextMenuPayload, !payload.isEmpty {
                 containsDirectory = payload.contains { url in
+                    guard !isPathOffline(url.path) else { return false }
+                    if let matched = results.first(where: { $0.path == url.path }) {
+                        return matched.isDir
+                    }
+                    if Self.isUnderVolumesNamespace(url.path) {
+                        return url.hasDirectoryPath || url.pathExtension.isEmpty
+                    }
                     var isDir: ObjCBool = false
                     if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
                         return isDir.boolValue
@@ -1617,7 +1898,7 @@ final class SearchResultsViewController: NSViewController {
                     return url.hasDirectoryPath || url.pathExtension.isEmpty
                 }
             } else {
-                containsDirectory = selectedResults.contains { $0.isDir }
+                containsDirectory = selectedResults.contains { $0.isDir && !isResultOffline($0) }
             }
             guard containsDirectory else {
                 return super.validRequestor(forSendType: sendType, returnType: returnType)
@@ -1635,6 +1916,7 @@ extension SearchResultsViewController: NSServicesMenuRequestor {
     func writeSelection(to pboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
         let targetURLs = contextualURLs
         guard !targetURLs.isEmpty else { return false }
+        let allowFileObjects = areAllContextualTargetsOnline
 
         var didWrite = false
         pboard.clearContents()
@@ -1642,14 +1924,13 @@ extension SearchResultsViewController: NSServicesMenuRequestor {
         let paths = targetURLs.map(\.path)
         let pathString = paths.joined(separator: "\n")
 
-        if types.contains(where: { ServicesPasteboard.fileObjectTypes.contains($0) }) {
+        if allowFileObjects && types.contains(where: { ServicesPasteboard.fileObjectTypes.contains($0) }) {
             pboard.writeObjects(targetURLs as [NSURL])
             didWrite = true
         }
 
-        let filenamesType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
-        if types.contains(filenamesType) {
-            pboard.setPropertyList(paths, forType: filenamesType)
+        if allowFileObjects && types.contains(ServicesPasteboard.filenamesType) {
+            pboard.setPropertyList(paths, forType: ServicesPasteboard.filenamesType)
             didWrite = true
         }
 
@@ -1680,7 +1961,11 @@ extension SearchResultsViewController: NSTableViewDataSource {
 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard row >= 0, row < results.count else { return nil }
-        return NSURL(fileURLWithPath: results[row].path)
+        let result = results[row]
+        if isResultOffline(result) {
+            return nil
+        }
+        return NSURL(fileURLWithPath: result.path)
     }
 
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
@@ -1706,19 +1991,20 @@ extension SearchResultsViewController: NSTableViewDelegate {
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row < results.count, let column = tableColumn else { return nil }
         let result = results[row]
+        let offline = isResultOffline(result)
         let colID = column.identifier
         let isLastColumn = tableView.tableColumns.last?.identifier == colID
 
         switch colID {
         case .columnName:
-            return nameCell(for: result, in: tableView)
+            return nameCell(for: result, isOffline: offline, in: tableView)
         case .columnPath:
-            return pathCell(for: result, in: tableView)
+            return pathCell(for: result, isOffline: offline, in: tableView)
         case .columnModified:
             return textCell(
                 string: dateText(for: TimeInterval(result.modified)),
                 font: fontCache.regular,
-                color: .labelColor,
+                color: offline ? NSColor.labelColor.withAlphaComponent(0.55) : .labelColor,
                 alignment: isLastColumn ? .right : .left,
                 identifier: colID,
                 in: tableView
@@ -1728,7 +2014,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
             return textCell(
                 string: str,
                 font: fontCache.monospacedDigit,
-                color: .secondaryLabelColor,
+                color: offline ? NSColor.secondaryLabelColor.withAlphaComponent(0.55) : .secondaryLabelColor,
                 alignment: isLastColumn ? .right : .left,
                 identifier: colID,
                 in: tableView
@@ -1767,13 +2053,13 @@ extension SearchResultsViewController: NSTableViewDelegate {
         return text
     }
 
-    private func nameCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
+    private func nameCell(for result: FfiSearchResult, isOffline: Bool, in tableView: NSTableView) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier("NameCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
-            reused.imageView?.image = iconForFile(at: result.path)
+            reused.imageView?.image = iconForFile(at: result.path, isDir: result.isDir, isOffline: isOffline)
             reused.updateIconSize(currentIconSize)
             reused.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
-            reused.configure(name: result.name, matchPositions: result.matchPositions)
+            reused.configure(name: result.name, matchPositions: result.matchPositions, isOffline: isOffline)
             return reused
         }
 
@@ -1783,7 +2069,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         let imageView = NSImageView()
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.image = iconForFile(at: result.path)
+        imageView.image = iconForFile(at: result.path, isDir: result.isDir, isOffline: isOffline)
         cell.addSubview(imageView)
         cell.imageView = imageView
 
@@ -1815,16 +2101,16 @@ extension SearchResultsViewController: NSTableViewDelegate {
 
         cell.setIconConstraints(width: widthConstraint, height: heightConstraint)
         cell.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
-        cell.configure(name: result.name, matchPositions: result.matchPositions)
+        cell.configure(name: result.name, matchPositions: result.matchPositions, isOffline: isOffline)
 
         return cell
     }
 
-    private func pathCell(for result: FfiSearchResult, in tableView: NSTableView) -> NSTableCellView {
+    private func pathCell(for result: FfiSearchResult, isOffline: Bool, in tableView: NSTableView) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier("PathCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchPathTableCellView {
             reused.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
-            reused.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
+            reused.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions, isOffline: isOffline)
             return reused
         }
 
@@ -1852,7 +2138,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         ])
 
         cell.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
-        cell.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions)
+        cell.configure(fullPath: result.path, parentMatchPositions: result.parentMatchPositions, isOffline: isOffline)
         return cell
     }
 
@@ -1903,7 +2189,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
 extension SearchResultsViewController: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.representedObject as? String == "search.ctx.services" || menuItem.hasSubmenu {
-            return !contextualURLs.isEmpty
+            return areAllContextualTargetsOnline
         }
         switch menuItem.action {
         case #selector(openSelected),
@@ -1912,11 +2198,12 @@ extension SearchResultsViewController: NSMenuItemValidation {
              #selector(openInTerminalSelected),
              #selector(showInfoSelected),
              #selector(copyFile),
-             #selector(copyPath),
-             #selector(copyName),
              #selector(moveToTrashSelected),
              #selector(openWithApp(_:)),
-             #selector(chooseOtherAppToOpen(_:)),
+             #selector(chooseOtherAppToOpen(_:)):
+            return areAllContextualTargetsOnline
+        case #selector(copyPath),
+             #selector(copyName),
              #selector(excludeDirectorySelected(_:)):
             return !contextualURLs.isEmpty
         case #selector(filterByDirectorySelected):
@@ -1927,9 +2214,16 @@ extension SearchResultsViewController: NSMenuItemValidation {
              #selector(breadcrumbOpenInTerminal(_:)),
              #selector(breadcrumbShowInfo(_:)):
             guard let url = menuItem.representedObject as? URL else { return false }
+            guard !pathBar.isOfflinePathMode, !isPathOffline(url.path) else { return false }
+            if Self.isUnderVolumesNamespace(url.path) {
+                return true
+            }
             return FileManager.default.fileExists(atPath: url.path)
         case #selector(breadcrumbFilterByDirectory(_:)):
             guard let url = menuItem.representedObject as? URL else { return false }
+            if pathBar.isOfflinePathMode || isPathOffline(url.path) || Self.isUnderVolumesNamespace(url.path) {
+                return selectedResult?.path != url.path || selectedResult?.isDir == true
+            }
             var isDir: ObjCBool = false
             return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
         case #selector(breadcrumbCopyPath(_:)),
@@ -1944,8 +2238,16 @@ extension SearchResultsViewController: NSMenuItemValidation {
 // MARK: - QLPreviewPanelDataSource & QLPreviewPanelDelegate
 
 extension SearchResultsViewController: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    private var previewableResults: [FfiSearchResult] {
+        let selected = selectedResults
+        guard !selected.isEmpty, !selected.contains(where: { isResultOffline($0) }) else {
+            return []
+        }
+        return selected
+    }
+
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
-        !selectedResults.isEmpty
+        !previewableResults.isEmpty
     }
 
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
@@ -1959,11 +2261,11 @@ extension SearchResultsViewController: QLPreviewPanelDataSource, QLPreviewPanelD
     }
 
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        selectedResults.count
+        previewableResults.count
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        let items = selectedResults
+        let items = previewableResults
         guard index >= 0, index < items.count else { return nil }
         return NSURL(fileURLWithPath: items[index].path)
     }
@@ -2030,12 +2332,20 @@ extension SearchResultsViewController: BreadcrumbPathControlDelegate {
 
     @objc private func breadcrumbRevealInFinder(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        guard !pathBar.isOfflinePathMode, !isPathOffline(url.path) else {
+            showBlockedActionFeedback()
+            return
+        }
         delegate?.searchResultsDidConsumeResult()
         revealFilesHandler([url])
     }
 
     @objc private func breadcrumbOpenItem(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        guard !pathBar.isOfflinePathMode, !isPathOffline(url.path) else {
+            showBlockedActionFeedback()
+            return
+        }
         delegate?.searchResultsDidConsumeResult()
         NSWorkspace.shared.open(url)
     }
@@ -2052,6 +2362,10 @@ extension SearchResultsViewController: BreadcrumbPathControlDelegate {
 
     @objc private func breadcrumbOpenInTerminal(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        guard !pathBar.isOfflinePathMode, !isPathOffline(url.path) else {
+            showBlockedActionFeedback()
+            return
+        }
         delegate?.searchResultsDidConsumeResult()
         openInTerminalHandler([url])
     }
@@ -2064,6 +2378,10 @@ extension SearchResultsViewController: BreadcrumbPathControlDelegate {
 
     @objc private func breadcrumbShowInfo(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
+        guard !pathBar.isOfflinePathMode, !isPathOffline(url.path) else {
+            showBlockedActionFeedback()
+            return
+        }
         openFinderInfoWindow(for: [url.path])
     }
 }
@@ -2337,8 +2655,11 @@ final class SearchNameTableCellView: SearchHighlightCellView {
         iconHeightConstraint?.constant = size
     }
 
-    func configure(name: String, matchPositions: [FfiMatchRange]) {
+    func configure(name: String, matchPositions: [FfiMatchRange], isOffline: Bool = false) {
         setDisplay(name, ranges: matchPositions.map { (Int($0.start), Int($0.end)) })
+        let alpha: CGFloat = isOffline ? 0.55 : 1.0
+        imageView?.alphaValue = alpha
+        textField?.alphaValue = alpha
         toolTip = name
         textField?.toolTip = name
     }
@@ -2361,18 +2682,24 @@ final class SearchPathTableCellView: SearchHighlightCellView {
         Self.middleTruncateStyle
     }
 
-    func configure(fullPath: String, parentMatchPositions: [FfiMatchRange]) {
+    func configure(fullPath: String, parentMatchPositions: [FfiMatchRange], isOffline: Bool = false) {
         let parent = (fullPath as NSString).deletingLastPathComponent
         guard !parent.isEmpty else {
-            setDisplay("", ranges: [])
-            toolTip = nil
-            textField?.toolTip = nil
+            let fallback = isOffline ? L("search.result.offline") : ""
+            setDisplay(fallback, ranges: [])
+            textField?.alphaValue = isOffline ? 0.55 : 1.0
+            toolTip = fallback.isEmpty ? nil : fullPath
+            textField?.toolTip = fallback.isEmpty ? nil : fullPath
             return
         }
 
         let abbreviated = abbreviateHomePrefix(parent)
-        setDisplay(abbreviated.display,
+        let display = isOffline
+            ? "\(abbreviated.display) · \(L("search.result.offline"))"
+            : abbreviated.display
+        setDisplay(display,
                    ranges: parentMatchPositions.compactMap { abbreviated.displayRange(for: $0) })
+        textField?.alphaValue = isOffline ? 0.55 : 1.0
         toolTip = fullPath
         textField?.toolTip = fullPath
     }
