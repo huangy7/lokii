@@ -90,6 +90,45 @@ pub fn search_index_tokens(
     max_results: usize,
     case_sensitive: bool,
 ) -> Vec<AdvancedSearchResult> {
+    search_index_tokens_inner(
+        read,
+        positive_tokens,
+        filter,
+        max_results,
+        case_sensitive,
+        None,
+    )
+    .into_iter()
+    .map(|(result, _)| result)
+    .collect()
+}
+
+pub(crate) fn search_index_tokens_raw(
+    read: &CompactIndex,
+    positive_tokens: &[super::filter::QueryToken],
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    seen: &std::collections::HashSet<String>,
+) -> Vec<(AdvancedSearchResult, u32)> {
+    search_index_tokens_inner(
+        read,
+        positive_tokens,
+        filter,
+        max_results,
+        case_sensitive,
+        Some(seen),
+    )
+}
+
+fn search_index_tokens_inner(
+    read: &CompactIndex,
+    positive_tokens: &[super::filter::QueryToken],
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    raw_order_excluding: Option<&std::collections::HashSet<String>>,
+) -> Vec<(AdvancedSearchResult, u32)> {
     if positive_tokens.is_empty() || max_results == 0 {
         return Vec::new();
     }
@@ -121,40 +160,95 @@ pub fn search_index_tokens(
     let targets_hidden = positive_tokens.iter().any(|t| t.text.starts_with('.'));
     let rank_ctx = super::ranking::RecordRankContext::default();
     let mut buffer = Vec::new();
-    let matches = super::rank_unique_names(
-        read,
-        filter,
-        max_results,
-        req,
-        targets_hidden,
-        &rank_ctx,
-        |name, _| {
-            let name_norm = crate::cjk::normalize_and_simplify_cow(name);
-            let haystack = Utf32Str::new(&name_norm, &mut buffer);
-            pattern
-                .score(haystack, &mut matcher)
-                .map(|raw| super::ranking::BaseNameScore::for_fuzzy(name, raw))
-        },
-    );
+    let mut score_name = |name: &str| {
+        let name_norm = crate::cjk::normalize_and_simplify_cow(name);
+        let haystack = Utf32Str::new(&name_norm, &mut buffer);
+        pattern.score(haystack, &mut matcher)
+    };
+    let matches: Vec<_> = if let Some(seen) = raw_order_excluding {
+        let mut top = super::top_k::TopK::new(max_results);
+        let mut path = String::new();
+        for &name_id in &read.sorted_names().ids {
+            if read
+                .name_signature(name_id)
+                .is_some_and(|sig| !sig.contains(req))
+            {
+                continue;
+            }
+            let Some((name, _)) = read.name_entry(name_id) else {
+                continue;
+            };
+            let Some(raw_score) = score_name(name) else {
+                continue;
+            };
+            for &ordinal in read.entries_for_name(name_id) {
+                let ordinal = ordinal as usize;
+                if !filter.matches_record_in(read, &read.records()[ordinal], Some(name)) {
+                    continue;
+                }
+                let Some(view) = read.view(crate::compact_index::EntryId(ordinal)) else {
+                    continue;
+                };
+                if !seen.is_empty() {
+                    view.path_into(&mut path);
+                    if seen.contains(&path) {
+                        continue;
+                    }
+                }
+                top.offer_path(ordinal, raw_score, view);
+            }
+        }
+        top.finish()
+            .into_iter()
+            .map(|candidate| {
+                let view = read
+                    .view(crate::compact_index::EntryId(candidate.ordinal))
+                    .unwrap();
+                let base = super::ranking::BaseNameScore::for_fuzzy(view.name, candidate.score);
+                let display_score = super::ranking::score_record(
+                    base,
+                    view.is_dir,
+                    view.parent,
+                    &rank_ctx,
+                    targets_hidden,
+                );
+                (candidate.ordinal, display_score, candidate.score)
+            })
+            .collect()
+    } else {
+        super::rank_unique_names(
+            read,
+            filter,
+            max_results,
+            req,
+            targets_hidden,
+            &rank_ctx,
+            |name, _| {
+                score_name(name).map(|raw| super::ranking::BaseNameScore::for_fuzzy(name, raw))
+            },
+        )
+        .into_iter()
+        .map(|candidate| (candidate.ordinal, candidate.score, 0))
+        .collect()
+    };
     let mut indices = Vec::new();
     matches
         .into_iter()
-        .map(|candidate| {
-            let view = read
-                .view(crate::compact_index::EntryId(candidate.ordinal))
-                .unwrap();
+        .map(|(ordinal, score, raw_score)| {
+            let view = read.view(crate::compact_index::EntryId(ordinal)).unwrap();
             let name_norm = crate::cjk::normalize_and_simplify_cow(view.name);
             let haystack = Utf32Str::new(&name_norm, &mut buffer);
             indices.clear();
             pattern.indices(haystack, &mut matcher, &mut indices);
             let positions = map_fuzzy_indices_to_orig(view.name, &name_norm, haystack, &indices);
-            AdvancedSearchResult {
+            let result = AdvancedSearchResult {
                 entry: view.materialize(),
-                score: candidate.score.to_f64(),
+                score: score.to_f64(),
                 match_positions: positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Fuzzy,
-            }
+            };
+            (result, raw_score)
         })
         .collect()
 }

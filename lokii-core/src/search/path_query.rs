@@ -201,6 +201,92 @@ impl PathQuery {
             || self.scope_prefix.is_some()
             || !self.scope_candidates.is_empty()
     }
+
+    /// 若分片存在挂载路径漂移（`configured_path != active_path`），
+    /// 将 `scope_prefix` 或绝对路径 `path_pattern` 中的历史配置前缀重写为当前生效前缀。
+    ///
+    /// 当配置路径与生效路径位于卷内子目录且共享相同尾部路径段（如 `/Volumes/Share/Projects` 与
+    /// `/Volumes/Share-1/Projects`）时，剥离双方相同的尾部路径段以推导出卷挂载根别名
+    /// （双方均至少保留 2 个非空路径段，如 `/Volumes/<Name>`），从而同时兼容卷根级 `in:` 作用域与
+    /// 子路径绝对查询；并严格维持前缀边界安全（如 `/Volumes/Share` 绝不误匹配 `/Volumes/ShareExtra`）
+    /// 与大小写不敏感匹配。
+    pub fn rewrite_drift_alias(&self, configured_path: &str, active_path: &str) -> Self {
+        let cfg_clean = collapse_consecutive_slashes(configured_path.trim_end_matches('/'));
+        let act_clean = collapse_consecutive_slashes(active_path.trim_end_matches('/'));
+
+        if cfg_clean.is_empty() || act_clean.is_empty() || eq_ignore_case(&cfg_clean, &act_clean) {
+            return self.clone();
+        }
+
+        let mut cfg_segments: Vec<&str> = cfg_clean.split('/').filter(|s| !s.is_empty()).collect();
+        let mut act_segments: Vec<&str> = act_clean.split('/').filter(|s| !s.is_empty()).collect();
+        if cfg_segments.is_empty() || act_segments.is_empty() {
+            return self.clone();
+        }
+
+        while cfg_segments.len() > 2 && act_segments.len() > 2 {
+            let cfg_tail = cfg_segments.last().copied().unwrap();
+            let act_tail = act_segments.last().copied().unwrap();
+            if !eq_ignore_case(cfg_tail, act_tail) {
+                break;
+            }
+            cfg_segments.pop();
+            act_segments.pop();
+        }
+
+        let cfg_prefix = format_segments_prefix(&cfg_clean, &cfg_segments);
+        let act_prefix = format_segments_prefix(&act_clean, &act_segments);
+        if cfg_prefix == act_prefix {
+            return self.clone();
+        }
+
+        let mut rewritten = self.clone();
+
+        for candidate in rewritten
+            .scope_candidates
+            .iter_mut()
+            .chain(rewritten.path_candidates.iter_mut())
+            .filter(|candidate| candidate.is_absolute)
+        {
+            if let Some(updated) = candidate.pattern.strip_prefix(&cfg_prefix) {
+                candidate.pattern = format!("{act_prefix}{updated}");
+            }
+        }
+        rewritten.scope_prefix = rewritten
+            .scope_candidates
+            .first()
+            .map(|c| c.pattern.clone());
+        rewritten.path_pattern = rewritten.path_candidates.first().map(|c| c.pattern.clone());
+        if let Some(raw) = rewritten.raw_dir_pattern.as_mut() {
+            let folded = crate::cjk::fold_cow(raw);
+            if folded.starts_with(&cfg_prefix) {
+                if let Some((_, end)) =
+                    super::map_norm_span_to_orig(raw, &folded, 0, cfg_prefix.len())
+                {
+                    *raw = format!("/{}/{}", act_segments.join("/"), &raw[end..]);
+                }
+            }
+        }
+
+        rewritten
+    }
+}
+
+fn eq_ignore_case(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        crate::cjk::fold_cow(a) == crate::cjk::fold_cow(b)
+    }
+}
+
+fn format_segments_prefix(clean: &str, segments: &[&str]) -> String {
+    let joined = segments.join("/");
+    if clean.starts_with('/') {
+        crate::cjk::fold_str(&format!("/{joined}/"))
+    } else {
+        crate::cjk::fold_str(&format!("{joined}/"))
+    }
 }
 
 fn lookup_dir_alias(seg_folded: &str) -> Option<&'static str> {
@@ -458,5 +544,56 @@ mod tests {
     fn test_parse_pure_cn_filename_is_not_path_query() {
         // 纯中文标准目录名不带 '/' 时不应误判为路径查询
         assert!(PathQuery::parse("桌面").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_drift_alias_subpath_mount_root_and_boundaries() {
+        let cfg = "/Volumes/Share/Projects";
+        let act = "/Volumes/Share-1/Projects";
+
+        // 1. 卷根级 in: 作用域改写
+        let q_root = PathQuery::parse("in:/Volumes/Share doc.txt").unwrap();
+        let rw_root = q_root.rewrite_drift_alias(cfg, act);
+        assert_eq!(rw_root.scope_prefix.as_deref(), Some("/volumes/share-1/"));
+
+        // 2. 子路径绝对查询改写
+        let q_sub = PathQuery::parse("/Volumes/Share/Projects/doc.txt").unwrap();
+        let rw_sub = q_sub.rewrite_drift_alias(cfg, act);
+        assert_eq!(rw_sub.path_pattern.as_deref(), Some("/volumes/share-1/projects/"));
+
+        // 3. 兄弟前缀边界守卫：/Volumes/ShareExtra 不得被误改写
+        let q_sibling = PathQuery::parse("in:/Volumes/ShareExtra doc.txt").unwrap();
+        let rw_sibling = q_sibling.rewrite_drift_alias(cfg, act);
+        assert_eq!(
+            rw_sibling.scope_prefix.as_deref(),
+            Some("/volumes/shareextra/")
+        );
+
+        let q_sibling_abs = PathQuery::parse("/Volumes/ShareExtra/Projects/doc.txt").unwrap();
+        let rw_sibling_abs = q_sibling_abs.rewrite_drift_alias(cfg, act);
+        assert_eq!(
+            rw_sibling_abs.path_pattern.as_deref(),
+            Some("/volumes/shareextra/projects/")
+        );
+
+        // 4. 至少保留 2 级路径段：/Volumes/A 与 /Other/A 不得剥离出只剩 1 级段的 /Volumes
+        let q_two_seg = PathQuery::parse("in:/Volumes/ doc.txt").unwrap();
+        let rw_two_seg = q_two_seg.rewrite_drift_alias("/Volumes/A", "/Other/A");
+        assert_eq!(rw_two_seg.scope_prefix.as_deref(), Some("/volumes/"));
+    }
+
+    #[test]
+    fn test_rewrite_drift_alias_non_ascii_and_unicode_case() {
+        let q = PathQuery::parse("in:/Volumes/中文卷 报告").unwrap();
+        let rw = q.rewrite_drift_alias("/Volumes/中文卷", "/Volumes/中文卷-1");
+        assert_eq!(rw.scope_prefix.as_deref(), Some("/volumes/中文卷-1/"));
+
+        // 带大小写扩展字符（如 'İ'）的目录名安全改写，不发生字节越界切片
+        let q_tr = PathQuery::parse("/Volumes/İSTANBUL/sub/doc.txt").unwrap();
+        let rw_tr = q_tr.rewrite_drift_alias("/Volumes/İSTANBUL", "/Volumes/İSTANBUL-1");
+        assert_eq!(
+            rw_tr.path_pattern.as_deref(),
+            Some("/volumes/i\u{307}stanbul-1/sub/")
+        );
     }
 }

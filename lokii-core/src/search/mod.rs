@@ -440,6 +440,25 @@ pub(crate) fn detect_mode_from_tokens(tokens: &[QueryToken]) -> SearchMode {
     SearchMode::Auto
 }
 
+/// 参与多源检索的分片描述符。
+#[derive(Clone, Copy)]
+pub struct SearchShard<'a> {
+    pub index: &'a CompactIndex,
+    pub configured_path: Option<&'a str>,
+    pub active_path: Option<&'a str>,
+    pub volume_name: Option<&'a str>,
+    pub is_offline: bool,
+}
+
+/// 携带来源分片元信息的高级检索结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiSearchResult {
+    pub result: AdvancedSearchResult,
+    pub volume_name: Option<String>,
+    pub is_offline: bool,
+}
+
 /// Detect search mode from query string.
 /// - Starts with `regex:` or matches regex sugar `/<pattern>/` (unquoted) -> Regex
 /// - Contains unescaped `|` -> Auto (or disjunction)
@@ -451,14 +470,14 @@ pub fn detect_mode(query: &str) -> SearchMode {
 }
 
 /// 校验证伪隐式扩展名在当前索引中是否存在；若不存在则移出过滤条件并归还至正向检索词元。
-fn resolve_inferred_exts(read: &CompactIndex, parsed: &mut ParsedQuery) {
+fn resolve_inferred_exts(parsed: &mut ParsedQuery, has_extension: impl Fn(&str) -> bool) {
     if parsed.filter.inferred_exts.is_empty() {
         return;
     }
     let inferred = std::mem::take(&mut parsed.filter.inferred_exts);
     let mut restored_tokens = false;
     for (inferred_ext, raw_token) in inferred {
-        if read.extension_id(&inferred_ext).is_none() {
+        if !has_extension(&inferred_ext) {
             parsed.filter.custom_exts.retain(|e| e != &inferred_ext);
             if parsed.filter.custom_ext.as_deref() == Some(inferred_ext.as_str()) {
                 parsed.filter.custom_ext = parsed.filter.custom_exts.first().cloned();
@@ -751,34 +770,36 @@ pub fn dispatch_with_filter(
     case_sensitivity: CaseSensitivity,
     max_results: usize,
 ) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
-    let mut parsed = parse_query_structured(query);
     let read = store.read();
-    let explicit_lock = case_sensitivity == CaseSensitivity::Sensitive;
-
-    let (results, resolved_cs, error, effective_mode) = dispatch_with_filter_inner(
+    let prepared = prepare_search(query, mode, case_sensitivity, false, |ext| {
+        read.extension_id(ext).is_some()
+    });
+    dispatch_with_filter_inner(
         &read,
-        &mut parsed,
-        query,
+        &prepared,
         mode,
-        filter,
+        &filter,
         case_sensitivity,
         max_results,
-        explicit_lock,
-    );
-    (results, resolved_cs, error, effective_mode)
+        None,
+        FuzzyPass::Both,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_with_filter_inner(
-    read: &CompactIndex,
-    parsed: &mut ParsedQuery,
+struct PreparedSearch {
+    parsed: ParsedQuery,
+    disjunction: Option<DisjunctionQuery>,
+    single_extension_exists: Option<bool>,
+}
+
+fn prepare_search(
     query: &str,
     mode: SearchMode,
-    filter: QueryFilter,
     case_sensitivity: CaseSensitivity,
-    max_results: usize,
-    explicit_lock: bool,
-) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
+    across_shards: bool,
+    has_extension: impl Fn(&str) -> bool,
+) -> PreparedSearch {
+    let mut parsed = parse_query_structured(query);
     let top_level_regex = mode == SearchMode::Regex
         || (!parsed.positive_tokens.iter().any(|t| t.quoted)
             && (parsed
@@ -789,43 +810,92 @@ fn dispatch_with_filter_inner(
                     && parse_regex_sugar(&parsed.clean_query).is_some())));
 
     // 并集检索（OR 查询）路由：在自动且非顶层正则模式下，先按双引号/转义感知的 `|` 切分，再逐子句解析过滤器。
-    if mode == SearchMode::Auto && !top_level_regex && has_unescaped_pipe(query) {
-        let parts = split_query_pipes(query);
+    let disjunction = if mode == SearchMode::Auto && !top_level_regex && has_unescaped_pipe(query) {
         let global_case = match case_sensitivity {
             CaseSensitivity::Auto => None,
             CaseSensitivity::Sensitive => Some(true),
             CaseSensitivity::Insensitive => Some(false),
         };
-        let mut clauses = Vec::with_capacity(parts.len());
-        let mut clause_compiled_filters = Vec::with_capacity(parts.len());
+        let clauses = split_query_pipes(query)
+            .into_iter()
+            .map(|raw| {
+                let mut clause = parse_query_structured(&raw);
+                resolve_inferred_exts(&mut clause, &has_extension);
+                DisjunctionQuery::build_clause_with_extension_check(
+                    raw,
+                    clause,
+                    global_case,
+                    |ext| !across_shards || has_extension(ext),
+                )
+            })
+            .collect();
+        Some(DisjunctionQuery { clauses })
+    } else {
+        resolve_inferred_exts(&mut parsed, &has_extension);
+        None
+    };
+    let single_extension_exists = if across_shards && disjunction.is_none() {
+        substring::single_inferred_extension(&parsed.positive_tokens).map(|ext| has_extension(&ext))
+    } else {
+        None
+    };
+    PreparedSearch {
+        parsed,
+        disjunction,
+        single_extension_exists,
+    }
+}
 
-        for raw in parts {
-            let mut clause_parsed = parse_query_structured(&raw);
-            resolve_inferred_exts(&read, &mut clause_parsed);
-            let clause_filter = clause_parsed.filter.merged_with(&filter);
-            let clause = DisjunctionQuery::build_clause(raw, clause_parsed, global_case);
-            let compiled = CompiledRecordFilter::compile_with_case(
-                &read,
-                &clause_filter,
-                clause.is_case_sensitive,
-            );
-            clauses.push(clause);
-            clause_compiled_filters.push(compiled);
-        }
+enum FuzzyPass<'a> {
+    Both,
+    Precise,
+    Jump {
+        seen: &'a std::collections::HashSet<String>,
+        output: &'a mut Vec<(AdvancedSearchResult, u32)>,
+    },
+}
 
-        let disjunction_query = DisjunctionQuery { clauses };
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_filter_inner(
+    read: &CompactIndex,
+    prepared: &PreparedSearch,
+    mode: SearchMode,
+    filter: &QueryFilter,
+    case_sensitivity: CaseSensitivity,
+    max_results: usize,
+    shard_context: Option<(&SearchShard<'_>, &[SearchShard<'_>])>,
+    fuzzy_pass: FuzzyPass<'_>,
+) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
+    let explicit_lock = case_sensitivity == CaseSensitivity::Sensitive;
+    if let Some(disjunction_query) = &prepared.disjunction {
         if disjunction_query.is_empty() {
             return (Vec::new(), false, None, SearchMode::Auto);
         }
         let is_case_sensitive = match case_sensitivity {
             CaseSensitivity::Sensitive => true,
             CaseSensitivity::Insensitive => false,
-            CaseSensitivity::Auto => disjunction_query.clauses.iter().any(|c| c.is_case_sensitive),
+            CaseSensitivity::Auto => disjunction_query
+                .clauses
+                .iter()
+                .any(|c| c.is_case_sensitive),
         };
-        let fallback_filter = CompiledRecordFilter::compile_with_case(read, &filter, is_case_sensitive);
+        let clause_compiled_filters: Vec<_> = disjunction_query
+            .clauses
+            .iter()
+            .map(|clause| {
+                let clause_filter = clause.filter.merged_with(filter);
+                CompiledRecordFilter::compile_with_case(
+                    read,
+                    &clause_filter,
+                    clause.is_case_sensitive,
+                )
+            })
+            .collect();
+        let fallback_filter =
+            CompiledRecordFilter::compile_with_case(read, filter, is_case_sensitive);
         let results = substring::search_disjunction_with_filters(
             read,
-            &disjunction_query,
+            disjunction_query,
             &fallback_filter,
             Some(&clause_compiled_filters),
             max_results,
@@ -834,8 +904,8 @@ fn dispatch_with_filter_inner(
         return (results, is_case_sensitive, None, SearchMode::Auto);
     }
 
-    resolve_inferred_exts(&read, parsed);
-    let effective_filter = parsed.filter.merged_with(&filter);
+    let parsed = &prepared.parsed;
+    let effective_filter = parsed.filter.merged_with(filter);
 
     // 识别行内正则语法糖（仅在 Auto 且无双引号/转义元字符/粘贴路径保护时推导）
     let regex_sugar = if mode == SearchMode::Auto
@@ -903,9 +973,18 @@ fn dispatch_with_filter_inner(
 
     // 含未加引号路径语法（'/' 或 'in:'）时交由路径检索器。
     if effective_mode != SearchMode::Regex {
-        if let Some(path_query) =
+        if let Some(mut path_query) =
             path_query::PathQuery::parse_from_tokens(&parsed.positive_tokens, is_case_sensitive)
         {
+            if matches!(fuzzy_pass, FuzzyPass::Jump { .. }) {
+                return (Vec::new(), is_case_sensitive, None, effective_mode);
+            }
+            if let Some((shard, _)) = shard_context {
+                if let (Some(configured), Some(active)) = (shard.configured_path, shard.active_path)
+                {
+                    path_query = path_query.rewrite_drift_alias(configured, active);
+                }
+            }
             let results = path_search::search_index(
                 read,
                 &path_query,
@@ -933,6 +1012,11 @@ fn dispatch_with_filter_inner(
                 return (colon_results, fallback_cs, None, effective_mode);
             }
 
+            if let Some((shard, shards)) = shard_context {
+                if !shard_allows_live_fallback(shard, shards, &path_query) {
+                    return (Vec::new(), is_case_sensitive, None, effective_mode);
+                }
+            }
             let read_dir_results = fallback_read_dir(
                 &path_query,
                 &compiled_filter,
@@ -957,6 +1041,7 @@ fn dispatch_with_filter_inner(
                 is_case_sensitive,
                 case_sensitivity,
                 explicit_lock,
+                prepared.single_extension_exists,
             );
             (results, None)
         }
@@ -981,6 +1066,20 @@ fn dispatch_with_filter_inner(
             )
         }
         SearchMode::Fuzzy => {
+            if let FuzzyPass::Jump { seen, output } = fuzzy_pass {
+                if prepared.single_extension_exists == Some(true) {
+                    return (Vec::new(), is_case_sensitive, None, effective_mode);
+                }
+                *output = fuzzy::search_index_tokens_raw(
+                    read,
+                    &parsed.positive_tokens,
+                    &compiled_filter,
+                    max_results,
+                    is_case_sensitive,
+                    seen,
+                );
+                return (Vec::new(), is_case_sensitive, None, effective_mode);
+            }
             // 模糊模式是 Auto 的放宽：子串/混合/拼音命中在前，跳字命中去重后补足剩余名额
             let mut results = substring::search_index_tokens_with_hybrid(
                 read,
@@ -990,9 +1089,10 @@ fn dispatch_with_filter_inner(
                 is_case_sensitive,
                 case_sensitivity,
                 explicit_lock,
+                prepared.single_extension_exists,
             );
             let remaining = max_results.saturating_sub(results.len());
-            if remaining == 0 {
+            if remaining == 0 || matches!(fuzzy_pass, FuzzyPass::Precise) {
                 return (results, is_case_sensitive, None, effective_mode);
             }
             let seen: std::collections::HashSet<String> =
@@ -1066,6 +1166,252 @@ pub fn dispatch(
         dispatch_with_options(store, query, mode, CaseSensitivity::Auto, max_results);
     (results, error)
 }
+/// 单个分片达到该条目阈值且至少存在两个大盘分片时，才启用跨分片并发检索；
+/// 常规场景（主索引 + 若干中小容量挂载卷）直接在调用线程串行执行，避免每次按键反复创建和销毁 OS 线程。
+const PARALLEL_SHARD_MIN_ENTRIES: usize = 50_000;
+
+fn run_parallel_map<T: Send>(
+    active_shards: &[&SearchShard<'_>],
+    f: impl Fn(&SearchShard<'_>) -> T + Sync,
+) -> Vec<T> {
+    if active_shards.len() <= 1 {
+        return active_shards.iter().map(|shard| f(shard)).collect();
+    }
+
+    let large_shard_count = active_shards
+        .iter()
+        .filter(|shard| shard.index.len() >= PARALLEL_SHARD_MIN_ENTRIES)
+        .count();
+    if large_shard_count < 2 {
+        return active_shards.iter().map(|shard| f(shard)).collect();
+    }
+
+    // 主调用线程直接承担首个分片，其余分片按 CPU 上限分组并发，避免多盘场景派生过多 OS 线程。
+    let max_workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
+    let extra_shards = &active_shards[1..];
+    let worker_count = (max_workers - 1).min(extra_shards.len());
+    let chunk_size = extra_shards.len().div_ceil(worker_count);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for chunk in extra_shards.chunks(chunk_size) {
+            let f_ref = &f;
+            handles.push(scope.spawn(move || {
+                chunk.iter().map(|shard| f_ref(shard)).collect::<Vec<_>>()
+            }));
+        }
+        let first = f(active_shards[0]);
+        let mut results = Vec::with_capacity(active_shards.len());
+        results.push(first);
+        for handle in handles {
+            results.extend(handle.join().unwrap());
+        }
+        results
+    })
+}
+
+fn wrap_shard_results(
+    results: Vec<AdvancedSearchResult>,
+    shard: &SearchShard<'_>,
+) -> Vec<MultiSearchResult> {
+    results
+        .into_iter()
+        .map(|result| MultiSearchResult {
+            result,
+            volume_name: shard.volume_name.map(|v| v.to_string()),
+            is_offline: shard.is_offline,
+        })
+        .collect()
+}
+
+fn merge_shard_results_by(
+    shard_results: Vec<Vec<MultiSearchResult>>,
+    max_results: usize,
+    mut cmp: impl FnMut(&MultiSearchResult, &MultiSearchResult) -> std::cmp::Ordering,
+) -> Vec<MultiSearchResult> {
+    if shard_results.is_empty() || max_results == 0 {
+        return Vec::new();
+    }
+    let total_count: usize = shard_results.iter().map(|v| v.len()).sum();
+    let mut all = Vec::with_capacity(total_count);
+    for list in shard_results {
+        all.extend(list);
+    }
+    all.sort_by(|a, b| {
+        cmp(a, b)
+            .then_with(|| a.result.entry.name.cmp(&b.result.entry.name))
+            .then_with(|| a.result.entry.path.cmp(&b.result.entry.path))
+    });
+    all.truncate(max_results);
+    all
+}
+
+fn cmp_score_desc(a: &MultiSearchResult, b: &MultiSearchResult) -> std::cmp::Ordering {
+    b.result
+        .score
+        .partial_cmp(&a.result.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn cmp_modified_desc(a: &MultiSearchResult, b: &MultiSearchResult) -> std::cmp::Ordering {
+    b.result.entry.modified.cmp(&a.result.entry.modified)
+}
+
+fn shard_allows_live_fallback(
+    shard: &SearchShard<'_>,
+    shards: &[SearchShard<'_>],
+    query: &path_query::PathQuery,
+) -> bool {
+    use crate::path_utils::path_starts_with_ci;
+    use std::path::Path;
+
+    let Some(dir) = query.raw_dir_pattern.as_deref().map(Path::new) else {
+        return false;
+    };
+    if shard.is_offline {
+        return false;
+    }
+    if let Some(active) = shard.active_path {
+        return path_starts_with_ci(dir, Path::new(active));
+    }
+    // 主索引分片严禁对 /Volumes/... 命名空间做同步 read_dir 兜底，防止未配置或父级失联网络挂载点卡死搜索线程
+    if path_starts_with_ci(dir, Path::new("/Volumes")) {
+        return false;
+    }
+    !shards.iter().any(|other| {
+        [other.active_path, other.configured_path]
+            .into_iter()
+            .flatten()
+            .any(|root| path_starts_with_ci(dir, Path::new(root)))
+    })
+}
+
+/// 检索活跃分片的快照，卷间共享查询解析与隐式扩展名裁决，卷内独立编译记录过滤器。
+pub fn dispatch_multi(
+    shards: &[SearchShard<'_>],
+    query: &str,
+    mode: SearchMode,
+    filter: QueryFilter,
+    case_sensitivity: CaseSensitivity,
+    max_results: usize,
+    include_offline: bool,
+) -> (Vec<MultiSearchResult>, bool, Option<String>, SearchMode) {
+    let active_shards: Vec<_> = shards
+        .iter()
+        .filter(|s| include_offline || !s.is_offline)
+        .collect();
+    let prepared = prepare_search(query, mode, case_sensitivity, true, |ext| {
+        active_shards
+            .iter()
+            .any(|shard| shard.index.extension_id(ext).is_some())
+    });
+    if active_shards.is_empty() || max_results == 0 {
+        let empty = CompactIndex::default();
+        let (_, is_case_sensitive, _, effective_mode) = dispatch_with_filter_inner(
+            &empty,
+            &prepared,
+            mode,
+            &filter,
+            case_sensitivity,
+            0,
+            None,
+            FuzzyPass::Precise,
+        );
+        return (Vec::new(), is_case_sensitive, None, effective_mode);
+    }
+
+    let per_shard = run_parallel_map(&active_shards, |shard| {
+        let (results, is_case_sensitive, error, effective_mode) = dispatch_with_filter_inner(
+            shard.index,
+            &prepared,
+            mode,
+            &filter,
+            case_sensitivity,
+            max_results,
+            Some((shard, shards)),
+            FuzzyPass::Precise,
+        );
+        (
+            wrap_shard_results(results, shard),
+            is_case_sensitive,
+            error,
+            effective_mode,
+        )
+    });
+    let is_case_sensitive = per_shard.iter().any(|p| p.1);
+    let effective_mode = per_shard[0].3;
+    let mut shard_results = Vec::with_capacity(per_shard.len());
+    let mut error = None;
+    for (results, _, shard_error, _) in per_shard {
+        error = error.or(shard_error);
+        shard_results.push(results);
+    }
+    let cmp = if effective_mode == SearchMode::Wildcard && prepared.parsed.clean_query.trim() == "*"
+    {
+        cmp_modified_desc
+    } else {
+        cmp_score_desc
+    };
+    let mut merged = merge_shard_results_by(shard_results, max_results, cmp);
+
+    let remaining = max_results - merged.len();
+    if effective_mode == SearchMode::Fuzzy && remaining > 0 {
+        let mut seen: std::collections::HashSet<String> = merged
+            .iter()
+            .map(|res| res.result.entry.path.clone())
+            .collect();
+        let mut candidates: Vec<_> = run_parallel_map(&active_shards, |shard| {
+            let mut raw = Vec::new();
+            dispatch_with_filter_inner(
+                shard.index,
+                &prepared,
+                mode,
+                &filter,
+                case_sensitivity,
+                remaining,
+                Some((shard, shards)),
+                FuzzyPass::Jump {
+                    seen: &seen,
+                    output: &mut raw,
+                },
+            );
+            raw.into_iter()
+                .map(|(result, score)| {
+                    (
+                        MultiSearchResult {
+                            result,
+                            volume_name: shard.volume_name.map(str::to_owned),
+                            is_offline: shard.is_offline,
+                        },
+                        score,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        candidates.sort_by(|(left, left_score), (right, right_score)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.result.entry.name.cmp(&right.result.entry.name))
+                .then_with(|| left.result.entry.path.cmp(&right.result.entry.path))
+        });
+        merged.extend(
+            candidates
+                .into_iter()
+                .map(|(res, _)| res)
+                .filter(|res| seen.insert(res.result.entry.path.clone()))
+                .take(remaining),
+        );
+    }
+    (merged, is_case_sensitive, error, effective_mode)
+}
+
+/// 多源并行检索协调器核心入口。
+///
 
 #[cfg(test)]
 mod tests {

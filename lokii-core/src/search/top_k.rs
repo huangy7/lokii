@@ -7,6 +7,7 @@ pub struct Candidate<'a, K> {
     pub ordinal: usize,
     pub score: K,
     name: &'a str,
+    path: Option<(&'a str, &'a str)>,
 }
 
 impl<'a, K> Candidate<'a, K> {
@@ -23,6 +24,13 @@ impl<K: Ord> Ord for Candidate<'_, K> {
             .score
             .cmp(&self.score)
             .then_with(|| self.name.cmp(other.name))
+            .then_with(|| match (self.path, other.path) {
+                (Some((left_parent, left_name)), Some((right_parent, right_name))) => left_parent
+                    .bytes()
+                    .chain(left_name.bytes())
+                    .cmp(right_parent.bytes().chain(right_name.bytes())),
+                (left, right) => left.cmp(&right),
+            })
             .then_with(|| self.ordinal.cmp(&other.ordinal))
     }
 }
@@ -47,14 +55,35 @@ impl<'a, K: Ord> TopK<'a, K> {
     }
 
     pub fn offer(&mut self, ordinal: usize, score: K, name: &'a str) {
-        if self.limit == 0 {
-            return;
-        }
-        let candidate = Candidate {
+        self.offer_candidate(Candidate {
             ordinal,
             score,
             name,
-        };
+            path: None,
+        });
+    }
+
+    pub(crate) fn offer_path(
+        &mut self,
+        ordinal: usize,
+        score: K,
+        view: crate::compact_index::EntryView<'a>,
+    ) {
+        let path = view
+            .raw_path()
+            .map_or((view.parent, view.name), |path| (path, ""));
+        self.offer_candidate(Candidate {
+            ordinal,
+            score,
+            name: view.name,
+            path: Some(path),
+        });
+    }
+
+    fn offer_candidate(&mut self, candidate: Candidate<'a, K>) {
+        if self.limit == 0 {
+            return;
+        }
         if self.candidates.len() < self.limit {
             self.candidates.push(candidate);
         } else if self

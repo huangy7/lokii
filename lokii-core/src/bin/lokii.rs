@@ -1,5 +1,6 @@
 //! `lokii` 命令行：向正在运行的 Lokii App 查询实时索引。
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::process::exit;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use lokii_core::query_server::{socket_path, Request, Response};
 use lokii_core::search::SearchMode;
 
-const USAGE: &str = "usage: lokii search [--json | --alfred] [--mode auto|substring|wildcard|regex|fuzzy] [--limit N] [--] <query...>";
+const USAGE: &str = "usage: lokii search [--json | --alfred] [--online-only] [--mode auto|substring|wildcard|regex|fuzzy] [--limit N] [--] <query...>";
 
 // App 卡住（索引写锁排队等）时不让 Alfred / 脚本永久挂起
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +27,7 @@ fn main() {
         fail(USAGE, 64);
     }
     let mut format = Format::Lines;
+    let mut online_only = false;
     let mut mode = None;
     let mut limit = None;
     let mut words = Vec::new();
@@ -33,6 +35,7 @@ fn main() {
         match arg.as_str() {
             "--json" => format = Format::Json,
             "--alfred" => format = Format::Alfred,
+            "--online-only" => online_only = true,
             "--mode" => {
                 let value = args.next().unwrap_or_default();
                 mode = Some(
@@ -65,6 +68,7 @@ fn main() {
         mode,
         limit,
         case_sensitivity: None,
+        include_offline: online_only.then_some(false),
     };
     let response = query(&request).unwrap_or_else(|e| {
         fail(
@@ -84,20 +88,31 @@ fn main() {
             .try_for_each(|e| writeln!(out, "{}", e.path)),
         Format::Json => writeln!(out, "{}", serde_json::to_string(&response.results).unwrap()),
         Format::Alfred => {
+            let offline_set: HashSet<usize> = response.offline_indices.iter().copied().collect();
             let items: Vec<_> = response
                 .results
                 .iter()
-                .map(|e| {
-                    serde_json::json!({
+                .enumerate()
+                .map(|(idx, e)| {
+                    let is_offline = offline_set.contains(&idx);
+                    let subtitle = if is_offline {
+                        format!("[Offline] {}", e.path)
+                    } else {
+                        e.path.clone()
+                    };
+                    let mut item = serde_json::json!({
                         "uid": e.path,
                         "type": "file",
                         "title": e.name,
-                        "subtitle": e.path,
+                        "subtitle": subtitle,
                         "arg": e.path,
                         // Alfred 勾选"过滤结果"时按此字段二次匹配；title 只有文件名，路径/fuzzy 查询会被滤空
                         "match": request.q,
-                        "icon": { "type": "fileicon", "path": e.path },
-                    })
+                    });
+                    if !is_offline {
+                        item["icon"] = serde_json::json!({ "type": "fileicon", "path": e.path });
+                    }
+                    item
                 })
                 .collect();
             writeln!(out, "{}", serde_json::json!({ "items": items }))

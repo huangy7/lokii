@@ -621,6 +621,172 @@ impl StringPool {
         }
         (strings, mapping)
     }
+
+    /// 重映射池中匹配指定前缀的字符串，并重建哈希表与冲突链。
+    ///
+    /// 遵循目录边界语义：
+    /// - 若 `old_prefix` 以 '/' 结尾，匹配所有以此前缀开头的字符串；
+    /// - 若 `old_prefix` 不以 '/' 结尾，匹配全等或后接 '/' 的目录前缀（避免误伤如 ShareExtra）。
+    /// 重构后重建每个活跃槽位的哈希值与 `next` 链表，若存在重串碰撞则返回错误且保持池状态未修改。
+    pub(crate) fn remap_prefix(
+        &mut self,
+        old_prefix: &str,
+        new_prefix: &str,
+        case_insensitive: bool,
+    ) -> Result<usize, IndexError> {
+        if old_prefix == new_prefix {
+            return Ok(0);
+        }
+
+        let mut staged_replacements: Vec<Option<Box<str>>> = vec![None; self.slots.len()];
+        let mut count = 0;
+
+        for (id, slot) in self.slots.iter().enumerate() {
+            if let Some(entry) = slot {
+                if let Some(remapped) =
+                    match_and_remap_prefix(&entry.text, old_prefix, new_prefix, case_insensitive)
+                {
+                    if remapped.as_str() != entry.text.as_ref() {
+                        staged_replacements[id] = Some(remapped.into_boxed_str());
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let mut new_lookup = std::collections::HashMap::with_capacity_and_hasher(
+            self.live,
+            self.lookup.hasher().clone(),
+        );
+        let mut new_next = vec![u32::MAX; self.slots.len()];
+
+        for (id, slot) in self.slots.iter().enumerate() {
+            if slot.is_some() {
+                let text: &str = if let Some(ref remapped) = staged_replacements[id] {
+                    remapped.as_ref()
+                } else {
+                    &slot.as_ref().unwrap().text
+                };
+
+                let hash = self.hash(text);
+                let prev_head = new_lookup.get(&hash).copied().unwrap_or(u32::MAX);
+                let mut current = prev_head;
+                while current != u32::MAX {
+                    let curr_text: &str =
+                        if let Some(ref remapped) = staged_replacements[current as usize] {
+                            remapped.as_ref()
+                        } else {
+                            &self.slots[current as usize].as_ref().unwrap().text
+                        };
+                    if curr_text == text {
+                        return Err(IndexError::InvalidReference);
+                    }
+                    current = new_next[current as usize];
+                }
+
+                new_next[id] = prev_head;
+                new_lookup.insert(hash, id as u32);
+            }
+        }
+
+        for (id, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(entry) = slot {
+                if let Some(remapped) = staged_replacements[id].take() {
+                    entry.text = remapped;
+                }
+                entry.next = new_next[id];
+            }
+        }
+        self.lookup = new_lookup;
+
+        Ok(count)
+    }
+}
+
+fn match_and_remap_prefix(
+    text: &str,
+    old_prefix: &str,
+    new_prefix: &str,
+    case_insensitive: bool,
+) -> Option<String> {
+    if old_prefix.is_empty() {
+        return None;
+    }
+
+    let match_prefix_ci = |haystack: &str, needle: &str| -> Option<usize> {
+        if haystack.len() < needle.len() {
+            return None;
+        }
+        if haystack.is_ascii() && needle.is_ascii() {
+            if haystack.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes()) {
+                return Some(needle.len());
+            }
+            return None;
+        }
+        let mut h_chars = haystack.chars();
+        let mut n_chars = needle.chars();
+        let mut matched_bytes = 0;
+        while let Some(nc) = n_chars.next() {
+            let Some(hc) = h_chars.next() else { return None; };
+            if nc == hc || nc.to_lowercase().eq(hc.to_lowercase()) {
+                matched_bytes += hc.len_utf8();
+            } else {
+                return None;
+            }
+        }
+        Some(matched_bytes)
+    };
+
+    if old_prefix.ends_with('/') {
+        let matched = if case_insensitive {
+            match_prefix_ci(text, old_prefix)
+        } else if text.starts_with(old_prefix) {
+            Some(old_prefix.len())
+        } else {
+            None
+        };
+        matched.map(|bytes| {
+            let suffix = &text[bytes..];
+            format!("{new_prefix}{suffix}")
+        })
+    } else {
+        let is_exact = if case_insensitive {
+            if text.len() == old_prefix.len() {
+                if text.is_ascii() && old_prefix.is_ascii() {
+                    text.eq_ignore_ascii_case(old_prefix)
+                } else {
+                    text.to_lowercase() == old_prefix.to_lowercase()
+                }
+            } else {
+                false
+            }
+        } else {
+            text == old_prefix
+        };
+        if is_exact {
+            return Some(new_prefix.to_string());
+        }
+
+        let matched = if case_insensitive {
+            match_prefix_ci(text, old_prefix)
+        } else if text.starts_with(old_prefix) {
+            Some(old_prefix.len())
+        } else {
+            None
+        };
+        if let Some(bytes) = matched {
+            if text[bytes..].starts_with('/') {
+                let suffix = &text[bytes..];
+                let prefix_trimmed = new_prefix.trim_end_matches('/');
+                return Some(format!("{prefix_trimmed}{suffix}"));
+            }
+        }
+        None
+    }
 }
 
 /// 零分配大小写无关比较与子串查找辅助函数。
@@ -854,5 +1020,48 @@ mod tests {
         // 排除非 ü 系 u 音节误带 v 位
         let luan_sig = NameSignature::from_name("乱码.txt", None);
         assert!(!luan_sig.contains(NameSignature::from_substring_query("lv")));
+    }
+
+    #[test]
+    fn remap_prefix_exact_boundary_and_rebuild_lookup() {
+        let mut pool = StringPool::default();
+        let p1 = pool.intern("/Volumes/Share/").unwrap();
+        let p2 = pool.intern("/Volumes/Share/sub/").unwrap();
+        let p3 = pool.intern("/Volumes/ShareExtra/").unwrap();
+
+        let count = pool
+            .remap_prefix("/Volumes/Share/", "/Volumes/Share-1/", false)
+            .unwrap();
+        assert_eq!(count, 2);
+
+        assert_eq!(pool.get(p1), Some("/Volumes/Share-1/"));
+        assert_eq!(pool.get(p2), Some("/Volumes/Share-1/sub/"));
+        assert_eq!(pool.get(p3), Some("/Volumes/ShareExtra/"));
+
+        assert_eq!(pool.find("/Volumes/Share-1/"), Some(p1));
+        assert_eq!(pool.find("/Volumes/Share-1/sub/"), Some(p2));
+        assert_eq!(pool.find("/Volumes/ShareExtra/"), Some(p3));
+        assert_eq!(pool.find("/Volumes/Share/"), None);
+
+        let mut refs = vec![0u32; pool.slot_len()];
+        refs[p1 as usize] = 1;
+        refs[p2 as usize] = 1;
+        refs[p3 as usize] = 1;
+        pool.validate_references(&refs).unwrap();
+    }
+
+    #[test]
+    fn remap_prefix_rejects_duplicate_collision() {
+        let mut pool = StringPool::default();
+        let p1 = pool.intern("/Volumes/Share/").unwrap();
+        let p2 = pool.intern("/Volumes/Share-1/").unwrap();
+
+        let err = pool
+            .remap_prefix("/Volumes/Share/", "/Volumes/Share-1/", false)
+            .unwrap_err();
+        assert!(matches!(err, IndexError::InvalidReference));
+
+        assert_eq!(pool.get(p1), Some("/Volumes/Share/"));
+        assert_eq!(pool.get(p2), Some("/Volumes/Share-1/"));
     }
 }

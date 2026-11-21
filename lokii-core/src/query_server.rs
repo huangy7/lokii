@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{AppConfig, ConfigStore};
 use crate::indexer::{FileEntry, IndexStore};
 use crate::search::{self, SearchMode};
+use crate::volume_manager::VolumeCoordinator;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -21,6 +22,8 @@ pub struct Request {
     pub mode: Option<SearchMode>,
     pub limit: Option<usize>,
     pub case_sensitivity: Option<search::CaseSensitivity>,
+    #[serde(default)]
+    pub include_offline: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,6 +32,8 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_case_sensitive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline_indices: Vec<usize>,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -37,12 +42,23 @@ pub fn socket_path() -> PathBuf {
 
 /// 绑定 `~/.config/lokii/query.sock`（仅本用户可读写）并在后台线程提供查询服务。
 pub fn start(store: IndexStore, config_store: ConfigStore) -> std::io::Result<()> {
+    start_with_coordinator(store, None, config_store)
+}
+
+/// 绑定 `~/.config/lokii/query.sock` 并在后台线程同时服务主本地索引与挂载卷协调器。
+pub fn start_with_coordinator(
+    store: IndexStore,
+    coordinator: Option<Arc<VolumeCoordinator>>,
+    config_store: ConfigStore,
+) -> std::io::Result<()> {
     let path = socket_path();
     // 上次进程异常退出会留下陈旧的 socket 文件，不删除则 bind 失败
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    std::thread::spawn(move || serve(listener, store, config_store, MAX_CONNECTIONS));
+    std::thread::spawn(move || {
+        serve_with_coordinator(listener, store, coordinator, config_store, MAX_CONNECTIONS)
+    });
     Ok(())
 }
 
@@ -59,9 +75,19 @@ impl Drop for Slot {
 
 // 每连接一线程，避免一个慢客户端拖住其他查询；IndexStore/ConfigStore 都是 Arc 包装，clone 很便宜。
 // 超过并发上限的连接直接丢弃；accept/spawn 失败只记日志，不能让服务线程退出。
-fn serve(
+pub fn serve(
     listener: UnixListener,
     store: IndexStore,
+    config_store: ConfigStore,
+    max_connections: usize,
+) {
+    serve_with_coordinator(listener, store, None, config_store, max_connections);
+}
+
+pub fn serve_with_coordinator(
+    listener: UnixListener,
+    primary: IndexStore,
+    coordinator: Option<Arc<VolumeCoordinator>>,
     config_store: ConfigStore,
     max_connections: usize,
 ) {
@@ -81,11 +107,14 @@ fn serve(
             continue;
         }
         let slot = Slot(Arc::clone(&active));
-        let store = store.clone();
+        let store = primary.clone();
+        let coordinator = coordinator.clone();
         let config_store = config_store.clone();
         let spawned = std::thread::Builder::new().spawn(move || {
             let _slot = slot;
-            if let Err(e) = handle_connection(stream, &store, &config_store) {
+            if let Err(e) =
+                handle_connection(stream, &store, coordinator.as_deref(), &config_store)
+            {
                 eprintln!("[Lokii] query connection failed: {e}");
             }
         });
@@ -98,6 +127,7 @@ fn serve(
 fn handle_connection(
     stream: UnixStream,
     store: &IndexStore,
+    coordinator: Option<&VolumeCoordinator>,
     config_store: &ConfigStore,
 ) -> std::io::Result<()> {
     // 防止客户端只连不发把服务线程卡死；写超时防止慢客户端卡住回写；读取上限防止无换行长流撑爆内存
@@ -115,18 +145,54 @@ fn handle_connection(
             let limit = request.limit.unwrap_or(max_results).min(max_results);
             let mode = request.mode.unwrap_or(SearchMode::Auto);
             let case_sensitivity = request.case_sensitivity.unwrap_or_default();
-            let (results, is_case_sensitive, error) =
-                search::dispatch_with_options(store, &request.q, mode, case_sensitivity, limit);
-            Response {
-                results: results.into_iter().map(|r| r.entry).collect(),
-                error,
-                is_case_sensitive: Some(is_case_sensitive),
+            let include_offline = request.include_offline.unwrap_or(true);
+            match coordinator {
+                Some(coord) => {
+                    let (multi, is_case_sensitive, error, _) = coord.search(
+                        store,
+                        &request.q,
+                        mode,
+                        case_sensitivity,
+                        limit,
+                        include_offline,
+                    );
+                    let mut results = Vec::with_capacity(multi.len());
+                    let mut offline_indices = Vec::new();
+                    for (idx, item) in multi.into_iter().enumerate() {
+                        if item.is_offline {
+                            offline_indices.push(idx);
+                        }
+                        results.push(item.result.entry);
+                    }
+                    Response {
+                        results,
+                        error,
+                        is_case_sensitive: Some(is_case_sensitive),
+                        offline_indices,
+                    }
+                }
+                None => {
+                    let (results, is_case_sensitive, error) = search::dispatch_with_options(
+                        store,
+                        &request.q,
+                        mode,
+                        case_sensitivity,
+                        limit,
+                    );
+                    Response {
+                        results: results.into_iter().map(|r| r.entry).collect(),
+                        error,
+                        is_case_sensitive: Some(is_case_sensitive),
+                        offline_indices: Vec::new(),
+                    }
+                }
             }
         }
         Err(e) => Response {
             results: Vec::new(),
             error: Some(format!("invalid request: {e}")),
             is_case_sensitive: None,
+            offline_indices: Vec::new(),
         },
     };
     let mut out = serde_json::to_vec(&response)?;
@@ -240,5 +306,98 @@ mod tests {
             recovered,
             "slot should be released after the holder disconnects"
         );
+    }
+
+    #[test]
+    fn serves_coordinator_offline_indices_and_online_only_filter() {
+        use crate::cache;
+        use crate::compact_index::CompactIndex;
+        use crate::volumes::{MountedFsInfo, VolumeIdentity, VolumeKind, VolumeManifest, VolumeRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("query.sock");
+        let cache_dir = dir.path().join("cache");
+        let volumes_dir = cache_dir.join("volumes");
+
+        let identity = VolumeIdentity::Network {
+            fstype: "smbfs".to_string(),
+            normalized_source: "//nas.local/docs".to_string(),
+            subpath: String::new(),
+        };
+        let record = VolumeRecord {
+            volume_id: identity.volume_id(),
+            configured_path: "/Volumes/Docs".to_string(),
+            active_configured_path: "/Volumes/Docs".to_string(),
+            active_mount_root: Some("/Volumes/Docs".to_string()),
+            subpath: String::new(),
+            display_name: "Docs".to_string(),
+            kind: VolumeKind::Network,
+            fstype: "smbfs".to_string(),
+            identity,
+            last_sync_at: Some(1_700_000_000),
+            last_event_id: None,
+            journal_uuid: None,
+            entry_count: 1,
+            dirty_filter: false,
+        };
+        let compact = CompactIndex::from_entries(vec![entry("report.rs", "/Volumes/Docs/report.rs")]).unwrap();
+        cache::save_compact(&compact, None, &volumes_dir.join(format!("{}.cache", record.volume_id))).unwrap();
+        let mut manifest = VolumeManifest::default();
+        manifest.upsert(record);
+        manifest.save_atomic(&volumes_dir).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec!["/Users/me/src".to_string(), "/Volumes/Docs".to_string()];
+
+        let coord = Arc::new(VolumeCoordinator::with_mount_lister(
+            cache_dir,
+            Arc::new(|| {
+                vec![MountedFsInfo {
+                    mount_point: "/".to_string(),
+                    fstype: "apfs".to_string(),
+                    from_name: "/dev/disk3s1s1".to_string(),
+                    is_local: true,
+                    uuid: Some("SYS".to_string()),
+                    total_bytes: 1_000_000,
+                    volume_name: "Macintosh HD".to_string(),
+                }]
+            }),
+        ));
+        coord.initialize(&cfg, Arc::new(|| {}));
+
+        let primary = IndexStore::new();
+        primary.replace(vec![entry("report_local.rs", "/Users/me/src/report_local.rs")]);
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let config_store = ConfigStore::new(cfg);
+        let coord_clone = Arc::clone(&coord);
+        std::thread::spawn(move || {
+            serve_with_coordinator(
+                listener,
+                primary,
+                Some(coord_clone),
+                config_store,
+                MAX_CONNECTIONS,
+            )
+        });
+
+        let all = query(&sock_path, r#"{"q":"report","mode":"substring"}"#);
+        assert_eq!(all.error, None);
+        assert_eq!(all.results.len(), 2);
+        let offline_pos = all
+            .results
+            .iter()
+            .position(|e| e.path == "/Volumes/Docs/report.rs")
+            .unwrap();
+        assert_eq!(all.offline_indices, vec![offline_pos]);
+
+        let online_only = query(
+            &sock_path,
+            r#"{"q":"report","mode":"substring","include_offline":false}"#,
+        );
+        assert_eq!(online_only.error, None);
+        assert_eq!(online_only.results.len(), 1);
+        assert_eq!(online_only.results[0].path, "/Users/me/src/report_local.rs");
+        assert!(online_only.offline_indices.is_empty());
     }
 }

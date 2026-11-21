@@ -286,6 +286,13 @@ typedef void (*UniffiCallbackInterfaceEventHandlerMethod4)(uint64_t, void* _Nonn
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD5
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_EVENT_HANDLER_METHOD5
+typedef void (*UniffiCallbackInterfaceEventHandlerMethod5)(uint64_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_EVENT_HANDLER
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_EVENT_HANDLER
 typedef struct UniffiVTableCallbackInterfaceEventHandler {
@@ -294,6 +301,7 @@ typedef struct UniffiVTableCallbackInterfaceEventHandler {
     UniffiCallbackInterfaceEventHandlerMethod2 _Nonnull onIndexUpdated;
     UniffiCallbackInterfaceEventHandlerMethod3 _Nonnull onWatcherError;
     UniffiCallbackInterfaceEventHandlerMethod4 _Nonnull onConfigReloaded;
+    UniffiCallbackInterfaceEventHandlerMethod5 _Nonnull onVolumeStatusesChanged;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceEventHandler;
 
@@ -338,6 +346,11 @@ void uniffi_lokii_core_fn_method_eventhandler_on_watcher_error(void*_Nonnull ptr
 void uniffi_lokii_core_fn_method_eventhandler_on_config_reloaded(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_EVENTHANDLER_ON_VOLUME_STATUSES_CHANGED
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_EVENTHANDLER_ON_VOLUME_STATUSES_CHANGED
+void uniffi_lokii_core_fn_method_eventhandler_on_volume_statuses_changed(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_CLONE_LOKIICORE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_CLONE_LOKIICORE
 void*_Nonnull uniffi_lokii_core_fn_clone_lokiicore(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -359,6 +372,11 @@ void*_Nonnull uniffi_lokii_core_fn_constructor_lokiicore_new(RustCallStatus *_No
 int8_t uniffi_lokii_core_fn_method_lokiicore_check_fda(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
+int8_t uniffi_lokii_core_fn_method_lokiicore_clear_volume_cache(void*_Nonnull ptr, RustBuffer path_or_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_config_json(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -374,6 +392,11 @@ RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_metrics(void*_Nonnull ptr, 
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_stats(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_VOLUME_STATUSES
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_VOLUME_STATUSES
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_volume_statuses(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_INITIALIZE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_INITIALIZE
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_initialize(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
@@ -384,9 +407,29 @@ RustBuffer uniffi_lokii_core_fn_method_lokiicore_initialize(void*_Nonnull ptr, v
 int8_t uniffi_lokii_core_fn_method_lokiicore_is_scanning(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_NOTIFY_VOLUME_DID_UNMOUNT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_NOTIFY_VOLUME_DID_UNMOUNT
+void uniffi_lokii_core_fn_method_lokiicore_notify_volume_did_unmount(void*_Nonnull ptr, RustBuffer mount_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_NOTIFY_VOLUME_MOUNTED
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_NOTIFY_VOLUME_MOUNTED
+void uniffi_lokii_core_fn_method_lokiicore_notify_volume_mounted(void*_Nonnull ptr, RustBuffer mount_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_NOTIFY_VOLUME_WILL_UNMOUNT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_NOTIFY_VOLUME_WILL_UNMOUNT
+void uniffi_lokii_core_fn_method_lokiicore_notify_volume_will_unmount(void*_Nonnull ptr, RustBuffer mount_path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_OPEN_FILE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_OPEN_FILE
 int8_t uniffi_lokii_core_fn_method_lokiicore_open_file(void*_Nonnull ptr, RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PEEK_STARTUP_IS_COLD_START
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PEEK_STARTUP_IS_COLD_START
+int8_t uniffi_lokii_core_fn_method_lokiicore_peek_startup_is_cold_start(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PERSIST_INDEX
@@ -399,6 +442,11 @@ void uniffi_lokii_core_fn_method_lokiicore_persist_index(void*_Nonnull ptr, Rust
 int8_t uniffi_lokii_core_fn_method_lokiicore_rebuild_index(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_RESCAN_VOLUME
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_RESCAN_VOLUME
+int8_t uniffi_lokii_core_fn_method_lokiicore_rescan_volume(void*_Nonnull ptr, RustBuffer path_or_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REVEAL_IN_FINDER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REVEAL_IN_FINDER
 int8_t uniffi_lokii_core_fn_method_lokiicore_reveal_in_finder(void*_Nonnull ptr, RustBuffer path, RustCallStatus *_Nonnull out_status
@@ -407,6 +455,11 @@ int8_t uniffi_lokii_core_fn_method_lokiicore_reveal_in_finder(void*_Nonnull ptr,
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_search(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustBuffer case_sensitivity, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH_WITH_OPTIONS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH_WITH_OPTIONS
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_search_with_options(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustBuffer case_sensitivity, int8_t include_offline, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_CONFIG_WATCHER
@@ -739,9 +792,21 @@ uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_config_reloaded(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_VOLUME_STATUSES_CHANGED
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_VOLUME_STATUSES_CHANGED
+uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_volume_statuses_changed(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CHECK_FDA
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CHECK_FDA
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_check_fda(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_clear_volume_cache(void
     
 );
 #endif
@@ -763,6 +828,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_get_stats(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_VOLUME_STATUSES
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_GET_VOLUME_STATUSES
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_get_volume_statuses(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_INITIALIZE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_INITIALIZE
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_initialize(void
@@ -775,9 +846,33 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_is_scanning(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_NOTIFY_VOLUME_DID_UNMOUNT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_NOTIFY_VOLUME_DID_UNMOUNT
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_notify_volume_did_unmount(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_NOTIFY_VOLUME_MOUNTED
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_NOTIFY_VOLUME_MOUNTED
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_notify_volume_mounted(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_NOTIFY_VOLUME_WILL_UNMOUNT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_NOTIFY_VOLUME_WILL_UNMOUNT
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_notify_volume_will_unmount(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_OPEN_FILE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_OPEN_FILE
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_open_file(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_PEEK_STARTUP_IS_COLD_START
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_PEEK_STARTUP_IS_COLD_START
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_peek_startup_is_cold_start(void
     
 );
 #endif
@@ -793,6 +888,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_rebuild_index(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_RESCAN_VOLUME
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_RESCAN_VOLUME
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_rescan_volume(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_REVEAL_IN_FINDER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_REVEAL_IN_FINDER
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_reveal_in_finder(void
@@ -802,6 +903,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_reveal_in_finder(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_search(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_WITH_OPTIONS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_WITH_OPTIONS
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_search_with_options(void
     
 );
 #endif

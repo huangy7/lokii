@@ -43,6 +43,8 @@ public struct FfiSearchResult: Equatable, Hashable {
     public var created: Int64
     public var modified: Int64
     public var matchPositions: [FfiMatchRange]
+    public var isOffline: Bool
+    public var volumeName: String?
 
     public init(
         name: String,
@@ -52,7 +54,9 @@ public struct FfiSearchResult: Equatable, Hashable {
         size: UInt64,
         created: Int64,
         modified: Int64,
-        matchPositions: [FfiMatchRange] = []
+        matchPositions: [FfiMatchRange] = [],
+        isOffline: Bool = false,
+        volumeName: String? = nil
     ) {
         self.name = name
         self.path = path
@@ -62,6 +66,8 @@ public struct FfiSearchResult: Equatable, Hashable {
         self.created = created
         self.modified = modified
         self.matchPositions = matchPositions
+        self.isOffline = isOffline
+        self.volumeName = volumeName
     }
 }
 """

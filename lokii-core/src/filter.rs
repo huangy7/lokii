@@ -190,6 +190,68 @@ impl IndexScopePolicy {
         deepest_matching_depth(&self.excluded_prefixes, &path_str).is_some()
     }
 
+    /// Construct a filter for the primary local index domain.
+    pub fn from_primary_config(
+        config: &AppConfig,
+        primary_roots: &[PathBuf],
+        mounted_exclude_roots: &[PathBuf],
+    ) -> Self {
+        let include_roots = primary_roots
+            .iter()
+            .cloned()
+            .map(NormalizedPrefix::new)
+            .collect();
+        let mut excluded_prefixes: Vec<NormalizedPrefix> = config
+            .resolve_exclude_paths()
+            .into_iter()
+            .map(NormalizedPrefix::new)
+            .collect();
+        for m in mounted_exclude_roots {
+            excluded_prefixes.push(NormalizedPrefix::new(m.clone()));
+        }
+        let excluded_names: HashSet<String> = config.index.exclude.iter().cloned().collect();
+
+        Self {
+            include_roots,
+            excluded_prefixes,
+            excluded_names,
+            include_hidden: config.index.include_hidden,
+            exclude_sensitive: config.index.exclude_sensitive,
+            sensitive_names: config.index.sensitive_names.clone(),
+            index_apps: config.index.index_apps,
+        }
+    }
+
+    /// Construct a filter isolated for a specific mounted volume.
+    pub fn for_volume(config: &AppConfig, active_root: &Path) -> Self {
+        let include_roots = vec![NormalizedPrefix::new(active_root.to_path_buf())];
+        // Strip out exclude paths that match active_root itself or are an ancestor of active_root
+        let excluded_prefixes: Vec<NormalizedPrefix> = config
+            .resolve_exclude_paths()
+            .into_iter()
+            .filter(|ex| !path_starts_with_ci(active_root, ex))
+            .map(NormalizedPrefix::new)
+            .collect();
+        let excluded_names: HashSet<String> = config.index.exclude.iter().cloned().collect();
+
+        Self {
+            include_roots,
+            excluded_prefixes,
+            excluded_names,
+            include_hidden: config.index.include_hidden,
+            exclude_sensitive: config.index.exclude_sensitive,
+            sensitive_names: config.index.sensitive_names.clone(),
+            index_apps: config.index.index_apps,
+        }
+    }
+
+    pub(crate) fn same_scan_options(&self, other: &Self) -> bool {
+        self.include_hidden == other.include_hidden
+            && self.exclude_sensitive == other.exclude_sensitive
+            && self.sensitive_names == other.sensitive_names
+            && self.index_apps == other.index_apps
+    }
+
     /// 是否有排除前缀位于 `path` 之下：用于判断该目录内部是否还藏有需要单独监听的目标。
     pub fn has_excluded_descendant(&self, path: &Path) -> bool {
         self.excluded_prefixes
@@ -367,6 +429,27 @@ mod tests {
         // ~/Documents should NOT be excluded
         let docs = home.join("Documents/report.pdf");
         assert!(!filter.is_excluded(&docs));
+    }
+
+    #[test]
+    fn volume_filter_allows_explicit_volume_despite_default_volumes_exclusion() {
+        let mut cfg = AppConfig::default();
+        cfg.index.exclude_paths = vec!["/Volumes".into(), "/Volumes/Share/PrivateCache".into()];
+        let f_sub = CompiledFilter::for_volume(&cfg, Path::new("/Volumes/Share"));
+        assert!(!f_sub.is_excluded(Path::new("/Volumes/Share/docs/a.txt")));
+        assert!(f_sub.is_excluded(Path::new("/Volumes/Share/PrivateCache/tmp.bin")));
+        let f_root = CompiledFilter::for_volume(&cfg, Path::new("/Volumes"));
+        assert!(!f_root.is_excluded(Path::new("/Volumes/DiskA/a.txt")));
+    }
+
+    #[test]
+    fn primary_filter_includes_mounted_exclude_roots() {
+        let cfg = AppConfig::default();
+        let primary_roots = vec![PathBuf::from("/Users/dev")];
+        let mounted_exclude = vec![PathBuf::from("/Users/dev/MountedSub")];
+        let filter = CompiledFilter::from_primary_config(&cfg, &primary_roots, &mounted_exclude);
+        assert!(!filter.is_excluded(Path::new("/Users/dev/docs/file.txt")));
+        assert!(filter.is_excluded(Path::new("/Users/dev/MountedSub/subfile.txt")));
     }
 
     #[test]

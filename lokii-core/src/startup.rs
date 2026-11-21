@@ -26,6 +26,30 @@ pub enum StartupMode {
     Failed(crate::compact_index::IndexError),
 }
 
+/// Error returned when index initialization fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitError {
+    Index(crate::compact_index::IndexError),
+    Io(String),
+}
+
+impl std::fmt::Display for InitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InitError::Index(e) => write!(f, "Index error during init: {e}"),
+            InitError::Io(e) => write!(f, "IO error during init: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for InitError {}
+
+impl From<crate::compact_index::IndexError> for InitError {
+    fn from(err: crate::compact_index::IndexError) -> Self {
+        InitError::Index(err)
+    }
+}
+
 /// Capture a checkpoint for a snapshot about to be scanned or replayed: the
 /// event id is read first, so anything that changes during the work is
 /// replayed again next time rather than lost.
@@ -45,6 +69,28 @@ pub fn scope_fingerprint(config: &AppConfig) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     config.resolve_paths().hash(&mut hasher);
     config.resolve_exclude_paths().hash(&mut hasher);
+    config.index.exclude.hash(&mut hasher);
+    config.index.include_hidden.hash(&mut hasher);
+    config.index.exclude_sensitive.hash(&mut hasher);
+    config.index.sensitive_names.hash(&mut hasher);
+    config.index.index_apps.hash(&mut hasher);
+    crate::permissions::has_full_disk_access().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Calculate scope fingerprint specifically for the primary local index domain.
+pub fn primary_scope_fingerprint(
+    config: &AppConfig,
+    primary_roots: &[std::path::PathBuf],
+    excluded_mount_roots: &[std::path::PathBuf],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    primary_roots.hash(&mut hasher);
+    config.resolve_exclude_paths().hash(&mut hasher);
+    if !excluded_mount_roots.is_empty() {
+        excluded_mount_roots.hash(&mut hasher);
+    }
     config.index.exclude.hash(&mut hasher);
     config.index.include_hidden.hash(&mut hasher);
     config.index.exclude_sensitive.hash(&mut hasher);
@@ -117,6 +163,99 @@ pub fn initialize_index(
                 scanned_count: count,
                 event_id: checkpoint.event_id,
             }
+        }
+    }
+}
+
+/// Initialize the primary index: try cache first, fall back to full scan.
+pub fn initialize_primary_index(
+    store: &IndexStore,
+    config: &AppConfig,
+    primary_roots: &[std::path::PathBuf],
+    excluded_mount_roots: &[std::path::PathBuf],
+    on_progress: &mut dyn FnMut(&str, u64),
+    cache_path: &Path,
+) -> Result<StartupMode, InitError> {
+    initialize_primary_index_with_progress(
+        store,
+        config,
+        primary_roots,
+        excluded_mount_roots,
+        Arc::new(AtomicUsize::new(0)),
+        on_progress,
+        cache_path,
+    )
+}
+
+/// Initialize the primary index while updating a shared atomic scan counter so
+/// callers can poll live progress during cold-start scans.
+pub fn initialize_primary_index_with_progress(
+    store: &IndexStore,
+    config: &AppConfig,
+    primary_roots: &[std::path::PathBuf],
+    excluded_mount_roots: &[std::path::PathBuf],
+    progress: Arc<AtomicUsize>,
+    on_progress: &mut dyn FnMut(&str, u64),
+    cache_path: &Path,
+) -> Result<StartupMode, InitError> {
+    if primary_roots.is_empty() {
+        store.replace_compact(crate::compact_index::CompactIndex::new());
+        if cache_path.exists() {
+            if let Ok((entries, _)) = cache::load_compact(cache_path) {
+                if !entries.is_empty() {
+                    let empty_index = crate::compact_index::CompactIndex::new();
+                    let _ = cache::save_compact(&empty_index, None, cache_path);
+                }
+            }
+        }
+        on_progress("ready", 0);
+        return Ok(StartupMode::HotStart {
+            cached_count: 0,
+            checkpoint: None,
+        });
+    }
+
+    let fingerprint = primary_scope_fingerprint(config, primary_roots, excluded_mount_roots);
+
+    match cache::load_compact(cache_path) {
+        Ok((entries, saved)) => {
+            let count = entries.len();
+            progress.store(count, std::sync::atomic::Ordering::Relaxed);
+            store.replace_compact(entries);
+            on_progress("cached", count as u64);
+            Ok(StartupMode::HotStart {
+                cached_count: count,
+                checkpoint: saved.filter(|saved| saved.fingerprint == fingerprint),
+            })
+        }
+        Err(_) => {
+            let current_event_id = crate::fsevents::current_event_id();
+            let checkpoint = cache::Checkpoint {
+                event_id: current_event_id,
+                fingerprint,
+            };
+            let filter = Arc::new(crate::filter::CompiledFilter::from_primary_config(
+                config,
+                primary_roots,
+                excluded_mount_roots,
+            ));
+            let fresh = match scanner::scan_compact(
+                primary_roots,
+                filter,
+                config.index.include_hidden,
+                progress,
+            ) {
+                Ok(fresh) => fresh,
+                Err(error) => return Err(InitError::Index(error)),
+            };
+            let count = fresh.len();
+            on_progress("scanned", count as u64);
+            let _ = cache::save_compact(&fresh, Some(checkpoint), cache_path);
+            store.replace_compact(fresh);
+            Ok(StartupMode::ColdStart {
+                scanned_count: count,
+                event_id: checkpoint.event_id,
+            })
         }
     }
 }
@@ -305,5 +444,81 @@ mod tests {
             store.len() > 0,
             "Store should have entries after blocking verify"
         );
+    }
+
+    #[test]
+    fn test_primary_scope_fingerprint_matches_legacy_when_no_mounted_excluded() {
+        let config = AppConfig::default();
+        let legacy_fp = scope_fingerprint(&config);
+        let primary_fp = primary_scope_fingerprint(&config, &config.resolve_paths(), &[]);
+        assert_eq!(primary_fp, legacy_fp);
+    }
+
+    #[test]
+    fn test_primary_scope_fingerprint_changes_on_roots() {
+        let cfg = AppConfig::default();
+        let roots_a = vec![std::path::PathBuf::from("/Users/dev")];
+        let roots_b = vec![std::path::PathBuf::from("/Users/dev2")];
+        let fp_a = primary_scope_fingerprint(&cfg, &roots_a, &[]);
+        let fp_b = primary_scope_fingerprint(&cfg, &roots_b, &[]);
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn test_initialize_primary_index_empty_roots_skips_scan() {
+        let store = IndexStore::new();
+        let cfg = AppConfig::default();
+        let tmp = TempDir::new().unwrap();
+        let cache_file = tmp.path().join("primary.cache");
+        let mut progress_count = 0u64;
+        let mut on_progress = |_phase: &str, count: u64| {
+            progress_count = count;
+        };
+        let res = initialize_primary_index(&store, &cfg, &[], &[], &mut on_progress, &cache_file);
+        assert!(res.is_ok());
+        assert_eq!(store.len(), 0);
+        assert_eq!(progress_count, 0);
+    }
+
+    #[test]
+    fn test_initialize_primary_index_with_progress_updates_atomic_counter() {
+        let store = IndexStore::new();
+        let tmp = TempDir::new().unwrap();
+        let scan_root = tmp.path().join("scan");
+        fs::create_dir_all(&scan_root).unwrap();
+        fs::write(scan_root.join("a.txt"), "a").unwrap();
+        fs::write(scan_root.join("b.txt"), "b").unwrap();
+
+        let cfg = make_test_config(&scan_root);
+        let cache_file = tmp.path().join("primary.cache");
+        let shared_progress = Arc::new(AtomicUsize::new(0));
+        let mut phases = Vec::new();
+        let mut on_progress = |phase: &str, count: u64| {
+            phases.push((phase.to_string(), count));
+        };
+
+        let mode = initialize_primary_index_with_progress(
+            &store,
+            &cfg,
+            &[scan_root],
+            &[],
+            Arc::clone(&shared_progress),
+            &mut on_progress,
+            &cache_file,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            mode,
+            StartupMode::ColdStart {
+                scanned_count: 3,
+                ..
+            }
+        ));
+        assert_eq!(
+            shared_progress.load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        assert_eq!(phases, vec![("scanned".to_string(), 3)]);
     }
 }
