@@ -16,6 +16,8 @@ protocol SearchMainSplitViewControllerDelegate: AnyObject {
     func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int)
     /// 检索结果条目被有效消费回调（如访达定位、终端唤起、复制、预览、拖拽等），用于归档有效搜索历史
     func searchMainSplitViewDidConsumeResult()
+    /// 左侧目录作用域过滤引起主列表可见结果数变化时回调（用于联动更新底栏命中计数）
+    func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?)
 }
 
 extension SearchMainSplitViewControllerDelegate {
@@ -25,6 +27,7 @@ extension SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidRequestFocusSearchField() {}
     func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {}
     func searchMainSplitViewDidConsumeResult() {}
+    func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?) {}
 }
 
 // MARK: - SearchMainSplitViewController
@@ -49,6 +52,15 @@ final class SearchMainSplitViewController: NSSplitViewController {
 
     private(set) var rawResults: [FfiSearchResult] = []
     private var isUpdatingSearchResults = false
+    /// 侧边栏折叠期间推迟了目录树构建的脏标记，待用户展开侧边栏或触发目录过滤时即时补建
+    private var isDirectoryTreeDirty = false
+    /// 当前结果集是否应自动预选首行（活跃检索为 true，默认空查询列表为 false）
+    private var autoSelectFirstResult = false
+
+    /// 当前是否需要立即维护左侧目录聚合树（仅在侧边栏展开或存在生效目录过滤时为 true）
+    var needsDirectoryTree: Bool {
+        !isSidebarCollapsed || sidebarTreeViewController.selectedPath != nil
+    }
 
     // MARK: - Initialization
 
@@ -105,6 +117,9 @@ final class SearchMainSplitViewController: NSSplitViewController {
         }
         set {
             sidebarSplitViewItem.animator().isCollapsed = newValue
+            if !newValue {
+                ensureDirectoryTreeBuiltIfNeeded()
+            }
         }
     }
 
@@ -113,23 +128,62 @@ final class SearchMainSplitViewController: NSSplitViewController {
         toggleSidebar(nil)
     }
 
+    override func toggleSidebar(_ sender: Any?) {
+        super.toggleSidebar(sender)
+        if !isSidebarCollapsed {
+            ensureDirectoryTreeBuiltIfNeeded()
+        }
+    }
+
+    override func splitViewDidResizeSubviews(_ notification: Notification) {
+        super.splitViewDidResizeSubviews(notification)
+        if !isSidebarCollapsed {
+            ensureDirectoryTreeBuiltIfNeeded()
+        }
+    }
+
+    /// 侧边栏由折叠转为展开时，若存在挂起未建的目录聚合树，基于当前全量结果即时补建
+    private func ensureDirectoryTreeBuiltIfNeeded() {
+        guard isDirectoryTreeDirty else { return }
+        isDirectoryTreeDirty = false
+        let tree: ResultDirectoryTree? = rawResults.isEmpty ? nil : ResultDirectoryTree.build(from: rawResults)
+        let wasUpdating = isUpdatingSearchResults
+        isUpdatingSearchResults = true
+        defer { isUpdatingSearchResults = wasUpdating }
+        sidebarTreeViewController.updateTree(tree)
+    }
+
     // MARK: - Mediator Public API
 
     /// 派发并同步最新的即时检索结果集与聚合树
     ///
     /// - Parameters:
     ///   - rawResults: 检索后端返回的未经目录筛选的原始命中集合
-    ///   - tree: 后台构建的目录聚合前缀树；若为 nil 则使左侧树恢复空状态
-    func updateSearchResults(rawResults: [FfiSearchResult], tree: ResultDirectoryTree?) {
+    ///   - tree: 后台构建的目录聚合前缀树；若为 nil 则使左侧树恢复空状态（除非启用 deferTreeBuild）
+    ///   - deferTreeBuild: 当侧边栏折叠且无活动目录过滤时，置 true 跳过侧边栏建树与 OutlineView 刷新
+    ///   - autoSelectFirstRow: 非空结果集是否自动预选首行（不抢占搜索框焦点）
+    func updateSearchResults(
+        rawResults: [FfiSearchResult],
+        tree: ResultDirectoryTree?,
+        deferTreeBuild: Bool = false,
+        autoSelectFirstRow: Bool = false
+    ) {
         isUpdatingSearchResults = true
         defer { isUpdatingSearchResults = false }
 
         self.rawResults = rawResults
+        self.autoSelectFirstResult = autoSelectFirstRow
 
-        // 1. 同步更新左侧目录聚合树（内部会静默恢复用户先前的展开与选中路径）
-        sidebarTreeViewController.updateTree(tree)
+        if deferTreeBuild && !needsDirectoryTree {
+            // 侧边栏折叠且无目录过滤时跳过 OutlineView 刷新，标记脏状态留待展开时补建
+            isDirectoryTreeDirty = true
+        } else {
+            isDirectoryTreeDirty = false
+            // 1. 同步更新左侧目录聚合树（内部会静默恢复用户先前的展开与选中路径）
+            sidebarTreeViewController.updateTree(tree)
+        }
 
-        // 2. 基于左侧当前选中的目录作用域过滤全量结果集，并推入中间虚拟列表渲染
+        // 2. 基于左侧当前选中的目录作用域过滤全量结果集，并推入主虚拟列表渲染
         let activePrefix = sidebarTreeViewController.selectedPath
         displayResults(byDirectoryPrefix: activePrefix)
     }
@@ -137,22 +191,35 @@ final class SearchMainSplitViewController: NSSplitViewController {
     /// 按目录作用域裁剪全量结果并刷新主列表，供首轮渲染、侧边栏选择与面包屑过滤共用
     private func displayResults(byDirectoryPrefix path: String?) {
         let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
-        searchResultsViewController.displayResults(filtered, preserveSelection: false)
+        searchResultsViewController.displayResults(
+            filtered,
+            preserveSelection: false,
+            autoSelectFirstRow: autoSelectFirstResult
+        )
+        delegate?.searchMainSplitViewDidFilterResults(
+            filteredCount: filtered.count,
+            totalCount: rawResults.count,
+            activeDirectory: path
+        )
     }
 
     /// 基于指定目录路径过滤检索结果，并联动更新侧边栏选中状态
     ///
     /// - Parameter path: 目标过滤目录路径
     func filterByDirectory(path: String) {
-        // 1. 若侧边栏当前处于收起状态，展开以提供视觉上下文
+        // 1. 若侧边栏当前处于收起状态，展开以提供视觉上下文并按需补建目录树
         if isSidebarCollapsed {
             isSidebarCollapsed = false
         }
+        ensureDirectoryTreeBuiltIfNeeded()
 
-        // 2. 尝试在左侧目录树中高亮匹配行（若存在独立对应节点）
+        // 2. 在左侧目录树中高亮精确节点或承载单链压缩段的折叠节点（静默选区避免触发双次刷新）
+        let wasUpdating = isUpdatingSearchResults
+        isUpdatingSearchResults = true
         sidebarTreeViewController.selectDirectory(path: path)
+        isUpdatingSearchResults = wasUpdating
 
-        // 3. 核心兜底过滤：无论该路径是否在单链压缩折叠段中，强制执行全量结果集前缀裁剪
+        // 3. 核心兜底过滤：无论该路径是否在单链压缩折叠段中，统一执行一次全量结果集前缀裁剪
         displayResults(byDirectoryPrefix: path)
     }
 
@@ -195,8 +262,13 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
 
     func searchResultsDidTrashItems(paths: Set<String>) {
         rawResults.removeAll { paths.contains($0.path) }
-        let tree = ResultDirectoryTree.build(from: rawResults)
-        sidebarTreeViewController.updateTree(tree)
+        if needsDirectoryTree {
+            isDirectoryTreeDirty = false
+            let tree = ResultDirectoryTree.build(from: rawResults)
+            sidebarTreeViewController.updateTree(tree)
+        } else {
+            isDirectoryTreeDirty = true
+        }
         delegate?.searchMainSplitViewDidTrashItems(paths: paths, remainingCount: rawResults.count)
     }
 

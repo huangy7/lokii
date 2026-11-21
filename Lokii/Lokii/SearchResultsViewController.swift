@@ -365,6 +365,15 @@ final class BreadcrumbMenuDelegate: NSObject, NSMenuDelegate {
     }
 }
 
+/// “打开方式”二级子菜单代理：仅在用户真正展开子菜单时按需查询 LaunchServices，避免主右键菜单弹出卡顿
+private final class OpenWithMenuDelegate: NSObject, NSMenuDelegate {
+    var onNeedsUpdate: ((NSMenu) -> Void)?
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        onNeedsUpdate?(menu)
+    }
+}
+
 /// 原生面包屑路径导航控件：支持组件单元格坐标精确几何命中与空白区域防穿透
 final class BreadcrumbPathControl: NSPathControl {
     weak var actionDelegate: BreadcrumbPathControlDelegate?
@@ -462,10 +471,22 @@ final class SearchResultsViewController: NSViewController {
     private(set) var results: [FfiSearchResult] = []
     private let iconCache: NSCache<NSString, NSImage> = {
         let cache = NSCache<NSString, NSImage>()
-        cache.countLimit = 512
+        cache.countLimit = 256
         return cache
     }()
+    /// 基于文件类型/扩展名的纯内存图标缓存（仅在主线程读写），规避普通文件逐路径查盘与缓存颠簸
+    private var typeIconCache: [String: NSImage] = [:]
+    /// 应用包自定义图标异步加载队列，确保主线程滚动零磁盘 I/O
+    private let iconLoadQueue = DispatchQueue(label: "com.lokii.results.iconLoad", qos: .userInitiated)
+    private var openWithAppNameCache: [String: String] = [:]
+    private var openWithAppIconCache: [String: NSImage] = [:]
+    private let openWithMenuDelegate = OpenWithMenuDelegate()
+
     private var lastReportedPath: String?
+    private var lastReportedOffline: Bool?
+    private var lastRenderedBottomPath: String?
+    private var lastRenderedBottomOffline: Bool = false
+    private var hasRenderedBottomPath: Bool = false
     private(set) var currentFontSize: CGFloat = CGFloat(TableDensity.defaultFontSize)
     private(set) var fontCache = TableFontCache(fontSize: CGFloat(TableDensity.defaultFontSize))
     private(set) var currentIconSize: CGFloat = TableDensity.calculateIconSize(for: CGFloat(TableDensity.defaultFontSize))
@@ -938,6 +959,10 @@ final class SearchResultsViewController: NSViewController {
 
         let openWithItem = NSMenuItem(title: L("search.ctx.openWith"), action: nil, keyEquivalent: "")
         let openWithSubmenu = NSMenu(title: L("search.ctx.openWith"))
+        openWithSubmenu.delegate = openWithMenuDelegate
+        openWithMenuDelegate.onNeedsUpdate = { [weak self] submenu in
+            self?.populateOpenWithSubmenu(submenu)
+        }
         openWithItem.submenu = openWithSubmenu
         menu.addItem(openWithItem)
 
@@ -966,7 +991,7 @@ final class SearchResultsViewController: NSViewController {
         menu.allowsContextMenuPlugIns = true
         menu.delegate = tableMenuDelegate
         tableMenuDelegate.onMenuWillOpen = { [weak self] m in
-            self?.updateOpenWithMenu(in: m)
+            self?.updateOpenWithItemAvailability(in: m)
         }
         tableView.menu = menu
     }
@@ -1080,18 +1105,23 @@ final class SearchResultsViewController: NSViewController {
                 tableView.selectRowIndexes(valid, byExtendingSelection: false)
             }
         }
-        updateBottomPath(with: selectedResult?.path)
+        hasRenderedBottomPath = false
+        updateBottomPath(for: selectedResult)
         if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
             QLPreviewPanel.shared().reloadData()
         }
     }
 
     /// 更新并渲染检索结果集合
-    func displayResults(_ results: [FfiSearchResult], preserveSelection: Bool) {
+    func displayResults(
+        _ results: [FfiSearchResult],
+        preserveSelection: Bool,
+        autoSelectFirstRow: Bool = false
+    ) {
         let previousPath = preserveSelection ? selectedResult?.path : nil
         self.results = results
         hasAppliedResults = true
-        // 图标按路径稳定复用，跨检索保留；展示串缓存随结果集更替释放，避免无限增长
+        // 图标按类型稳定复用，跨检索保留；展示串缓存随结果集更替释放，避免无限增长
         dateTextCache.removeAll()
         sizeTextCache.removeAll()
 
@@ -1101,17 +1131,25 @@ final class SearchResultsViewController: NSViewController {
             sortResults(by: key, ascending: descriptor.ascending)
         }
 
-        reloadWithFade()
+        // 高频击键刷新直接整表重绘，规避每次按键触发 150ms 离屏图层淡入合成与视觉残影
+        tableView.reloadData()
 
         if let previousPath,
            let matchIndex = self.results.firstIndex(where: { $0.path == previousPath }) {
             tableView.selectRowIndexes(IndexSet(integer: matchIndex), byExtendingSelection: false)
             tableView.scrollRowToVisible(matchIndex)
+        } else if !preserveSelection && autoSelectFirstRow && !self.results.isEmpty {
+            // 活跃检索自动预选首行，便于用户直接按 Return 打开最佳匹配项并实时预览底栏路径，不抢占搜索框焦点
+            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            tableView.scrollRowToVisible(0)
         } else {
             tableView.deselectAll(nil)
         }
         renderEmptyState()
         notifySelectionChanged()
+        if QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible {
+            QLPreviewPanel.shared().reloadData()
+        }
     }
 
     /// 选中首行并滚动至可见视野
@@ -1143,19 +1181,42 @@ final class SearchResultsViewController: NSViewController {
 
     // MARK: - Bottom Bar Interface
 
+    /// 直接依据已选中的检索条目 O(1) 更新底栏文件路径展示，消除结果集线性扫描
+    func updateBottomPath(for result: FfiSearchResult?) {
+        guard let result else {
+            applyBottomPath(path: nil, isDir: false, isOffline: false)
+            return
+        }
+        applyBottomPath(path: result.path, isDir: result.isDir, isOffline: isResultOffline(result))
+    }
+
     /// 更新底栏文件路径展示并协同控制与权限提示的互斥显隐
     func updateBottomPath(with path: String?) {
-        let isTargetOffline: Bool = {
-            guard let path else { return false }
-            if let matched = results.first(where: { $0.path == path }), isResultOffline(matched) {
-                return true
-            }
-            return isPathOffline(path)
-        }()
-        if let path, isTargetOffline {
+        guard let path else {
+            applyBottomPath(path: nil, isDir: false, isOffline: false)
+            return
+        }
+        let matched = results.first(where: { $0.path == path })
+        let isTargetOffline = matched.map { isResultOffline($0) } ?? isPathOffline(path)
+        let isTargetDir = matched?.isDir ?? false
+        applyBottomPath(path: path, isDir: isTargetDir, isOffline: isTargetOffline)
+    }
+
+    private func applyBottomPath(path: String?, isDir: Bool, isOffline: Bool) {
+        if hasRenderedBottomPath,
+           lastRenderedBottomPath == path,
+           lastRenderedBottomOffline == isOffline {
+            updateBottomBarVisibility()
+            return
+        }
+        hasRenderedBottomPath = true
+        lastRenderedBottomPath = path
+        lastRenderedBottomOffline = isOffline
+
+        if let path, isOffline {
             // Build offline breadcrumb items purely in memory without assigning URLs on NSPathControl
             // or NSPathComponentCell so AppKit never stats stale mount points.
-            applyOfflinePathItems(for: path)
+            applyOfflinePathItems(for: path, isDir: isDir)
         } else {
             pathBar.clearOfflineState()
             if path == nil {
@@ -1167,9 +1228,8 @@ final class SearchResultsViewController: NSViewController {
         updateBottomBarVisibility()
     }
 
-    private func applyOfflinePathItems(for path: String) {
+    private func applyOfflinePathItems(for path: String, isDir isTargetDir: Bool) {
         let folderIcon = offlineFallbackIcon(isDir: true)
-        let isTargetDir = results.first(where: { $0.path == path })?.isDir ?? false
         let components = (path as NSString).pathComponents.filter { $0 != "/" }
         var items: [NSPathControlItem] = []
         var urls: [URL] = []
@@ -1338,9 +1398,10 @@ final class SearchResultsViewController: NSViewController {
         }
         tableView.headerView?.needsDisplay = true
         tableView.menu?.refreshLocalizedTitles()
-        // 格式化结果随语言环境变化，缓存需整体失效
+        // 格式化结果与应用本地化显示名随语言环境变化，缓存需整体失效
         dateTextCache.removeAll()
         sizeTextCache.removeAll()
+        openWithAppNameCache.removeAll()
         tableView.reloadData()
         rebuildButton.toolTip = L("search.rebuildIndex")
         rebuildButton.setAccessibilityLabel(L("search.rebuildIndex"))
@@ -1429,8 +1490,10 @@ final class SearchResultsViewController: NSViewController {
     private func notifySelectionChanged() {
         let current = selectedResult
         let currentPath = current?.path
-        if currentPath != lastReportedPath {
+        let currentOffline = current.map { isResultOffline($0) }
+        if currentPath != lastReportedPath || currentOffline != lastReportedOffline {
             lastReportedPath = currentPath
+            lastReportedOffline = currentOffline
             delegate?.searchResultsDidSelect(result: current)
         }
     }
@@ -1549,32 +1612,52 @@ final class SearchResultsViewController: NSViewController {
         openInTerminalHandler(urls)
     }
 
-    /// 动态构建“打开方式”子菜单项列表
-    private func updateOpenWithMenu(in menu: NSMenu) {
+    /// 主右键菜单展开时仅执行纯内存可用性判定，不阻塞查询 LaunchServices
+    private func updateOpenWithItemAvailability(in menu: NSMenu) {
         guard let openWithItem = menu.items.first(where: {
             $0.submenu?.title == L("search.ctx.openWith") || $0.title == L("search.ctx.openWith")
-        }), let submenu = openWithItem.submenu else { return }
+        }) else { return }
+        openWithItem.isEnabled = areAllContextualTargetsOnline && !contextualURLs.isEmpty
+    }
+
+    /// 仅在用户真正悬停展开“打开方式”子菜单时按需填充候选应用，并对显示名与 16pt 图标做内存复用
+    private func populateOpenWithSubmenu(_ submenu: NSMenu) {
         submenu.removeAllItems()
 
         // Skip NSWorkspace queries entirely when target paths are offline so Finder/LaunchServices never block.
         guard areAllContextualTargetsOnline, let firstURL = contextualURLs.first else {
-            openWithItem.isEnabled = false
             return
         }
-        openWithItem.isEnabled = true
 
         let appURLs = NSWorkspace.shared.urlsForApplications(toOpen: firstURL)
         let defaultAppURL = NSWorkspace.shared.urlForApplication(toOpen: firstURL)
 
         for appURL in appURLs {
-            let appName = FileManager.default.displayName(atPath: appURL.path)
+            let appPath = appURL.path
+            let appName: String
+            if let cachedName = openWithAppNameCache[appPath] {
+                appName = cachedName
+            } else {
+                let resolved = FileManager.default.displayName(atPath: appPath)
+                openWithAppNameCache[appPath] = resolved
+                appName = resolved
+            }
+
             let item = NSMenuItem(title: appName, action: #selector(openWithApp(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = appURL
-            let icon = NSWorkspace.shared.icon(forFile: appURL.path)
-            icon.size = NSSize(width: 16, height: 16)
+
+            let icon: NSImage
+            if let cachedIcon = openWithAppIconCache[appPath] {
+                icon = cachedIcon
+            } else {
+                let loaded = NSWorkspace.shared.icon(forFile: appPath)
+                loaded.size = NSSize(width: 16, height: 16)
+                openWithAppIconCache[appPath] = loaded
+                icon = loaded
+            }
             item.image = icon
-            if let defaultURL = defaultAppURL, defaultURL.path == appURL.path {
+            if let defaultURL = defaultAppURL, defaultURL.path == appPath {
                 item.state = .on
             }
             submenu.addItem(item)
@@ -1781,11 +1864,15 @@ final class SearchResultsViewController: NSViewController {
         alert.beginSheetModal(for: window, completionHandler: nil)
     }
 
-    private func playTrashSound() {
+    private static let trashSound: NSSound? = {
         let soundPath = "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/dock/drag to trash.aif"
-        if FileManager.default.fileExists(atPath: soundPath) {
-            NSSound(contentsOfFile: soundPath, byReference: true)?.play()
-        }
+        guard FileManager.default.fileExists(atPath: soundPath) else { return nil }
+        return NSSound(contentsOfFile: soundPath, byReference: true)
+    }()
+
+    private func playTrashSound() {
+        Self.trashSound?.stop()
+        Self.trashSound?.play()
     }
 
     private func sortResults(by key: String, ascending: Bool) {
@@ -1813,45 +1900,87 @@ final class SearchResultsViewController: NSViewController {
         }
     }
 
+    private static func fileExtensionLowercased(of path: String) -> String {
+        let lastSlash = path.lastIndex(of: "/")
+        let nameStart = lastSlash.map { path.index(after: $0) } ?? path.startIndex
+        guard nameStart < path.endIndex,
+              let dot = path[nameStart...].lastIndex(of: "."),
+              dot > nameStart else {
+            return ""
+        }
+        let extStart = path.index(after: dot)
+        guard extStart < path.endIndex else { return "" }
+        return path[extStart...].lowercased()
+    }
+
+    /// 仅应用程序包与系统偏好面板具有独立自定义图标，普通文件与常规目录统一复用扩展名/类型纯内存图标
+    private static func needsCustomBundleIcon(path: String) -> Bool {
+        let ext = fileExtensionLowercased(of: path)
+        return ext == "app" || ext == "prefpane"
+    }
+
     private func offlineFallbackIcon(isDir: Bool) -> NSImage {
-        let key = (isDir ? "__offline__dir__" : "__offline__file__") as NSString
-        if let cached = iconCache.object(forKey: key) { return cached }
+        let key = isDir ? "__offline__dir__" : "__offline__file__"
+        if let cached = typeIconCache[key] { return cached }
         let symbolName = isDir ? "folder" : "doc"
         let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) ?? NSImage()
-        iconCache.setObject(icon, forKey: key)
+        typeIconCache[key] = icon
         return icon
     }
 
-    private func nonBlockingTypeIcon(for path: String, isDir: Bool) -> NSImage {
-        if isDir {
-            let key = "__type_icon_dir__" as NSString
-            if let cached = iconCache.object(forKey: key) { return cached }
+    private func nonBlockingTypeIcon(for path: String, isDir: Bool, fileExtension: String? = nil) -> NSImage {
+        if isDir && !Self.needsCustomBundleIcon(path: path) {
+            let key = "__type_icon_dir__"
+            if let cached = typeIconCache[key] { return cached }
             let icon = NSWorkspace.shared.icon(for: .folder)
-            iconCache.setObject(icon, forKey: key)
+            typeIconCache[key] = icon
             return icon
         }
-        let ext = (path as NSString).pathExtension.lowercased()
-        let key = "__type_icon_ext_\(ext)" as NSString
-        if let cached = iconCache.object(forKey: key) { return cached }
+        let ext = (fileExtension?.isEmpty == false ? fileExtension!.lowercased() : Self.fileExtensionLowercased(of: path))
+        let key = "__type_icon_ext_\(ext)"
+        if let cached = typeIconCache[key] { return cached }
         let utType = ext.isEmpty ? UTType.data : (UTType(filenameExtension: ext) ?? .data)
         let icon = NSWorkspace.shared.icon(for: utType)
-        iconCache.setObject(icon, forKey: key)
+        typeIconCache[key] = icon
         return icon
     }
 
-    func iconForFile(at path: String, isDir: Bool = false, isOffline: Bool = false) -> NSImage {
+    func iconForFile(at path: String, isDir: Bool = false, isOffline: Bool = false, fileExtension: String? = nil) -> NSImage {
         if isOffline || isPathOffline(path) {
             return offlineFallbackIcon(isDir: isDir)
         }
-        // `/Volumes/*` 下的外置盘与网络共享严禁在主线程表格渲染期间同步调用 NSWorkspace.icon(forFile:)，
-        // 避免 SMB/NFS 逐行 stat 往返导致滚动卡顿或挂载假死时冻结界面。
-        if Self.isUnderVolumesNamespace(path) {
-            return nonBlockingTypeIcon(for: path, isDir: isDir)
+        // `/Volumes/*` 与常规文件/目录在主线程表格渲染期间严禁同步调用 NSWorkspace.icon(forFile:)，
+        // 统一走基于扩展名/UTType 的 O(1) 纯内存类型图标缓存，消除高频磁盘 stat 与云盘阻塞。
+        if !Self.isUnderVolumesNamespace(path),
+           Self.needsCustomBundleIcon(path: path),
+           let cached = iconCache.object(forKey: path as NSString) {
+            return cached
         }
-        if let cached = iconCache.object(forKey: path as NSString) { return cached }
-        let icon = workspaceIconProvider(path)
-        iconCache.setObject(icon, forKey: path as NSString)
-        return icon
+        return nonBlockingTypeIcon(for: path, isDir: isDir, fileExtension: fileExtension)
+    }
+
+    /// 异步加载应用包（.app / .prefPane）的专属自定义图标并回填仍展示该路径的单元格
+    private func loadCustomBundleIconIfNeeded(for result: FfiSearchResult, isOffline: Bool, into cell: SearchNameTableCellView) {
+        let path = result.path
+        cell.representedPath = path
+        guard !isOffline,
+              !isPathOffline(path),
+              !Self.isUnderVolumesNamespace(path),
+              Self.needsCustomBundleIcon(path: path),
+              iconCache.object(forKey: path as NSString) == nil else {
+            return
+        }
+        let provider = workspaceIconProvider
+        iconLoadQueue.async { [weak self, weak cell] in
+            let loaded = provider(path)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.iconCache.setObject(loaded, forKey: path as NSString)
+                if let cell, cell.representedPath == path {
+                    cell.imageView?.image = loaded
+                }
+            }
+        }
     }
 
     // MARK: - NSServicesRequests
@@ -2056,10 +2185,11 @@ extension SearchResultsViewController: NSTableViewDelegate {
     private func nameCell(for result: FfiSearchResult, isOffline: Bool, in tableView: NSTableView) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier("NameCell")
         if let reused = tableView.makeView(withIdentifier: id, owner: nil) as? SearchNameTableCellView {
-            reused.imageView?.image = iconForFile(at: result.path, isDir: result.isDir, isOffline: isOffline)
+            reused.imageView?.image = iconForFile(at: result.path, isDir: result.isDir, isOffline: isOffline, fileExtension: result.extension)
             reused.updateIconSize(currentIconSize)
             reused.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
             reused.configure(name: result.name, matchPositions: result.matchPositions, isOffline: isOffline)
+            loadCustomBundleIconIfNeeded(for: result, isOffline: isOffline, into: reused)
             return reused
         }
 
@@ -2069,7 +2199,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         let imageView = NSImageView()
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.image = iconForFile(at: result.path, isDir: result.isDir, isOffline: isOffline)
+        imageView.image = iconForFile(at: result.path, isDir: result.isDir, isOffline: isOffline, fileExtension: result.extension)
         cell.addSubview(imageView)
         cell.imageView = imageView
 
@@ -2102,6 +2232,7 @@ extension SearchResultsViewController: NSTableViewDelegate {
         cell.setIconConstraints(width: widthConstraint, height: heightConstraint)
         cell.applyFonts(regular: fontCache.regular, bold: fontCache.bold)
         cell.configure(name: result.name, matchPositions: result.matchPositions, isOffline: isOffline)
+        loadCustomBundleIconIfNeeded(for: result, isOffline: isOffline, into: cell)
 
         return cell
     }
@@ -2482,6 +2613,11 @@ final class SearchTableView: NSTableView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // 焦点位于文本编辑器（如搜索输入框）时，将 ⌘⌫ 交还给文本编辑器的整行删除语义，防止误将预选首行移入废纸篓
+        if event.keyCode == 51 && event.modifierFlags.contains(.command),
+           window?.firstResponder is NSTextView {
+            return false
+        }
         if let menu = self.menu, menu.performKeyEquivalent(with: event) {
             return true
         }
@@ -2574,6 +2710,7 @@ class SearchHighlightCellView: NSTableCellView {
 
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet {
+            guard oldValue != backgroundStyle else { return }
             renderText()
         }
     }
@@ -2593,6 +2730,7 @@ class SearchHighlightCellView: NSTableCellView {
     /// 后端下发的是 UTF-8 字节偏移，需夹取后映射为 NSRange。
     private static func nsRanges(in string: String,
                                  byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
+        guard !byteRanges.isEmpty else { return [] }
         let utf8 = string.utf8
         return byteRanges.compactMap { range in
             guard range.start < range.end,
@@ -2612,8 +2750,17 @@ class SearchHighlightCellView: NSTableCellView {
         }
 
         let isSelected = backgroundStyle == .emphasized
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let defaultColor: NSColor = isSelected ? NSColor.white.withAlphaComponent(selectedAlpha) : baseColor
+
+        // 无高亮区间时走纯文本快路径：NSTextField 原生保留自身的 lineBreakMode，无需逐行分配 NSMutableAttributedString
+        if displayRanges.isEmpty {
+            textField?.font = regularFont
+            textField?.textColor = defaultColor
+            textField?.stringValue = displayString
+            return
+        }
+
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let highlightColor: NSColor = isSelected ? .white : (isDark ? .controlAccentColor : .labelColor)
 
         var baseAttributes: [NSAttributedString.Key: Any] = [
@@ -2641,6 +2788,9 @@ class SearchHighlightCellView: NSTableCellView {
 final class SearchNameTableCellView: SearchHighlightCellView {
     /// 选中态下普通字符用微透明白保持层级，命中字符用纯白加粗突出。
     override var selectedAlpha: CGFloat { 0.82 }
+
+    /// 当前单元格绑定的文件路径，供异步应用包图标加载完成后校验是否已被复用
+    var representedPath: String?
 
     private(set) var iconWidthConstraint: NSLayoutConstraint?
     private(set) var iconHeightConstraint: NSLayoutConstraint?

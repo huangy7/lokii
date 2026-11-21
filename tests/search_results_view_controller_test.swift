@@ -892,7 +892,61 @@ assertTrue(!workspaceIconCalls.contains(dynamicallyOffline.path), "动态降级�
 assertTrue(controller.tableView(controller.tableView, pasteboardWriterForRow: 0) == nil, "动态命中离线路径的行不应允许文件拖拽")
 assertEqual(controller.pathBar.isOfflinePathMode, true, "refreshOfflineStates 应同步将底栏切换至离线模式")
 
-print("测试全部通过：15/15 项断言成功。")
+print("[16/16] 测试自动预选首行、文本编辑态 ⌘⌫ 保护、普通文件零主线程磁盘图标与 O(1) 底栏更新...")
+workspaceIconCalls.removeAll()
+controller.isPathOfflineHandler = nil
+let autoSelectDelegate = MockDelegate()
+controller.delegate = autoSelectDelegate
+let localCodeItem = FfiSearchResult(
+    name: "engine.swift",
+    path: "/tmp/project/engine.swift",
+    extension: "swift",
+    isDir: false,
+    size: 2048,
+    created: 1000,
+    modified: 2000
+)
+let localDocItem = FfiSearchResult(
+    name: "guide.md",
+    path: "/tmp/project/guide.md",
+    extension: "md",
+    isDir: false,
+    size: 512,
+    created: 1000,
+    modified: 1900
+)
+controller.displayResults([localCodeItem, localDocItem], preserveSelection: false, autoSelectFirstRow: true)
+assertEqual(controller.tableView.selectedRow, 0, "启用 autoSelectFirstRow 时非空结果集应自动预选第 0 行")
+assertEqual(autoSelectDelegate.selectedResult?.path, localCodeItem.path, "自动预选首行后应立即通知代理更新底栏路径")
+
+// 普通文件渲染绝不在主线程同步调用 NSWorkspace.icon(forFile:)
+_ = controller.tableView(controller.tableView, viewFor: testNameCol, row: 0)
+assertTrue(!workspaceIconCalls.contains(localCodeItem.path), "普通代码文件应走纯内存 UTType 类型图标，严禁主线程同步查盘")
+
+// O(1) updateBottomPath(for:) 接口验证
+controller.updateBottomPath(for: localCodeItem)
+assertEqual(controller.pathBar.url?.path, localCodeItem.path, "updateBottomPath(for:) 应正确更新在线文件路径")
+controller.updateBottomPath(for: offlineItem)
+assertEqual(controller.pathBar.isOfflinePathMode, true, "updateBottomPath(for:) 应直接识别离线条目进入纯内存模式")
+assertTrue(controller.pathBar.url == nil, "updateBottomPath(for:) 离线模式绝不可写入 pathBar.url")
+
+// 验证打开方式子菜单挂载独立按需代理，避免主右键菜单同步查询 LaunchServices
+assertTrue(menu.items[1].submenu?.delegate != nil, "打开方式子菜单必须挂载独立 NSMenuDelegate 实现展开时按需构建")
+
+// 验证焦点在文本编辑器（搜索框）时，⌘⌫ 不得被 SearchTableView 劫持触发废纸篓删除
+let hostWin = NSWindow(
+    contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+    styleMask: [.titled],
+    backing: .buffered,
+    defer: false
+)
+let textEditor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 30))
+hostWin.contentView?.addSubview(controller.view)
+hostWin.contentView?.addSubview(textEditor)
+hostWin.makeFirstResponder(textEditor)
+assertEqual(controller.tableView.performKeyEquivalent(with: deleteEvent), false, "焦点位于文本编辑器时 ⌘⌫ 必须交还给文本编辑器，不得误删预选首行")
+
+print("测试全部通过：16/16 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

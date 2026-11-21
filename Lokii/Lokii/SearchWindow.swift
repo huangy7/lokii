@@ -52,6 +52,17 @@ final class SearchWindow: NSWindowController {
         return NSRect(x: round(x), y: round(y), width: round(finalWidth), height: round(finalHeight))
     }
 
+    /// 在目标屏幕可见工作区内保留既有窗口宽高并黄金居中，避免跨屏唤醒重置用户自定义窗口尺寸
+    static func calculateCenteredFrame(preservingSize size: NSSize, on screen: NSScreen) -> NSRect {
+        let visible = screen.visibleFrame
+        let width = min(max(size.width, 780), visible.width)
+        let height = min(max(size.height, 420), visible.height)
+        let x = visible.origin.x + (visible.width - width) / 2
+        let targetY = visible.origin.y + (visible.height - height) / 2 + (visible.height * 0.05)
+        let y = min(max(targetY, visible.origin.y), visible.maxY - height)
+        return NSRect(x: round(x), y: round(y), width: round(width), height: round(height))
+    }
+
     private let savedWindowFrameKey = "LokiiMainWindowFrame"
     let splitViewController = SearchMainSplitViewController()
     var searchResultsViewController: SearchResultsViewController { splitViewController.searchResultsViewController }
@@ -131,6 +142,8 @@ final class SearchWindow: NSWindowController {
         window.toolbarStyle = .unified
         window.minSize = NSSize(width: 780, height: 420)
         window.isReleasedWhenClosed = false
+        // 允许全局快捷键将窗口就地召唤至当前活跃桌面空间（Space），避免跨空间强行切屏
+        window.collectionBehavior = [.moveToActiveSpace]
 
         super.init(window: window)
 
@@ -219,8 +232,15 @@ final class SearchWindow: NSWindowController {
         if isFirstAppear {
             let mouseLoc = NSEvent.mouseLocation
             let mouseScreen = NSScreen.screens.first { NSMouseInRect(mouseLoc, $0.frame, false) }
-            if let targetScreen = mouseScreen, targetScreen != window.screen {
-                let newFrame = Self.calculateDefaultWindowFrame(on: targetScreen)
+            if shouldRememberWindowPosition {
+                // 开启位置记忆时尊重用户持久化坐标；仅当保存位置已脱离全部在线屏幕时才迁移至当前屏
+                let isOnAnyScreen = NSScreen.screens.contains { $0.visibleFrame.intersects(window.frame) }
+                if !isOnAnyScreen, let targetScreen = mouseScreen {
+                    let newFrame = Self.calculateCenteredFrame(preservingSize: window.frame.size, on: targetScreen)
+                    window.setFrame(newFrame, display: false)
+                }
+            } else if let targetScreen = mouseScreen, targetScreen != window.screen {
+                let newFrame = Self.calculateCenteredFrame(preservingSize: window.frame.size, on: targetScreen)
                 window.setFrame(newFrame, display: false)
             }
 
@@ -265,7 +285,8 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    @objc private func hideWindowWithAnimation() {
+    /// 统一窗口收起入口：成对关闭过滤浮层与快速查看面板，避免失焦隐藏或全局快捷键收起残留浮窗
+    func hideWindow(animated: Bool = true) {
         if filterPopoverController.isShown {
             filterPopoverController.close()
         }
@@ -273,7 +294,14 @@ final class SearchWindow: NSWindowController {
             QLPreviewPanel.shared().orderOut(nil)
         }
         guard let window = window, window.isVisible else { return }
-        
+
+        guard animated else {
+            window.orderOut(nil)
+            window.alphaValue = 1.0
+            window.contentView?.layer?.transform = CATransform3DIdentity
+            return
+        }
+
         // Remove scale pop on close for cleaner exit
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15
@@ -284,6 +312,10 @@ final class SearchWindow: NSWindowController {
             self?.window?.alphaValue = 1.0
             self?.window?.contentView?.layer?.transform = CATransform3DIdentity
         })
+    }
+
+    @objc private func hideWindowWithAnimation() {
+        hideWindow(animated: true)
     }
 
     // MARK: - UI Setup
@@ -388,7 +420,7 @@ final class SearchWindow: NSWindowController {
                 guard let self = self else { return }
                 self.lastQuery = query
                 if query.isEmpty {
-                    self.searchResultsViewController.updateBottomPath(with: nil)
+                    self.searchResultsViewController.updateBottomPath(for: nil)
                     self.loadDefaultResults()
                 } else {
                     self.performSearch(query: query)
@@ -920,7 +952,7 @@ final class SearchWindow: NSWindowController {
         searchWorkItem?.cancel()
 
         if query.isEmpty {
-            searchResultsViewController.updateBottomPath(with: nil)
+            searchResultsViewController.updateBottomPath(for: nil)
             updateCaseSensitivityButtonState()
             loadDefaultResults()
             return
@@ -933,35 +965,63 @@ final class SearchWindow: NSWindowController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: item)
     }
 
-    private var isSearching = false
-    private var pendingVolumeRefresh = false
+    /// 递增检索代际令牌，用于淘汰陈旧后台检索并杜绝过期结果在主线程触发冗余刷表
+    private let searchGenerationLock = NSLock()
+    private var latestSearchGeneration: UInt64 = 0
+    private var lastSearchError: String? = nil
 
-    /// 搜索框为空时自动呈现全量索引文件与目录树（按文件名自然字母顺序排列，且清除匹配高亮）
+    private func nextSearchGeneration() -> UInt64 {
+        searchGenerationLock.lock()
+        latestSearchGeneration &+= 1
+        let gen = latestSearchGeneration
+        searchGenerationLock.unlock()
+        return gen
+    }
+
+    private func isCurrentSearchGeneration(_ generation: UInt64) -> Bool {
+        searchGenerationLock.lock()
+        let isCurrent = (latestSearchGeneration == generation)
+        searchGenerationLock.unlock()
+        return isCurrent
+    }
+
+    private func updateMatchCountText(_ count: Int) {
+        if count == 1 {
+            searchMatchText = .key("search.matchedCount.one")
+        } else {
+            searchMatchText = .formatted("search.matchedCount", formatFileCount(UInt64(count)))
+        }
+    }
+
+    /// 搜索框为空时自动呈现全量索引文件与目录树（按修改时间倒序，时间相同时按文件名自然字母顺序排列）
     private func loadDefaultResults() {
         guard indexingState != .failed else { return }
-        if isSearching {
-            pendingVolumeRefresh = true
-            return
-        }
-        isSearching = true
+        let generation = nextSearchGeneration()
+        let shouldBuildTree = splitViewController.needsDirectoryTree
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.engine.search(query: "*", mode: .wildcard)
-            // 循环外一次性读取卷状态快照，避免 500~1000 条结果逐条加锁拷贝数组
-            let volumeStatuses = self.engine.getVolumeStatuses()
+            guard self.isCurrentSearchGeneration(generation) else { return }
+
             // 默认未检索状态下按修改时间倒序排列（最近活跃优先），时间相同时按文件名自然字母顺序排列
-            let items: [FfiSearchResult] = response.results
-                .sorted {
-                    if $0.modified != $1.modified {
-                        return $0.modified > $1.modified
-                    }
-                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            let sorted = response.results.sorted {
+                if $0.modified != $1.modified {
+                    return $0.modified > $1.modified
                 }
-                .map { item in
-                    let matchedStatus = volumeStatuses.isEmpty
-                        ? nil
-                        : SearchEngine.matchVolumeStatus(forPath: item.path, in: volumeStatuses)
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+            guard self.isCurrentSearchGeneration(generation) else { return }
+
+            // 循环外一次性预归一化卷状态快照；无外部卷且后端已返回空高亮区间时零拷贝直通
+            let volumeStatuses = self.engine.getVolumeStatuses()
+            let items: [FfiSearchResult]
+            if volumeStatuses.isEmpty && sorted.allSatisfy({ $0.matchPositions.isEmpty && $0.parentMatchPositions.isEmpty }) {
+                items = sorted
+            } else {
+                let matcher = SettingsPathStatusResolver.VolumeStatusMatcher(volumeStatuses: volumeStatuses)
+                items = sorted.map { item in
+                    let matchedStatus = matcher.isEmpty ? nil : matcher.match(path: item.path)
                     let offline = item.isOffline || (matchedStatus.map { $0.state == .offline || $0.state == .missing } ?? false)
                     let resolvedVolumeName = item.volumeName ?? matchedStatus?.displayName
                     return FfiSearchResult(
@@ -980,91 +1040,70 @@ final class SearchWindow: NSWindowController {
                         volumeName: resolvedVolumeName
                     )
                 }
-            let tree: ResultDirectoryTree? = items.isEmpty ? nil : ResultDirectoryTree.build(from: items)
+            }
+            guard self.isCurrentSearchGeneration(generation) else { return }
+
+            let tree: ResultDirectoryTree? = (shouldBuildTree && !items.isEmpty)
+                ? ResultDirectoryTree.build(from: items)
+                : nil
+            guard self.isCurrentSearchGeneration(generation) else { return }
 
             DispatchQueue.main.async {
-                self.isSearching = false
-                guard self.indexingState != .failed else { return }
+                guard self.indexingState != .failed, self.isCurrentSearchGeneration(generation) else { return }
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
-
-                let needsVolumeRefresh = self.pendingVolumeRefresh
-                self.pendingVolumeRefresh = false
-
-                let currentText = self.searchField.stringValue
-                if !currentText.isEmpty {
-                    self.lastQuery = currentText
-                    self.performSearch(query: currentText)
-                    return
-                }
-                if needsVolumeRefresh {
-                    self.loadDefaultResults()
-                    return
-                }
                 self.lastExclusionHint = nil
+                self.lastSearchError = nil
                 self.updateEmptyState()
-                self.splitViewController.updateSearchResults(rawResults: items, tree: tree)
-                self.searchMatchText = nil
+                self.splitViewController.updateSearchResults(
+                    rawResults: items,
+                    tree: tree,
+                    deferTreeBuild: !shouldBuildTree,
+                    autoSelectFirstRow: false
+                )
+                if self.sidebarTreeViewController.selectedPath == nil {
+                    self.searchMatchText = nil
+                }
                 self.updateStatusLabel()
-                self.searchResultsViewController.updateBottomPath(with: self.searchResultsViewController.selectedResult?.path)
             }
         }
     }
 
     private func performSearch(query: String) {
         guard indexingState != .failed else { return }
-        if isSearching {
-            pendingVolumeRefresh = true
-            return
-        }
-        isSearching = true
-        searchMatchText = .key("search.searching")
-
+        let generation = nextSearchGeneration()
         let mode = currentMode
         let caseSensitivity = currentCaseSensitivity
+        let shouldBuildTree = splitViewController.needsDirectoryTree
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.engine.search(query: query, mode: mode, caseSensitivity: caseSensitivity)
-            let tree: ResultDirectoryTree? = response.results.isEmpty ? nil : ResultDirectoryTree.build(from: response.results)
+            guard self.isCurrentSearchGeneration(generation) else { return }
+
+            let tree: ResultDirectoryTree? = (shouldBuildTree && !response.results.isEmpty)
+                ? ResultDirectoryTree.build(from: response.results)
+                : nil
+            guard self.isCurrentSearchGeneration(generation) else { return }
+
             DispatchQueue.main.async {
-                self.isSearching = false
-                guard self.indexingState != .failed else { return }
+                guard self.indexingState != .failed, self.isCurrentSearchGeneration(generation) else { return }
                 self.lastExclusionHint = response.hint
+                self.lastSearchError = response.error
                 self.updateEmptyState()
-                self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
+                self.splitViewController.updateSearchResults(
+                    rawResults: response.results,
+                    tree: tree,
+                    deferTreeBuild: !shouldBuildTree,
+                    autoSelectFirstRow: true
+                )
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
                 self.updateCaseSensitivityButtonState(responseCaseSensitive: response.isCaseSensitive)
                 self.updateRegexModeButtonState(effectiveMode: response.effectiveMode)
 
                 if let error = response.error {
-                    let formattedError = error.hasPrefix("⚠️") ? error : "⚠️ \(error)"
-                    self.searchMatchText = .verbatim(formattedError)
+                    self.searchMatchText = .verbatim(error)
                 } else {
-                    let count = response.results.count
-                    if count == 1 {
-                        self.searchMatchText = .key("search.matchedCount.one")
-                    } else {
-                        self.searchMatchText = .formatted("search.matchedCount", formatFileCount(UInt64(count)))
-                    }
-                }
-
-                // 检索期间若输入内容变动、检索模式/大小写敏感切换或卷状态更新，在此重新调度
-                let needsVolumeRefresh = self.pendingVolumeRefresh
-                self.pendingVolumeRefresh = false
-                let currentText = self.searchField.stringValue
-                if needsVolumeRefresh || (currentText != query && !currentText.isEmpty) || self.currentMode != mode || self.currentCaseSensitivity != caseSensitivity {
-                    if currentText.isEmpty {
-                        self.searchResultsViewController.updateBottomPath(with: nil)
-                        self.loadDefaultResults()
-                    } else {
-                        self.lastQuery = currentText
-                        self.performSearch(query: currentText)
-                    }
-                } else if currentText.isEmpty && currentText != query {
-                    self.searchResultsViewController.updateBottomPath(with: nil)
-                    self.loadDefaultResults()
-                } else {
-                    self.searchResultsViewController.updateBottomPath(with: self.searchResultsViewController.selectedResult?.path)
+                    self.updateMatchCountText(self.searchResultsViewController.results.count)
                 }
             }
         }
@@ -1461,9 +1500,10 @@ final class SearchWindow: NSWindowController {
 
         PillLayoutManager.ensureInstalled(on: fieldEditor)
 
+        let baseFont = searchField.font ?? .systemFont(ofSize: 14)
         let formatted = FilterQuerySyncCoordinator.formatQuerySyntax(
             query,
-            baseFont: searchField.font ?? .systemFont(ofSize: 14)
+            baseFont: baseFont
         )
 
         hasAppliedFilterSyntaxHighlighting = hasFilterSyntax
@@ -1477,6 +1517,11 @@ final class SearchWindow: NSWindowController {
         }
         storage.endEditing()
         fieldEditor.selectedRange = savedRange
+        // 重置编辑态默认属性，防止胶囊末尾紧跟中文/多字节输入法组字时继承胶囊蓝色衬底与字距
+        fieldEditor.typingAttributes = [
+            .font: baseFont,
+            .foregroundColor: NSColor.labelColor,
+        ]
     }
 
     // MARK: - Focus Management
@@ -1524,7 +1569,7 @@ final class SearchWindow: NSWindowController {
 
 extension SearchWindow: SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidSelect(result: FfiSearchResult?) {
-        searchResultsViewController.updateBottomPath(with: result?.path)
+        searchResultsViewController.updateBottomPath(for: result)
     }
 
     func searchMainSplitViewDidDoubleClick(result: FfiSearchResult) {
@@ -1545,10 +1590,15 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
     }
 
     func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {
-        if remainingCount == 1 {
-            searchMatchText = .key("search.matchedCount.one")
+        updateMatchCountText(searchResultsViewController.results.count)
+    }
+
+    func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?) {
+        guard lastSearchError == nil else { return }
+        if !searchField.stringValue.isEmpty || activeDirectory != nil {
+            updateMatchCountText(filteredCount)
         } else {
-            searchMatchText = .formatted("search.matchedCount", formatFileCount(UInt64(remainingCount)))
+            searchMatchText = nil
         }
     }
 }
@@ -1581,8 +1631,11 @@ extension SearchWindow: NSSearchFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        // 回车确认命令：当存在命中结果时归档有效搜索历史，并打开当前选定条目
+        // 回车确认命令：输入法组字期间放行上屏；其余场景归档有效搜索历史并打开当前选定条目
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            if textView.hasMarkedText() {
+                return false
+            }
             openSelected()
             return true
         }
@@ -1609,12 +1662,15 @@ extension SearchWindow: NSSearchFieldDelegate {
             }
         }
 
-        // 方向下键语义命令：当光标处于文本末尾或输入为空时，将焦点交接至结果列表
+        // 方向下键语义命令：当光标处于文本末尾或输入为空时，将焦点交接至结果列表；
+        // 若首行已随检索自动预选且结果超过 1 条，直接顺滑推进至第 2 行，避免重复按两次下键
         if commandSelector == #selector(NSResponder.moveDown(_:)) {
             let length = (textView.string as NSString).length
             if textView.selectedRange.length == 0 && textView.selectedRange.location == length {
-                if searchResultsViewController.results.count > 0 {
-                    return searchResultsViewController.focusResults()
+                let count = searchResultsViewController.results.count
+                if count > 0 {
+                    let targetRow: Int? = (searchResultsViewController.tableView.selectedRow == 0 && count > 1) ? 1 : nil
+                    return searchResultsViewController.focusResults(row: targetRow)
                 }
             }
         }

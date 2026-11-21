@@ -251,7 +251,7 @@ assertTrue(controller.outlineView.isItemExpanded(updatedSrc), "刷新后 updated
 controller.outlineView.collapseItem(updatedSrc)
 assertEqual(controller.expandedPathSet.contains("/workspace/src"), false, "折叠后 expandedPathSet 应移除 /workspace/src")
 
-print("[6/6] 测试 clear() 重置行为...")
+print("[6/7] 测试 clear() 重置行为...")
 controller.clear()
 assertEqual(controller.currentTree == nil, true, "clear() 后 currentTree 应为 nil")
 assertEqual(controller.selectedPath, nil, "clear() 后 selectedPath 应为 nil")
@@ -259,7 +259,25 @@ assertTrue(controller.expandedPathSet.isEmpty, "clear() 后 expandedPathSet 应�
 assertEqual(controller.emptyLabel.isHidden, false, "clear() 后 emptyLabel 应恢复可见")
 assertEqual(controller.scrollView.isHidden, true, "clear() 后 scrollView 应隐藏")
 
-print("测试全部通过：6/6 项断言成功。")
+print("[7/7] 测试单链折叠目录祖先过滤选中与“全部结果”退出过滤...")
+let foldedResults = [
+    FfiSearchResult(name: "main.rs", path: "/workspace/lokii/src/main.rs", extension: "rs", isDir: false, size: 100, created: 1, modified: 1),
+    FfiSearchResult(name: "lib.rs", path: "/workspace/lokii/src/lib.rs", extension: "rs", isDir: false, size: 100, created: 1, modified: 1),
+    FfiSearchResult(name: "notes.txt", path: "/other/docs/notes.txt", extension: "txt", isDir: false, size: 100, created: 1, modified: 1),
+]
+let foldedTree = ResultDirectoryTree.build(from: foldedResults)
+controller.updateTree(foldedTree)
+mockDelegate.callbackCount = 0
+controller.selectDirectory(path: "/other")
+assertEqual(controller.selectedPath, "/other", "对单链折叠祖先路径 /other 过滤时应保留完整作用域路径")
+assertTrue(controller.outlineView.selectedRow > 0, "单链折叠祖先过滤应高亮对应的折叠节点行，不得停留在全部结果行")
+assertEqual(mockDelegate.selectedPath, "/other", "代理应收到 /other 作用域路径")
+
+controller.selectAllResults()
+assertEqual(controller.selectedPath, nil, "点击全部结果后应成功清除单链折叠祖先过滤作用域")
+assertEqual(mockDelegate.selectedPath, nil, "点击全部结果后代理应收到 nil 回调")
+
+print("测试全部通过：7/7 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

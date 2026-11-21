@@ -71,6 +71,7 @@
 "prefs.networkRescan.unit" = "min";
 "prefs.networkRescan.off" = "Off";
 "prefs.index.unsaved" = "Unsaved changes";
+"prefs.index.saveFailed" = "Failed to save index settings. Please try again.";
 "prefs.resetToDefaults" = "Restore Defaults";
 "prefs.save" = "Save";
 "prefs.unsavedChanges.title" = "Index changes are not saved yet";

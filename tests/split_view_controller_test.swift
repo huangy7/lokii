@@ -117,6 +117,14 @@ final class MockSplitDelegate: SearchMainSplitViewControllerDelegate {
         trashedRemainingCount = remainingCount
         trashCallCount += 1
     }
+
+    var lastFilteredCount: Int?
+    var lastFilteredDirectory: String?
+
+    func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?) {
+        lastFilteredCount = filteredCount
+        lastFilteredDirectory = activeDirectory
+    }
 }
 
 print("[1/5] 测试双栏容器分栏条目（NSSplitViewItem）配置参数...")
@@ -232,7 +240,32 @@ assertEqual(splitVC.searchResultsViewController.results.isEmpty, true, "清空�
 
 splitVC.onLanguageChanged()
 
-print("测试全部通过：5/5 项断言成功。")
+print("[6/6] 测试侧边栏折叠时的惰性目录树构建、展开补建与自动首行预选...")
+let lazySplitVC = SearchMainSplitViewController()
+_ = lazySplitVC.view
+let lazyDelegate = MockSplitDelegate()
+lazySplitVC.delegate = lazyDelegate
+
+assertEqual(lazySplitVC.isSidebarCollapsed, true, "初始侧边栏应折叠")
+assertEqual(lazySplitVC.needsDirectoryTree, false, "侧边栏折叠且无目录过滤时 needsDirectoryTree 应为 false")
+
+// 传入 deferTreeBuild: true + autoSelectFirstRow: true，不构建树也不更新 OutlineView
+lazySplitVC.updateSearchResults(
+    rawResults: testRawResults,
+    tree: nil,
+    deferTreeBuild: true,
+    autoSelectFirstRow: true
+)
+assertEqual(lazySplitVC.sidebarTreeViewController.currentTree == nil, true, "侧边栏折叠且 deferTreeBuild 为 true 时应跳过目录树更新")
+assertEqual(lazySplitVC.searchResultsViewController.selectedResult, itemA, "启用 autoSelectFirstRow 时应自动预选首行 itemA")
+assertEqual(lazyDelegate.lastFilteredCount, 3, "过滤回调应报告当前可见条目数 3")
+
+// 展开侧边栏后自动即时补建目录树
+lazySplitVC.toggleSidebar()
+assertEqual(lazySplitVC.isSidebarCollapsed, false, "toggleSidebar 后侧边栏应展开")
+assertEqual(lazySplitVC.sidebarTreeViewController.currentTree?.totalMatchCount, 3, "展开侧边栏时应自动补建包含 3 项结果的目录树")
+
+print("测试全部通过：6/6 项断言成功。")
 """
 
 let combinedSource = """

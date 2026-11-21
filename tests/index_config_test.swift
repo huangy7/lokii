@@ -311,6 +311,12 @@ do {
     updatedStatus.lastSyncAt = 123
     assertEqual(updatedStatus.hasSameLifecycle(as: disk2Slot), false, "扫描完成应触发生命周期通知")
 
+    let batchMatcher = SettingsPathStatusResolver.VolumeStatusMatcher(volumeStatuses: allVols)
+    assertEqual(batchMatcher.match(path: "/Volumes/Disk2/file.txt")?.displayName, "Disk2", "预归一化批处理匹配器应按边界精确命中 Disk2")
+    assertEqual(batchMatcher.match(path: "/volumes/disk/sub/deep.log")?.displayName, "DiskSub", "预归一化批处理匹配器应深度优先命中嵌套卷")
+    assertEqual(batchMatcher.match(path: expandedHomeTarget)?.displayName, "HomeMount", "预归一化批处理匹配器应兼容 ~ 展开路径")
+    assertTrue(batchMatcher.match(path: "/Users/local/file.txt") == nil, "非卷本地路径应返回 nil")
+
     print("IndexConfig 编解码、卷状态解析与通知测试全部通过！")
 } catch {
     fputs("测试执行抛出异常: \\(error)\\n", stderr)

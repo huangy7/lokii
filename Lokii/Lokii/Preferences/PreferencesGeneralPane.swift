@@ -8,16 +8,6 @@ struct PreferencesGeneralPane: View {
     /// 下拉菜单中“选择其他...”动作的哨兵标识，拦截选中后打开文件选择面板而不写入配置
     private static let chooseOtherTerminalTag = "__lokii.terminal.chooseOther__"
 
-    /// 将应用图标重绘为 16pt 逻辑尺寸（保留 Retina 分辨率），与标准尺寸下拉菜单文字比例协调
-    private static func terminalMenuIcon(for appURL: URL) -> NSImage {
-        let source = NSWorkspace.shared.icon(forFile: appURL.path)
-        let targetSize = NSSize(width: 16, height: 16)
-        return NSImage(size: targetSize, flipped: false) { rect in
-            source.draw(in: rect)
-            return true
-        }
-    }
-
     var body: some View {
         Form {
             // Section 1: 行为
@@ -66,7 +56,7 @@ struct PreferencesGeneralPane: View {
                             Label {
                                 Text(item.name)
                             } icon: {
-                                Image(nsImage: Self.terminalMenuIcon(for: item.appURL))
+                                Image(nsImage: item.menuIcon)
                             }
                             .tag(item.id)
                         }

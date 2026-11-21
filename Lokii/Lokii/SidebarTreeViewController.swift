@@ -134,6 +134,17 @@ final class SidebarTreeViewController: NSViewController {
 
         outlineView.dataSource = self
         outlineView.delegate = self
+        outlineView.target = self
+        outlineView.action = #selector(outlineViewClicked)
+    }
+
+    /// 兜底处理点击“全部结果”行：当此前通过单链祖先或非树内路径激活过滤导致首行仍高亮时，点击首行仍可退出过滤
+    @objc private func outlineViewClicked() {
+        let clickedRow = outlineView.clickedRow
+        if clickedRow == 0 && selectedPath != nil {
+            selectedPath = nil
+            delegate?.sidebarDidSelectDirectory(path: nil)
+        }
     }
 
     // MARK: - Public API
@@ -163,16 +174,17 @@ final class SidebarTreeViewController: NSViewController {
         scrollView.isHidden = false
         outlineView.reloadData()
 
-        // 默认展开“全部结果”根节点
+        // 批量包裹根节点与历史展开态恢复，规避逐节点触发多次布局重算
+        outlineView.beginUpdates()
         outlineView.expandItem(allResultsItem)
-
-        // 静默恢复先前用户的文件夹展开状态
         restoreExpansion(for: tree.rootNodes)
+        outlineView.endUpdates()
 
-        // 恢复先前选中的目录路径；若该目录已不在新结果集中则安全回退至“全部结果”
+        // 恢复先前选中的目录路径（支持单链折叠祖先匹配）；若该目录已不在新结果集中则安全回退至“全部结果”
         var targetRow = 0
         selectedPath = nil
-        if let prevPath = previousSelectedPath, let row = row(forPath: prevPath) {
+        if let prevPath = previousSelectedPath,
+           let row = row(matchingScopePath: prevPath) {
             targetRow = row
             selectedPath = prevPath
         }
@@ -199,14 +211,32 @@ final class SidebarTreeViewController: NSViewController {
         notifySelectionChanged()
     }
 
-    /// 编程式选中指定路径目录并触发范围过滤
+    /// 编程式选中指定路径目录并触发范围过滤（支持命中单链紧凑折叠节点中的祖先路径）
     func selectDirectory(path: String) {
         guard let tree = currentTree else { return }
-        expandAncestors(of: path, in: tree.rootNodes)
-        if let row = row(forPath: path) {
+        let normalized = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+
+        outlineView.beginUpdates()
+        expandAncestors(of: normalized, in: tree.rootNodes)
+        outlineView.endUpdates()
+
+        let previousPath = selectedPath
+        if let row = row(matchingScopePath: normalized) {
+            let wasUpdating = isUpdatingTree
+            isUpdatingTree = true
             outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             outlineView.scrollRowToVisible(row)
-            notifySelectionChanged()
+            isUpdatingTree = wasUpdating
+            selectedPath = normalized
+            if previousPath != normalized {
+                delegate?.sidebarDidSelectDirectory(path: normalized)
+            }
+        } else {
+            // 未找到独立或折叠节点时，记录生效作用域并维持与主列表一致，便于点击“全部结果”退出过滤
+            selectedPath = normalized
+            if previousPath != normalized {
+                delegate?.sidebarDidSelectDirectory(path: normalized)
+            }
         }
     }
 
@@ -249,6 +279,26 @@ final class SidebarTreeViewController: NSViewController {
             }
         }
         return nil
+    }
+
+    /// 查找精确匹配目录行，或当目标路径落在单链紧凑折叠段内时返回承载该折叠段的唯一节点行
+    private func row(matchingScopePath path: String) -> Int? {
+        if let exact = row(forPath: path) {
+            return exact
+        }
+        var candidates: [Int] = []
+        for r in 0..<outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: r) as? DirectoryTreeNode else { continue }
+            if ResultDirectoryTree.isContained(node.fullPath, inDirectory: path) {
+                let parentContained = node.parent.map {
+                    ResultDirectoryTree.isContained($0.fullPath, inDirectory: path)
+                } ?? false
+                if !parentContained {
+                    candidates.append(r)
+                }
+            }
+        }
+        return candidates.count == 1 ? candidates[0] : nil
     }
 
     private func notifySelectionChanged() {
@@ -453,8 +503,14 @@ final class SidebarTreeCellView: NSTableCellView {
 
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet {
+            guard oldValue != backgroundStyle else { return }
             updateColors()
         }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateColors()
     }
 
     private func updateColors() {

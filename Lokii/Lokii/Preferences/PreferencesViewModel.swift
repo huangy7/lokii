@@ -27,7 +27,7 @@ enum SettingsPathAvailabilityState: Equatable {
 /// Pure status resolver mapping a path against cached volume statuses and background local probes.
 enum SettingsPathStatusResolver {
     static func normalizePath(_ path: String) -> String {
-        let expanded = (path as NSString).expandingTildeInPath
+        let expanded = path.hasPrefix("~") ? (path as NSString).expandingTildeInPath : path
         guard expanded.count > 1 else { return expanded }
         var trimmed = expanded
         while trimmed.count > 1 && trimmed.hasSuffix("/") {
@@ -112,6 +112,61 @@ enum SettingsPathStatusResolver {
             }
         }
         return bestMatch?.status
+    }
+
+    /// 预归一化卷状态匹配器：在高频批处理循环外一次性完成卷路径规范化与小写化，消除逐条结果重复展开开销
+    struct VolumeStatusMatcher {
+        private struct Entry {
+            let rootLower: String
+            let rootWithSlashLower: String
+            let length: Int
+            let status: FfiVolumeStatus
+        }
+
+        private let entries: [Entry]
+
+        init(volumeStatuses: [FfiVolumeStatus]) {
+            var built: [Entry] = []
+            built.reserveCapacity(volumeStatuses.count * 2)
+            for status in volumeStatuses {
+                var roots = [SettingsPathStatusResolver.normalizePath(status.configuredPath)]
+                if let activePath = status.activePath, !activePath.isEmpty {
+                    roots.append(SettingsPathStatusResolver.normalizePath(activePath))
+                }
+                for root in roots where !root.isEmpty {
+                    let lower = root.lowercased()
+                    let withSlash = lower == "/" ? "/" : lower + "/"
+                    built.append(Entry(
+                        rootLower: lower,
+                        rootWithSlashLower: withSlash,
+                        length: root.count,
+                        status: status
+                    ))
+                }
+            }
+            self.entries = built
+        }
+
+        var isEmpty: Bool { entries.isEmpty }
+
+        func match(path: String) -> FfiVolumeStatus? {
+            guard !entries.isEmpty else { return nil }
+            let normalized = SettingsPathStatusResolver.normalizePath(path)
+            let targetLower = normalized.lowercased()
+            var bestMatch: (length: Int, status: FfiVolumeStatus)?
+            for entry in entries {
+                let matched: Bool
+                if entry.rootLower == "/" {
+                    matched = targetLower.hasPrefix("/")
+                } else {
+                    matched = targetLower == entry.rootLower || targetLower.hasPrefix(entry.rootWithSlashLower)
+                }
+                if matched, bestMatch == nil || entry.length > bestMatch!.length {
+                    bestMatch = (entry.length, entry.status)
+                }
+            }
+            return bestMatch?.status
+        }
     }
 
     static func isPath(_ target: String, insideOrEqual root: String) -> Bool {
@@ -271,13 +326,21 @@ class PreferencesViewModel: ObservableObject {
     @Published var localPathAvailability: [String: Bool] = [:]
     /// 最近一次卷重扫或缓存清理失败提示
     @Published var volumeActionErrorMessage: String? = nil
+    /// 索引配置保存失败提示
+    @Published var indexSaveErrorMessage: String? = nil
+    /// 后台主索引重建进行中标记与实时扫描计数，用于设置页底部闭环反馈
+    @Published var isRebuildingIndex: Bool = false
+    @Published var rebuildScannedCount: UInt64 = 0
 
     private var volumeStatusObserver: NSObjectProtocol?
+    private var indexProgressObserver: NSObjectProtocol?
+    private var indexReadyObserver: NSObjectProtocol?
     private var volumeStatusSubscription: AnyCancellable?
     private var workspaceVolumeObservers: [NSObjectProtocol] = []
     private let pathProbeQueue = DispatchQueue(label: "com.lokii.prefs.pathProbe", qos: .utility)
     private let mountedVolumeProbeQueue = DispatchQueue(label: "com.lokii.prefs.mountedVolumes", qos: .utility)
     private var localProbeGeneration: UInt64 = 0
+    private var cliProbeGeneration: UInt64 = 0
 
     // 已持久化的索引配置，用于脏状态比对与放弃更改恢复
     @Published var savedIndexPaths: [String] = []
@@ -319,6 +382,30 @@ class PreferencesViewModel: ObservableObject {
             self?.refreshLocalPathChecks()
             self?.refreshMountedVolumes()
         }
+        indexProgressObserver = NotificationCenter.default.addObserver(
+            forName: SearchEngine.indexProgressNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let source = note.userInfo?["source"] as? String ?? ""
+            guard source == "rebuild" || self.isRebuildingIndex else { return }
+            let count = note.userInfo?["scannedFiles"] as? UInt64 ?? 0
+            self.isRebuildingIndex = true
+            self.rebuildScannedCount = count
+        }
+        indexReadyObserver = NotificationCenter.default.addObserver(
+            forName: SearchEngine.indexReadyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let source = note.userInfo?["source"] as? String ?? ""
+            if source == "rebuild" || self.isRebuildingIndex {
+                self.isRebuildingIndex = false
+                self.rebuildScannedCount = 0
+            }
+        }
         let wsCenter = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
             let obs = wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -330,6 +417,12 @@ class PreferencesViewModel: ObservableObject {
 
     deinit {
         if let observer = volumeStatusObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = indexProgressObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = indexReadyObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         let wsCenter = NSWorkspace.shared.notificationCenter
@@ -620,28 +713,42 @@ class PreferencesViewModel: ObservableObject {
         }
     }
 
-    /// 校验并刷新 /usr/local/bin/lokii 软链接状态
+    /// 后台异步校验并刷新 /usr/local/bin/lokii 软链接状态，避免激活设置窗口时在主线程同步执行磁盘探测
     func refreshCliStatus() {
-        let fm = FileManager.default
-        var isInstalled = false
-        if let attrs = try? fm.attributesOfItem(atPath: cliTarget),
-           attrs[.type] as? FileAttributeType == .typeSymbolicLink,
-           let dest = try? fm.destinationOfSymbolicLink(atPath: cliTarget) {
-            isInstalled = isOurCliLink(dest) && fm.fileExists(atPath: cliTarget)
-        }
-
         // 安装/卸载进行中时不让被动窗口激活轮询覆盖状态
         if case .installing = cliState {
             return
         }
 
-        if isInstalled {
-            self.cliState = .installed
-        } else {
-            if case .failed = cliState {
-                // 保留失败信息供用户重试或查看日志
-            } else {
-                self.cliState = .notInstalled
+        cliProbeGeneration &+= 1
+        let generation = cliProbeGeneration
+        let target = cliTarget
+        let source = cliSource
+
+        pathProbeQueue.async { [weak self] in
+            let fm = FileManager.default
+            var isInstalled = false
+            if let attrs = try? fm.attributesOfItem(atPath: target),
+               attrs[.type] as? FileAttributeType == .typeSymbolicLink,
+               let dest = try? fm.destinationOfSymbolicLink(atPath: target) {
+                let isOurs = dest == source || dest.hasSuffix("/Contents/Helpers/lokii")
+                isInstalled = isOurs && fm.fileExists(atPath: target)
+            }
+
+            DispatchQueue.main.async {
+                guard let self, self.cliProbeGeneration == generation else { return }
+                if case .installing = self.cliState {
+                    return
+                }
+                if isInstalled {
+                    self.cliState = .installed
+                } else {
+                    if case .failed = self.cliState {
+                        // 保留失败信息供用户重试或查看日志
+                    } else {
+                        self.cliState = .notInstalled
+                    }
+                }
             }
         }
     }
@@ -865,7 +972,11 @@ class PreferencesViewModel: ObservableObject {
     }
 
     func saveIndexChanges() -> Bool {
-        guard var config = engine.getConfig() else { return false }
+        indexSaveErrorMessage = nil
+        guard var config = engine.getConfig() else {
+            indexSaveErrorMessage = L("prefs.index.saveFailed")
+            return false
+        }
         // 判定是否需要触发本地主索引全量重建：
         // 1. 仅追加新的排除路径（内核可就地毫秒级剔除）、
         // 2. 仅调整网络卷定时重扫间隔、
@@ -918,8 +1029,12 @@ class PreferencesViewModel: ObservableObject {
             savedExcludeSensitive = excludeSensitive
             savedNetworkRescanMinutes = networkRescanMinutes
             if needsRebuild {
+                isRebuildingIndex = true
+                rebuildScannedCount = 0
                 engine.rebuildIndex()
             }
+        } else {
+            indexSaveErrorMessage = L("prefs.index.saveFailed")
         }
         return success
     }

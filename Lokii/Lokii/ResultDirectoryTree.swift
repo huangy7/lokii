@@ -87,60 +87,66 @@ public final class ResultDirectoryTree {
             return ResultDirectoryTree(rootNodes: [], totalMatchCount: 0)
         }
 
-        // 1. 构建 Trie 前缀树
-        let rootBuilder = TrieBuilderNode(component: "", fullPath: normalizedRootPrefix ?? "")
+        // 1. 先按规范化父目录路径聚合直接命中计数，避免同目录下的大量结果重复切分与拼接祖先路径
+        var countsByDir: [String: Int] = [:]
+        countsByDir.reserveCapacity(min(scopedResults.count, 256))
 
         for result in scopedResults {
             let dirPath: String
             if result.isDir {
                 dirPath = result.path
             } else {
-                dirPath = (result.path as NSString).deletingLastPathComponent
+                dirPath = Self.parentDirectoryPath(of: result.path)
             }
-
-            // 规范化路径，去除冗余尾斜杠
             let cleanDirPath = normalizedPath(dirPath)
+            countsByDir[cleanDirPath, default: 0] += 1
+        }
 
+        // 2. 基于去重后的唯一目录集合构建 Trie 前缀树
+        let rootBuilder = TrieBuilderNode(component: "", fullPath: normalizedRootPrefix ?? "")
+
+        for (cleanDirPath, matchCount) in countsByDir {
             // 计算路径分段
-            let components: [String]
+            let components: [Substring]
             let basePath: String
             if let root = normalizedRootPrefix {
                 if cleanDirPath == root {
                     components = []
                     basePath = root
                 } else if isContained(cleanDirPath, inDirectory: root) {
-                    let relative = String(cleanDirPath.dropFirst(root.count + 1))
-                    components = relative.split(separator: "/").map(String.init)
+                    let relativeStart = cleanDirPath.index(cleanDirPath.startIndex, offsetBy: root.count + 1)
+                    components = cleanDirPath[relativeStart...].split(separator: "/")
                     basePath = root
                 } else {
-                    components = cleanDirPath.split(separator: "/").map(String.init)
+                    components = cleanDirPath.split(separator: "/")
                     basePath = ""
                 }
             } else {
-                components = cleanDirPath.split(separator: "/").map(String.init)
+                components = cleanDirPath.split(separator: "/")
                 basePath = ""
             }
 
             var current = rootBuilder
             var currentFullPath = basePath
 
-            for comp in components {
-                if currentFullPath.isEmpty || currentFullPath == "/" {
-                    currentFullPath = "/" + comp
-                } else {
-                    currentFullPath = currentFullPath + "/" + comp
-                }
-
+            for compSub in components {
+                let comp = String(compSub)
                 if let existing = current.children[comp] {
                     current = existing
+                    currentFullPath = existing.fullPath
                 } else {
+                    if currentFullPath.isEmpty || currentFullPath == "/" {
+                        currentFullPath = "/" + comp
+                    } else {
+                        currentFullPath = currentFullPath + "/" + comp
+                    }
                     let newChild = TrieBuilderNode(component: comp, fullPath: currentFullPath)
                     current.children[comp] = newChild
                     current = newChild
                 }
             }
 
-            current.directMatchCount += 1
+            current.directMatchCount += matchCount
         }
 
         // 2. 后序 DFS 转换、递归计数统计与单链紧凑折叠
@@ -200,12 +206,44 @@ public final class ResultDirectoryTree {
 
     /// 去除路径冗余尾斜杠；根斜杠本身保持不变
     private static func normalizedPath(_ path: String) -> String {
-        path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        var end = path.endIndex
+        while end > path.startIndex {
+            let prev = path.index(before: end)
+            if path[prev] == "/" && prev > path.startIndex {
+                end = prev
+            } else {
+                break
+            }
+        }
+        return end == path.endIndex ? path : String(path[..<end])
     }
 
-    /// 判断路径是否位于目标目录之下（含目录自身）
+    /// 纯 Swift 推导父目录路径，规避高频建树时的 NSString 桥接开销
+    private static func parentDirectoryPath(of path: String) -> String {
+        var end = path.endIndex
+        while end > path.startIndex {
+            let prev = path.index(before: end)
+            if path[prev] == "/" && prev > path.startIndex {
+                end = prev
+            } else {
+                break
+            }
+        }
+        guard let lastSlash = path[..<end].lastIndex(of: "/") else {
+            return ""
+        }
+        if lastSlash == path.startIndex {
+            return "/"
+        }
+        return String(path[..<lastSlash])
+    }
+
+    /// 判断路径是否位于目标目录之下（含目录自身），零临时字符串拼接
     static func isContained(_ path: String, inDirectory directory: String) -> Bool {
-        path == directory || path.hasPrefix(directory + "/")
+        guard path.hasPrefix(directory) else { return false }
+        if path.count == directory.count { return true }
+        let boundaryIndex = path.index(path.startIndex, offsetBy: directory.count)
+        return path[boundaryIndex] == "/"
     }
 
     // MARK: - Private Helper Methods
