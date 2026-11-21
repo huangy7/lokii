@@ -309,8 +309,10 @@ const MAX_BATCH_SIZE: usize = 10_000;
 /// 仅用户态丢事件时，静默这么久后从已应用位置重开流重放；连续这么多次仍丢则改为全量对账。
 const GAP_QUIET: Duration = Duration::from_secs(2);
 const GAP_REPLAYS: u32 = 3;
-/// 有变更时最多隔这么久落一次盘：崩溃后只需回放这段时间。
-const PERSIST_EVERY: Duration = Duration::from_secs(10 * 60);
+/// 兜底：变更再少也最多隔这么久落一次盘，避免检查点比 FSEvents 历史还旧。
+const PERSIST_EVERY: Duration = Duration::from_secs(12 * 3600);
+/// 未落盘的索引事件达到这么多条就先落一次盘：与启动回放要处理的事件数一一对应；取 REPLAY_PATH_LIMIT 的 1/4 留余量。
+const PERSIST_EVENTS: usize = 50_000;
 /// 全量对账拿不到扫描锁（重建进行中）时的重试间隔，与扫描出错后的退避。
 const RECONCILE_RETRY: Duration = Duration::from_secs(2);
 const RECONCILE_BACKOFF: Duration = Duration::from_secs(60);
@@ -554,6 +556,8 @@ struct Service<F, P> {
     /// 上次落盘后是否写入过变更。
     dirty: bool,
     last_persist: Instant,
+    /// 上次落盘后收下的索引事件数，对应下次启动要回放的量。
+    unpersisted_events: usize,
     network_scanned: Option<Instant>,
     network_scanning: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -606,13 +610,17 @@ where
     }
 
     fn persist_if_due(&mut self) {
-        if self.dirty && self.last_persist.elapsed() >= PERSIST_EVERY {
+        if self.dirty
+            && (self.unpersisted_events >= PERSIST_EVENTS
+                || self.last_persist.elapsed() >= PERSIST_EVERY)
+        {
             self.persist_now();
         }
     }
 
     fn persist_now(&mut self) {
         self.dirty = false;
+        self.unpersisted_events = 0;
         self.last_persist = Instant::now();
         let handle_view = WatcherHandle {
             control: self.control_tx.clone(),
@@ -665,6 +673,7 @@ where
                 self.request_rescan(event.path, event.id);
             } else if self.scope.admits(&event.path) {
                 self.metrics.events_enqueued.fetch_add(1, Ordering::Relaxed);
+                self.unpersisted_events += 1;
                 let change = self.pending.entry(event.path).or_default();
                 change.flags |= event.flags;
                 change.inode = event.inode.or(change.inode);
@@ -991,6 +1000,7 @@ where
             history_paths: 0,
             dirty: false,
             last_persist: Instant::now(),
+            unpersisted_events: 0,
             network_scanned: None,
             network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1264,6 +1274,7 @@ mod tests {
             history_paths: 0,
             dirty: false,
             last_persist: Instant::now(),
+            unpersisted_events: 0,
             network_scanned: None,
             network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1354,11 +1365,49 @@ mod tests {
         assert!(saved.borrow().is_empty(), "nothing changed, nothing to save");
 
         service.intake(vec![event(file, crate::fsevents::ITEM_CREATED, 60)]);
+        assert_eq!(service.unpersisted_events, 1);
         service.flush();
+        service.last_persist = Instant::now() - Duration::from_secs(11 * 3600);
+        service.persist_if_due();
+        assert!(saved.borrow().is_empty(), "fallback interval has not elapsed");
+
+        service.last_persist = Instant::now() - Duration::from_secs(12 * 3600);
         service.persist_if_due();
         assert_eq!(*saved.borrow(), [60]);
+        assert_eq!(service.unpersisted_events, 0);
         service.persist_if_due();
         assert_eq!(*saved.borrow(), [60], "saved once per interval");
+    }
+
+    #[test]
+    fn changes_are_persisted_when_the_event_threshold_is_reached() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("a.txt");
+        fs::write(&file, "x").unwrap();
+        let store = IndexStore::new();
+        let saved = std::cell::RefCell::new(Vec::new());
+        let mut service = idle_service_persisting(
+            &store,
+            &root,
+            |_: &crate::compact_index::CompactIndex, checkpoint: crate::cache::Checkpoint| {
+                saved.borrow_mut().push(checkpoint.event_id)
+            },
+        );
+
+        service.intake(vec![event(file, crate::fsevents::ITEM_CREATED, 60)]);
+        service.flush();
+        service.unpersisted_events = PERSIST_EVENTS - 1;
+        service.persist_if_due();
+        assert!(saved.borrow().is_empty(), "neither persistence trigger is due");
+
+        service.unpersisted_events = PERSIST_EVENTS;
+        service.persist_if_due();
+        assert_eq!(*saved.borrow(), [60]);
+        assert_eq!(service.unpersisted_events, 0);
+        assert!(!service.dirty);
+        service.persist_if_due();
+        assert_eq!(*saved.borrow(), [60], "saved once per threshold crossing");
     }
 
     #[test]

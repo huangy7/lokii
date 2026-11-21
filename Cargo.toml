@@ -1,3 +1,8 @@
 [workspace]
 members = ["lokii-core"]
 resolver = "2"
+
+# 规避 macOS 27 新版链接器对 proc-macro dylib 执行 strip=debuginfo 后导致 rustc 无法解析派生宏元数据的问题；
+# build-override 仅作用于编译期构建脚本与过程宏，不影响最终发布产物的 strip 行为与体积。
+[profile.release.build-override]
+strip = "none"
