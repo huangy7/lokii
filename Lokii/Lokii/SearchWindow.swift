@@ -1789,11 +1789,24 @@ extension SearchWindow: NSMenuItemValidation {
 /// 核心设计：
 /// 1. 锁定固定几何尺寸（38 x 22pt），彻底消除激活数字角标出现/消失时引发的工具栏重排与浮层定位漂移；
 /// 2. 自绘轻量级悬停与激活态圆角胶囊底衬，不产生冗余系统级双层套环。
+/// 点击透传的堆栈容器，承载过滤图标与计数标签而不拦截按钮鼠标事件。
+private final class FilterTriggerContentStack: NSStackView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 final class FilterTriggerButton: NSButton {
     var activeCount: Int = 0 {
         didSet {
             if oldValue != activeCount {
-                needsDisplay = true
+                updateContentAppearance()
+            }
+        }
+    }
+
+    override var isHighlighted: Bool {
+        didSet {
+            if oldValue != isHighlighted {
+                updateContentAppearance()
             }
         }
     }
@@ -1801,15 +1814,58 @@ final class FilterTriggerButton: NSButton {
     private var isHovered: Bool = false {
         didSet {
             if oldValue != isHovered {
-                needsDisplay = true
+                updateContentAppearance()
             }
         }
     }
 
+    private let contentStack = FilterTriggerContentStack()
+    private let iconView = NSImageView()
+    private let countLabel = NSTextField(labelWithString: "")
     private var trackingAreaRef: NSTrackingArea?
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: 38, height: 22)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupContentViews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupContentViews()
+    }
+
+    private func setupContentViews() {
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.orientation = .horizontal
+        contentStack.alignment = .centerY
+        contentStack.spacing = 3
+
+        iconView.imageScaling = .scaleNone
+        countLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        countLabel.isEditable = false
+        countLabel.isSelectable = false
+        countLabel.isBezeled = false
+        countLabel.drawsBackground = false
+
+        contentStack.addArrangedSubview(iconView)
+        contentStack.addArrangedSubview(countLabel)
+        addSubview(contentStack)
+
+        NSLayoutConstraint.activate([
+            contentStack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            contentStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+
+        updateContentAppearance()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateContentAppearance()
     }
 
     override func updateTrackingAreas() {
@@ -1837,11 +1893,24 @@ final class FilterTriggerButton: NSButton {
         isHovered = false
     }
 
+    private func updateContentAppearance() {
+        let isActive = activeCount > 0
+        let fgColor: NSColor = isActive ? .controlAccentColor : (isHovered ? .labelColor : .secondaryLabelColor)
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 11.5, weight: isActive ? .semibold : .medium)
+        iconView.image = NSImage(systemSymbolName: "line.3.horizontal.decrease", accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfig)
+        iconView.contentTintColor = fgColor
+        countLabel.stringValue = isActive ? "\(activeCount)" : ""
+        countLabel.textColor = fgColor
+        countLabel.isHidden = !isActive
+        needsDisplay = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let isActive = activeCount > 0
         let isPressed = isHighlighted
 
-        // 绘制悬停态或激活态圆角微胶囊底衬
+        // 仅自绘轻量级悬停或激活态圆角微胶囊底衬，图标与计数由原生子视图渲染
         let pillRect = bounds.insetBy(dx: 1, dy: 1)
         let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 6, yRadius: 6)
 
@@ -1856,55 +1925,6 @@ final class FilterTriggerButton: NSButton {
             NSColor.labelColor.withAlphaComponent(0.06).setFill()
             pillPath.fill()
         }
-
-        let fgColor: NSColor = isActive ? .controlAccentColor : (isHovered ? .labelColor : .secondaryLabelColor)
-        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 11.5, weight: isActive ? .semibold : .medium)
-        guard let baseIcon = NSImage(systemSymbolName: "line.3.horizontal.decrease", accessibilityDescription: nil),
-              let configuredIcon = baseIcon.withSymbolConfiguration(symbolConfig) else {
-            return
-        }
-
-        // 渲染着色图标与可选的激活计数
-        let iconSize = configuredIcon.size
-        if isActive {
-            let badgeText = "\(activeCount)" as NSString
-            let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: fgColor
-            ]
-            let textSize = badgeText.size(withAttributes: attrs)
-            let spacing: CGFloat = 3.0
-            let totalWidth = iconSize.width + spacing + textSize.width
-            let startX = round((bounds.width - totalWidth) / 2.0)
-            let iconY = round((bounds.height - iconSize.height) / 2.0)
-
-            drawTintedImage(configuredIcon, in: NSRect(x: startX, y: iconY, width: iconSize.width, height: iconSize.height), tint: fgColor)
-
-            let textY = round((bounds.height - textSize.height) / 2.0)
-            badgeText.draw(at: NSPoint(x: startX + iconSize.width + spacing, y: textY), withAttributes: attrs)
-        } else {
-            let iconX = round((bounds.width - iconSize.width) / 2.0)
-            let iconY = round((bounds.height - iconSize.height) / 2.0)
-            drawTintedImage(configuredIcon, in: NSRect(x: iconX, y: iconY, width: iconSize.width, height: iconSize.height), tint: fgColor)
-        }
-    }
-
-    private func drawTintedImage(_ image: NSImage, in rect: NSRect, tint: NSColor) {
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let ctx = NSGraphicsContext.current?.cgContext else {
-            image.draw(in: rect)
-            return
-        }
-        ctx.saveGState()
-        // AppKit 按钮视图默认 isFlipped == true，CGContext 需在局部坐标系翻转以正向绘制图标マスク
-        ctx.translateBy(x: rect.minX, y: rect.maxY)
-        ctx.scaleBy(x: 1.0, y: -1.0)
-        let localRect = CGRect(x: 0, y: 0, width: rect.width, height: rect.height)
-        ctx.clip(to: localRect, mask: cgImage)
-        tint.setFill()
-        ctx.fill(localRect)
-        ctx.restoreGState()
     }
 }
 
