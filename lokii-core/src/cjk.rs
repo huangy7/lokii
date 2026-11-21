@@ -1,8 +1,12 @@
 use std::borrow::Cow;
+use icu_normalizer::ComposingNormalizerBorrowed;
 use crate::cjk_data::TRAD_TO_SIMP;
 
 pub const MIN_TRAD_CHAR: char = '\u{346F}';
 pub const MAX_TRAD_CHAR: char = '\u{30EDE}';
+
+/// 编译期静态嵌入的 Unicode NFC 合成归一化器，用于消除跨文件系统（如 macOS APFS NFD 与用户输入 NFC）的表示差异。
+const NFC: ComposingNormalizerBorrowed<'static> = ComposingNormalizerBorrowed::new_nfc();
 
 /// 将单个 CJK 繁体字字符转换为规范简体字字符。
 /// 若字符不在繁体字表中，或为 ASCII / 非 CJK 字符，直接原样返回。
@@ -40,21 +44,47 @@ pub fn fold_char(c: char) -> char {
     }
 }
 
-/// 将字符串统一转换为简体字。
-/// 若字符串无需转换（无繁体字符），返回 Cow::Borrowed，实现零堆分配。
-pub fn to_simplified_str(s: &str) -> Cow<'_, str> {
-    // 绝大多数文件名是纯 ASCII，先整串判定可省掉逐字符解码，百万级文件名下约快 15 倍
-    if s.is_ascii() || s.chars().all(|c| to_simplified_char(c) == c) {
+/// 保持大小写的纯 Unicode NFC 归一化入口。
+/// 纯 ASCII 或原本已符合 NFC 规范的字符串直接零拷贝借用原切片。
+#[inline]
+pub fn normalize_nfc_cow(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
         Cow::Borrowed(s)
     } else {
-        Cow::Owned(s.chars().map(to_simplified_char).collect())
+        NFC.normalize(s)
     }
 }
 
-/// 快速判定字符串是否包含需要折叠的大写字符或繁体汉字。
-/// 对 CJK 统一表意文字短路跳过大小写判定，规避不必要的 Unicode 查找表开销。
+/// 保持大小写的同时完成 Unicode NFC 合成归一化与汉字繁简转换。
+/// 先合成 NFC 再做繁简映射，可覆盖 CJK 兼容汉字区（如 U+F900..U+FAFF）合成为标准表意文字后的简体映射。
+pub fn normalize_and_simplify_cow(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() {
+        return Cow::Borrowed(s);
+    }
+    let nfc = NFC.normalize(s);
+    if nfc.chars().all(|c| to_simplified_char(c) == c) {
+        nfc
+    } else {
+        Cow::Owned(nfc.chars().map(to_simplified_char).collect())
+    }
+}
+
+/// 将字符串统一转换为 NFC 合规且简体化的形式。
+/// 绝大多数文件名是纯 ASCII 或已规范化，先判定可实现零堆分配借用，避免百万级索引下无谓内存分配。
+pub fn to_simplified_str(s: &str) -> Cow<'_, str> {
+    normalize_and_simplify_cow(s)
+}
+
+/// 快速判定字符串是否需要执行大小写折叠、繁体转换或 Unicode NFC 合成。
+/// 对纯 ASCII 仅扫描大写字节，对非 ASCII 先检查 NFC 状态并跳过无大小写差异的 CJK 统一表意文字。
 #[inline]
 pub fn needs_fold(s: &str) -> bool {
+    if s.is_ascii() {
+        return s.bytes().any(|b| b.is_ascii_uppercase());
+    }
+    if !NFC.is_normalized(s) {
+        return true;
+    }
     s.chars().any(|c| {
         if c.is_ascii() {
             c.is_ascii_uppercase()
@@ -70,7 +100,7 @@ pub fn needs_fold(s: &str) -> bool {
 }
 
 /// 统一的查询串与索引名归一化折叠器（Cow 优化版本）：
-/// 若字符串无需任何转换（已是全小写且不含繁体字），返回 Cow::Borrowed，实现真正的零堆分配。
+/// 若字符串已满足 NFC、全小写且不含繁体字，返回 Cow::Borrowed，实现真正的零堆分配。
 pub fn fold_cow<'a>(s: &'a str) -> Cow<'a, str> {
     if !needs_fold(s) {
         Cow::Borrowed(s)
@@ -80,15 +110,19 @@ pub fn fold_cow<'a>(s: &'a str) -> Cow<'a, str> {
 }
 
 /// 统一的查询串与索引名归一化折叠器：
-/// 1. 小写化（ASCII 与非 ASCII 拉丁字符小写化）；
-/// 2. CJK 繁体字转换为规范简体字。
-/// 保证查询与索引折叠镜像在单字级别完全对齐。
+///
+/// 1. 非 ASCII 输入先经 Unicode NFC 合成归一化（覆盖 NFD 变音符与组合韩文字母）；
+/// 2. CJK 繁体字转换为规范简体字；
+/// 3. ASCII 与非 ASCII 字母统一小写化，并在必要时再次保证输出处于 NFC 状态。
+///
+/// 确保检索查询与索引折叠镜像在单字及组合字符簇级别保持严格等价。
 pub fn fold_str(s: &str) -> String {
     if s.is_ascii() {
         return s.to_ascii_lowercase();
     }
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
+    let nfc = NFC.normalize(s);
+    let mut result = String::with_capacity(nfc.len());
+    for c in nfc.chars() {
         if c.is_ascii() {
             result.push(c.to_ascii_lowercase());
         } else {
@@ -103,7 +137,11 @@ pub fn fold_str(s: &str) -> String {
             }
         }
     }
-    result
+    if !NFC.is_normalized(&result) {
+        NFC.normalize(&result).into_owned()
+    } else {
+        result
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +183,29 @@ mod tests {
         assert_eq!(fold_str("Hello WORLD"), "hello world");
         assert_eq!(fold_str("測試文檔.MD"), "测试文档.md");
         assert_eq!(fold_str("開發規範_v1.0.rs"), "开发规范_v1.0.rs");
+    }
+
+    #[test]
+    fn test_nfc_normalization_and_cow_fast_paths() {
+        let ascii = "src/main.rs";
+        assert!(matches!(normalize_nfc_cow(ascii), Cow::Borrowed(_)));
+        assert!(matches!(normalize_and_simplify_cow(ascii), Cow::Borrowed(_)));
+        assert!(matches!(fold_cow(ascii), Cow::Borrowed(_)));
+        assert!(!needs_fold("already_lower.rs"));
+        assert!(needs_fold("MixedCase.rs"));
+
+        let nfd_cafe = "Cafe\u{0301}";
+        let nfc_cafe = "Café";
+        assert!(needs_fold("cafe\u{0301}"));
+        assert!(!needs_fold("café"));
+        assert_eq!(normalize_nfc_cow(nfd_cafe).as_ref(), nfc_cafe);
+        assert!(matches!(normalize_nfc_cow(nfc_cafe), Cow::Borrowed(_)));
+        assert_eq!(normalize_and_simplify_cow("測Cafe\u{0301}").as_ref(), "测Café");
+        assert_eq!(fold_cow(nfd_cafe).as_ref(), "café");
+        assert_eq!(fold_str("\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}"), "한글");
+        // 幂等性验证
+        let once = fold_str("測İCafe\u{0301}");
+        assert_eq!(fold_str(&once), once);
+        assert!(!needs_fold(&once));
     }
 }

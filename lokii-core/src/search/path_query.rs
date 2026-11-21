@@ -1,12 +1,34 @@
 use crate::compact_index::split_path;
+use super::filter::QueryToken;
+
+/// 中英标准系统目录双向别名表（全量使用 fold_str 后的简体小写形式）。
+const CN_EN_DIR_ALIASES: &[(&str, &str)] = &[
+    ("桌面", "desktop"),
+    ("下载", "downloads"),
+    ("文稿", "documents"),
+    ("图片", "pictures"),
+    ("音乐", "music"),
+    ("影片", "movies"),
+    ("应用程序", "applications"),
+    ("废纸篓", "trash"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PathCandidate {
+    pub pattern: String,
+    pub is_absolute: bool,
+    pub require_segment_boundary: bool,
+}
 
 /// 路径感知查询：父目录约束与终端文件名词元分离。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathQuery {
     /// 父路径匹配模式（小写），如 "src/"。
     pub path_pattern: Option<String>,
-    /// 文件名关键词（小写）。
+    /// 文件名关键词（已按大小写设置折叠或规范化）。
     pub name_terms: Vec<String>,
+    /// 保留原始大小写（经 NFC 规范化）的文件名关键词，供精确大小写加分判定使用。
+    pub(crate) raw_name_terms: Vec<String>,
     /// 扩展名约束（小写，不含点号）。
     pub extension: Option<String>,
     /// 查询以 '/' 结尾：仅匹配目录本身及其下级。
@@ -15,13 +37,27 @@ pub struct PathQuery {
     pub is_absolute_prefix: bool,
     /// `in:` 作用域前缀（已展开 '~'，以 '/' 结尾）。
     pub scope_prefix: Option<String>,
+    /// 保留原始大小写的 NFC 目录路径（经 `~` 展开与斜杠合并），供未索引绝对目录 `read_dir` 兜底使用。
+    pub(crate) raw_dir_pattern: Option<String>,
+    /// 展开别名后的父路径候选列表。
+    pub(crate) path_candidates: Vec<PathCandidate>,
+    /// 展开别名后的 `in:` 作用域候选列表。
+    pub(crate) scope_candidates: Vec<PathCandidate>,
 }
 
 impl PathQuery {
-    /// 查询是否含路径语法（'/' 或 `in:`）。
+    /// 查询是否含路径语法（经粘贴路径清洗后含 '/' 或 `in:`）。
+    #[cfg(test)]
     pub(crate) fn is_path_query(query: &str) -> bool {
-        let trimmed = query.trim();
-        trimmed.contains('/') || trimmed.starts_with("in:") || trimmed.contains(" in:")
+        let tokens = super::filter::tokenize_query(query);
+        Self::is_path_query_tokens(&tokens)
+    }
+
+    /// 判断结构化正向词元序列是否触发路径感知查询（带引号词元视为纯字面文件名，不触发路径模式）。
+    pub(crate) fn is_path_query_tokens(tokens: &[QueryToken]) -> bool {
+        tokens
+            .iter()
+            .any(|t| !t.negated && !t.quoted && (t.text.contains('/') || t.text.starts_with("in:")))
     }
 
     /// 解析查询；无路径语法时返回 None。
@@ -32,75 +68,113 @@ impl PathQuery {
     /// 接收大小写敏感配置解析路径感知查询。
     pub fn parse_with_case(query: &str, case_sensitive: bool) -> Option<Self> {
         let trimmed = query.trim();
-        if trimmed.is_empty() || !Self::is_path_query(trimmed) {
+        if trimmed.is_empty() {
+            return None;
+        }
+        let tokens = super::filter::tokenize_query(trimmed);
+        Self::parse_from_tokens(&tokens, case_sensitive)
+    }
+
+    /// 基于结构化正向词元解析路径感知查询：带引号词元不参与 `in:` / `.ext` / `/` 路径拆分。
+    pub(crate) fn parse_from_tokens(tokens: &[QueryToken], case_sensitive: bool) -> Option<Self> {
+        if tokens.is_empty() || !Self::is_path_query_tokens(tokens) {
             return None;
         }
 
         let mut scope_prefix = None;
         let mut path_pattern = None;
+        let mut raw_dir_pattern = None;
+        let mut path_candidates: Vec<PathCandidate> = Vec::new();
+        let mut scope_candidates: Vec<PathCandidate> = Vec::new();
         let mut name_terms = Vec::new();
+        let mut raw_name_terms = Vec::new();
         let mut extension = None;
         let mut is_dir_only = false;
         let mut is_absolute_prefix = false;
 
-        for word in trimmed.split_whitespace() {
-            // 1. 作用域过滤器: in:<path>
-            if let Some(scope_raw) = word.strip_prefix("in:") {
-                let mut scope = collapse_consecutive_slashes(&expand_tilde(scope_raw));
-                if !scope.ends_with('/') {
-                    scope.push('/');
-                }
-                scope_prefix = Some(scope.to_lowercase());
+        for token in tokens {
+            if token.negated {
+                continue;
+            }
+            let word = token.text.as_str();
+            if word.is_empty() {
                 continue;
             }
 
-            // 2. 独立扩展名: .rs, .toml（排除隐藏点文件，如 .env、.gitignore）
-            if word.starts_with('.') && !word.contains('/') && word.len() > 1 {
-                if crate::search::filter::is_dotfile_query(word) {
-                    name_terms.push(if case_sensitive {
-                        word.to_string()
+            if !token.quoted {
+                // 1. 作用域过滤器: in:<path>
+                if let Some(scope_raw) = word.strip_prefix("in:") {
+                    let mut cands = build_dir_candidates(scope_raw, true);
+                    if let Some(first) = cands.first() {
+                        scope_prefix = Some(first.pattern.clone());
+                    }
+                    push_unique_candidates(&mut scope_candidates, &mut cands);
+                    continue;
+                }
+
+                // 2. 独立扩展名: .rs, .toml（排除隐藏点文件，如 .env、.gitignore）
+                if word.starts_with('.') && !word.contains('/') && word.len() > 1 {
+                    if crate::search::filter::is_dotfile_query(word) {
+                        raw_name_terms.push(crate::cjk::normalize_nfc_cow(word).into_owned());
+                        name_terms.push(if case_sensitive {
+                            crate::cjk::normalize_and_simplify_cow(word).into_owned()
+                        } else {
+                            crate::cjk::fold_str(word)
+                        });
                     } else {
-                        word.to_lowercase()
-                    });
-                } else {
-                    extension = Some(word[1..].to_lowercase());
-                }
-                continue;
-            }
-
-            // 3. 含 '/' 的词元
-            if word.contains('/') {
-                let expanded = expand_tilde(word);
-                let collapsed = collapse_consecutive_slashes(&expanded);
-
-                if collapsed.starts_with('/') {
-                    is_absolute_prefix = true;
+                        extension = Some(crate::cjk::fold_str(&word[1..]));
+                    }
+                    continue;
                 }
 
-                if collapsed.ends_with('/') {
-                    // 以 '/' 结尾（父目录约束始终小写）
-                    is_dir_only = true;
-                    path_pattern = Some(collapsed.to_lowercase());
-                } else {
-                    // 中间含 '/'：拆成目录与文件名（父目录约束始终小写，仅文件名按需区分大小写）
-                    let (dir_part, name_part) = split_path(&collapsed);
-                    if !dir_part.is_empty() {
-                        path_pattern = Some(dir_part.to_lowercase());
-                        if !name_part.is_empty() {
-                            name_terms.push(if case_sensitive {
-                                crate::cjk::to_simplified_str(name_part).into_owned()
-                            } else {
-                                crate::cjk::fold_str(name_part)
-                            });
+                // 3. 含 '/' 的词元
+                if word.contains('/') {
+                    let expanded = expand_tilde(word);
+                    let collapsed = collapse_consecutive_slashes(&expanded);
+
+                    if collapsed.starts_with('/') {
+                        is_absolute_prefix = true;
+                    }
+
+                    if collapsed.ends_with('/') {
+                        // 以 '/' 结尾（父目录约束始终小写并完成 NFC 归一化；原始大小写另存以供兜底读盘）
+                        is_dir_only = true;
+                        raw_dir_pattern =
+                            Some(crate::cjk::normalize_nfc_cow(&collapsed).into_owned());
+                        let mut cands = build_dir_candidates(word, false);
+                        if let Some(first) = cands.first() {
+                            path_pattern = Some(first.pattern.clone());
+                        }
+                        push_unique_candidates(&mut path_candidates, &mut cands);
+                    } else {
+                        // 中间含 '/'：拆成目录与文件名（父目录约束始终小写与 NFC 归一化，仅文件名按需区分大小写）
+                        let (word_dir, _) = split_path(word);
+                        let (dir_part, name_part) = split_path(&collapsed);
+                        if !dir_part.is_empty() {
+                            let mut cands = build_dir_candidates(word_dir, false);
+                            if let Some(first) = cands.first() {
+                                path_pattern = Some(first.pattern.clone());
+                            }
+                            push_unique_candidates(&mut path_candidates, &mut cands);
+                            if !name_part.is_empty() {
+                                raw_name_terms
+                                    .push(crate::cjk::normalize_nfc_cow(name_part).into_owned());
+                                name_terms.push(if case_sensitive {
+                                    crate::cjk::normalize_and_simplify_cow(name_part).into_owned()
+                                } else {
+                                    crate::cjk::fold_str(name_part)
+                                });
+                            }
                         }
                     }
+                    continue;
                 }
-                continue;
             }
 
-            // 4. 普通文件名词元
+            // 4. 普通文件名词元（或被双引号保护的字面词元）
+            raw_name_terms.push(crate::cjk::normalize_nfc_cow(word).into_owned());
             name_terms.push(if case_sensitive {
-                crate::cjk::to_simplified_str(word).into_owned()
+                crate::cjk::normalize_and_simplify_cow(word).into_owned()
             } else {
                 crate::cjk::fold_str(word)
             });
@@ -109,17 +183,140 @@ impl PathQuery {
         Some(Self {
             path_pattern,
             name_terms,
+            raw_name_terms,
             extension,
             is_dir_only,
             is_absolute_prefix,
             scope_prefix,
+            raw_dir_pattern,
+            path_candidates,
+            scope_candidates,
         })
     }
 
     /// 查询中是否存在有效的父路径匹配约束。
     pub fn has_path(&self) -> bool {
-        self.path_pattern.is_some() || self.scope_prefix.is_some()
+        self.path_pattern.is_some()
+            || !self.path_candidates.is_empty()
+            || self.scope_prefix.is_some()
+            || !self.scope_candidates.is_empty()
     }
+}
+
+fn lookup_dir_alias(seg_folded: &str) -> Option<&'static str> {
+    if seg_folded == "应用程式" {
+        return Some("applications");
+    }
+    for &(cn, en) in CN_EN_DIR_ALIASES {
+        if seg_folded == cn {
+            return Some(en);
+        }
+        if seg_folded == en {
+            return Some(cn);
+        }
+    }
+    None
+}
+
+fn push_unique_candidates(dst: &mut Vec<PathCandidate>, src: &mut Vec<PathCandidate>) {
+    for cand in src.drain(..) {
+        if !dst.iter().any(|existing| existing == &cand) {
+            dst.push(cand);
+        }
+    }
+}
+
+/// 逐段展开标准目录别名（中文简繁体 <-> 英文标准目录名），上限 8 组防止多段组合爆炸。
+fn expand_dir_segment_aliases(folded_dir: &str, is_absolute: bool) -> Vec<PathCandidate> {
+    let had_leading = folded_dir.starts_with('/');
+    let had_trailing = folded_dir.ends_with('/');
+    let core = folded_dir.trim_matches('/');
+    let mut seg_lists: Vec<Vec<String>> = vec![if core.is_empty() {
+        Vec::new()
+    } else {
+        core.split('/').map(|s| s.to_string()).collect()
+    }];
+
+    let seg_count = seg_lists[0].len();
+    for idx in 0..seg_count {
+        let current_seg = seg_lists[0][idx].clone();
+        if let Some(alt) = lookup_dir_alias(&current_seg) {
+            let existing_len = seg_lists.len();
+            for j in 0..existing_len {
+                if seg_lists.len() >= 8 {
+                    break;
+                }
+                let mut cloned = seg_lists[j].clone();
+                cloned[idx] = alt.to_string();
+                seg_lists.push(cloned);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(seg_lists.len());
+    for (variant_idx, list) in seg_lists.into_iter().enumerate() {
+        let mut pat = String::new();
+        if had_leading {
+            pat.push('/');
+        }
+        pat.push_str(&list.join("/"));
+        if had_trailing && !pat.ends_with('/') {
+            pat.push('/');
+        }
+        // 经别名换写生成的候选强制按完整目录段边界匹配，避免 "downloads/" 误命中 "mydownloads/"
+        let require_segment_boundary = variant_idx > 0;
+        if !out
+            .iter()
+            .any(|c: &PathCandidate| c.pattern == pat && c.is_absolute == is_absolute)
+        {
+            out.push(PathCandidate {
+                pattern: pat,
+                is_absolute,
+                require_segment_boundary,
+            });
+        }
+    }
+    out
+}
+
+/// 构建路径或 `in:` 目录候选列表：
+/// 1) 识别路径首部 `个人 <-> ~`（同时产出 `$HOME` 绝对候选与相对 `个人/` 候选）；
+/// 2) 为每个基础候选展开标准系统目录中英双向别名。
+fn build_dir_candidates(raw_dir: &str, ensure_trailing_slash: bool) -> Vec<PathCandidate> {
+    let normalized_raw = collapse_consecutive_slashes(raw_dir);
+    let ensure_slash = |mut s: String| {
+        if ensure_trailing_slash && !s.ends_with('/') {
+            s.push('/');
+        }
+        s
+    };
+
+    let folded_raw = crate::cjk::fold_str(&normalized_raw);
+    let mut base_entries: Vec<(String, bool)> = Vec::new();
+
+    if folded_raw == "个人" || folded_raw.starts_with("个人/") {
+        let suffix = folded_raw.strip_prefix("个人").unwrap_or("");
+        let tilde_input = format!("~{suffix}");
+        let home_expanded = collapse_consecutive_slashes(&expand_tilde(&tilde_input));
+        let home_is_abs = home_expanded.starts_with('/');
+        let home_folded = crate::cjk::fold_str(&ensure_slash(home_expanded));
+        base_entries.push((home_folded, home_is_abs));
+        base_entries.push((ensure_slash(folded_raw), false));
+    } else {
+        let expanded = collapse_consecutive_slashes(&expand_tilde(&normalized_raw));
+        let dir_with_slash = ensure_slash(expanded);
+        let is_abs = dir_with_slash.starts_with('/');
+        let folded = crate::cjk::fold_str(&dir_with_slash);
+        base_entries.push((folded, is_abs));
+    }
+
+    let mut result = Vec::new();
+    for (dir_folded, is_abs) in base_entries {
+        let mut expanded = expand_dir_segment_aliases(&dir_folded, is_abs);
+        push_unique_candidates(&mut result, &mut expanded);
+    }
+
+    result
 }
 
 /// 规约连续斜杠（如 "///foo///bar//" -> "/foo/bar/"）。
@@ -255,5 +452,11 @@ mod tests {
         let q2 = PathQuery::parse_with_case("Src/AppDelegate.swift", false).expect("should parse");
         assert_eq!(q2.path_pattern.as_deref(), Some("src/"));
         assert_eq!(q2.name_terms, vec!["appdelegate.swift"]);
+    }
+
+    #[test]
+    fn test_parse_pure_cn_filename_is_not_path_query() {
+        // 纯中文标准目录名不带 '/' 时不应误判为路径查询
+        assert!(PathQuery::parse("桌面").is_none());
     }
 }

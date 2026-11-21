@@ -45,6 +45,11 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         viewModel?.updateFDAStatus()
     }
 
+    /// 指定设置页签；窗口展示仍由调用方负责
+    func selectTab(_ tab: String) {
+        viewModel?.selectedTab = tab
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if allowCloseAfterUnsavedPrompt {
             allowCloseAfterUnsavedPrompt = false

@@ -15,30 +15,21 @@ assert(nextMode(.auto) == .sensitive)
 assert(nextMode(.sensitive) == .insensitive)
 assert(nextMode(.insensitive) == .auto)
 
-// 测试纯大写判定（用于 0ms 前端即时本地推导）
-func hasEffectiveUppercase(query: String) -> Bool {
-    var terms: [String] = []
-    for word in query.split(separator: " ") {
-        let s = String(word)
-        if s.starts(with: "in:") || s.starts(with: "type:") || s.starts(with: "ext:") || s.starts(with: "size:") {
-            continue
-        }
-        if s.contains("/") {
-            if s.hasSuffix("/") { continue }
-            if let last = s.split(separator: "/").last, !last.isEmpty {
-                terms.append(String(last))
-            }
-            continue
-        }
-        if s.starts(with: ".") && !s.starts(with: "..") {
-            continue
-        }
-        terms.append(s)
-    }
-    return terms.contains { term in
-        term.contains { $0.isUppercase }
-    }
+// 从 SearchWindow.swift 实时提取并测试真正的 hasEffectiveUppercase 实现
+let searchWindowSrcPath = "Lokii/Lokii/SearchWindow.swift"
+guard let searchWindowSrc = try? String(contentsOfFile: searchWindowSrcPath, encoding: .utf8),
+      let fnStart = searchWindowSrc.range(of: "    static func hasEffectiveUppercase(query: String) -> Bool {"),
+      let fnEnd = searchWindowSrc.range(of: "\n    // MARK: - Fuzzy & Regex Mode Actions & State", range: fnStart.upperBound..<searchWindowSrc.endIndex) else {
+    fputs("tests/case_sensitivity_test.swift: error: 无法从 SearchWindow.swift 提取 hasEffectiveUppercase\n", stderr)
+    exit(1)
 }
+let extractedFn = String(searchWindowSrc[fnStart.lowerBound..<fnEnd.lowerBound])
+    .replacingOccurrences(of: "    static func hasEffectiveUppercase", with: "func hasEffectiveUppercase")
+
+let runnerScript = """
+import Foundation
+
+\(extractedFn)
 
 assert(hasEffectiveUppercase(query: "report") == false)
 assert(hasEffectiveUppercase(query: "Report") == true)
@@ -50,7 +41,36 @@ assert(hasEffectiveUppercase(query: "type:pdf /path/to/file") == false)
 assert(hasEffectiveUppercase(query: ".git report") == false)
 assert(hasEffectiveUppercase(query: ".GIT Report") == true)
 
+// 引号保护、否定词忽略与正则转义兼容断言
+assert(hasEffectiveUppercase(query: "!Test") == false, "!Test negated token must not trigger smart case")
+assert(hasEffectiveUppercase(query: "!\\"Test\\"") == false, "negated quoted phrase must not trigger smart case")
+assert(hasEffectiveUppercase(query: "\\"Test\\"") == true, "positive quoted phrase must preserve uppercase")
+assert(hasEffectiveUppercase(query: "main !Test") == false, "negative uppercase alongside lowercase positive stays insensitive")
+assert(hasEffectiveUppercase(query: "Main !Test") == true, "positive uppercase still triggers smart case")
+assert(hasEffectiveUppercase(query: "\\"type:PDF\\"") == true, "quoted filter-like text stays literal and triggers smart case")
+assert(hasEffectiveUppercase(query: "\\"in:Dir\\"") == true, "quoted in: prefix stays literal and triggers smart case")
+assert(hasEffectiveUppercase(query: "\\"foo/Bar\\"") == true, "quoted slash stays literal")
+assert(hasEffectiveUppercase(query: "regex:\\\\D+ !Skip") == false, "regex escapes and negation must not trigger smart case")
+assert(hasEffectiveUppercase(query: "regex:^Main !skip") == true, "regex literal uppercase triggers smart case")
+
 print("Swift case sensitivity tests passed!")
+"""
+
+let tmpCaseDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+try! FileManager.default.createDirectory(at: tmpCaseDir, withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: tmpCaseDir) }
+let tmpCaseMain = tmpCaseDir.appendingPathComponent("main.swift")
+try! runnerScript.write(to: tmpCaseMain, atomically: true, encoding: .utf8)
+let caseProc = Process()
+caseProc.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
+caseProc.arguments = [tmpCaseMain.path]
+caseProc.standardOutput = FileHandle.standardOutput
+caseProc.standardError = FileHandle.standardError
+try! caseProc.run()
+caseProc.waitUntilExit()
+if caseProc.terminationStatus != 0 {
+    exit(caseProc.terminationStatus)
+}
 
 // MARK: - Regex Mode & Syntax Sugar Tests
 

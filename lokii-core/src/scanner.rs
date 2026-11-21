@@ -46,7 +46,6 @@ pub(crate) fn protected_paths() -> Vec<PathBuf> {
         home.join("Music"),
         home.join("iTunes"),
         // 系统目录（有些可能触发弹窗，有些是为防止误扫）
-        PathBuf::from("/System/Applications"),
         PathBuf::from("/System/Library/Assets"),
         PathBuf::from("/Library/Application Support/com.apple.TCC"),
     ];
@@ -164,20 +163,9 @@ pub(crate) fn deduplicate_scan_roots(
                     .ancestors()
                     .take_while(|ancestor| !paths_equal_ci(ancestor, other))
                     .all(|ancestor| {
-                        // 1. 若沿途节点被排除规则阻断，上层扫描无法深入
-                        if filter.is_excluded(ancestor) {
-                            return false;
-                        }
-                        // 2. 若未开启索引隐藏文件且沿途节点为隐藏目录，上层扫描器会在读取子项时剪枝跳过
-                        if !include_hidden
-                            && ancestor
-                                .file_name()
-                                .map(|n| n.to_string_lossy().starts_with('.'))
-                                .unwrap_or(false)
-                        {
-                            return false;
-                        }
-                        true
+                        // 上层扫描器会在 HardDrop 或 IndexShallowContainer 节点剪枝阻断，无法继续深入子项
+                        filter.evaluate_with_hidden(ancestor, true, include_hidden)
+                            == crate::filter::ScopeDecision::IndexNormally
                     })
         });
         if !is_redundant {
@@ -216,33 +204,37 @@ fn scan_with_sink(
         let skip_paths_clone = skip_paths.clone();
 
         let walker = jwalk::WalkDir::new(root)
-            .skip_hidden(false) // We handle hidden file filtering ourselves in process_read_dir
-            .process_read_dir(move |_depth, _path, _state, children| {
-                children.retain(|entry_result| {
-                    entry_result
-                        .as_ref()
-                        .map(|entry| {
-                            let full_path = entry.path();
-                            // 没有 FDA 时跳过受保护路径（不论是目录还是文件）
-                            if is_protected_or_descendant(&full_path, &skip_paths_clone) {
-                                return false;
-                            }
+            .skip_hidden(false) // Hidden and scope decisions are evaluated in process_read_dir
+            .process_read_dir(move |depth, _path, _state, children| {
+                children.retain_mut(|entry_result| {
+                    let Ok(entry) = entry_result else {
+                        return false;
+                    };
+                    let full_path = entry.path();
+                    // 没有 FDA 时跳过受保护路径（不论是目录还是文件）
+                    if is_protected_or_descendant(&full_path, &skip_paths_clone) {
+                        return false;
+                    }
 
-                            let name = entry.file_name.to_string_lossy();
+                    // 显式索引根（depth == None）在未配置全局 include_roots 的测试桩中仍需放行，仅检查系统噪声与显式排除前缀
+                    if depth.is_none() && filter_clone.has_empty_include_roots() {
+                        return !crate::filter::is_system_noise_path(&full_path)
+                            && !filter_clone.matches_excluded_prefix(&full_path);
+                    }
 
-                            // Skip hidden files/dirs if configured
-                            if !include_hidden && name.starts_with('.') {
-                                return false;
-                            }
-
-                            // Use CompiledFilter to exclude paths and directories
-                            if filter_clone.is_excluded(&full_path) {
-                                return false;
-                            }
-
+                    match filter_clone.evaluate_with_hidden(
+                        &full_path,
+                        entry.file_type().is_dir(),
+                        include_hidden,
+                    ) {
+                        crate::filter::ScopeDecision::HardDrop => false,
+                        crate::filter::ScopeDecision::IndexShallowContainer => {
+                            // 浅层容器保留目录自身条目，同时置空 read_children_path 阻断 jwalk 向下遍历
+                            entry.read_children_path = None;
                             true
-                        })
-                        .unwrap_or(false) // Filter out Err entries (permission denied)
+                        }
+                        crate::filter::ScopeDecision::IndexNormally => true,
+                    }
                 });
             });
 
@@ -362,6 +354,39 @@ mod tests {
         // app.rs should be present
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"app.rs"));
+    }
+
+    #[test]
+    fn test_scan_package_dir_is_shallow_container() {
+        let tmp = make_temp_dir();
+        fs::create_dir_all(tmp.path().join("Demo.app/Resources")).unwrap();
+        fs::write(tmp.path().join("Demo.app/Resources/tool"), "bin").unwrap();
+        fs::write(tmp.path().join("Demo.app/Info.plist"), "plist").unwrap();
+        fs::write(tmp.path().join("notes.txt"), "hello").unwrap();
+
+        let scan = |index_apps: bool| {
+            let mut config = crate::config::AppConfig::default();
+            config.index.index_paths = vec![tmp.path().to_string_lossy().into_owned()];
+            config.index.index_apps = index_apps;
+            scan_directories(
+                &[tmp.path().to_path_buf()],
+                std::sync::Arc::new(crate::filter::CompiledFilter::from_config(&config)),
+                true,
+                make_progress(),
+            )
+        };
+
+        // 开关关闭：应用包按普通目录递归（main 行为）
+        let names: Vec<String> = scan(false).iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&"Info.plist".to_string()));
+        assert!(names.contains(&"tool".to_string()));
+
+        // 开关打开：包目录自身收录，内部整棵不扫
+        let names: Vec<String> = scan(true).iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&"Demo.app".to_string()), "包目录自身应被收录");
+        assert!(!names.contains(&"Info.plist".to_string()), "包内文件不应被收录");
+        assert!(!names.contains(&"Resources".to_string()), "包内目录不应被收录");
+        assert!(names.contains(&"notes.txt".to_string()));
     }
 
     #[test]
@@ -569,5 +594,37 @@ mod tests {
         let roots_with_hidden = deduplicate_scan_roots(&input_roots, &filter, true);
         assert!(roots_with_hidden.contains(&home));
         assert!(!roots_with_hidden.contains(&nvim));
+    }
+
+    #[test]
+    fn test_deduplicate_scan_roots_preserves_root_inside_shallow_container() {
+        let tmp = make_temp_dir();
+        let home = tmp.path().join("home");
+        let nm = home.join("node_modules");
+        let pkg = nm.join("my_pkg");
+        fs::create_dir_all(&pkg).unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.index.index_paths = vec![
+            home.to_string_lossy().to_string(),
+            pkg.to_string_lossy().to_string(),
+        ];
+        config.index.include_hidden = true;
+        let filter = crate::filter::CompiledFilter::from_config(&config);
+
+        let roots = deduplicate_scan_roots(&[home.clone(), pkg.clone()], &filter, true);
+        assert!(roots.contains(&home));
+        assert!(
+            roots.contains(&pkg),
+            "explicit root inside shallow container must remain independent because parent stops at container"
+        );
+    }
+    #[test]
+    fn test_protected_paths_allows_system_applications() {
+        let protected = protected_paths();
+        assert!(
+            !protected.contains(&PathBuf::from("/System/Applications")),
+            "/System/Applications must not be blocked in protected_paths"
+        );
     }
 }

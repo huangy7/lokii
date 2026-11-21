@@ -50,6 +50,8 @@ pub struct FfiSearchResponse {
     pub error: Option<String>,
     pub is_case_sensitive: bool,
     pub effective_mode: FfiSearchMode,
+    /// 结果为空且查询路径命中排除规则时的命中片段，供界面解释「为什么搜不到」。
+    pub hint: Option<String>,
 }
 
 // ── UniFFI Enums ────────────────────────────────────────────────────────
@@ -344,11 +346,18 @@ impl LokiiCore {
             max_results,
         );
 
+        let hint = if results.is_empty() {
+            crate::filter::exclusion_hint(&query, &self.config_store.read())
+        } else {
+            None
+        };
+
         FfiSearchResponse {
             results: convert_results(results),
             error,
             is_case_sensitive,
             effective_mode: effective_mode.into(),
+            hint,
         }
     }
 

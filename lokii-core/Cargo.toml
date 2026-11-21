@@ -20,6 +20,8 @@ notify = "8.2"
 glob-match = "0.2"
 regex = "1"
 nucleo-matcher = "0.3"
+icu_normalizer = { version = "2.4", default-features = false, features = ["compiled_data"] }
+unicode-segmentation = "1.13"
 fsevent-sys = "4"
 libc = "0.2"
 

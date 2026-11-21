@@ -77,7 +77,9 @@ fn compact_cache_migrates_legacy_and_rejects_corruption() {
     }
     std::fs::write(&path, b"LOKI\x04\0\0\0bad").unwrap();
     assert!(lokii_core::cache::load_compact(&path).is_err());
-    std::fs::write(&path, b"LOKI\x05\0\0\0short").unwrap();
+    std::fs::write(&path, b"LOKI\x05\0\0\0bad").unwrap();
+    assert!(lokii_core::cache::load_compact(&path).is_err());
+    std::fs::write(&path, b"LOKI\x06\0\0\0short").unwrap();
     assert!(lokii_core::cache::load_compact(&path).is_err());
 }
 

@@ -1364,14 +1364,22 @@ public struct FfiSearchResponse {
     public var error: String?
     public var isCaseSensitive: Bool
     public var effectiveMode: FfiSearchMode
+    /**
+     * 结果为空且查询路径命中排除规则时的命中片段，供界面解释「为什么搜不到」。
+     */
+    public var hint: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(results: [FfiSearchResult], error: String?, isCaseSensitive: Bool, effectiveMode: FfiSearchMode) {
+    public init(results: [FfiSearchResult], error: String?, isCaseSensitive: Bool, effectiveMode: FfiSearchMode, 
+        /**
+         * 结果为空且查询路径命中排除规则时的命中片段，供界面解释「为什么搜不到」。
+         */hint: String?) {
         self.results = results
         self.error = error
         self.isCaseSensitive = isCaseSensitive
         self.effectiveMode = effectiveMode
+        self.hint = hint
     }
 }
 
@@ -1394,6 +1402,9 @@ extension FfiSearchResponse: Equatable, Hashable {
         if lhs.effectiveMode != rhs.effectiveMode {
             return false
         }
+        if lhs.hint != rhs.hint {
+            return false
+        }
         return true
     }
 
@@ -1402,6 +1413,7 @@ extension FfiSearchResponse: Equatable, Hashable {
         hasher.combine(error)
         hasher.combine(isCaseSensitive)
         hasher.combine(effectiveMode)
+        hasher.combine(hint)
     }
 }
 
@@ -1417,7 +1429,8 @@ public struct FfiConverterTypeFfiSearchResponse: FfiConverterRustBuffer {
                 results: FfiConverterSequenceTypeFfiSearchResult.read(from: &buf), 
                 error: FfiConverterOptionString.read(from: &buf), 
                 isCaseSensitive: FfiConverterBool.read(from: &buf), 
-                effectiveMode: FfiConverterTypeFfiSearchMode.read(from: &buf)
+                effectiveMode: FfiConverterTypeFfiSearchMode.read(from: &buf), 
+                hint: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1426,6 +1439,7 @@ public struct FfiConverterTypeFfiSearchResponse: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.error, into: &buf)
         FfiConverterBool.write(value.isCaseSensitive, into: &buf)
         FfiConverterTypeFfiSearchMode.write(value.effectiveMode, into: &buf)
+        FfiConverterOptionString.write(value.hint, into: &buf)
     }
 }
 

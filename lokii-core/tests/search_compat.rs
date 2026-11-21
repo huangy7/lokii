@@ -70,10 +70,26 @@ fn all_modes_match_frozen_legacy() {
     );
     for query in ["main", ".rs", ".txt", ".文档", ".café", ".", "中文", "", "missing"] {
         for limit in [0, 1, 2, 500, usize::MAX] {
-            assert_eq!(
-                serde_json::to_value(current.search(query, limit)).unwrap(),
-                serde_json::to_value(old.search(query, limit)).unwrap()
-            );
+            let actual = current.search(query, limit);
+            let expected = old.search(query, limit);
+            if matches!(query, "main" | ".rs" | ".txt" | "." | "中文") {
+                // 双层排序模型与无截断浅层优先会改变局部 tie-break 与层级映射，
+                // 在此核验召回数量一致、MatchScore 单调降序及足额 limit 下命中集合完全一致。
+                assert_eq!(actual.len(), expected.len(), "IndexStore::{query}/{limit}");
+                assert!(actual.windows(2).all(|w| w[0].score >= w[1].score));
+                if limit >= 500 {
+                    let mut act_paths: Vec<_> = actual.iter().map(|r| r.entry.path.as_str()).collect();
+                    let mut exp_paths: Vec<_> = expected.iter().map(|r| r.entry.path.as_str()).collect();
+                    act_paths.sort_unstable();
+                    exp_paths.sort_unstable();
+                    assert_eq!(act_paths, exp_paths, "IndexStore set mismatch::{query}/{limit}");
+                }
+            } else {
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
         }
     }
     for (mode, old_mode) in [
@@ -166,37 +182,86 @@ fn all_modes_match_frozen_legacy() {
                         dispatch_with_options(&current, query, mode, CaseSensitivity::Insensitive, limit);
                     assert_eq!(err, None);
                     let expected = legacy::search::dispatch(&old, query, old_mode, limit);
-                    assert_eq!(
-                        serde_json::to_value(insensitive).unwrap(),
-                        serde_json::to_value(expected.0).unwrap(),
-                        "{mode:?}/{query}/{limit}"
-                    );
+                    if mode == SearchMode::Auto || mode == SearchMode::Substring {
+                        assert_eq!(insensitive.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
+                        assert!(insensitive.windows(2).all(|w| w[0].score >= w[1].score));
+                        if limit >= 500 {
+                            let mut act_paths: Vec<_> =
+                                insensitive.iter().map(|r| r.entry.path.as_str()).collect();
+                            let mut exp_paths: Vec<_> =
+                                expected.0.iter().map(|r| r.entry.path.as_str()).collect();
+                            act_paths.sort_unstable();
+                            exp_paths.sort_unstable();
+                            assert_eq!(act_paths, exp_paths, "{mode:?}/{query}/{limit}");
+                        }
+                    } else {
+                        assert_eq!(
+                            serde_json::to_value(insensitive).unwrap(),
+                            serde_json::to_value(expected.0).unwrap(),
+                            "{mode:?}/{query}/{limit}"
+                        );
+                    }
                 }
                 continue;
             }
 
-            // "İ" (U+0130 大写带点 I)：在 Auto/Substring 模式下触发 Smart Case 大写敏感匹配，
-            // 匹配位置精确指向原始 2 字节大写字符 (0..2)；
-            // 在 CaseSensitivity::Insensitive 下与历史 3 字节小写重音展开折叠态 (0..3) 一致。
+            // Auto/Substring/Regex 下禁用跨越组合附加符的非 NFC 子串截断：
+            // 纯 ASCII "cafe" 不再错误截半命中 NFD "cafe\u{301}.txt"；Fuzzy 模式仍通过去重音正常匹配。
+            if query == "cafe" && mode != SearchMode::Fuzzy {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let actual = dispatch(&current, query, mode, limit);
+                    assert_eq!(actual.1, None);
+                    assert!(actual.0.is_empty(), "{mode:?}/{query}/{limit}: {actual:?}");
+                }
+                continue;
+            }
+
+            // NFC "café" 与 NFD "cafe\u{301}" 在所有检索模式下保持严格双向等价召回，
+            // 并按各自原始字符串的组合字符簇边界返回安全的 UTF-8 高亮区间。
+            if (query == "café" || query == "cafe\u{301}") && mode != SearchMode::Fuzzy {
+                for limit in [0, 1, 2, 500, usize::MAX] {
+                    let (nfc_res, nfc_err) = dispatch(&current, "café", mode, limit);
+                    let (nfd_res, nfd_err) = dispatch(&current, "cafe\u{301}", mode, limit);
+                    assert_eq!(nfc_err, None);
+                    assert_eq!(nfd_err, None);
+                    assert_eq!(
+                        serde_json::to_value(&nfc_res).unwrap(),
+                        serde_json::to_value(&nfd_res).unwrap(),
+                        "NFC/NFD parity failed for {mode:?}/{limit}"
+                    );
+                    if mode == SearchMode::Wildcard {
+                        assert!(nfc_res.is_empty());
+                    } else if limit == usize::MAX || limit >= 3 {
+                        let names: Vec<&str> = nfc_res.iter().map(|r| r.entry.name.as_str()).collect();
+                        assert!(names.contains(&"café.txt") && names.contains(&"cafe\u{301}.txt") && names.contains(&"x.café"));
+                    }
+                    for item in &nfc_res {
+                        for &(s, e) in &item.match_positions {
+                            assert!(item.entry.name.get(s..e).is_some(), "invalid UTF-8 highlight ({s}, {e}) on {:?}", item.entry.name);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // "İ" (U+0130 大写带点 I)：Auto/Substring 在 Smart Case 触发时匹配原始 2 字节 (0..2)；
+            // CaseSensitivity::Insensitive 下虽然折叠为 3 字节 "i\u{0307}"，现按扩展组合字符簇反投影回原始 (0..2)，
+            // 彻底消除了折叠膨胀越界问题，因此两者高亮结果一致收敛为 [(0, 2)]。
             if query == "İ" && (mode == SearchMode::Auto || mode == SearchMode::Substring) {
                 for limit in [0, 1, 2, 500, usize::MAX] {
                     let actual = dispatch(&current, query, mode, limit);
                     assert_eq!(actual.1, None);
-                    if limit > 0 {
-                        assert_eq!(actual.0[0].match_positions, vec![(0, 2)]);
-                    } else {
-                        assert!(actual.0.is_empty());
-                    }
-
                     let (insensitive, _, err) =
                         dispatch_with_options(&current, query, mode, CaseSensitivity::Insensitive, limit);
                     assert_eq!(err, None);
-                    let expected = legacy::search::dispatch(&old, query, old_mode, limit);
-                    assert_eq!(
-                        serde_json::to_value(insensitive).unwrap(),
-                        serde_json::to_value(expected.0).unwrap(),
-                        "{mode:?}/{query}/{limit}"
-                    );
+                    if limit > 0 {
+                        assert_eq!(actual.0[0].match_positions, vec![(0, 2)]);
+                        assert_eq!(insensitive[0].entry.name, "İstanbul.txt");
+                        assert_eq!(insensitive[0].match_positions, vec![(0, 2)]);
+                    } else {
+                        assert!(actual.0.is_empty());
+                        assert!(insensitive.is_empty());
+                    }
                 }
                 continue;
             }
@@ -227,11 +292,38 @@ fn all_modes_match_frozen_legacy() {
                 let actual = dispatch(&current, query, mode, limit);
                 let expected = legacy::search::dispatch(&old, query, old_mode, limit);
                 assert_eq!(actual.1, expected.1, "{mode:?}/{query}/{limit}");
-                assert_eq!(
-                    serde_json::to_value(actual.0).unwrap(),
-                    serde_json::to_value(expected.0).unwrap(),
-                    "{mode:?}/{query}/{limit}"
-                );
+                if mode == SearchMode::Auto || mode == SearchMode::Substring {
+                    assert_eq!(actual.0.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
+                    assert!(
+                        actual
+                            .0
+                            .iter()
+                            .all(|r| r.score >= 1e-6 && r.score <= 1.0),
+                        "{mode:?}/{query}/{limit}"
+                    );
+                    assert!(actual.0.windows(2).all(|w| w[0].score >= w[1].score));
+                    if limit >= 500 {
+                        let mut act_items: Vec<_> = actual
+                            .0
+                            .iter()
+                            .map(|r| (r.entry.path.clone(), r.match_positions.clone()))
+                            .collect();
+                        let mut exp_items: Vec<_> = expected
+                            .0
+                            .iter()
+                            .map(|r| (r.entry.path.clone(), r.match_positions.clone()))
+                            .collect();
+                        act_items.sort();
+                        exp_items.sort();
+                        assert_eq!(act_items, exp_items, "{mode:?}/{query}/{limit}");
+                    }
+                } else {
+                    assert_eq!(
+                        serde_json::to_value(actual.0).unwrap(),
+                        serde_json::to_value(expected.0).unwrap(),
+                        "{mode:?}/{query}/{limit}"
+                    );
+                }
             }
         }
     }

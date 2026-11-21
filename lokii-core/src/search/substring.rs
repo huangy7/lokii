@@ -1,21 +1,20 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::compact_index::CompactIndex;
-use crate::indexer::{score_match_zero_alloc, IndexStore, MatchScore};
+use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
 use super::disjunction::{extension_matches, extension_signature};
-use super::{
-    find_positions, is_dotfile_query, merge_highlight_spans, AdvancedSearchResult,
-    CompiledRecordFilter, DisjunctionQuery, SearchMode,
+use super::filter::QueryToken;
+use super::ranking::{
+    bucket_slices, keywords_target_hidden, score_name_rank, score_record, BaseNameScore,
+    RankScore, RecordRankContext,
 };
-
-/// Convert MatchScore to normalized f64 per research recommendation.
-fn score_to_f64(score: MatchScore) -> f64 {
-    match score {
-        MatchScore::Exact => 1.0,
-        MatchScore::Prefix => 0.75,
-        MatchScore::Substring => 0.5,
-    }
-}
+use super::{
+    find_positions, is_dotfile_query, map_norm_span_to_orig, merge_highlight_spans,
+    resolve_case_sensitive_tokens, AdvancedSearchResult, CaseSensitivity, CompiledRecordFilter,
+    DisjunctionQuery, SearchMode,
+};
 
 /// 子串检索器，接入预编译位掩码记录过滤器以达成零堆分配预筛选。
 /// 保持原有语义：扩展名过滤、多关键词 AND 匹配、Exact > Prefix > Substring 排序。
@@ -29,7 +28,34 @@ pub fn search(
     search_index(&read, query, filter, max_results, false, false)
 }
 
-/// 接收统一快照读锁的子串检索实现，杜绝锁重入与快照位掩码漂移。
+/// 扩展名池槽位匹配器：纯 ASCII 退化为单一整数 ID 等值比较；非 ASCII 使用位图覆盖多规范化变体槽位。
+enum ExtMatcher {
+    ExactId(u32),
+    Mask(Vec<bool>),
+}
+
+impl ExtMatcher {
+    fn compile(read: &CompactIndex, extension: &str) -> Option<Self> {
+        if extension.is_ascii() {
+            read.extension_id(extension).map(Self::ExactId)
+        } else {
+            let mask = read.evaluate_extensions(|slot| {
+                super::filter::ext_matches_folded(slot, extension)
+            });
+            mask.iter().any(|&m| m).then_some(Self::Mask(mask))
+        }
+    }
+
+    #[inline]
+    fn matches(&self, ext_id: u32) -> bool {
+        match self {
+            Self::ExactId(id) => ext_id == *id,
+            Self::Mask(mask) => mask.get(ext_id as usize).copied().unwrap_or(false),
+        }
+    }
+}
+
+/// 接收统一快照读锁的子串检索实现，将空白分隔词元转为未加引号词元后委托 `search_index_tokens`。
 pub fn search_index(
     read: &CompactIndex,
     query: &str,
@@ -38,42 +64,140 @@ pub fn search_index(
     case_sensitive: bool,
     explicit_lock: bool,
 ) -> Vec<AdvancedSearchResult> {
-    let query = query.trim();
-    if max_results == 0 {
-        return Vec::new();
+    let tokens: Vec<QueryToken> = query
+        .split_whitespace()
+        .map(|s| QueryToken {
+            text: s.to_string(),
+            quoted: false,
+            negated: false,
+            raw: s.to_string(),
+            had_escaped_meta: false,
+            was_sanitized_pasted_path: false,
+        })
+        .collect();
+    search_index_tokens(
+        read,
+        &tokens,
+        filter,
+        max_results,
+        case_sensitive,
+        explicit_lock,
+    )
+}
+
+/// 基于结构化正向词元的子串检索核心实现：保留带引号短语完整性（不拆词且不误触发 `.ext` 扩展名快路径）。
+pub fn search_index_tokens(
+    read: &CompactIndex,
+    positive_tokens: &[QueryToken],
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    explicit_lock: bool,
+) -> Vec<AdvancedSearchResult> {
+    search_index_tokens_with_ordinals(
+        read,
+        positive_tokens,
+        filter,
+        max_results,
+        case_sensitive,
+        explicit_lock,
+    )
+    .0
+}
+
+/// 在纯文件名子串检索未填满 `max_results` 时，按相邻切分追加 `parent_term + filename_term` 混合召回。
+pub(crate) fn search_index_tokens_with_hybrid(
+    read: &CompactIndex,
+    positive_tokens: &[QueryToken],
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    case_sensitivity: CaseSensitivity,
+    explicit_lock: bool,
+) -> Vec<AdvancedSearchResult> {
+    let (mut results, matched_ordinals) = search_index_tokens_with_ordinals(
+        read,
+        positive_tokens,
+        filter,
+        max_results,
+        case_sensitive,
+        explicit_lock,
+    );
+    let remaining = max_results.saturating_sub(results.len());
+    if remaining == 0 || positive_tokens.len() < 2 {
+        return results;
     }
-    let mut extension = (!is_dotfile_query(query)
-        && query.starts_with('.')
-        && !query.contains(' '))
-    .then(|| query[1..].to_lowercase());
+
+    append_hybrid_parent_name_hits(
+        read,
+        positive_tokens,
+        filter,
+        remaining,
+        case_sensitivity,
+        &matched_ordinals,
+        &mut results,
+    );
+    results
+}
+
+fn search_index_tokens_with_ordinals(
+    read: &CompactIndex,
+    positive_tokens: &[QueryToken],
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    explicit_lock: bool,
+) -> (Vec<AdvancedSearchResult>, Vec<usize>) {
+    if max_results == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut extension = if positive_tokens.len() == 1 && !positive_tokens[0].quoted {
+        let single = positive_tokens[0].text.trim();
+        (!is_dotfile_query(single) && single.starts_with('.') && !single.contains(' '))
+            .then(|| crate::cjk::fold_str(&single[1..]))
+    } else {
+        None
+    };
 
     // 扩展名回退机制（Fallback Guard）：
     // 若查询形式形似单扩展名（以单点开头），但在当前索引库中查无该扩展名记录
     // （例如用户正在键入的隐藏点文件前缀 .giti、.myse 等），
     // 绝不可直接返回空列表，而应将 extension 撤销为 None，
     // 顺畅回退至常规子串匹配流程，避免静默漏搜。
-    if let Some(ref ext) = extension {
-        if read.extension_id(ext).is_none() {
-            extension = None;
-        }
+    let compiled_ext = extension
+        .as_deref()
+        .and_then(|ext| ExtMatcher::compile(read, ext));
+    if extension.is_some() && compiled_ext.is_none() {
+        extension = None;
     }
-    let keywords: Vec<String> = if case_sensitive {
-        query
-            .split_whitespace()
-            .map(|s| crate::cjk::to_simplified_str(s).into_owned())
-            .collect()
-    } else {
-        query.split_whitespace().map(crate::cjk::fold_str).collect()
-    };
-    let matches = match &extension {
-        Some(extension) => {
-            let Some(ext_id) = read.extension_id(extension) else {
-                return Vec::new();
-            };
+    let keywords: Vec<String> = positive_tokens
+        .iter()
+        .filter(|t| !t.text.is_empty())
+        .map(|t| {
+            if case_sensitive {
+                crate::cjk::normalize_and_simplify_cow(&t.text).into_owned()
+            } else {
+                crate::cjk::fold_str(&t.text)
+            }
+        })
+        .collect();
+    let raw_keywords: Vec<String> = positive_tokens
+        .iter()
+        .filter(|t| !t.text.is_empty())
+        .map(|t| crate::cjk::normalize_nfc_cow(&t.text).into_owned())
+        .collect();
+    let rank_ctx = RecordRankContext::default();
+    let targets_hidden = keywords_target_hidden(extension.is_some(), &keywords);
+
+    let matches = match (&extension, compiled_ext.as_ref()) {
+        (Some(extension), Some(ext_matcher)) => {
             let req = extension_signature(extension);
             let ext_ascii = extension.is_ascii();
             let mut top = super::top_k::TopK::new(max_results);
             let sorted = read.sorted_names();
+            let records = read.records();
+            let passthrough = filter.is_passthrough();
+            let allow_dirs = filter.allow_dirs();
             for &name_id in &sorted.ids {
                 if !extension.is_empty() {
                     if let Some(sig) = read.name_signature(name_id) {
@@ -82,126 +206,448 @@ pub fn search_index(
                         }
                     }
                 }
+                let entries = read.entries_for_name(name_id);
+                if entries.is_empty() {
+                    continue;
+                }
                 let Some((name, folded)) = read.name_entry(name_id) else {
                     continue;
                 };
-                let matched = extension_matches(name, folded, extension, ext_ascii);
-                if !matched {
+                if !extension_matches(name, folded, extension, ext_ascii) {
                     continue;
                 }
-                for &ordinal in read.entries_for_name(name_id) {
-                    let record = &read.records()[ordinal as usize];
-                    if record.extension == ext_id {
-                        if !filter.matches_record(record, || Some(name)) {
-                            continue;
-                        }
-                        top.offer(ordinal as usize, MatchScore::Exact, name);
-                        if top.is_full() {
-                            break;
-                        }
+                let base = BaseNameScore::for_exact_fast_path(name);
+                let upper = base.upper_bound(&rank_ctx, allow_dirs, false);
+                if let Some(worst) = top.worst() {
+                    if upper < worst.score || (upper == worst.score && name > worst.name()) {
+                        continue;
                     }
                 }
-                if top.is_full() {
-                    break;
+                let (head, tail) = bucket_slices(entries);
+                for &ordinal in head.iter().chain(tail.iter()) {
+                    let Some(record) = records.get(ordinal as usize) else {
+                        continue;
+                    };
+                    if ext_matcher.matches(record.extension) {
+                        if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                            continue;
+                        }
+                        let parent = read.record_parent(record);
+                        let score = score_record(base, record.is_dir, parent, &rank_ctx, false);
+                        top.offer(ordinal as usize, score, name);
+                    }
                 }
             }
             top.finish()
         }
-        None => {
-            if query.is_empty() {
-                if filter.is_passthrough() && !filter.has_explicit_type_all() {
+        _ => {
+            if keywords.is_empty() {
+                // 纯否定过滤词（如 `!test` / `!.pdf`）在无正向筛选条件与无 `type:all` 时不返回全量文件
+                if !filter.has_positive_filter() && !filter.has_explicit_type_all() {
                     Vec::new()
                 } else {
                     let mut top = super::top_k::TopK::new(max_results);
                     let records = read.records();
                     for (id, name) in read.names() {
-                        if let Some(record) = records.get(id.0) {
-                            if !filter.matches_record(record, || Some(name)) {
-                                continue;
-                            }
+                        let Some(record) = records.get(id.0) else {
+                            continue;
+                        };
+                        if !filter.matches_record_in(read, record, Some(name)) {
+                            continue;
                         }
-                        top.offer(id.0, MatchScore::Exact, name);
+                        let base = BaseNameScore::for_exact_fast_path(name);
+                        let parent = read.record_parent(record);
+                        let score = score_record(base, record.is_dir, parent, &rank_ctx, false);
+                        top.offer(id.0, score, name);
                     }
                     top.finish()
                 }
             } else {
                 let mut req = NameSignature::default();
                 for kw in &keywords {
-                    req = req.union(NameSignature::from_substring_query(&kw.to_lowercase()));
+                    req = req.union(NameSignature::from_substring_query(kw));
                 }
                 let all_ascii = keywords.iter().all(|k| k.is_ascii());
-                super::rank_unique_names(&read, filter, max_results, req, |name, folded| {
-                    score_match_zero_alloc(
-                        name,
-                        folded,
-                        &keywords,
-                        all_ascii,
-                        case_sensitive,
-                        explicit_lock,
-                    )
-                })
+                super::rank_unique_names(
+                    read,
+                    filter,
+                    max_results,
+                    req,
+                    targets_hidden,
+                    &rank_ctx,
+                    |name, folded| {
+                        score_name_rank(
+                            name,
+                            folded,
+                            &keywords,
+                            &raw_keywords,
+                            all_ascii,
+                            case_sensitive,
+                            explicit_lock,
+                        )
+                    },
+                )
             }
         }
     };
     let kw_prepared: Vec<(&str, String)> = keywords
         .iter()
-        .map(|k| (k.as_str(), k.to_lowercase()))
+        .map(|k| (k.as_str(), crate::cjk::fold_str(k)))
         .collect();
     let kw_refs: Vec<(&str, &str)> = kw_prepared
         .iter()
         .map(|(raw, lower)| (*raw, lower.as_str()))
         .collect();
 
-    matches
+    let ordinals: Vec<usize> = matches.iter().map(|c| c.ordinal).collect();
+    let results = matches
         .into_iter()
         .map(|candidate| {
             let view = read
                 .view(crate::compact_index::EntryId(candidate.ordinal))
                 .unwrap();
-            let match_positions = if extension.is_some() || query.is_empty() {
+            let match_positions = if extension.is_some() || keywords.is_empty() {
                 Vec::new()
             } else {
-                find_positions(
-                    &view.name,
-                    &view.name.to_lowercase(),
-                    &kw_refs,
-                )
+                let name_folded = crate::cjk::fold_cow(view.name);
+                find_positions(view.name, name_folded.as_ref(), &kw_refs)
             };
             AdvancedSearchResult {
                 entry: view.materialize(),
-                score: score_to_f64(candidate.score),
+                score: candidate.score.to_f64(),
                 match_positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Substring,
             }
         })
-        .collect()
+        .collect();
+    (results, ordinals)
+}
+
+struct HybridSplitPlan {
+    parent_terms: Vec<String>,
+    name_keywords: Vec<String>,
+    name_raw_keywords: Vec<String>,
+    all_name_ascii: bool,
+    name_case_sensitive: bool,
+    name_explicit_lock: bool,
+    required_sig: NameSignature,
+}
+
+#[inline]
+fn is_parent_word_boundary(haystack_bytes: &[u8], pos: usize) -> bool {
+    pos == 0 || matches!(haystack_bytes[pos - 1], b'/' | b'_' | b'-' | b' ' | b'.')
+}
+
+/// 在剔除末尾 `/` 后的父路径上检查是否包含所有 `parent_terms`，并判别是否全部命中在段/词边界。
+fn evaluate_hybrid_parent(parent_folded: &str, parent_terms: &[String]) -> Option<bool> {
+    let bytes = parent_folded.as_bytes();
+    let mut all_boundary = true;
+    for term in parent_terms {
+        if term.is_empty() {
+            continue;
+        }
+        let mut found_any = false;
+        let mut found_boundary = false;
+        let mut offset = 0;
+        while let Some(rel) = parent_folded[offset..].find(term.as_str()) {
+            let abs = offset + rel;
+            found_any = true;
+            if is_parent_word_boundary(bytes, abs) {
+                found_boundary = true;
+                break;
+            }
+            let step = parent_folded[abs..].chars().next().map_or(1, char::len_utf8);
+            offset = abs + step;
+        }
+        if !found_any {
+            return None;
+        }
+        if !found_boundary {
+            all_boundary = false;
+        }
+    }
+    Some(all_boundary)
+}
+
+fn compute_parent_match_positions(parent: &str, parent_terms: &[String]) -> Vec<(usize, usize)> {
+    let parent_no_slash = parent.trim_end_matches('/');
+    if parent_no_slash.is_empty() {
+        return Vec::new();
+    }
+    let parent_folded = crate::cjk::fold_cow(parent_no_slash);
+    let bytes = parent_folded.as_bytes();
+    let mut spans = Vec::new();
+    for term in parent_terms {
+        if term.is_empty() {
+            continue;
+        }
+        let mut chosen: Option<(usize, usize)> = None;
+        let mut offset = 0;
+        while let Some(rel) = parent_folded[offset..].find(term.as_str()) {
+            let abs = offset + rel;
+            if chosen.is_none() {
+                chosen = Some((abs, abs + term.len()));
+            }
+            if is_parent_word_boundary(bytes, abs) {
+                chosen = Some((abs, abs + term.len()));
+                break;
+            }
+            let step = parent_folded[abs..].chars().next().map_or(1, char::len_utf8);
+            offset = abs + step;
+        }
+        if let Some((ns, ne)) = chosen {
+            if let Some(orig) = map_norm_span_to_orig(parent_no_slash, &parent_folded, ns, ne) {
+                spans.push(orig);
+            }
+        }
+    }
+    merge_highlight_spans(spans, parent_no_slash.len())
+}
+
+fn append_hybrid_parent_name_hits(
+    read: &CompactIndex,
+    positive_tokens: &[QueryToken],
+    filter: &CompiledRecordFilter,
+    remaining: usize,
+    case_sensitivity: CaseSensitivity,
+    pure_matched_ordinals: &[usize],
+    results: &mut Vec<AdvancedSearchResult>,
+) {
+    let k = positive_tokens.len();
+    let mut plans = Vec::new();
+    for split in (1..k).rev() {
+        let lead = &positive_tokens[..split];
+        let tail = &positive_tokens[split..];
+        if lead.iter().any(|t| t.quoted || t.text.is_empty())
+            || tail.iter().all(|t| t.text.is_empty())
+        {
+            continue;
+        }
+        let parent_terms: Vec<String> = lead.iter().map(|t| crate::cjk::fold_str(&t.text)).collect();
+        let name_cs =
+            resolve_case_sensitive_tokens(tail, case_sensitivity, SearchMode::Substring);
+        let name_explicit_lock = case_sensitivity == CaseSensitivity::Sensitive;
+        let name_keywords: Vec<String> = tail
+            .iter()
+            .filter(|t| !t.text.is_empty())
+            .map(|t| {
+                if name_cs {
+                    crate::cjk::normalize_and_simplify_cow(&t.text).into_owned()
+                } else {
+                    crate::cjk::fold_str(&t.text)
+                }
+            })
+            .collect();
+        if name_keywords.is_empty() {
+            continue;
+        }
+        let name_raw_keywords: Vec<String> = tail
+            .iter()
+            .filter(|t| !t.text.is_empty())
+            .map(|t| crate::cjk::normalize_nfc_cow(&t.text).into_owned())
+            .collect();
+        let all_name_ascii = name_keywords.iter().all(|kw| kw.is_ascii());
+        let mut required_sig = NameSignature::default();
+        for kw in &name_keywords {
+            required_sig = required_sig.union(NameSignature::from_substring_query(kw));
+        }
+        plans.push(HybridSplitPlan {
+            parent_terms,
+            name_keywords,
+            name_raw_keywords,
+            all_name_ascii,
+            name_case_sensitive: name_cs,
+            name_explicit_lock,
+            required_sig,
+        });
+    }
+    if plans.is_empty() {
+        return;
+    }
+
+    let all_folded_terms: Vec<String> = positive_tokens
+        .iter()
+        .filter(|t| !t.text.is_empty())
+        .map(|t| crate::cjk::fold_str(&t.text))
+        .collect();
+    let targets_hidden = keywords_target_hidden(false, &all_folded_terms);
+    let rank_ctx = RecordRankContext::default();
+    let pure_seen: HashSet<usize> = pure_matched_ordinals.iter().copied().collect();
+
+    let query_index = read.query_index();
+    let records = read.records();
+    let passthrough = filter.is_passthrough();
+
+    // ordinal -> (best_plan_idx, best_score, name_str)
+    let mut best_by_ordinal: HashMap<usize, (usize, RankScore, &str)> = HashMap::new();
+
+    for (plan_idx, plan) in plans.iter().enumerate() {
+        for name_id in 0..query_index.slot_count() as u32 {
+            let sig = query_index.signature_at(name_id);
+            if sig == NameSignature::default() && !query_index.is_ready(name_id) {
+                continue;
+            }
+            if !sig.contains(plan.required_sig) {
+                continue;
+            }
+            let entries = query_index.entries(name_id);
+            if entries.is_empty() {
+                continue;
+            }
+            let Some(name) = read.name_text(name_id) else {
+                continue;
+            };
+            let Some(name_base) = score_name_rank(
+                name,
+                query_index.folded(name_id),
+                &plan.name_keywords,
+                &plan.name_raw_keywords,
+                plan.all_name_ascii,
+                plan.name_case_sensitive,
+                plan.name_explicit_lock,
+            ) else {
+                continue;
+            };
+
+            let name_quality_bonus =
+                ((name_base.tier as i64) * 2_000) + ((name_base.sub_tier as i64) * 200);
+
+            let (head, tail_slice) = bucket_slices(entries);
+            for &ordinal in head.iter().chain(tail_slice.iter()) {
+                let ord_usize = ordinal as usize;
+                if pure_seen.contains(&ord_usize) {
+                    continue;
+                }
+                let Some(record) = records.get(ord_usize) else {
+                    continue;
+                };
+                if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                    continue;
+                }
+                let parent = read.record_parent(record);
+                let parent_no_slash = parent.trim_end_matches('/');
+                if parent_no_slash.is_empty() {
+                    continue;
+                }
+                let parent_folded = crate::cjk::fold_cow(parent_no_slash);
+                let Some(is_word_boundary) =
+                    evaluate_hybrid_parent(&parent_folded, &plan.parent_terms)
+                else {
+                    continue;
+                };
+
+                let hybrid_base = BaseNameScore::for_hybrid_parent_name(
+                    name,
+                    is_word_boundary,
+                    name_quality_bonus,
+                );
+                let score = score_record(hybrid_base, record.is_dir, parent, &rank_ctx, targets_hidden);
+                match best_by_ordinal.get_mut(&ord_usize) {
+                    Some((prev_plan, prev_score, _)) => {
+                        if score > *prev_score {
+                            *prev_plan = plan_idx;
+                            *prev_score = score;
+                        }
+                    }
+                    None => {
+                        best_by_ordinal.insert(ord_usize, (plan_idx, score, name));
+                    }
+                }
+            }
+        }
+    }
+
+    if best_by_ordinal.is_empty() {
+        return;
+    }
+
+    let mut top = super::top_k::TopK::new(remaining);
+    for (&ordinal, &(_, score, name)) in &best_by_ordinal {
+        top.offer(ordinal, score, name);
+    }
+
+    let chosen = top.finish();
+    let prepared_kws: Vec<Vec<(&str, String)>> = plans
+        .iter()
+        .map(|plan| {
+            plan.name_keywords
+                .iter()
+                .map(|k| (k.as_str(), crate::cjk::fold_str(k)))
+                .collect()
+        })
+        .collect();
+
+    for candidate in chosen {
+        let Some(&(plan_idx, _, _)) = best_by_ordinal.get(&candidate.ordinal) else {
+            continue;
+        };
+        let plan = &plans[plan_idx];
+        let view = read
+            .view(crate::compact_index::EntryId(candidate.ordinal))
+            .expect("valid compact reference");
+        let name_folded = crate::cjk::fold_cow(view.name);
+        let kw_refs: Vec<(&str, &str)> = prepared_kws[plan_idx]
+            .iter()
+            .map(|(raw, lower)| (*raw, lower.as_str()))
+            .collect();
+        let match_positions = find_positions(view.name, name_folded.as_ref(), &kw_refs);
+        let parent = if view.raw_path().is_some() {
+            read.record_parent(&records[candidate.ordinal])
+        } else {
+            view.parent
+        };
+        let parent_match_positions =
+            compute_parent_match_positions(parent, &plan.parent_terms);
+
+        results.push(AdvancedSearchResult {
+            entry: view.materialize(),
+            score: candidate.score.to_f64(),
+            match_positions,
+            parent_match_positions,
+            search_mode: SearchMode::Substring,
+        });
+    }
 }
 
 struct PreparedDisjunctionClause<'a> {
+    clause_idx: usize,
     is_extension: bool,
     extension: Option<&'a str>,
-    ext_id: Option<u32>,
+    ext_matcher: Option<ExtMatcher>,
     ext_ascii: bool,
     keywords: Vec<String>,
+    raw_keywords: Vec<String>,
     all_ascii: bool,
     case_sensitive: bool,
+    targets_hidden: bool,
     required_sig: NameSignature,
     kw_prepared: Vec<(&'a str, String)>,
 }
 
-/// 并集检索执行引擎：支持带管道符多子句的单趟签名位运算预筛与极值打分遍历。
-///
-/// 算法核心机制：
-/// 1. 单趟 128 位超集签名预筛：多子句签名求或（Any），零堆分配短路快速跳过无关名字；
-/// 2. 候选极值打分：对每个唯一名合并计算最佳匹配分数，一旦出现 Exact 得分即提前终止子句比对；
-/// 3. 分数梯度堆顶动态置换：严禁在外层名字遍历中依据堆满状态早退，确保低字典序的高分记录顺利置换低分项；
-/// 4. 扩展名类型守卫：纯扩展名匹配子句在展开 CSR 条目时严格校验非目录属性与扩展名池编号；
-/// 5. 命中子句高亮隔离：仅对实际产生匹配判定的子句提取高亮字符区间，杜绝未命中词元误高亮，并执行 UTF-8 字符边界对齐。
+/// 并集检索执行引擎：支持带管道符多子句的单趟签名位运算预筛、上界剪枝与双层复合打分。
 pub fn search_disjunction(
     read: &CompactIndex,
     query: &DisjunctionQuery,
     filter: &CompiledRecordFilter,
+    max_results: usize,
+    explicit_lock: bool,
+) -> Vec<AdvancedSearchResult> {
+    search_disjunction_with_filters(read, query, filter, None, max_results, explicit_lock)
+}
+
+/// 支持按子句独立作用域编译过滤器的并集检索引擎（如 `foo !a | bar !b` 各子句独立过滤与高亮隔离）。
+///
+/// 算法核心机制：
+/// 1. 单趟 128 位超集签名预筛：多子句签名求或（Any），零堆分配短路快速跳过无关名字；
+/// 2. 桶级子句匹配收集与上界剪枝：先行以桶上界淘汰必然落败的名字桶；
+/// 3. 双层记录扩展与子句过滤器隔离：仅由通过各自子句过滤器的分支参与计分；
+/// 4. 命中子句高亮隔离：仅对通过自身过滤器且实际命中该记录的子句提取高亮字符区间。
+pub fn search_disjunction_with_filters(
+    read: &CompactIndex,
+    query: &DisjunctionQuery,
+    filter: &CompiledRecordFilter,
+    clause_filters: Option<&[CompiledRecordFilter]>,
     max_results: usize,
     explicit_lock: bool,
 ) -> Vec<AdvancedSearchResult> {
@@ -210,39 +656,39 @@ pub fn search_disjunction(
     }
 
     let mut prepared_clauses = Vec::with_capacity(query.clauses.len());
-    for clause in &query.clauses {
+    for (clause_idx, clause) in query.clauses.iter().enumerate() {
         let is_extension = clause.extension.is_some();
         if clause.keywords.is_empty() && !is_extension {
             continue;
         }
 
         let case_sensitive = clause.is_case_sensitive;
-
         let ext_str = clause.extension.as_deref();
-        let ext_id = ext_str.and_then(|ext| read.extension_id(ext));
-        let ext_ascii = ext_str.map_or(true, |ext| ext.is_ascii());
+        let ext_matcher = ext_str.and_then(|ext| ExtMatcher::compile(read, ext));
+        let ext_ascii = ext_str.is_none_or(|ext| ext.is_ascii());
 
-        let keywords: Vec<String> = if case_sensitive {
-            clause.keywords.clone()
-        } else {
-            clause.keywords.iter().map(|k| k.to_lowercase()).collect()
-        };
+        let keywords = clause.keywords.clone();
+        let raw_keywords = clause.raw_keywords.clone();
         let all_ascii = keywords.iter().all(|k| k.is_ascii());
+        let targets_hidden = keywords_target_hidden(is_extension, &keywords);
 
         let kw_prepared: Vec<(&str, String)> = clause
             .keywords
             .iter()
-            .map(|k| (k.as_str(), k.to_lowercase()))
+            .map(|k| (k.as_str(), crate::cjk::fold_str(k)))
             .collect();
 
         prepared_clauses.push(PreparedDisjunctionClause {
+            clause_idx,
             is_extension,
             extension: ext_str,
-            ext_id,
+            ext_matcher,
             ext_ascii,
             keywords,
+            raw_keywords,
             all_ascii,
             case_sensitive,
+            targets_hidden,
             required_sig: clause.required_sig,
             kw_prepared,
         });
@@ -254,6 +700,10 @@ pub fn search_disjunction(
 
     let sorted = read.sorted_names();
     let mut top = super::top_k::TopK::new(max_results);
+    let rank_ctx = RecordRankContext::default();
+    let records = read.records();
+    let mut matched_clauses: Vec<(usize, Option<BaseNameScore>, Option<&ExtMatcher>)> =
+        Vec::with_capacity(prepared_clauses.len());
 
     for &name_id in &sorted.ids {
         // 1. 单趟 128 位超集签名位运算预筛
@@ -262,7 +712,7 @@ pub fn search_disjunction(
                 if c.keywords.is_empty() && !c.is_extension {
                     return false;
                 }
-                if c.is_extension && c.ext_id.is_none() {
+                if c.is_extension && c.ext_matcher.is_none() {
                     return false;
                 }
                 sig.contains(c.required_sig)
@@ -272,71 +722,103 @@ pub fn search_disjunction(
             }
         }
 
+        let entries = read.entries_for_name(name_id);
+        if entries.is_empty() {
+            continue;
+        }
         let Some((name, folded)) = read.name_entry(name_id) else {
             continue;
         };
 
-        // 2. 多子句极值打分与短路
-        let mut best_keyword_score: Option<MatchScore> = None;
-        let mut matched_ext_id: Option<u32> = None;
-
-        for clause in &prepared_clauses {
+        // 2. 收集命中当前名字的子句及其基分
+        matched_clauses.clear();
+        for (prep_idx, clause) in prepared_clauses.iter().enumerate() {
             if clause.is_extension {
-                if matched_ext_id.is_none() {
-                    if let (Some(ext), Some(ext_id)) = (clause.extension, clause.ext_id) {
-                        if extension_matches(name, folded, ext, clause.ext_ascii) {
-                            matched_ext_id = Some(ext_id);
-                        }
+                if let (Some(ext), Some(ref matcher)) = (clause.extension, &clause.ext_matcher) {
+                    if extension_matches(name, folded, ext, clause.ext_ascii) {
+                        matched_clauses.push((prep_idx, None, Some(matcher)));
                     }
                 }
-            } else {
-                if best_keyword_score == Some(MatchScore::Exact) {
-                    continue;
-                }
-                if let Some(score) = score_match_zero_alloc(
-                    name,
-                    folded,
-                    &clause.keywords,
-                    clause.all_ascii,
-                    clause.case_sensitive,
-                    explicit_lock,
-                ) {
-                    if best_keyword_score.map_or(true, |b| score > b) {
-                        best_keyword_score = Some(score);
-                    }
-                    if score == MatchScore::Exact {
-                        break;
-                    }
-                }
+            } else if let Some(base) = score_name_rank(
+                name,
+                folded,
+                &clause.keywords,
+                &clause.raw_keywords,
+                clause.all_ascii,
+                clause.case_sensitive,
+                explicit_lock,
+            ) {
+                matched_clauses.push((prep_idx, Some(base), None));
             }
         }
 
-        if matched_ext_id.is_none() && best_keyword_score.is_none() {
+        if matched_clauses.is_empty() {
             continue;
         }
 
-        // 3. CSR 条目展开与记录级守卫
-        // 严禁依据 top.is_full() 中断外层名字循环，确保分数梯度能正确置换堆顶
-        for &ordinal in read.entries_for_name(name_id) {
-            let Some(record) = read.records().get(ordinal as usize) else {
-                continue;
-            };
-
-            let score = if !record.is_dir
-                && matched_ext_id.is_some()
-                && Some(record.extension) == matched_ext_id
-            {
-                MatchScore::Exact
-            } else if let Some(kw_score) = best_keyword_score {
-                kw_score
-            } else {
-                continue;
-            };
-
-            if !filter.matches_record(record, || Some(name)) {
+        let ext_base = matched_clauses
+            .iter()
+            .any(|(_, _, ext_opt)| ext_opt.is_some())
+            .then(|| BaseNameScore::for_exact_fast_path(name));
+        let mut bucket_upper: Option<RankScore> = None;
+        for &(prep_idx, base_opt, ext_opt) in &matched_clauses {
+            let c = &prepared_clauses[prep_idx];
+            let cf = clause_filters
+                .and_then(|fs| fs.get(c.clause_idx))
+                .unwrap_or(filter);
+            if ext_opt.is_some() {
+                if let Some(base) = ext_base {
+                    let ub = base.upper_bound(&rank_ctx, false, false);
+                    bucket_upper = Some(bucket_upper.map_or(ub, |cur| cur.max(ub)));
+                }
+            }
+            if let Some(base) = base_opt {
+                let ub = base.upper_bound(&rank_ctx, cf.allow_dirs(), c.targets_hidden);
+                bucket_upper = Some(bucket_upper.map_or(ub, |cur| cur.max(ub)));
+            }
+        }
+        if let (Some(upper), Some(worst)) = (bucket_upper, top.worst()) {
+            if upper < worst.score || (upper == worst.score && name > worst.name()) {
                 continue;
             }
-            top.offer(ordinal as usize, score, name);
+        }
+
+        // 3. CSR 条目展开与分句独立记录级守卫
+        let (head, tail) = bucket_slices(entries);
+        for &ordinal in head.iter().chain(tail.iter()) {
+            let Some(record) = records.get(ordinal as usize) else {
+                continue;
+            };
+
+            let parent = read.record_parent(record);
+            let mut best_record_score: Option<RankScore> = None;
+
+            for &(prep_idx, base_opt, ext_opt) in &matched_clauses {
+                let c = &prepared_clauses[prep_idx];
+                let cf = clause_filters
+                    .and_then(|fs| fs.get(c.clause_idx))
+                    .unwrap_or(filter);
+                if !cf.is_passthrough() && !cf.matches_record_in(read, record, Some(name)) {
+                    continue;
+                }
+
+                if let Some(matcher) = ext_opt {
+                    if !record.is_dir && matcher.matches(record.extension) {
+                        if let Some(base) = ext_base {
+                            let s = score_record(base, false, parent, &rank_ctx, false);
+                            best_record_score = Some(best_record_score.map_or(s, |cur| cur.max(s)));
+                        }
+                    }
+                }
+                if let Some(base) = base_opt {
+                    let s = score_record(base, record.is_dir, parent, &rank_ctx, c.targets_hidden);
+                    best_record_score = Some(best_record_score.map_or(s, |cur| cur.max(s)));
+                }
+            }
+
+            if let Some(score) = best_record_score {
+                top.offer(ordinal as usize, score, name);
+            }
         }
     }
 
@@ -349,7 +831,7 @@ pub fn search_disjunction(
             continue;
         };
         let name = view.name;
-        let name_lower = name.to_lowercase();
+        let name_folded = crate::cjk::fold_cow(name);
         let record = &read.records()[candidate.ordinal];
         let folded = read.name_entry(record.name).and_then(|(_, f)| f);
 
@@ -358,10 +840,17 @@ pub fn search_disjunction(
             if clause.is_extension || clause.keywords.is_empty() {
                 continue;
             }
-            let matched = score_match_zero_alloc(
+            let cf = clause_filters
+                .and_then(|fs| fs.get(clause.clause_idx))
+                .unwrap_or(filter);
+            if !cf.is_passthrough() && !cf.matches_record_in(read, record, Some(name)) {
+                continue;
+            }
+            let matched = score_name_rank(
                 name,
                 folded,
                 &clause.keywords,
+                &clause.raw_keywords,
                 clause.all_ascii,
                 clause.case_sensitive,
                 explicit_lock,
@@ -374,7 +863,7 @@ pub fn search_disjunction(
                     .iter()
                     .map(|(raw, lower)| (*raw, lower.as_str()))
                     .collect();
-                let spans = find_positions(name, &name_lower, &kw_refs);
+                let spans = find_positions(name, name_folded.as_ref(), &kw_refs);
                 all_spans.extend(spans);
             }
         }
@@ -389,7 +878,7 @@ pub fn search_disjunction(
 
         results.push(AdvancedSearchResult {
             entry: view.materialize(),
-            score: score_to_f64(candidate.score),
+            score: candidate.score.to_f64(),
             match_positions,
             parent_match_positions: Vec::new(),
             search_mode: SearchMode::Substring,
@@ -481,10 +970,10 @@ mod tests {
         let filter = CompiledRecordFilter::default();
         let results = search(&store, "main", &filter, 500);
         assert_eq!(results.len(), 2);
-        // Prefix should score higher than substring
+        // Prefix（`main.rs`）严格高于 WordBoundary（`my_main.rs`）
         assert!(results[0].score > results[1].score);
-        assert_eq!(results[0].score, 0.75); // prefix
-        assert_eq!(results[1].score, 0.5); // substring
+        assert!(results[0].score > 0.8);
+        assert!(results[1].score > 0.65 && results[1].score < results[0].score);
     }
 
     #[test]
@@ -537,7 +1026,7 @@ mod tests {
             .into_iter()
             .map(|r| r.entry.name)
             .collect();
-        assert_eq!(bare_dot_names, ["Makefile", "foo.", "noext"]);
+        assert_eq!(bare_dot_names, ["foo.", "noext", "Makefile"]);
 
         let rs_names: Vec<_> = search(&store, ".rs", &filter, 500)
             .into_iter()

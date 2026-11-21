@@ -61,7 +61,9 @@
 "prefs.excludePatterns.editor.confirm" = "保存";
 "prefs.excludePatterns.editor.cancel" = "取消";
 "prefs.includeHidden" = "索引隐藏文件";
-"prefs.includeHidden.description" = "包含以点开头的文件和目录，例如 `.ssh`、`.config`。";
+"prefs.includeHidden.description" = "包含以点开头的文件和目录，例如 .config、.zshrc。";
+"prefs.excludeSensitive" = "保护凭据目录";
+"prefs.excludeSensitive.description" = "开启隐藏文件索引时，仍排除 .ssh、.gnupg、.aws、.kube 等凭据目录。";
 "prefs.networkRescan" = "网络卷重扫间隔";
 "prefs.networkRescan.description" = "网络共享等非本地卷上的远端改动无法实时感知，按此间隔整体重扫这些索引目录。";
 "prefs.networkRescan.minutes" = "%d 分钟";
@@ -121,6 +123,12 @@
 "search.indexReady" = "索引已就绪";
 "search.empty.title" = "未找到匹配项";
 "search.empty.subtitle" = "请检查拼写、尝试使用模糊匹配模式，或按 ⌥F 调整过滤条件";
+"search.empty.excluded.title" = "此位置未被索引";
+"search.empty.excluded.subtitle" = "当前搜索路径命中了索引排除规则，暂时无法搜索此位置的文件。";
+"search.empty.excluded.tag" = "排除规则";
+"search.empty.manageRules" = "管理索引规则";
+"search.empty.indexing.title" = "正在建立索引";
+"search.empty.indexing.subtitle" = "索引尚未完成，部分文件暂时无法搜索，请稍候。";
 "search.toolbar.pin" = "置顶视窗";
 "search.caseSensitivity.auto" = "大小写敏感: 自动";
 "search.caseSensitivity.autoActive" = "大小写敏感: 自动 (检测到大写)";
@@ -187,6 +195,9 @@
 /* Preferences - About & Group Titles */
 "prefs.tab.about" = "关于";
 "prefs.index.group.paths" = "索引路径";
+"prefs.index.applications" = "索引应用程序";
+"prefs.index.applications.description" = "加入 /Applications 与系统应用目录；应用包内部不会被索引。";
+"prefs.index.applications.conflict" = "开关已打开，但相关目录被排除路径或排除名单挡住，当前不会生效。";
 "prefs.index.group.excludes" = "排除规则";
 "prefs.index.group.excludePaths" = "排除路径";
 "prefs.index.group.excludePaths.description" = "跳过匹配前缀的整个目录树，避免遍历巨型系统或缓存文件夹。";

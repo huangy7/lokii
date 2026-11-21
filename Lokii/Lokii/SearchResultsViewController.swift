@@ -478,10 +478,65 @@ final class SearchResultsViewController: NSViewController {
     var activeContextMenuPayload: [URL]?
 
     // MARK: - Empty State View
-    var hasActiveSearchQuery: Bool = false
-    let emptyStateContainer = NSView()
+    enum EmptyState: Equatable {
+        case noMatches
+        case excluded(rule: String)
+        case indexing
+    }
+
+    var emptyState: EmptyState = .noMatches {
+        didSet {
+            if oldValue != emptyState { renderEmptyState() }
+        }
+    }
+    var onManageIndexRules: (() -> Void)?
+    let emptyStateContainer = NSStackView()
     let emptyIconImageView = NSImageView()
     let emptyTitleLabel = NSTextField(labelWithString: "")
+    let emptySubtitleLabel = NSTextField(wrappingLabelWithString: "")
+    let emptyRuleRow = NSStackView()
+    private let emptyRuleTagLabel = NSTextField(labelWithString: "")
+    let emptyRuleNameLabel = NSTextField(labelWithString: "")
+    private let emptyManageRulesButton = NSButton()
+
+    private static let searchSymbolImage = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 38, weight: .light))
+    private static let indexingSymbolImage = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 38, weight: .light))
+
+    /// 首次结果集是否已写入；建库完成到默认列表返回之间结果仍为空，此时不能把空态当成「未找到匹配项」闪出来
+    private var hasAppliedResults = false
+
+    private func renderEmptyState() {
+        emptyStateContainer.isHidden = !results.isEmpty || (emptyState == .noMatches && !hasAppliedResults)
+        guard results.isEmpty else { return }
+
+        let isExcluded: Bool
+        switch emptyState {
+        case .noMatches:
+            emptyTitleLabel.stringValue = L("search.empty.title")
+            emptySubtitleLabel.stringValue = L("search.empty.subtitle")
+            emptyIconImageView.image = Self.searchSymbolImage
+            isExcluded = false
+        case .excluded(let rule):
+            emptyTitleLabel.stringValue = L("search.empty.excluded.title")
+            emptySubtitleLabel.stringValue = L("search.empty.excluded.subtitle")
+            emptyRuleNameLabel.stringValue = rule
+            emptyIconImageView.image = Self.searchSymbolImage
+            isExcluded = true
+        case .indexing:
+            emptyTitleLabel.stringValue = L("search.empty.indexing.title")
+            emptySubtitleLabel.stringValue = L("search.empty.indexing.subtitle")
+            emptyIconImageView.image = Self.indexingSymbolImage
+            isExcluded = false
+        }
+
+        emptyRuleTagLabel.stringValue = "\(L("search.empty.excluded.tag")): "
+        emptyManageRulesButton.title = L("search.empty.manageRules")
+        emptyManageRulesButton.setAccessibilityLabel(L("search.empty.manageRules"))
+        emptyRuleRow.isHidden = !isExcluded
+        emptyManageRulesButton.isHidden = !isExcluded
+    }
 
     /// 主检索列表右键上下文菜单代理：成对维护 NSApp.servicesMenu 状态机
     private let tableMenuDelegate = BreadcrumbMenuDelegate()
@@ -543,27 +598,7 @@ final class SearchResultsViewController: NSViewController {
 
         setupBottomBar()
 
-        emptyStateContainer.translatesAutoresizingMaskIntoConstraints = false
-        emptyStateContainer.isHidden = true
-        containerView.addSubview(emptyStateContainer)
-
-        emptyIconImageView.translatesAutoresizingMaskIntoConstraints = false
-        let iconConfig = NSImage.SymbolConfiguration(pointSize: 36, weight: .light)
-        emptyIconImageView.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
-            .withSymbolConfiguration(iconConfig)
-        emptyIconImageView.contentTintColor = .tertiaryLabelColor
-        emptyStateContainer.addSubview(emptyIconImageView)
-
-        emptyTitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        emptyTitleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
-        emptyTitleLabel.textColor = .secondaryLabelColor
-        emptyTitleLabel.alignment = .center
-        emptyTitleLabel.isEditable = false
-        emptyTitleLabel.isSelectable = false
-        emptyTitleLabel.drawsBackground = false
-        emptyTitleLabel.isBezeled = false
-        emptyTitleLabel.stringValue = L("search.empty.title")
-        emptyStateContainer.addSubview(emptyTitleLabel)
+        setupEmptyState(in: containerView)
 
         NSLayoutConstraint.activate([
             // 顶端锚定至安全区布局辅助线，使表头与滚动视口始终对齐至窗口工具栏底缘，
@@ -585,19 +620,75 @@ final class SearchResultsViewController: NSViewController {
             emptyStateContainer.centerXAnchor.constraint(equalTo: tableScrollView.centerXAnchor),
             emptyStateContainer.centerYAnchor.constraint(equalTo: tableScrollView.centerYAnchor, constant: -16),
             emptyStateContainer.widthAnchor.constraint(lessThanOrEqualTo: tableScrollView.widthAnchor, constant: -48),
-
-            emptyIconImageView.topAnchor.constraint(equalTo: emptyStateContainer.topAnchor),
-            emptyIconImageView.centerXAnchor.constraint(equalTo: emptyStateContainer.centerXAnchor),
-            emptyIconImageView.widthAnchor.constraint(equalToConstant: 40),
-            emptyIconImageView.heightAnchor.constraint(equalToConstant: 40),
-
-            emptyTitleLabel.topAnchor.constraint(equalTo: emptyIconImageView.bottomAnchor, constant: 12),
-            emptyTitleLabel.leadingAnchor.constraint(equalTo: emptyStateContainer.leadingAnchor),
-            emptyTitleLabel.trailingAnchor.constraint(equalTo: emptyStateContainer.trailingAnchor),
-            emptyTitleLabel.bottomAnchor.constraint(equalTo: emptyStateContainer.bottomAnchor),
         ])
 
         self.view = containerView
+    }
+
+    private func setupEmptyState(in containerView: NSView) {
+        emptyStateContainer.translatesAutoresizingMaskIntoConstraints = false
+        emptyStateContainer.orientation = .vertical
+        emptyStateContainer.alignment = .centerX
+        emptyStateContainer.spacing = 10
+        containerView.addSubview(emptyStateContainer)
+
+        emptyIconImageView.contentTintColor = .tertiaryLabelColor
+        emptyTitleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        emptyTitleLabel.textColor = .labelColor
+        emptyTitleLabel.alignment = .center
+        emptySubtitleLabel.font = .systemFont(ofSize: 13)
+        emptySubtitleLabel.textColor = .secondaryLabelColor
+        emptySubtitleLabel.alignment = .center
+        emptySubtitleLabel.maximumNumberOfLines = 3
+
+        emptyRuleRow.orientation = .horizontal
+        emptyRuleRow.alignment = .centerY
+        emptyRuleRow.spacing = 4
+
+        emptyRuleTagLabel.font = .systemFont(ofSize: 12)
+        emptyRuleTagLabel.textColor = .secondaryLabelColor
+        emptyRuleTagLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        emptyRuleNameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        emptyRuleNameLabel.textColor = .labelColor
+        emptyRuleNameLabel.lineBreakMode = .byTruncatingMiddle
+        emptyRuleNameLabel.maximumNumberOfLines = 1
+
+        emptyRuleRow.addArrangedSubview(emptyRuleTagLabel)
+        emptyRuleRow.addArrangedSubview(emptyRuleNameLabel)
+
+        emptyManageRulesButton.bezelStyle = .rounded
+        emptyManageRulesButton.controlSize = .regular
+        emptyManageRulesButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        emptyManageRulesButton.imagePosition = .imageLeading
+        emptyManageRulesButton.contentTintColor = .secondaryLabelColor
+        emptyManageRulesButton.target = self
+        emptyManageRulesButton.action = #selector(manageIndexRulesClicked)
+
+        for element in [emptyIconImageView, emptyTitleLabel, emptySubtitleLabel, emptyRuleRow, emptyManageRulesButton] {
+            element.translatesAutoresizingMaskIntoConstraints = false
+            emptyStateContainer.addArrangedSubview(element)
+        }
+        emptyStateContainer.setCustomSpacing(8, after: emptyTitleLabel)
+        emptyStateContainer.setCustomSpacing(8, after: emptySubtitleLabel)
+        emptyStateContainer.setCustomSpacing(16, after: emptyRuleRow)
+
+        let preferredWidth = emptyStateContainer.widthAnchor.constraint(equalToConstant: 440)
+        preferredWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            preferredWidth,
+            emptyIconImageView.widthAnchor.constraint(equalToConstant: 44),
+            emptyIconImageView.heightAnchor.constraint(equalToConstant: 44),
+            emptyTitleLabel.widthAnchor.constraint(equalTo: emptyStateContainer.widthAnchor),
+            emptySubtitleLabel.widthAnchor.constraint(equalTo: emptyStateContainer.widthAnchor),
+            emptyRuleNameLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
+        ])
+        renderEmptyState()
+    }
+
+    @objc private func manageIndexRulesClicked() {
+        onManageIndexRules?()
     }
 
     private func setupBottomBar() {
@@ -827,6 +918,7 @@ final class SearchResultsViewController: NSViewController {
         qlItem.keyEquivalentModifierMask = []
         let revealItem = menu.addLocalizedItem("search.ctx.revealInFinder", action: #selector(revealSelected), keyEquivalent: "r")
         revealItem.keyEquivalentModifierMask = [.command]
+        menu.addLocalizedItem("search.ctx.filterByDirectory", action: #selector(filterByDirectorySelected), keyEquivalent: "")
         menu.addLocalizedItem("search.ctx.openInTerminal", action: #selector(openInTerminalSelected), keyEquivalent: "")
         menu.addLocalizedItem("search.ctx.getInfo", action: #selector(showInfoSelected), keyEquivalent: "i")
         menu.addItem(NSMenuItem.separator())
@@ -877,6 +969,7 @@ final class SearchResultsViewController: NSViewController {
     func displayResults(_ results: [FfiSearchResult], preserveSelection: Bool) {
         let previousPath = preserveSelection ? selectedResult?.path : nil
         self.results = results
+        hasAppliedResults = true
         // 图标按路径稳定复用，跨检索保留；展示串缓存随结果集更替释放，避免无限增长
         dateTextCache.removeAll()
         sizeTextCache.removeAll()
@@ -896,7 +989,7 @@ final class SearchResultsViewController: NSViewController {
         } else {
             tableView.deselectAll(nil)
         }
-        emptyStateContainer.isHidden = !(results.isEmpty && hasActiveSearchQuery)
+        renderEmptyState()
         notifySelectionChanged()
     }
 
@@ -1067,7 +1160,7 @@ final class SearchResultsViewController: NSViewController {
             statusLabel.stringValue = L("search.backgroundRefresh")
             statusFeedbackCapsule.label.stringValue = L("search.backgroundRefresh")
         }
-        emptyTitleLabel.stringValue = L("search.empty.title")
+        renderEmptyState()
         updateFDAButtonContent()
     }
 
@@ -1316,6 +1409,30 @@ final class SearchResultsViewController: NSViewController {
             config.activates = true
             NSWorkspace.shared.open(urls, withApplicationAt: appURL, configuration: config, completionHandler: nil)
         }
+    }
+
+    @objc func filterByDirectorySelected(_ sender: Any? = nil) {
+        guard selectedResults.count == 1,
+              let item = selectedResults.first,
+              let targetDir = scopeFilterDirectory(for: item) else {
+            return
+        }
+        delegate?.searchResultsDidConsumeResult()
+        delegate?.searchResultsDidRequestScopeFilter(path: targetDir)
+    }
+
+    private func scopeFilterDirectory(for result: FfiSearchResult) -> String? {
+        var path = result.path
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
+        }
+        guard !path.isEmpty else { return nil }
+        if result.isDir {
+            return path
+        }
+        guard path != "/" else { return nil }
+        let parent = (path as NSString).deletingLastPathComponent
+        return parent.isEmpty ? nil : parent
     }
 
     @objc func excludeDirectorySelected(_ sender: Any? = nil) {
@@ -1802,6 +1919,9 @@ extension SearchResultsViewController: NSMenuItemValidation {
              #selector(chooseOtherAppToOpen(_:)),
              #selector(excludeDirectorySelected(_:)):
             return !contextualURLs.isEmpty
+        case #selector(filterByDirectorySelected):
+            guard selectedResults.count == 1, let item = selectedResults.first else { return false }
+            return scopeFilterDirectory(for: item) != nil
         case #selector(breadcrumbRevealInFinder(_:)),
              #selector(breadcrumbOpenItem(_:)),
              #selector(breadcrumbOpenInTerminal(_:)),

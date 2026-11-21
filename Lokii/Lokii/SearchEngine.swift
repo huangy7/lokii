@@ -34,33 +34,45 @@ struct LokiiConfig: Codable {
 
     struct IndexConfig: Codable {
         var indexPaths: [String]
+        var indexApps: Bool
         var exclude: [String]
         var excludePaths: [String]
         var includeHidden: Bool
+        var excludeSensitive: Bool
+        var sensitiveNames: [String]
         var maxResults: Int
         var networkRescanMinutes: Int
 
         enum CodingKeys: String, CodingKey {
             case indexPaths = "index_paths"
+            case indexApps = "index_apps"
             case exclude
             case excludePaths = "exclude_paths"
             case includeHidden = "include_hidden"
+            case excludeSensitive = "exclude_sensitive"
+            case sensitiveNames = "sensitive_names"
             case maxResults = "max_results"
             case networkRescanMinutes = "network_rescan_minutes"
         }
 
         init(
             indexPaths: [String] = [],
+            indexApps: Bool = false,
             exclude: [String] = [],
             excludePaths: [String] = [],
-            includeHidden: Bool = false,
+            includeHidden: Bool = true,
+            excludeSensitive: Bool = true,
+            sensitiveNames: [String] = [],
             maxResults: Int = 1000,
             networkRescanMinutes: Int = 5
         ) {
             self.indexPaths = indexPaths
+            self.indexApps = indexApps
             self.exclude = exclude
             self.excludePaths = excludePaths
             self.includeHidden = includeHidden
+            self.excludeSensitive = excludeSensitive
+            self.sensitiveNames = sensitiveNames
             self.maxResults = maxResults
             self.networkRescanMinutes = networkRescanMinutes
         }
@@ -68,9 +80,12 @@ struct LokiiConfig: Codable {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.indexPaths = try container.decodeIfPresent([String].self, forKey: .indexPaths) ?? []
+            self.indexApps = try container.decodeIfPresent(Bool.self, forKey: .indexApps) ?? false
             self.exclude = try container.decodeIfPresent([String].self, forKey: .exclude) ?? []
             self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? []
-            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? false
+            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? true
+            self.excludeSensitive = try container.decodeIfPresent(Bool.self, forKey: .excludeSensitive) ?? true
+            self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? []
             self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? 1000
             self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? 5
         }

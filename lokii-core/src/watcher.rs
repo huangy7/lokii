@@ -1,5 +1,5 @@
 use crate::config::{AppConfig, ConfigStore};
-use crate::filter::CompiledFilter;
+use crate::filter::{CompiledFilter, ScopeDecision};
 use crate::indexer::{FileEntry, IndexStore};
 use crate::metrics::WatcherMetrics;
 use crate::permissions::has_full_disk_access;
@@ -81,13 +81,26 @@ fn apply_batch(
     filter: &CompiledFilter,
     include_hidden: bool,
 ) -> Result<(usize, usize), crate::compact_index::IndexError> {
-    let excluded_renames: Vec<_> = renames
-        .iter()
-        .filter(|(_, new)| {
-            filter.is_excluded(Path::new(new)) || (!include_hidden && is_hidden(Path::new(new)))
-        })
-        .map(|(_, new)| new.clone())
-        .collect();
+    let mut excluded_renames = Vec::new();
+    let mut shallow_rename_entries = Vec::new();
+    let mut shallow_remove_roots = Vec::new();
+    for (_, new) in &renames {
+        let new_path = Path::new(new);
+        let new_is_dir = std::fs::metadata(new_path).map(|m| m.is_dir()).unwrap_or(true);
+        match filter.evaluate_with_hidden(new_path, new_is_dir, include_hidden) {
+            ScopeDecision::HardDrop => excluded_renames.push(new.clone()),
+            ScopeDecision::IndexShallowContainer => {
+                // 改名落入浅层容器时保留容器目录自身并清退原目录下所有子孙条目
+                if let Some(entry) = file_entry_from_path(new_path) {
+                    shallow_remove_roots.push(new.clone());
+                    shallow_rename_entries.push(entry);
+                } else {
+                    excluded_renames.push(new.clone());
+                }
+            }
+            ScopeDecision::IndexNormally => {}
+        }
+    }
     for (old, new) in &renames {
         batch.removes.retain(|path| path.to_string_lossy() != *old);
         batch.creates.retain(|path| path.to_string_lossy() != *new);
@@ -95,23 +108,41 @@ fn apply_batch(
             .dir_creates
             .retain(|path| path.to_string_lossy() != *new);
     }
-    // DirtyQueue 会把新建目录的子项事件合并掉，目录内容只能在此处回扫补齐，
-    // 否则新建目录下的文件要等下一次全量对账才进入索引。
-    let dir_roots: Vec<PathBuf> = batch
-        .dir_creates
-        .iter()
-        .filter(|path| !filter.is_excluded(path))
-        .filter(|path| include_hidden || !is_hidden(path))
-        .cloned()
-        .collect();
+    // DirtyQueue 会把新建目录的子项事件合并掉，普通目录需回扫补齐；
+    // 浅层容器目录仅收录自身条目并清除残留子项，不触发子目录扫描。
+    let mut dir_roots = Vec::new();
+    let mut shallow_dir_paths = Vec::new();
+    for path in &batch.dir_creates {
+        match filter.evaluate_with_hidden(path, true, include_hidden) {
+            ScopeDecision::HardDrop => {}
+            ScopeDecision::IndexShallowContainer => shallow_dir_paths.push(path.clone()),
+            ScopeDecision::IndexNormally => dir_roots.push(path.clone()),
+        }
+    }
     let mut creates: Vec<_> = batch
         .creates
         .iter()
-        .filter(|path| !filter.is_excluded(path))
-        .filter(|path| include_hidden || !is_hidden(path))
         .filter(|path| !dir_roots.iter().any(|root| root == *path))
-        .filter_map(|path| file_entry_from_path(path))
+        .filter(|path| !shallow_dir_paths.iter().any(|root| root == *path))
+        .filter_map(|path| {
+            let entry = file_entry_from_path(path)?;
+            match filter.evaluate_with_hidden(path, entry.is_dir, include_hidden) {
+                ScopeDecision::HardDrop => None,
+                ScopeDecision::IndexShallowContainer => {
+                    shallow_remove_roots.push(path.to_string_lossy().into_owned());
+                    Some(entry)
+                }
+                ScopeDecision::IndexNormally => Some(entry),
+            }
+        })
         .collect();
+    creates.extend(shallow_rename_entries);
+    for path in &shallow_dir_paths {
+        if let Some(entry) = file_entry_from_path(path) {
+            shallow_remove_roots.push(path.to_string_lossy().into_owned());
+            creates.push(entry);
+        }
+    }
     if !dir_roots.is_empty() {
         creates.extend(scanner::scan_directories(
             &dir_roots,
@@ -120,12 +151,13 @@ fn apply_batch(
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ));
     }
-    // 回扫的目录整棵以扫描结果为准：先删旧子树再追加，目录改名后又被重建时不留旧子项。
+    // 回扫目录与浅层容器均先删旧子树再追加，避免改名重建或容器切入后遗留旧子项。
     let remove_roots: Vec<String> = batch
         .removes
         .iter()
         .chain(&dir_roots)
         .map(|path| path.to_string_lossy().into_owned())
+        .chain(shallow_remove_roots)
         .collect();
     store
         .write()
@@ -151,8 +183,9 @@ fn collect_safe_watch_paths(
         return;
     }
 
-    if filter.is_excluded(path) {
-        return;
+    match filter.evaluate(path, path.is_dir()) {
+        ScopeDecision::HardDrop | ScopeDecision::IndexShallowContainer => return,
+        ScopeDecision::IndexNormally => {}
     }
 
     // Check if this directory contains any protected or excluded descendants
@@ -422,27 +455,13 @@ impl Scope {
         }
     }
 
-    /// 事件是否该处理：先剔除排除与受保护路径，免得逐条 stat（受保护路径还会触发 TCC 弹窗）。
+    /// 事件是否该处理：先剔除受保护路径与策略硬丢弃项，免得逐条 stat（受保护路径还会触发 TCC 弹窗）。
     fn admits(&self, path: &Path) -> bool {
-        !self.filter.is_excluded(path)
-            && (self.has_fda || !scanner::is_protected_or_descendant(path, &self.protected))
-            && (self.include_hidden || !self.under_hidden_dir(path))
-    }
-
-    /// 路径在其索引根之下是否经过隐藏目录（扫描不会进入这些目录，事件也不该把其中文件加进来）。
-    fn under_hidden_dir(&self, path: &Path) -> bool {
-        let Some(root) = self
-            .scan_paths
-            .iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.as_os_str().len())
-        else {
-            return false;
-        };
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        relative
-            .parent()
-            .is_some_and(|dirs| dirs.components().any(|part| is_hidden(Path::new(part.as_os_str()))))
+        (self.has_fda || !scanner::is_protected_or_descendant(path, &self.protected))
+            && self
+                .filter
+                .evaluate_with_hidden(path, true, self.include_hidden)
+                != ScopeDecision::HardDrop
     }
 
     /// 新范围是否只是在旧范围上追加了排除路径（或失去 FDA）：索引就地剔除即可，无需重扫。
@@ -1704,7 +1723,18 @@ mod tests {
         config.index.include_hidden = false;
         let scope = Scope::new(&config);
         assert!(!scope.admits(&root.join(".cache/x.txt")));
+        assert!(!scope.admits(&root.join(".secret")));
+        assert!(!scope.admits(&root.join(".DS_Store")));
         assert!(scope.admits(&root.join("src/x.txt")));
+
+        config.index.include_hidden = true;
+        config.index.exclude = crate::config::IndexConfig::default().exclude;
+        let scope_hidden_on = Scope::new(&config);
+        assert!(!scope_hidden_on.admits(&root.join(".DS_Store")));
+        assert!(scope_hidden_on.admits(&root.join("._note.txt")));
+        assert!(scope_hidden_on.admits(&root.join(".zshrc")));
+        assert!(!scope_hidden_on.admits(&root.join("node_modules")));
+        assert!(!scope_hidden_on.admits(&root.join("node_modules/pkg/a.js")));
     }
 
     #[test]
@@ -2112,13 +2142,14 @@ mod tests {
 
     #[test]
     fn test_dir_rename_to_excluded_removes_children() {
-        // Rename dir to "node_modules" (excluded) — all children should be removed
+        // Rename dir to "node_modules" (excluded name) — old entries are removed and the new path is not indexed
         let tmp = TempDir::new().unwrap();
         let old_dir = tmp.path().join("mydir");
         let new_dir = tmp.path().join("node_modules");
         fs::create_dir(&new_dir).unwrap();
 
         let old_prefix = old_dir.to_string_lossy().to_string();
+        let new_prefix = new_dir.to_string_lossy().to_string();
 
         let store = IndexStore::new();
         store.add_entries(vec![
@@ -2127,14 +2158,46 @@ mod tests {
             make_entry("b.txt", &format!("{}/b.txt", old_prefix), false),
         ]);
 
-        let renames = vec![(old_prefix.clone(), new_dir.to_string_lossy().into_owned())];
+        let renames = vec![(old_prefix.clone(), new_prefix.clone())];
         apply_batch(EventBatch::default(), renames, &store, &dummy_filter(), true).unwrap();
 
-        assert_eq!(
-            store.len(),
-            0,
-            "All entries should be removed when renamed to excluded directory"
-        );
+        assert!(store.entries().is_empty());
+    }
+
+    #[test]
+    fn test_apply_batch_excluded_dir_create_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let nm = root.join("node_modules");
+        let nm_child = nm.join("pkg");
+        fs::create_dir_all(&nm_child).unwrap();
+        fs::write(nm_child.join("index.js"), "export {}").unwrap();
+        let noise = root.join(".DS_Store");
+        fs::write(&noise, "junk").unwrap();
+
+        let store = IndexStore::new();
+
+        let mut cfg = scoped_config(&root);
+        cfg.index.include_hidden = true;
+        cfg.index.exclude = crate::config::IndexConfig::default().exclude;
+        let filter = CompiledFilter::from_config(&cfg);
+
+        let batch = EventBatch {
+            creates: vec![noise],
+            removes: vec![],
+            dir_creates: vec![nm.clone()],
+        };
+        apply_batch(batch, Vec::new(), &store, &filter, true).unwrap();
+
+        assert!(store.entries().is_empty());
+
+        // collect_safe_watch_paths stops recursion on excluded directories when descending due to protected sibling
+        let protected_sibling = root.join("Documents");
+        fs::create_dir_all(&protected_sibling).unwrap();
+        let mut watch_out = Vec::new();
+        collect_safe_watch_paths(&root, &filter, std::slice::from_ref(&protected_sibling), &mut watch_out);
+        assert!(!watch_out.contains(&nm));
+        assert!(!watch_out.contains(&nm_child));
     }
 
     #[test]

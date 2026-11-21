@@ -117,11 +117,39 @@ pub struct EntryView<'a> {
 }
 
 impl<'a> EntryView<'a> {
+    /// 基于外部实时扫描到的元数据字段构造只读条目视图，供未索引目录兜底列举复用过滤器。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        name: &'a str,
+        parent: &'a str,
+        extension: &'a str,
+        is_dir: bool,
+        size: u64,
+        modified: u64,
+        created_at: u64,
+    ) -> Self {
+        Self {
+            name,
+            parent,
+            extension,
+            is_dir,
+            size,
+            modified,
+            created_at,
+            raw_path: None,
+        }
+    }
+
     fn path_key(&self) -> (&'a str, &'a str) {
         match self.raw_path {
             Some(raw) => split_path(raw),
             None => (self.parent, self.name),
         }
+    }
+
+    #[inline]
+    pub(crate) fn raw_path(&self) -> Option<&'a str> {
+        self.raw_path
     }
     pub fn path_into(&self, output: &mut String) {
         output.clear();
@@ -997,13 +1025,34 @@ impl CompactIndex {
         }
     }
 
+    /// 仅解析父目录字符串，池化记录直接查父目录池，避免冗余路径拼接或二次文件名查找。
+    #[inline]
+    pub fn record_parent(&self, record: &CompactRecord) -> &str {
+        if record.raw_path {
+            self.raw_paths
+                .get(record.path)
+                .map_or("", |p| split_path(p).0)
+        } else {
+            self.parents.get(record.path).unwrap_or("")
+        }
+    }
+
     pub(crate) fn extension(&self, id: u32) -> Option<&str> {
         self.extensions.get(id)
     }
 
     /// 查找扩展名在池中的槽位编号。
+    /// 纯 ASCII 走哈希槽直查；非 ASCII 若字面未命中，则按 Unicode NFC 与大小写折叠回退匹配（如 `.café` 命中 NFD 槽位）。
     pub fn extension_id(&self, ext: &str) -> Option<u32> {
-        self.extensions.find(ext)
+        if let Some(id) = self.extensions.find(ext) {
+            return Some(id);
+        }
+        if ext.is_ascii() {
+            return None;
+        }
+        let target = crate::cjk::fold_cow(ext);
+        self.extensions
+            .find_matching(|slot| !slot.is_ascii() && crate::cjk::fold_cow(slot) == target)
     }
 
     /// 评估扩展名池中的每个槽位是否满足谓词条件，产出与池容量等长的布尔位图。
@@ -1017,6 +1066,21 @@ impl CompactIndex {
         mapper: impl FnMut(&str) -> T,
     ) -> Vec<T> {
         self.parents.evaluate_ids(default, mapper)
+    }
+
+    /// 评估名字池中的每个槽位是否满足谓词条件，产出与名字池等长的布尔位图。
+    pub(crate) fn evaluate_name_mask(&self, predicate: impl FnMut(&str) -> bool) -> Vec<bool> {
+        self.names.matching_ids(predicate)
+    }
+
+    /// 评估父目录池中的每个槽位是否满足谓词条件，产出与父目录池等长的布尔位图。
+    pub(crate) fn evaluate_parent_mask(&self, predicate: impl FnMut(&str) -> bool) -> Vec<bool> {
+        self.parents.matching_ids(predicate)
+    }
+
+    /// 评估原始路径池中的每个槽位是否满足谓词条件，产出与原始路径池等长的布尔位图。
+    pub(crate) fn evaluate_raw_path_mask(&self, predicate: impl FnMut(&str) -> bool) -> Vec<bool> {
+        self.raw_paths.matching_ids(predicate)
     }
 
     pub fn materialize(&self, id: EntryId) -> Result<FileEntry, IndexError> {

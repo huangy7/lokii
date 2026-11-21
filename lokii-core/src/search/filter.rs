@@ -1,4 +1,28 @@
+use std::borrow::Cow;
+
 use crate::compact_index::{CompactIndex, CompactRecord, EntryView};
+
+/// 将用户或过滤规则中的扩展名规范化为 NFC 小写形态。
+/// 纯 ASCII 仅做 ASCII 小写化，非 ASCII 经 Unicode NFC 与大小写折叠消除 NFD/NFC 差异。
+#[inline]
+pub(crate) fn normalize_ext_filter(raw: &str) -> String {
+    let clean = raw.trim().trim_start_matches('.').trim();
+    if clean.is_ascii() {
+        clean.to_ascii_lowercase()
+    } else {
+        crate::cjk::fold_str(clean)
+    }
+}
+
+/// 判断索引扩展名（可能包含大写或 NFD 组合字符）是否与已折叠的目标扩展名等价。
+#[inline]
+pub(crate) fn ext_matches_folded(ext: &str, target_folded: &str) -> bool {
+    if target_folded.is_ascii() {
+        ext.eq_ignore_ascii_case(target_folded)
+    } else {
+        crate::cjk::fold_cow(ext) == target_folded
+    }
+}
 
 /// 文件分类枚举，用于在检索结果中按文件类型快速过滤。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -125,7 +149,7 @@ impl SizeFilter {
     }
 }
 
-/// 查询级过滤条件，包含预设文件类别、自定义扩展名与文件大小区间过滤。
+/// 查询级过滤条件，包含预设文件类别、自定义扩展名、文件大小区间与 `!exclude` 否定排除规则。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueryFilter {
     /// 目标文件类别，默认为 `FileType::All`（兼容单分类模式）。
@@ -142,6 +166,694 @@ pub struct QueryFilter {
     pub has_explicit_type_all: bool,
     /// 由独立 `.ext` 语法隐式推断出的候选扩展名与原始词元 (extension, raw_token)
     pub inferred_exts: Vec<(String, String)>,
+    /// 通过 `!term` / `!"phrase"` / `!.gitignore` 指定排除的文件名或路径子串词元。
+    pub exclude_terms: Vec<String>,
+    /// 通过 `!.ext` 指定排除的扩展名（不含前导点号，已归一化小写/折叠）。
+    pub exclude_exts: Vec<String>,
+    /// 通过 `!dir/` / `!src/test` / `!"my dir/"` 指定排除的路径分量或子路径（已剥离尾随 `/`）。
+    pub exclude_paths: Vec<String>,
+}
+
+impl QueryFilter {
+    /// 将内联过滤条件与外层传入条件合并（内联类别/扩展/大小覆盖外层默认值，否定条件取并集）。
+    pub fn merged_with(&self, caller: &QueryFilter) -> QueryFilter {
+        let effective_file_type =
+            if self.file_type != FileType::All || self.has_explicit_type_all {
+                self.file_type
+            } else {
+                caller.file_type
+            };
+
+        let effective_custom_ext = self
+            .custom_ext
+            .clone()
+            .or_else(|| caller.custom_ext.clone());
+
+        let effective_file_types = if !self.file_types.is_empty() || self.has_explicit_type_all {
+            self.file_types.clone()
+        } else if !caller.file_types.is_empty() {
+            caller.file_types.clone()
+        } else if effective_file_type != FileType::All {
+            vec![effective_file_type]
+        } else {
+            Vec::new()
+        };
+
+        let effective_custom_exts = if !self.custom_exts.is_empty() {
+            self.custom_exts.clone()
+        } else if !caller.custom_exts.is_empty() {
+            caller.custom_exts.clone()
+        } else if let Some(ext) = &effective_custom_ext {
+            vec![ext.clone()]
+        } else {
+            Vec::new()
+        };
+
+        let effective_size_filter = if !self.size_filter.is_unconstrained() {
+            self.size_filter
+        } else {
+            caller.size_filter
+        };
+
+        let mut exclude_terms = caller.exclude_terms.clone();
+        for t in &self.exclude_terms {
+            if !exclude_terms.contains(t) {
+                exclude_terms.push(t.clone());
+            }
+        }
+        let mut exclude_exts = caller.exclude_exts.clone();
+        for e in &self.exclude_exts {
+            if !exclude_exts.contains(e) {
+                exclude_exts.push(e.clone());
+            }
+        }
+        let mut exclude_paths = caller.exclude_paths.clone();
+        for p in &self.exclude_paths {
+            if !exclude_paths.contains(p) {
+                exclude_paths.push(p.clone());
+            }
+        }
+
+        QueryFilter {
+            file_type: effective_file_type,
+            custom_ext: effective_custom_ext,
+            file_types: effective_file_types,
+            custom_exts: effective_custom_exts,
+            size_filter: effective_size_filter,
+            has_explicit_type_all: self.has_explicit_type_all || caller.has_explicit_type_all,
+            inferred_exts: self.inferred_exts.clone(),
+            exclude_terms,
+            exclude_exts,
+            exclude_paths,
+        }
+    }
+}
+
+/// 词法状态机产出的结构化检索词元，保留引号保护与 `!` 否定状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryToken {
+    /// 剥离成对双引号及外部 `\"`/`\!`/`\|` 转义与前导 `!` 后的词元内容。
+    pub text: String,
+    /// 该词元整体是否由成对双引号包裹（如 `"hello world"` 或 `!"my dir/"`）。
+    pub quoted: bool,
+    /// 是否以未转义、未加引号的 `!` 开头。
+    pub negated: bool,
+    /// 原始输入片段（在推断 `.ext` 回退等场景中用于还原）。
+    pub raw: String,
+    /// 词元外部是否存在反斜杠转义（如 `\|`）。
+    pub had_escaped_meta: bool,
+    /// 词元是否经粘贴路径/URI/shell 转义清洗还原；为 true 时禁止再次推导为正则语法糖。
+    pub was_sanitized_pasted_path: bool,
+}
+
+/// 结构化词法与过滤解析结果，供下游搜索引擎直接使用词元边界与正负过滤条件。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedQuery {
+    /// 剥离过滤语法后保留的正向内容词元列表。
+    pub positive_tokens: Vec<QueryToken>,
+    /// 兼容字符串拼接表示（当词元包含空格时下游优先读取 `positive_tokens`）。
+    pub clean_query: String,
+    /// 解析提取出的内联正负过滤条件。
+    pub filter: QueryFilter,
+}
+
+/// 查找从 `after_open`（跳过开引号之后）开始的下一个未转义闭合 `"` 字节偏移。
+pub(crate) fn find_closing_quote(input: &str, after_open: usize) -> Option<usize> {
+    let mut backslashes = 0usize;
+    for (offset, ch) in input[after_open..].char_indices() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' && backslashes.is_multiple_of(2) {
+            return Some(after_open + offset);
+        } else {
+            backslashes = 0;
+        }
+    }
+    None
+}
+
+fn is_file_uri(s: &str) -> bool {
+    s.as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file://"))
+}
+
+/// 仅当内部明确以文件 URI、绝对 `/` 或 `~/` 开头，且不触发行内 `/.../` 正则语法糖时，
+/// 才允许剥离外部粘贴引号，避免破坏 `"foo/bar"`、`"hello world"` 与 `"/a\s+b/"` 等字面查询。
+fn has_pasted_path_signature(inner: &str) -> bool {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if is_file_uri(trimmed) || trimmed.starts_with("~/") {
+        return true;
+    }
+    if trimmed.starts_with('/') && trimmed.len() > 1 {
+        let no_trailing = trimmed.strip_suffix('/').unwrap_or(trimmed);
+        let multi_segment_without_backslash =
+            no_trailing[1..].contains('/') && !trimmed.contains('\\');
+        return super::regex_sugar::parse_regex_sugar(trimmed).is_none()
+            || multi_segment_without_backslash;
+    }
+    false
+}
+
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 仅在剥离 `file://` 后解码 `%XX` UTF-8 字节；非合法十六进制转义原样保留，非法 UTF-8 整体回退原文。
+fn percent_decode_utf8_or_verbatim(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) =
+                (decode_hex_nibble(bytes[idx + 1]), decode_hex_nibble(bytes[idx + 2]))
+            {
+                out.push((hi << 4) | lo);
+                idx += 3;
+                continue;
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    match std::str::from_utf8(&out) {
+        Ok(decoded) => Cow::Owned(decoded.to_string()),
+        Err(_) => Cow::Borrowed(s),
+    }
+}
+
+fn collapse_slashes_cow(s: &str) -> String {
+    if !s.contains("//") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut prev_slash = false;
+    for ch in s.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                out.push('/');
+            }
+            prev_slash = true;
+        } else {
+            out.push(ch);
+            prev_slash = false;
+        }
+    }
+    out
+}
+
+fn unescape_posix_shell_chars(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next_ch) = chars.peek() {
+                if matches!(next_ch, ' ' | '(' | ')' | '&' | '\'') {
+                    chars.next();
+                    out.push(next_ch);
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 清洗单个粘贴路径片段（解包路径特征外层引号、剥离 `file://` 与可选 `%XX` 解码、POSIX shell 转义还原）。
+pub fn sanitize_path_fragment(input: &str) -> String {
+    let mut curr = input.trim();
+    for _ in 0..2 {
+        let mut unwrapped = None;
+        for quote in ['"', '\''] {
+            if let Some(inner) = curr
+                .strip_prefix(quote)
+                .and_then(|rest| rest.strip_suffix(quote))
+            {
+                if has_pasted_path_signature(inner) {
+                    unwrapped = Some(inner.trim());
+                    break;
+                }
+            }
+        }
+        match unwrapped {
+            Some(next) => curr = next,
+            None => break,
+        }
+    }
+
+    let mut uri_stripped = false;
+    if curr
+        .as_bytes()
+        .get(..16)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file://localhost"))
+        && curr.as_bytes().get(16) == Some(&b'/')
+    {
+        curr = &curr[16..];
+        uri_stripped = true;
+    } else if is_file_uri(curr) {
+        curr = &curr[7..];
+        uri_stripped = true;
+    }
+
+    if uri_stripped {
+        let decoded = percent_decode_utf8_or_verbatim(curr);
+        return collapse_slashes_cow(decoded.as_ref());
+    }
+
+    if !curr.starts_with("regex:")
+        && super::regex_sugar::parse_regex_sugar(curr).is_none()
+        && (curr.contains('/') || curr.starts_with("~/"))
+    {
+        return collapse_slashes_cow(&unescape_posix_shell_chars(curr));
+    }
+
+    curr.to_string()
+}
+
+/// 清洗粘贴的输入文本；单路径/URI 片段直接就地清洗，普通多词查询按分词边界分别保留与清洗。
+pub fn sanitize_path_input(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let has_paired_outer_quote = ['"', '\''].iter().any(|&quote| {
+        trimmed
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+            .is_some_and(has_pasted_path_signature)
+    });
+    if has_paired_outer_quote
+        || (!trimmed.chars().any(char::is_whitespace) && is_file_uri(trimmed))
+    {
+        return sanitize_path_fragment(trimmed);
+    }
+
+    let tokens = tokenize_query(trimmed);
+    if tokens.is_empty() {
+        return String::new();
+    }
+    tokens
+        .into_iter()
+        .map(|tok| {
+            if tok.negated {
+                if tok.quoted {
+                    format!("!\"{}\"", tok.text)
+                } else {
+                    format!("!{}", tok.text)
+                }
+            } else if tok.quoted {
+                format!("\"{}\"", tok.text)
+            } else {
+                tok.text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn find_closing_single_quote_at_token_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        if b == b'\'' {
+            let idx = start + offset;
+            let after = idx + 1;
+            if after >= input.len()
+                || input[after..].chars().next().is_some_and(char::is_whitespace)
+            {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn unescape_double_quoted_inner(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'"') {
+            chars.next();
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 仅当连续 shell 转义片段内确实出现 `/` 时才允许剥离 `\ ` / `\(` 等 POSIX shell 转义，避免跨普通关键词误并词。
+fn token_can_unescape_posix_shell_escapes(rest: &str) -> bool {
+    if rest.is_empty() || rest.starts_with('"') {
+        return false;
+    }
+    let mut saw_slash = false;
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next_ch) = chars.peek() {
+                if matches!(next_ch, ' ' | '(' | ')' | '&' | '\'' | '"' | '!' | '|') {
+                    chars.next();
+                    continue;
+                }
+            }
+            continue;
+        }
+        if c.is_whitespace() || c == '"' {
+            break;
+        }
+        if c == '/' {
+            saw_slash = true;
+        }
+    }
+    saw_slash
+}
+
+/// 使用状态机扫描查询字符串，支持成对双引号 `"..."`、路径特征单双引号解包、URI/shell 转义清洗与正则透传保护。
+///
+/// - 仅在内部具备明确粘贴路径或 URI 特征时剥离外层成对引号，普通 `"foo/bar"`、`"hello world"`、`"README's"` 与 `"/a\s+b/"` 保持字面语义；
+/// - 非路径情境下 `'` 始终视作普通字面字符，确保 `John's report.pdf` 与 `README's` 自然匹配；
+/// - 未闭合的双引号 `"` 自动回退为普通字面量字符；
+/// - 忽略空引号 `""`、`!""` 及孤立的 `!`；
+/// - 针对 `regex:...` 词元与可被解析为正则语法糖的 `/.../` 词元保留反斜杠原貌，不破坏 `\D+`、`\.`、`\|` 等正则语法。
+pub fn tokenize_query(input: &str) -> Vec<QueryToken> {
+    let mut tokens = Vec::new();
+    let len = input.len();
+    let mut i = 0;
+
+    while i < len {
+        // 跳过前导空白
+        while i < len {
+            let ch = input[i..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if i >= len {
+            break;
+        }
+
+        let token_start = i;
+        let rest = &input[i..];
+
+        // regex: 与行内正则语法糖 /.../ 整体保持反斜杠原样透传（不剥离 \D+ / \. / \|）
+        let is_verbatim_regex = rest.starts_with("regex:") || {
+            let ws_end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(pos, _)| pos)
+                .unwrap_or(rest.len());
+            let candidate = &rest[..ws_end];
+            candidate.starts_with('/') && super::regex_sugar::parse_regex_sugar(candidate).is_some()
+        };
+
+        if is_verbatim_regex {
+            let ws_end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(pos, _)| pos)
+                .unwrap_or(rest.len());
+            let raw_slice = &rest[..ws_end];
+            tokens.push(QueryToken {
+                text: raw_slice.to_string(),
+                quoted: false,
+                negated: false,
+                raw: raw_slice.to_string(),
+                had_escaped_meta: false,
+                was_sanitized_pasted_path: false,
+            });
+            i += ws_end;
+            continue;
+        }
+
+        let mut negated = false;
+        let first_char = rest.chars().next().unwrap();
+        if first_char == '!' {
+            negated = true;
+            i += first_char.len_utf8();
+            if i >= len || input[i..].chars().next().is_some_and(char::is_whitespace) {
+                // 孤立 '!' 忽略
+                continue;
+            }
+        }
+
+        let body_start = i;
+        let body_rest = &input[body_start..];
+
+        // 整词粘贴路径/URI 快速通道：成对双引号、成对单引号、直接粘贴的 file://
+        if body_rest.starts_with('"') {
+            if let Some(close_idx) = find_closing_quote(input, body_start + 1) {
+                let after = close_idx + 1;
+                if after >= len || input[after..].chars().next().is_some_and(char::is_whitespace) {
+                    let inner = unescape_double_quoted_inner(&input[body_start + 1..close_idx]);
+                    if has_pasted_path_signature(&inner) {
+                        let sanitized = sanitize_path_fragment(&inner);
+                        i = after;
+                        if !sanitized.is_empty() {
+                            tokens.push(QueryToken {
+                                text: sanitized,
+                                quoted: false,
+                                negated,
+                                raw: input[token_start..i].to_string(),
+                                had_escaped_meta: false,
+                                was_sanitized_pasted_path: true,
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
+        } else if body_rest.starts_with('\'') {
+            if let Some(close_idx) = find_closing_single_quote_at_token_end(input, body_start + 1) {
+                let inner = &input[body_start + 1..close_idx];
+                if has_pasted_path_signature(inner) {
+                    let sanitized = sanitize_path_fragment(inner);
+                    i = close_idx + 1;
+                    if !sanitized.is_empty() {
+                        tokens.push(QueryToken {
+                            text: sanitized,
+                            quoted: false,
+                            negated,
+                            raw: input[token_start..i].to_string(),
+                            had_escaped_meta: false,
+                            was_sanitized_pasted_path: true,
+                        });
+                    }
+                    continue;
+                }
+            }
+        } else if let Some((prefix, path_rest, ws_end)) = body_rest
+            .strip_prefix("in:")
+            .map(|rest| ("in:", rest))
+            .or(Some(("", body_rest)))
+            .and_then(|(prefix, rest)| {
+                if !is_file_uri(rest) {
+                    return None;
+                }
+                let ws_end = rest
+                    .char_indices()
+                    .find(|(_, c)| c.is_whitespace())
+                    .map(|(pos, _)| pos)
+                    .unwrap_or(rest.len());
+                // 未加引号的 in: 负载若含管道符 `|`，交回常规解析以保留并集切分语义
+                if !prefix.is_empty() && rest[..ws_end].contains('|') {
+                    return None;
+                }
+                Some((prefix, rest, ws_end))
+            })
+        {
+            let raw_slice = &path_rest[..ws_end];
+            let sanitized = sanitize_path_fragment(raw_slice);
+            i = body_start + prefix.len() + ws_end;
+            if !sanitized.is_empty() {
+                let text = if prefix.is_empty() {
+                    sanitized
+                } else {
+                    format!("{prefix}{sanitized}")
+                };
+                tokens.push(QueryToken {
+                    text,
+                    quoted: false,
+                    negated,
+                    raw: input[token_start..i].to_string(),
+                    had_escaped_meta: false,
+                    was_sanitized_pasted_path: true,
+                });
+            }
+            continue;
+        }
+
+        let allow_posix_shell_escapes = token_can_unescape_posix_shell_escapes(body_rest);
+        let mut text = String::new();
+        let mut started_with_quote = false;
+        let mut has_unquoted_content = false;
+        let mut had_escaped_meta = false;
+        let mut was_sanitized_pasted_path = false;
+
+        while i < len {
+            let ch = input[i..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                break;
+            }
+
+            if ch == '"' {
+                if let Some(close_idx) = find_closing_quote(input, i + 1) {
+                    if i == body_start {
+                        started_with_quote = true;
+                    }
+                    let inner = unescape_double_quoted_inner(&input[i + 1..close_idx]);
+                    if text == "in:" && has_pasted_path_signature(&inner) {
+                        text.push_str(&sanitize_path_fragment(&inner));
+                        was_sanitized_pasted_path = true;
+                        has_unquoted_content = true;
+                    } else {
+                        text.push_str(&inner);
+                    }
+                    i = close_idx + 1;
+                    continue;
+                }
+                // 未闭合的双引号回退为普通字面字符 '"'
+                text.push('"');
+                has_unquoted_content = true;
+                i += 1;
+                continue;
+            }
+
+            if ch == '\'' && text == "in:" {
+                if let Some(close_idx) = find_closing_single_quote_at_token_end(input, i + 1) {
+                    let inner = &input[i + 1..close_idx];
+                    if has_pasted_path_signature(inner) {
+                        text.push_str(&sanitize_path_fragment(inner));
+                        was_sanitized_pasted_path = true;
+                        has_unquoted_content = true;
+                        i = close_idx + 1;
+                        continue;
+                    }
+                }
+            }
+
+            if ch == '\\' {
+                let next_idx = i + 1;
+                if let Some(next_ch) = input[next_idx..].chars().next() {
+                    if matches!(next_ch, '"' | '!' | '|') {
+                        if next_ch == '|' {
+                            had_escaped_meta = true;
+                        }
+                        text.push(next_ch);
+                        has_unquoted_content = true;
+                        i = next_idx + next_ch.len_utf8();
+                        continue;
+                    }
+                    if allow_posix_shell_escapes && matches!(next_ch, ' ' | '(' | ')' | '&' | '\'')
+                    {
+                        text.push(next_ch);
+                        has_unquoted_content = true;
+                        was_sanitized_pasted_path = true;
+                        i = next_idx + next_ch.len_utf8();
+                        continue;
+                    }
+                }
+                text.push('\\');
+                has_unquoted_content = true;
+                i += 1;
+                continue;
+            }
+
+            text.push(ch);
+            has_unquoted_content = true;
+            i += ch.len_utf8();
+        }
+
+        if text.is_empty() {
+            // 忽略空引号 "" / !""
+            continue;
+        }
+
+        if was_sanitized_pasted_path {
+            text = collapse_slashes_cow(&text);
+        }
+
+        let quoted = started_with_quote && !has_unquoted_content;
+        tokens.push(QueryToken {
+            text,
+            quoted,
+            negated,
+            raw: input[token_start..i].to_string(),
+            had_escaped_meta,
+            was_sanitized_pasted_path,
+        });
+    }
+
+    tokens
+}
+
+/// 判断经剥离 `/` 规范化后的否定路径片段（非绝对路径时）或绝对路径是否命中给定路径串。
+pub(crate) fn path_matches_excluded_subpath(candidate_path: &str, needle_folded: &str) -> bool {
+    if needle_folded.is_empty() {
+        return false;
+    }
+    let cand_cow = crate::cjk::fold_cow(candidate_path);
+    let cand = cand_cow.as_ref();
+
+    if needle_folded.starts_with('/') {
+        return cand == needle_folded
+            || (cand.starts_with(needle_folded)
+                && cand.as_bytes().get(needle_folded.len()) == Some(&b'/'));
+    }
+
+    let n_len = needle_folded.len();
+    let mut search_from = 0usize;
+    while let Some(rel_pos) = cand[search_from..].find(needle_folded) {
+        let pos = search_from + rel_pos;
+        let left_ok = pos == 0 || cand.as_bytes()[pos - 1] == b'/';
+        let right_idx = pos + n_len;
+        let right_ok = right_idx == cand.len() || cand.as_bytes()[right_idx] == b'/';
+        if left_ok && right_ok {
+            return true;
+        }
+        let step = cand[pos..].chars().next().map_or(1, char::len_utf8);
+        search_from = pos + step;
+    }
+    false
+}
+
+/// 匹配当前大小写及 NFC/CJK 折叠策略的否定子串比对。
+#[inline]
+pub(crate) fn text_contains_excluded_term(haystack: &str, term: &str, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        let hay_norm = crate::cjk::normalize_and_simplify_cow(haystack);
+        let term_norm = crate::cjk::normalize_and_simplify_cow(term);
+        hay_norm.contains(term_norm.as_ref())
+    } else {
+        let hay_folded = crate::cjk::fold_cow(haystack);
+        let term_folded = crate::cjk::fold_cow(term);
+        hay_folded.contains(term_folded.as_ref())
+    }
+}
+
+/// 规范化 `!path` 否定路径模式：展开 `~/`、合并重复 `/` 并剥离尾部 `/`。
+fn normalize_exclude_path_pattern(raw: &str) -> String {
+    let expanded = super::path_query::expand_tilde(raw);
+    let collapsed = super::path_query::collapse_consecutive_slashes(&expanded);
+    let trimmed = collapsed.trim_end_matches('/');
+    crate::cjk::fold_str(trimmed)
 }
 
 /// 解析单项带单位的大小字符串（如 "10m"、"500k"、"1.5g"、"1024b"），遵循 macOS 原生十进制规范（1KB = 10^3, 1MB = 10^6 等）。
@@ -369,27 +1081,74 @@ pub fn is_dotfile_query(query: &str) -> bool {
 /// 解析检索输入中的类型、扩展名与文件大小过滤指令，提取清理后的纯检索词与对应的 `QueryFilter`。
 ///
 /// 支持语法规则：
+/// 解析检索输入中的类型、扩展名、文件大小与 `!exclude` 过滤指令，返回结构化词法产物 `ParsedQuery`。
+///
+/// 支持语法规则：
 /// 1. `type:<category>`：设置文件分类（如 `type:code`、`type:doc`、`type:img` 等），支持逗号分隔复合分类（如 `type:code,doc`）。未知分类将退化为普通检索词。
 /// 2. `ext:<extension>`：指定精确扩展名（如 `ext:png`、`ext:.pdf` 等），支持逗号分隔多扩展名（如 `ext:rs,swift,ts`），自动剥离前导点号。
 /// 3. `size:<condition>`：指定文件大小约束（如 `size:>10m`、`size:<500k`、`size:1.5m..100m` 等），支持十进制单位与多个条件交集收敛。
-/// 4. 独立 `.ext`：当词以点号开头、长度合理（2..=6）、纯字母数字且不包含路径分隔符时，若非知名隐藏点文件（如 `.gitignore`、`.idea` 等），识别为自定义扩展名。
-pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
+/// 4. 独立 `.ext`：未加引号且多正向词元存在时识别为隐式自定义扩展名。
+/// 5. `!exclude` 否定词元：
+///    - 未加引号的 `!.ext`（且非 `is_dotfile_query`）-> `exclude_exts`；
+///    - 含 `/`（如 `!node_modules/`、`!src/test`、`!"my dir/"`）-> 剥离尾 `/` 加入 `exclude_paths`；
+///    - 其余（`!test`、`!.gitignore`、`!".pdf"`）-> `exclude_terms`。
+/// 6. 成对双引号 `"..."` 包裹的词元保留字面含义，不参与过滤标签与模式触发解析。
+pub fn parse_query_structured(input: &str) -> ParsedQuery {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return (String::new(), QueryFilter::default());
+        return ParsedQuery::default();
     }
 
-    let raw_terms: Vec<&str> = trimmed.split_whitespace().collect();
-    let term_count = raw_terms.len();
+    let tokens = tokenize_query(trimmed);
+    let positive_candidate_count = tokens.iter().filter(|t| !t.negated).count();
 
-    let mut remaining_terms = Vec::new();
+    let mut positive_tokens = Vec::new();
     let mut file_types = Vec::new();
     let mut custom_exts = Vec::new();
     let mut inferred_exts = Vec::new();
     let mut size_filter = SizeFilter::default();
     let mut has_explicit_type_all = false;
+    let mut exclude_terms = Vec::new();
+    let mut exclude_exts = Vec::new();
+    let mut exclude_paths = Vec::new();
 
-    for term in raw_terms {
+    for token in tokens {
+        if token.negated {
+            let payload = token.text.as_str();
+            if !token.quoted
+                && !is_dotfile_query(payload)
+                && payload.starts_with('.')
+                && payload.len() > 1
+                && payload.len() <= 6
+                && !payload.contains('/')
+                && payload[1..].chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                let ext = normalize_ext_filter(payload);
+                if !ext.is_empty() && !exclude_exts.contains(&ext) {
+                    exclude_exts.push(ext);
+                }
+            } else if payload.contains('/') {
+                let norm = normalize_exclude_path_pattern(payload);
+                if !norm.is_empty() && !exclude_paths.contains(&norm) {
+                    exclude_paths.push(norm);
+                }
+            } else if !payload.is_empty() {
+                let term = payload.to_string();
+                if !exclude_terms.contains(&term) {
+                    exclude_terms.push(term);
+                }
+            }
+            continue;
+        }
+
+        // 成对双引号保护的词元不解析为 type:/ext:/size:/.ext，直接作为正向字面词元保留
+        if token.quoted {
+            positive_tokens.push(token);
+            continue;
+        }
+
+        let term = token.text.as_str();
+
         // 1. type:<category>（支持以逗号切分的复合分类，如 type:code,doc）
         if term.len() >= 5 && term.is_char_boundary(5) && term[..5].eq_ignore_ascii_case("type:") {
             let cat_str = &term[5..];
@@ -419,7 +1178,7 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             }
 
             // 未知或空分类保留为检索词
-            remaining_terms.push(term);
+            positive_tokens.push(token);
             continue;
         }
 
@@ -434,7 +1193,7 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
 
             if !parts.is_empty() {
                 for p in parts {
-                    let lower = p.to_ascii_lowercase();
+                    let lower = normalize_ext_filter(p);
                     if !custom_exts.contains(&lower) {
                         custom_exts.push(lower);
                     }
@@ -450,27 +1209,22 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
                 size_filter.intersect(parsed);
                 continue;
             }
-            remaining_terms.push(term);
+            positive_tokens.push(token);
             continue;
         }
 
         // 4. 独立 .ext（非隐藏点文件与相对路径守卫）
-        // 关键语义约束：仅当查询包含多个词元时（例如存在前置主检索词时，如 "config .json" 或 "main .rs"），
-        // 独立的 .ext 词元才作为隐式扩展名修饰符；
-        // 若整条查询仅由单个词元构成（如 ".rs"、".giti"、".secret"），则保留在 remaining_terms 中为主检索词，
-        // 避免在无其他检索词时误吞输入导致检索词变空，或使未列入白名单的点文件/隐藏目录前缀被误杀漏搜。
-        if term_count > 1
+        if positive_candidate_count > 1
             && term.starts_with('.')
             && term.len() > 1
             && term.len() <= 6
             && !term.contains('/')
         {
             if is_dotfile_query(term) {
-                remaining_terms.push(term);
+                positive_tokens.push(token);
                 continue;
             }
             let candidate = &term[1..];
-            // 边界守卫：后缀候选必须全为字母或数字，防止 `..` 或 `...` 等相对路径/省略词元被误识别为扩展名过滤
             if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
                 let lower = candidate.to_ascii_lowercase();
                 if !custom_exts.contains(&lower) {
@@ -481,15 +1235,21 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             }
         }
 
-        remaining_terms.push(term);
+        positive_tokens.push(token);
     }
 
     let primary_file_type = file_types.first().copied().unwrap_or(FileType::All);
     let primary_custom_ext = custom_exts.first().cloned();
+    let clean_query = positive_tokens
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
 
-    (
-        remaining_terms.join(" "),
-        QueryFilter {
+    ParsedQuery {
+        positive_tokens,
+        clean_query,
+        filter: QueryFilter {
             file_type: primary_file_type,
             custom_ext: primary_custom_ext,
             file_types,
@@ -497,8 +1257,17 @@ pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
             size_filter,
             has_explicit_type_all,
             inferred_exts,
+            exclude_terms,
+            exclude_exts,
+            exclude_paths,
         },
-    )
+    }
+}
+
+/// 兼容旧签名入口：提取清理后的查询文本与内联 `QueryFilter`。
+pub fn parse_query_filter(input: &str) -> (String, QueryFilter) {
+    let parsed = parse_query_structured(input);
+    (parsed.clean_query, parsed.filter)
 }
 
 /// 判断无后缀的隐藏点文件是否属于代码工程或环境配置文件（用于 `type:code` 分类判定）。
@@ -586,10 +1355,41 @@ pub(crate) fn is_code_special_filename(name: &str) -> bool {
     is_code_dotfile(name)
 }
 
+/// 判断 `(parent, name)` 组成的非原始记录路径是否匹配包含 `/` 的否定路径模式（多段相对路径或绝对路径）。
+fn full_path_matches_excluded_subpath(parent: &str, name: &str, pat_folded: &str) -> bool {
+    let Some((pat_prefix, pat_leaf)) = pat_folded.rsplit_once('/') else {
+        return false;
+    };
+    if crate::cjk::fold_cow(name).as_ref() != pat_leaf {
+        return false;
+    }
+    let parent_folded = crate::cjk::fold_cow(parent);
+    let raw_parent = parent_folded.as_ref();
+    // 非根父目录在 CompactIndex 中保留末尾 '/'（如 "/proj/src/"），剥离后再与 rsplit_once 得到的无尾斜杠前缀比对；
+    // 根目录 "/"（len == 1）需保持原貌以便 !/test 精确命中根下条目。
+    let parent_str = if raw_parent.len() > 1 {
+        raw_parent.strip_suffix('/').unwrap_or(raw_parent)
+    } else {
+        raw_parent
+    };
+    if pat_folded.starts_with('/') {
+        if pat_prefix.is_empty() {
+            parent_str == "/"
+        } else {
+            parent_str == pat_prefix
+        }
+    } else {
+        parent_str == pat_prefix
+            || (parent_str.len() > pat_prefix.len()
+                && parent_str.ends_with(pat_prefix)
+                && parent_str.as_bytes()[parent_str.len() - pat_prefix.len() - 1] == b'/')
+    }
+}
+
 /// 针对当前紧凑索引完成编译的记录过滤器。
 ///
-/// 通过在检索前预先将过滤规则投影为扩展名池位掩码（`valid_ext_mask`），
-/// 在单趟扫描时将原本代价较高的字符串比对与模式匹配退化为 O(1) 的下标寻址与位判断，
+/// 通过在检索前预先将过滤规则投影为扩展名、文件名与父目录池位掩码，
+/// 在单趟扫描时将代价较高的字符串比对退化为 O(1) 的下标寻址与位判断，
 /// 达成零堆内存分配的亚毫秒级记录初筛。
 #[derive(Debug, Clone)]
 pub struct CompiledRecordFilter {
@@ -606,6 +1406,18 @@ pub struct CompiledRecordFilter {
     max_size_bytes: u64,
     has_size_filter: bool,
     has_explicit_type_all: bool,
+    has_negative_filter: bool,
+    exclude_case_sensitive: bool,
+    exclude_terms: Vec<String>,
+    exclude_exts: Vec<String>,
+    exclude_rel_single_paths: Vec<String>,
+    exclude_slash_paths: Vec<String>,
+    exclude_ext_mask: Vec<bool>,
+    exclude_name_mask: Vec<bool>,
+    exclude_parent_mask: Vec<bool>,
+    exclude_raw_path_mask: Vec<bool>,
+    exclude_path_leaf_mask: Vec<bool>,
+    exclude_multi_leaf_mask: Vec<bool>,
 }
 
 impl Default for CompiledRecordFilter {
@@ -625,15 +1437,39 @@ impl Default for CompiledRecordFilter {
             max_size_bytes: u64::MAX,
             has_size_filter: false,
             has_explicit_type_all: false,
+            has_negative_filter: false,
+            exclude_case_sensitive: false,
+            exclude_terms: Vec::new(),
+            exclude_exts: Vec::new(),
+            exclude_rel_single_paths: Vec::new(),
+            exclude_slash_paths: Vec::new(),
+            exclude_ext_mask: Vec::new(),
+            exclude_name_mask: Vec::new(),
+            exclude_parent_mask: Vec::new(),
+            exclude_raw_path_mask: Vec::new(),
+            exclude_path_leaf_mask: Vec::new(),
+            exclude_multi_leaf_mask: Vec::new(),
         }
     }
 }
 
 impl CompiledRecordFilter {
-    /// 判断当前过滤器是否为全放行的直通模式。
+    /// 是否存在正向约束条件（类别、扩展名或大小过滤）。
+    #[inline]
+    pub fn has_positive_filter(&self) -> bool {
+        self.has_type_filter || self.has_custom_ext || self.has_size_filter
+    }
+
+    /// 是否存在 `!` 否定排除条件。
+    #[inline]
+    pub fn has_negative_filter(&self) -> bool {
+        self.has_negative_filter
+    }
+
+    /// 判断当前过滤器是否为全放行的直通模式（既无正向约束也无否定排除）。
     #[inline]
     pub fn is_passthrough(&self) -> bool {
-        !self.has_type_filter && !self.has_custom_ext && !self.has_size_filter
+        !self.has_positive_filter() && !self.has_negative_filter
     }
 
     /// 是否显式指定了 `type:all`。
@@ -660,15 +1496,24 @@ impl CompiledRecordFilter {
         self.dirs_only
     }
 
-    /// 针对特定紧凑索引将 `QueryFilter` 编译为位掩码与标量过滤器。
+    /// 针对特定紧凑索引将 `QueryFilter` 编译为位掩码与标量过滤器（默认大小写不敏感排除）。
     pub fn compile(index: &CompactIndex, filter: &QueryFilter) -> Self {
+        Self::compile_with_case(index, filter, false)
+    }
+
+    /// 针对特定紧凑索引与当前大小写敏感状态编译记录过滤器。
+    pub fn compile_with_case(
+        index: &CompactIndex,
+        filter: &QueryFilter,
+        case_sensitive: bool,
+    ) -> Self {
         let empty_ext_id = index.extension_id("");
 
         // 1. 规范化 custom_exts（兼容单字段 custom_ext）
         let mut clean_custom_exts: Vec<String> = filter
             .custom_exts
             .iter()
-            .map(|c| c.trim().trim_start_matches('.').trim().to_ascii_lowercase())
+            .map(|c| normalize_ext_filter(c))
             .filter(|t| !t.is_empty())
             .collect();
 
@@ -676,10 +1521,10 @@ impl CompiledRecordFilter {
             if let Some(target) = filter
                 .custom_ext
                 .as_deref()
-                .map(|c| c.trim().trim_start_matches('.').trim())
+                .map(normalize_ext_filter)
                 .filter(|t| !t.is_empty())
             {
-                clean_custom_exts.push(target.to_ascii_lowercase());
+                clean_custom_exts.push(target);
             }
         }
 
@@ -723,7 +1568,7 @@ impl CompiledRecordFilter {
             index.evaluate_extensions(|ext| {
                 clean_custom_exts
                     .iter()
-                    .any(|target| ext.eq_ignore_ascii_case(target))
+                    .any(|target| ext_matches_folded(ext, target))
             })
         } else if has_type_filter {
             if dirs_only {
@@ -742,6 +1587,128 @@ impl CompiledRecordFilter {
         let has_size_filter =
             filter.size_filter.min_bytes.is_some() || filter.size_filter.max_bytes.is_some();
 
+        // 3. 编译否定排除条件（术语、扩展名与路径/目录）
+        let exclude_terms: Vec<String> = filter
+            .exclude_terms
+            .iter()
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .collect();
+        let exclude_exts: Vec<String> = filter
+            .exclude_exts
+            .iter()
+            .map(|e| normalize_ext_filter(e))
+            .filter(|e| !e.is_empty())
+            .collect();
+
+        let mut exclude_rel_single_paths = Vec::new();
+        let mut exclude_slash_paths = Vec::new();
+        for raw in &filter.exclude_paths {
+            let norm = normalize_exclude_path_pattern(raw);
+            if norm.is_empty() {
+                continue;
+            }
+            if norm.contains('/') {
+                if !exclude_slash_paths.contains(&norm) {
+                    exclude_slash_paths.push(norm);
+                }
+            } else if !exclude_rel_single_paths.contains(&norm) {
+                exclude_rel_single_paths.push(norm);
+            }
+        }
+
+        let has_negative_filter = !exclude_terms.is_empty()
+            || !exclude_exts.is_empty()
+            || !exclude_rel_single_paths.is_empty()
+            || !exclude_slash_paths.is_empty();
+
+        let exclude_ext_mask = if exclude_exts.is_empty() {
+            Vec::new()
+        } else {
+            index.evaluate_extensions(|ext| {
+                exclude_exts
+                    .iter()
+                    .any(|target| ext_matches_folded(ext, target))
+            })
+        };
+
+        let exclude_name_mask = if exclude_terms.is_empty() {
+            Vec::new()
+        } else {
+            index.evaluate_name_mask(|name| {
+                exclude_terms
+                    .iter()
+                    .any(|term| text_contains_excluded_term(name, term, case_sensitive))
+            })
+        };
+
+        let exclude_path_leaf_mask = if exclude_rel_single_paths.is_empty() {
+            Vec::new()
+        } else {
+            index.evaluate_name_mask(|name| {
+                let folded = crate::cjk::fold_cow(name);
+                exclude_rel_single_paths
+                    .iter()
+                    .any(|pat| folded.as_ref() == pat.as_str())
+            })
+        };
+
+        let exclude_multi_leaf_mask = if exclude_slash_paths.is_empty() {
+            Vec::new()
+        } else {
+            let leaves: Vec<&str> = exclude_slash_paths
+                .iter()
+                .filter_map(|p| p.rsplit('/').next())
+                .filter(|leaf| !leaf.is_empty())
+                .collect();
+            if leaves.is_empty() {
+                Vec::new()
+            } else {
+                index.evaluate_name_mask(|name| {
+                    let folded = crate::cjk::fold_cow(name);
+                    leaves.iter().any(|&leaf| folded.as_ref() == leaf)
+                })
+            }
+        };
+
+        let exclude_parent_mask = if exclude_terms.is_empty()
+            && exclude_rel_single_paths.is_empty()
+            && exclude_slash_paths.is_empty()
+        {
+            Vec::new()
+        } else {
+            index.evaluate_parent_mask(|parent| {
+                exclude_terms
+                    .iter()
+                    .any(|term| text_contains_excluded_term(parent, term, case_sensitive))
+                    || exclude_rel_single_paths
+                        .iter()
+                        .any(|pat| path_matches_excluded_subpath(parent, pat))
+                    || exclude_slash_paths
+                        .iter()
+                        .any(|pat| path_matches_excluded_subpath(parent, pat))
+            })
+        };
+
+        let exclude_raw_path_mask = if exclude_terms.is_empty()
+            && exclude_rel_single_paths.is_empty()
+            && exclude_slash_paths.is_empty()
+        {
+            Vec::new()
+        } else {
+            index.evaluate_raw_path_mask(|raw| {
+                exclude_terms
+                    .iter()
+                    .any(|term| text_contains_excluded_term(raw, term, case_sensitive))
+                    || exclude_rel_single_paths
+                        .iter()
+                        .any(|pat| path_matches_excluded_subpath(raw, pat))
+                    || exclude_slash_paths
+                        .iter()
+                        .any(|pat| path_matches_excluded_subpath(raw, pat))
+            })
+        };
+
         Self {
             has_custom_ext,
             empty_ext_id,
@@ -756,12 +1723,75 @@ impl CompiledRecordFilter {
             max_size_bytes,
             has_size_filter,
             has_explicit_type_all: filter.has_explicit_type_all,
+            has_negative_filter,
+            exclude_case_sensitive: case_sensitive,
+            exclude_terms,
+            exclude_exts,
+            exclude_rel_single_paths,
+            exclude_slash_paths,
+            exclude_ext_mask,
+            exclude_name_mask,
+            exclude_parent_mask,
+            exclude_raw_path_mask,
+            exclude_path_leaf_mask,
+            exclude_multi_leaf_mask,
         }
     }
 
     /// 评估单条 `EntryView` 是否满足过滤条件。
     pub fn matches_view(&self, view: &EntryView<'_>) -> bool {
         if self.is_passthrough() {
+            return true;
+        }
+
+        // 0. 否定排除优先拦截（必须先于正向直通或目录放行执行）
+        if self.has_negative_filter {
+            if !self.exclude_exts.is_empty()
+                && self
+                    .exclude_exts
+                    .iter()
+                    .any(|target| ext_matches_folded(view.extension, target))
+            {
+                return false;
+            }
+            if let Some(raw) = view.raw_path() {
+                if self.exclude_terms.iter().any(|term| {
+                    text_contains_excluded_term(view.name, term, self.exclude_case_sensitive)
+                        || text_contains_excluded_term(raw, term, self.exclude_case_sensitive)
+                }) || self
+                    .exclude_rel_single_paths
+                    .iter()
+                    .chain(self.exclude_slash_paths.iter())
+                    .any(|pat| path_matches_excluded_subpath(raw, pat))
+                {
+                    return false;
+                }
+            } else {
+                if self.exclude_terms.iter().any(|term| {
+                    text_contains_excluded_term(view.name, term, self.exclude_case_sensitive)
+                        || text_contains_excluded_term(view.parent, term, self.exclude_case_sensitive)
+                }) {
+                    return false;
+                }
+                if !self.exclude_rel_single_paths.is_empty() {
+                    let name_folded = crate::cjk::fold_cow(view.name);
+                    if self.exclude_rel_single_paths.iter().any(|pat| {
+                        name_folded.as_ref() == pat.as_str()
+                            || path_matches_excluded_subpath(view.parent, pat)
+                    }) {
+                        return false;
+                    }
+                }
+                if self.exclude_slash_paths.iter().any(|pat| {
+                    path_matches_excluded_subpath(view.parent, pat)
+                        || full_path_matches_excluded_subpath(view.parent, view.name, pat)
+                }) {
+                    return false;
+                }
+            }
+        }
+
+        if !self.has_positive_filter() {
             return true;
         }
         if view.is_dir {
@@ -788,7 +1818,7 @@ impl CompiledRecordFilter {
                 if self
                     .custom_exts
                     .iter()
-                    .any(|target| dotfile_candidate.eq_ignore_ascii_case(target))
+                    .any(|target| ext_matches_folded(dotfile_candidate, target))
                 {
                     return true;
                 }
@@ -796,7 +1826,7 @@ impl CompiledRecordFilter {
             return self
                 .custom_exts
                 .iter()
-                .any(|target| view.extension.eq_ignore_ascii_case(target));
+                .any(|target| ext_matches_folded(view.extension, target));
         }
         if self.has_code_type
             && view.extension.is_empty()
@@ -811,16 +1841,105 @@ impl CompiledRecordFilter {
 
     /// 评估单条底层 `CompactRecord` 是否满足过滤条件。
     ///
-    /// 对于特殊无后缀工程文件（如 Makefile、Dockerfile 等），
-    /// 通过惰性闭包 `get_name` 检查文件名，避免常规记录解析时的额外开销。
+    /// 对于特殊无后缀工程文件或带 `/` 的嵌套排除路径，调用方具备 `CompactIndex` 引用时应优先使用 `matches_record_in`。
     pub fn matches_record<'a>(
         &self,
+        record: &CompactRecord,
+        get_name: impl FnOnce() -> Option<&'a str>,
+    ) -> bool {
+        self.matches_record_core(None, record, get_name)
+    }
+
+    /// 结合完整 `CompactIndex` 上下文评估单条底层 `CompactRecord`（支持跨层级否定路径精确判定）。
+    pub fn matches_record_in(
+        &self,
+        index: &CompactIndex,
+        record: &CompactRecord,
+        name: Option<&str>,
+    ) -> bool {
+        self.matches_record_core(Some(index), record, || {
+            name.or_else(|| Some(index.record_name(record)))
+        })
+    }
+
+    fn matches_record_core<'a>(
+        &self,
+        index: Option<&CompactIndex>,
         record: &CompactRecord,
         get_name: impl FnOnce() -> Option<&'a str>,
     ) -> bool {
         if self.is_passthrough() {
             return true;
         }
+
+        // 0. 否定排除优先拦截（必须先于仅大小放行、目录放行与无正向约束放行）
+        if self.has_negative_filter {
+            if self
+                .exclude_ext_mask
+                .get(record.extension as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            if record.raw_path {
+                if self
+                    .exclude_raw_path_mask
+                    .get(record.path as usize)
+                    .copied()
+                    .unwrap_or(false)
+                    || self
+                        .exclude_name_mask
+                        .get(record.name as usize)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    return false;
+                }
+            } else {
+                if self
+                    .exclude_parent_mask
+                    .get(record.path as usize)
+                    .copied()
+                    .unwrap_or(false)
+                    || self
+                        .exclude_name_mask
+                        .get(record.name as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    || self
+                        .exclude_path_leaf_mask
+                        .get(record.name as usize)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    return false;
+                }
+                if self
+                    .exclude_multi_leaf_mask
+                    .get(record.name as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    if let Some(idx) = index {
+                        let parent = idx.record_parent(record);
+                        let rec_name = idx.record_name(record);
+                        if self
+                            .exclude_slash_paths
+                            .iter()
+                            .any(|pat| full_path_matches_excluded_subpath(parent, rec_name, pat))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !self.has_positive_filter() {
+            return true;
+        }
+
         // 1. 目录守卫：纯目录检索时按目录项自身大小比对，混排检索时目录不参与大小比较
         if record.is_dir {
             if !self.allow_dirs {
@@ -855,7 +1974,7 @@ impl CompiledRecordFilter {
                         if self
                             .custom_exts
                             .iter()
-                            .any(|target| dotfile_candidate.eq_ignore_ascii_case(target))
+                            .any(|target| ext_matches_folded(dotfile_candidate, target))
                         {
                             return true;
                         }
@@ -2063,5 +3182,362 @@ mod tests {
         assert!(!names.contains(&".DS_Store"));
         assert!(!names.contains(&".zsh_history"));
         assert!(!names.contains(&"normal.txt"));
+    }
+
+    #[test]
+    fn test_tokenize_query_quotes_escapes_and_negations() {
+        let tokens = tokenize_query(
+            r#""hello world" John's \"lit\" \!bang foo\|bar "" !"" ! !test !.pdf !.gitignore !".pdf" !node_modules/ !src/test !"my dir/""#,
+        );
+        let summary: Vec<(&str, bool, bool)> = tokens
+            .iter()
+            .map(|t| (t.text.as_str(), t.quoted, t.negated))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("hello world", true, false),
+                ("John's", false, false),
+                ("\"lit\"", false, false),
+                ("!bang", false, false),
+                ("foo|bar", false, false),
+                ("test", false, true),
+                (".pdf", false, true),
+                (".gitignore", false, true),
+                (".pdf", true, true),
+                ("node_modules/", false, true),
+                ("src/test", false, true),
+                ("my dir/", true, true),
+            ]
+        );
+
+        // Unclosed quote falls back to literal '"'
+        let unclosed = tokenize_query(r#""hello world"#);
+        assert_eq!(unclosed.len(), 2);
+        assert_eq!(unclosed[0].text, "\"hello");
+        assert!(!unclosed[0].quoted);
+        assert_eq!(unclosed[1].text, "world");
+
+        // regex: payload preserves backslash escapes verbatim
+        let regex_tokens = tokenize_query(r"regex:^main\.\d+\|\D+ !tmp");
+        assert_eq!(regex_tokens[0].text, r"regex:^main\.\d+\|\D+");
+        assert!(!regex_tokens[0].quoted);
+        assert!(!regex_tokens[0].negated);
+        assert_eq!(regex_tokens[1].text, "tmp");
+        assert!(regex_tokens[1].negated);
+
+        // Negation classification inside parse_query_filter
+        let (clean, qf) = parse_query_filter(
+            r#"main !.pdf !.gitignore !".pdf" !node_modules/ !src/test !"my dir/" !draft"#,
+        );
+        assert_eq!(clean, "main");
+        assert_eq!(qf.exclude_exts, vec!["pdf"]);
+        assert_eq!(qf.exclude_paths, vec!["node_modules", "src/test", "my dir"]);
+        assert_eq!(qf.exclude_terms, vec![".gitignore", ".pdf", "draft"]);
+    }
+
+    #[test]
+    fn test_compiled_filter_negative_masks_and_passthrough() {
+        let index = CompactIndex::from_entries(vec![
+            FileEntry {
+                name: "keep.rs".to_string(),
+                path: "/proj/src/keep.rs".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "rs".to_string(),
+            },
+            FileEntry {
+                name: "skip_test.rs".to_string(),
+                path: "/proj/src/skip_test.rs".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "rs".to_string(),
+            },
+            FileEntry {
+                name: "index.js".to_string(),
+                path: "/proj/node_modules/pkg/index.js".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "js".to_string(),
+            },
+            FileEntry {
+                name: "report.pdf".to_string(),
+                path: "/proj/docs/report.pdf".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "pdf".to_string(),
+            },
+        ])
+        .unwrap();
+
+        let (_clean, neg_only) = parse_query_filter("!test !node_modules/ !.pdf");
+        let compiled = CompiledRecordFilter::compile(&index, &neg_only);
+        assert!(!compiled.is_passthrough());
+        assert!(compiled.has_negative_filter());
+        assert!(!compiled.has_positive_filter());
+
+        let records = index.records();
+        assert!(compiled.matches_record_in(&index, &records[0], Some("keep.rs")));
+        assert!(!compiled.matches_record_in(&index, &records[1], Some("skip_test.rs")));
+        assert!(!compiled.matches_record_in(&index, &records[2], Some("index.js")));
+        assert!(!compiled.matches_record_in(&index, &records[3], Some("report.pdf")));
+    }
+
+    #[test]
+    fn test_path_matches_excluded_subpath_multibyte_utf8_no_panic() {
+        // Multi-byte UTF-8 partial component miss must step by full char UTF-8 byte length, not +1.
+        assert!(!path_matches_excluded_subpath("/a中文/file.txt", "中文"));
+        assert!(!path_matches_excluded_subpath("/prefix中文suffix/file.txt", "中文"));
+        assert!(!path_matches_excluded_subpath("/a中文", "中文"));
+        assert!(!path_matches_excluded_subpath("/ba/中文/file.txt", "a/中文"));
+        assert!(!path_matches_excluded_subpath("/a/中文suffix/file.txt", "a/中文"));
+
+        // Partial component miss followed by a real component match later in the path.
+        assert!(path_matches_excluded_subpath("/a中文/中文/file.txt", "中文"));
+        assert!(path_matches_excluded_subpath("/ba/中文/a/中文/file.txt", "a/中文"));
+
+        // Exact multi-byte UTF-8 path component hits.
+        assert!(path_matches_excluded_subpath("/a/中文/file.txt", "中文"));
+        assert!(path_matches_excluded_subpath("/a/中文/file.txt", "a/中文"));
+        assert!(path_matches_excluded_subpath("/中文/file.txt", "/中文"));
+    }
+
+    #[test]
+    fn test_excluded_slash_path_self_and_root_child_matching() {
+        // Direct unit coverage for trailing-slash parent normalization in CompactIndex.
+        assert!(full_path_matches_excluded_subpath("/proj/src/", "test", "src/test"));
+        assert!(full_path_matches_excluded_subpath("src/", "test", "src/test"));
+        assert!(full_path_matches_excluded_subpath("/proj/src/", "test", "/proj/src/test"));
+        assert!(full_path_matches_excluded_subpath("/", "test", "/test"));
+        assert!(!full_path_matches_excluded_subpath("/proj/other/", "test", "src/test"));
+        assert!(!full_path_matches_excluded_subpath("/proj/subsrc/", "test", "src/test"));
+        assert!(!full_path_matches_excluded_subpath("/proj/src/", "test", "/test"));
+        assert!(!full_path_matches_excluded_subpath("", "test", "/test"));
+
+        let index = CompactIndex::from_entries(vec![
+            FileEntry {
+                name: "test".to_string(),
+                path: "/proj/src/test".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "test".to_string(),
+                path: "/proj/src/test".to_string(),
+                is_dir: true,
+                size: 0,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "sub.rs".to_string(),
+                path: "/proj/src/test/sub.rs".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "rs".to_string(),
+            },
+            FileEntry {
+                name: "test".to_string(),
+                path: "/proj/other/test".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "test".to_string(),
+                path: "/proj/subsrc/test".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "test".to_string(),
+                path: "/test".to_string(),
+                is_dir: true,
+                size: 0,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "sub.rs".to_string(),
+                path: "/test/sub.rs".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "rs".to_string(),
+            },
+            // raw_path records (name differs from path suffix)
+            FileEntry {
+                name: "alias_src".to_string(),
+                path: "/proj/src/test".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "alias_root".to_string(),
+                path: "/test".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+            FileEntry {
+                name: "alias_test".to_string(),
+                path: "/actual/item".to_string(),
+                is_dir: false,
+                size: 100,
+                modified: 0,
+                created_at: 0,
+                extension: "".to_string(),
+            },
+        ])
+        .unwrap();
+
+        let records = index.records();
+
+        // 1. Relative multi-segment exclusion !src/test
+        let (_c1, f_rel) = parse_query_filter("!src/test");
+        let c_rel = CompiledRecordFilter::compile(&index, &f_rel);
+        assert!(!c_rel.matches_record_in(&index, &records[0], Some("test")));
+        assert!(!c_rel.matches_record_in(&index, &records[1], Some("test")));
+        assert!(!c_rel.matches_record_in(&index, &records[2], Some("sub.rs")));
+        assert!(c_rel.matches_record_in(&index, &records[3], Some("test")));
+        assert!(c_rel.matches_record_in(&index, &records[4], Some("test")));
+        assert!(c_rel.matches_record_in(&index, &records[5], Some("test")));
+        assert!(c_rel.matches_record_in(&index, &records[6], Some("sub.rs")));
+        assert!(!c_rel.matches_record_in(&index, &records[7], Some("alias_src")));
+        assert!(c_rel.matches_record_in(&index, &records[8], Some("alias_root")));
+        assert!(c_rel.matches_record_in(&index, &records[9], Some("alias_test")));
+
+        for (i, record) in records.iter().enumerate() {
+            let view = index.view(crate::compact_index::EntryId(i)).unwrap();
+            assert_eq!(
+                c_rel.matches_view(&view),
+                c_rel.matches_record_in(&index, record, None),
+                "matches_view vs matches_record_in mismatch at index {i} for !src/test"
+            );
+        }
+
+        // 1b. Term exclusion !test also excludes raw_path record whose entry name contains "test"
+        let (_c_term, f_term) = parse_query_filter("!test");
+        let c_term = CompiledRecordFilter::compile(&index, &f_term);
+        assert!(!c_term.matches_record_in(&index, &records[9], Some("alias_test")));
+        let view9 = index.view(crate::compact_index::EntryId(9)).unwrap();
+        assert!(!c_term.matches_view(&view9));
+
+        // 2. Absolute multi-segment exclusion !/proj/src/test
+        let (_c2, f_abs) = parse_query_filter("!/proj/src/test");
+        let c_abs = CompiledRecordFilter::compile(&index, &f_abs);
+        assert!(!c_abs.matches_record_in(&index, &records[0], Some("test")));
+        assert!(!c_abs.matches_record_in(&index, &records[1], Some("test")));
+        assert!(!c_abs.matches_record_in(&index, &records[2], Some("sub.rs")));
+        assert!(c_abs.matches_record_in(&index, &records[3], Some("test")));
+        assert!(c_abs.matches_record_in(&index, &records[5], Some("test")));
+        assert!(!c_abs.matches_record_in(&index, &records[7], Some("alias_src")));
+
+        // 3. Root child exclusion !/test
+        let (_c3, f_root) = parse_query_filter("!/test");
+        let c_root = CompiledRecordFilter::compile(&index, &f_root);
+        assert!(c_root.matches_record_in(&index, &records[0], Some("test")));
+        assert!(c_root.matches_record_in(&index, &records[1], Some("test")));
+        assert!(c_root.matches_record_in(&index, &records[2], Some("sub.rs")));
+        assert!(c_root.matches_record_in(&index, &records[3], Some("test")));
+        assert!(!c_root.matches_record_in(&index, &records[5], Some("test")));
+        assert!(!c_root.matches_record_in(&index, &records[6], Some("sub.rs")));
+        assert!(c_root.matches_record_in(&index, &records[7], Some("alias_src")));
+        assert!(!c_root.matches_record_in(&index, &records[8], Some("alias_root")));
+    }
+
+    #[test]
+    fn test_tokenize_query_pasted_paths_and_regex_protection() {
+        let quoted_abs = tokenize_query(r#""/Users/alice/My Docs/spec.md""#);
+        assert_eq!(quoted_abs.len(), 1);
+        assert!(!quoted_abs[0].quoted);
+        assert_eq!(quoted_abs[0].text, "/Users/alice/My Docs/spec.md");
+
+        let single_quoted_uri = tokenize_query("'file:///Users/alice/My%20Docs/spec.md'");
+        assert_eq!(single_quoted_uri.len(), 1);
+        assert!(!single_quoted_uri[0].quoted);
+        assert_eq!(single_quoted_uri[0].text, "/Users/alice/My Docs/spec.md");
+
+        let shell_escaped = tokenize_query(r"/Users/alice/My\ Docs/a\ \(1\)\&b\'c.txt");
+        assert_eq!(shell_escaped.len(), 1);
+        assert_eq!(shell_escaped[0].text, "/Users/alice/My Docs/a (1)&b'c.txt");
+
+        // 非路径引号词元与引号正则保持原样
+        let literal_slash = tokenize_query(r#""foo/bar""#);
+        assert_eq!(literal_slash.len(), 1);
+        assert!(literal_slash[0].quoted);
+        assert_eq!(literal_slash[0].text, "foo/bar");
+
+        let quoted_regex = tokenize_query(r#""/a\s+b/""#);
+        assert_eq!(quoted_regex.len(), 1);
+        assert!(quoted_regex[0].quoted);
+        assert_eq!(quoted_regex[0].text, r"/a\s+b/");
+
+        let inline_regex = tokenize_query(r"/^foo\s+bar/");
+        assert_eq!(inline_regex.len(), 1);
+        assert_eq!(inline_regex[0].text, r"/^foo\s+bar/");
+
+        // Windows 路径不再做特殊处理，按普通字面量保留
+        let win = tokenize_query(r"C:\(1)\foo.txt");
+        assert_eq!(win.len(), 1);
+        assert!(!win[0].was_sanitized_pasted_path);
+
+        assert!(quoted_abs[0].was_sanitized_pasted_path);
+        assert!(single_quoted_uri[0].was_sanitized_pasted_path);
+        assert!(shell_escaped[0].was_sanitized_pasted_path);
+        assert!(!literal_slash[0].was_sanitized_pasted_path);
+        assert!(!quoted_regex[0].was_sanitized_pasted_path);
+        assert!(!inline_regex[0].was_sanitized_pasted_path);
+    }
+
+    #[test]
+    fn test_sanitize_path_fragment_and_input_variants() {
+        assert_eq!(
+            sanitize_path_fragment(r#"  "file:///Users/a/My%20Doc/spec.md"  "#),
+            "/Users/a/My Doc/spec.md"
+        );
+        assert_eq!(
+            sanitize_path_fragment("FILE://LOCALHOST/Users/a/My%20Doc/spec.md"),
+            "/Users/a/My Doc/spec.md"
+        );
+        assert_eq!(
+            sanitize_path_fragment("file:///Users/a/%ZZ/trunc%/%FF/spec.md"),
+            "/Users/a/%ZZ/trunc%/%FF/spec.md"
+        );
+        assert_eq!(sanitize_path_fragment(r#""100% done""#), r#""100% done""#);
+        assert_eq!(sanitize_path_fragment(r#""foo/bar""#), r#""foo/bar""#);
+
+        assert_eq!(
+            sanitize_path_input(r#""/Users/alice/My Docs/spec.md""#),
+            "/Users/alice/My Docs/spec.md"
+        );
+        assert_eq!(sanitize_path_input(r#""100% done""#), r#""100% done""#);
+        assert_eq!(sanitize_path_input("regex:^main_\\d+"), "regex:^main_\\d+");
     }
 }

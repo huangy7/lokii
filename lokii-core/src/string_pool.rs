@@ -23,7 +23,15 @@ pub(crate) struct NameSignature {
 impl NameSignature {
     #[inline]
     pub fn from_name(name: &str, folded_non_ascii: Option<&str>) -> Self {
-        let target = folded_non_ascii.unwrap_or(name);
+        let folded_cow;
+        let target = match folded_non_ascii {
+            Some(folded) => folded,
+            None if name.is_ascii() => name,
+            None => {
+                folded_cow = crate::cjk::fold_cow(name);
+                folded_cow.as_ref()
+            }
+        };
         let bytes = target.as_bytes();
         let mut lo = 0u64;
         let mut hi = 0u64;
@@ -80,34 +88,8 @@ impl NameSignature {
 
         if (lo & (1u64 << 51)) != 0 {
             for ch in target.chars() {
-                let u = ch as u32;
-                if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
-                    lo |= 1u64 << 52;
-                    if let Some((syllable, initial)) = crate::pinyin::char_pinyin(ch) {
-                        for b in syllable.bytes() {
-                            if b.is_ascii_lowercase() {
-                                lo |= 1u64 << (b - b'a');
-                            }
-                        }
-                        if initial.is_ascii_lowercase() {
-                            let bit = (initial as u8 - b'a') as u32;
-                            lo |= 1u64 << bit;
-                            hi |= 1u64 << bit;
-                        }
-                    }
-                } else if (0x3040..=0x30FF).contains(&u) {
-                    lo |= 1u64 << 53;
-                } else if (0xAC00..=0xD7AF).contains(&u) {
-                    lo |= 1u64 << 54;
-                } else if u >= 0x80 {
-                    // 将带重音/变音符的拉丁扩展字符折叠映射至对应的 ASCII 基础字母/数字签名位，
-                    // 确保模糊匹配器的智能变音归一化（如 cafe 命中 café.txt、naive 命中 naïve.md）不被签名预筛误剪枝。
-                    let norm = nucleo_matcher::chars::normalize(ch);
-                    if norm.is_ascii() {
-                        if let Some(bit) = ascii_alnum_bit(norm as u8) {
-                            lo |= 1u64 << bit;
-                        }
-                    }
+                if !ch.is_ascii() {
+                    apply_non_ascii_signature_bits(ch, true, &mut lo, &mut hi);
                 }
             }
         }
@@ -123,48 +105,30 @@ impl NameSignature {
     /// 因此这里只要求字符出现位，不要求符号位、相邻二元组与词首位。
     #[inline]
     pub fn from_fuzzy_query(query: &str) -> Self {
+        let norm = crate::cjk::normalize_and_simplify_cow(query);
         let mut lo = 0u64;
-        for ch in query.chars() {
+        let mut unused_hi = 0u64;
+        for ch in norm.chars() {
             if ch.is_ascii() {
                 if let Some(bit) = ascii_alnum_bit(ch as u8) {
                     lo |= 1u64 << bit;
                 }
-                continue;
-            }
-            let u = ch as u32;
-            if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
-                lo |= 1u64 << 52;
-                // 命中的文件名必然包含该汉字，其签名也必然携带同一组拼音字母位
-                if let Some((syllable, _)) = crate::pinyin::char_pinyin(ch) {
-                    for b in syllable.bytes() {
-                        if let Some(bit) = ascii_alnum_bit(b) {
-                            lo |= 1u64 << bit;
-                        }
-                    }
-                }
-            } else if (0x3040..=0x30FF).contains(&u) {
-                lo |= 1u64 << 53;
-            } else if (0xAC00..=0xD7AF).contains(&u) {
-                lo |= 1u64 << 54;
             } else {
-                // 变音字符经归一化后仍是同一基础字母，签名位口径与 from_name 保持一致
-                let norm = nucleo_matcher::chars::normalize(ch);
-                if norm.is_ascii() {
-                    if let Some(bit) = ascii_alnum_bit(norm as u8) {
-                        lo |= 1u64 << bit;
-                    }
-                }
+                apply_non_ascii_signature_bits(ch, false, &mut lo, &mut unused_hi);
             }
         }
         Self { lo, hi: 0 }
     }
 
-    /// 根据已经转小写的查询子串片段生成必需签名位（超集过滤掩码）。
+    /// 根据查询子串片段生成必需签名位（超集过滤掩码）。
     ///
-    /// 任何包含 `needle_lower` 的文件名，其 `NameSignature` 必然包含返回掩码中的所有 1 位。
+    /// 非 ASCII 查询先做 NFC 合成与折叠再构建签名，保证与索引端 NFD/NFC 归一化口径保持一致。
+    /// 任何包含 `needle` 的文件名，其 `NameSignature` 必然包含返回掩码中的所有 1 位。
     #[inline]
     pub fn from_substring_query(needle_lower: &str) -> Self {
-        let bytes = needle_lower.as_bytes();
+        let folded_cow = crate::cjk::fold_cow(needle_lower);
+        let target = folded_cow.as_ref();
+        let bytes = target.as_bytes();
         let mut lo = 0u64;
         let mut hi = 0u64;
         let mut prev_folded: u8 = 0;
@@ -206,26 +170,9 @@ impl NameSignature {
         }
 
         if (lo & (1u64 << 51)) != 0 {
-            for ch in needle_lower.chars() {
-                let u = ch as u32;
-                if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
-                    lo |= 1u64 << 52;
-                    if let Some((syllable, initial)) = crate::pinyin::char_pinyin(ch) {
-                        for b in syllable.bytes() {
-                            if b.is_ascii_lowercase() {
-                                lo |= 1u64 << (b - b'a');
-                            }
-                        }
-                        if initial.is_ascii_lowercase() {
-                            let bit = (initial as u8 - b'a') as u32;
-                            lo |= 1u64 << bit;
-                            hi |= 1u64 << bit;
-                        }
-                    }
-                } else if (0x3040..=0x30FF).contains(&u) {
-                    lo |= 1u64 << 53;
-                } else if (0xAC00..=0xD7AF).contains(&u) {
-                    lo |= 1u64 << 54;
+            for ch in target.chars() {
+                if !ch.is_ascii() {
+                    apply_non_ascii_signature_bits(ch, true, &mut lo, &mut hi);
                 }
             }
         }
@@ -260,6 +207,54 @@ impl NameSignature {
             }
         }
         false
+    }
+}
+
+/// 为非 ASCII 字符设置统一的签名位，保证建库端与各检索模式查询端保持同一脚本与变音映射口径。
+#[inline]
+fn apply_non_ascii_signature_bits(
+    ch: char,
+    include_cjk_initial_hi: bool,
+    lo: &mut u64,
+    hi: &mut u64,
+) {
+    let u = ch as u32;
+    if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
+        *lo |= 1u64 << 52;
+        // 遍历繁简归一化后的全部合法读音变体，补充多音字字母位、边界首字母及精确 ü(v)/u 签名位；
+        // 严禁在 ASCII 字节路径交叉置 u/v，避免影响纯英文词项的预筛精度。
+        for &syllable in crate::pinyin::char_pinyin_variants(ch) {
+            for b in syllable.bytes() {
+                if b.is_ascii_lowercase() {
+                    *lo |= 1u64 << (b - b'a');
+                }
+            }
+            if let Some(&first) = syllable.as_bytes().first() {
+                if first.is_ascii_lowercase() {
+                    let bit = (first - b'a') as u32;
+                    *lo |= 1u64 << bit;
+                    if include_cjk_initial_hi {
+                        *hi |= 1u64 << bit;
+                    }
+                }
+            }
+            if crate::pinyin::is_v_u_syllable(syllable) {
+                *lo |= 1u64 << (b'v' - b'a');
+            }
+        }
+    } else if (0x3040..=0x30FF).contains(&u) {
+        *lo |= 1u64 << 53;
+    } else if (0xAC00..=0xD7AF).contains(&u) || (0x1100..=0x11FF).contains(&u) {
+        *lo |= 1u64 << 54;
+    } else if u >= 0x80 {
+        // 将带重音/变音符的拉丁扩展字符折叠映射至对应的 ASCII 基础字母/数字单字 lo 位，
+        // 严禁写入 hi 或二元组位，确保模糊去重音检索与 NFC/NFD 归一化检索均满足超集不变式。
+        let norm = nucleo_matcher::chars::normalize(ch);
+        if norm.is_ascii() {
+            if let Some(bit) = ascii_alnum_bit(norm as u8) {
+                *lo |= 1u64 << bit;
+            }
+        }
     }
 }
 
@@ -478,6 +473,13 @@ impl StringPool {
             current = slot.next;
         }
         None
+    }
+
+    pub(crate) fn find_matching(&self, mut predicate: impl FnMut(&str) -> bool) -> Option<u32> {
+        self.slots.iter().enumerate().find_map(|(idx, slot)| {
+            let text = slot.as_ref()?.text.as_ref();
+            predicate(text).then_some(idx as u32)
+        })
     }
 
     pub(crate) fn release(&mut self, id: u32) {
@@ -760,5 +762,97 @@ mod tests {
         assert_eq!(pool.get(first), Some("first"));
         pool.release_hashed(first, 7);
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn name_signature_superset_invariant_for_unicode_normalization() {
+        let exact_pairs = [
+            ("cafe\u{0301}.txt", "café"),
+            ("café.txt", "cafe\u{0301}"),
+            ("\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.txt", "한글"),
+            ("한글.txt", "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}"),
+            ("開發規範.md", "开发"),
+        ];
+
+        for (name, query) in exact_pairs {
+            let name_sig = NameSignature::from_name(name, None);
+            let sub_req = NameSignature::from_substring_query(query);
+            assert!(
+                name_sig.contains(sub_req),
+                "substring signature superset violated for name={name:?} query={query:?}"
+            );
+            let fuzzy_req = NameSignature::from_fuzzy_query(query);
+            assert!(
+                name_sig.contains(fuzzy_req),
+                "fuzzy signature superset violated for name={name:?} query={query:?}"
+            );
+        }
+
+        // 模糊搜索中纯 ASCII "cafe" 必须能匹配 NFD "cafe\u{0301}.txt" 与 NFC "café.txt"
+        for name in ["cafe\u{0301}.txt", "café.txt"] {
+            let name_sig = NameSignature::from_name(name, None);
+            let fuzzy_req = NameSignature::from_fuzzy_query("cafe");
+            assert!(
+                name_sig.contains(fuzzy_req),
+                "fuzzy de-accenting superset violated for name={name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_signature_superset_invariant_for_polyphones_and_vu() {
+        let polyphone_and_vu_pairs = [
+            ("重量.xlsx", "zhongliang"),
+            ("重新整理.md", "chongxin"),
+            ("银行对账单.pdf", "yinhang"),
+            ("行事历.ics", "xingshi"),
+            ("長度说明.txt", "changdu"),
+            ("长度说明.txt", "changdu"),
+            ("调试日志.log", "tiaoshi"),
+            ("地图.png", "ditu"),
+            ("音樂.mp3", "yinyue"),
+            ("音乐.mp3", "yinyue"),
+            ("乾坤.txt", "qiankun"),
+            ("干坤.txt", "qiankun"),
+            ("绿色.txt", "lvse"),
+            ("女儿.png", "nver"),
+            ("略过.txt", "lve"),
+            ("觉得.txt", "jve"),
+            ("概率统计.pdf", "gailv"),
+            ("2026年财务预算表.xlsx", "2026ncw"),
+        ];
+
+        for (name, query) in polyphone_and_vu_pairs {
+            let name_sig = NameSignature::from_name(name, None);
+            let sub_req = NameSignature::from_substring_query(query);
+            assert!(
+                name_sig.contains(sub_req),
+                "substring signature superset violated for name={name:?} query={query:?}"
+            );
+            let fuzzy_req = NameSignature::from_fuzzy_query(query);
+            assert!(
+                name_sig.contains(fuzzy_req),
+                "fuzzy signature superset violated for name={name:?} query={query:?}"
+            );
+        }
+
+        // 纯 ASCII 对照组：严禁在 ASCII 字节路径交叉置 u/v 位，防止 "dev" 与 "use" 误匹配
+        let dev_sig = NameSignature::from_name("dev.rs", None);
+        let use_sig = NameSignature::from_name("use.rs", None);
+        let dev_sub = NameSignature::from_substring_query("dev");
+        let use_sub = NameSignature::from_substring_query("use");
+        let dev_fuzzy = NameSignature::from_fuzzy_query("dev");
+        let use_fuzzy = NameSignature::from_fuzzy_query("use");
+
+        assert!(dev_sig.contains(dev_sub));
+        assert!(use_sig.contains(use_sub));
+        assert!(!use_sig.contains(dev_sub));
+        assert!(!dev_sig.contains(use_sub));
+        assert!(!use_sig.contains(dev_fuzzy));
+        assert!(!dev_sig.contains(use_fuzzy));
+
+        // 排除非 ü 系 u 音节误带 v 位
+        let luan_sig = NameSignature::from_name("乱码.txt", None);
+        assert!(!luan_sig.contains(NameSignature::from_substring_query("lv")));
     }
 }

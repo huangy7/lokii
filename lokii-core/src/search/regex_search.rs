@@ -86,17 +86,18 @@ pub fn search_index(
     max_results: usize,
     case_sensitive: bool,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
-    let pattern = query.trim().strip_prefix("regex:").unwrap_or(query.trim());
-    if pattern.is_empty() {
+    let raw_pattern = query.trim().strip_prefix("regex:").unwrap_or(query.trim());
+    if raw_pattern.is_empty() {
         return (Vec::new(), None);
     }
-    if pattern.len() > 1024 {
+    if raw_pattern.len() > 1024 {
         return (
             Vec::new(),
             Some("Regex pattern exceeds 1024 bytes limit".to_string()),
         );
     }
-    let regex = match RegexBuilder::new(pattern)
+    let pattern_nfc = crate::cjk::normalize_nfc_cow(raw_pattern);
+    let regex = match RegexBuilder::new(&pattern_nfc)
         .case_insensitive(!case_sensitive)
         .size_limit(10_000_000)
         .build()
@@ -104,7 +105,7 @@ pub fn search_index(
         Ok(regex) => regex,
         Err(error) => return (Vec::new(), Some(format!("Invalid regex: {error}"))),
     };
-    let req = required_signature_for_regex(pattern);
+    let req = required_signature_for_regex(&pattern_nfc);
     let mut top = super::top_k::TopK::new(max_results);
     let sorted = read.sorted_names();
     for &name_id in &sorted.ids {
@@ -116,10 +117,11 @@ pub fn search_index(
         let Some((name, _)) = read.name_entry(name_id) else {
             continue;
         };
-        if regex.is_match(name) {
+        let name_nfc = crate::cjk::normalize_nfc_cow(name);
+        if regex.is_match(&name_nfc) {
             for &ordinal in read.entries_for_name(name_id) {
                 let record = &read.records()[ordinal as usize];
-                if !filter.matches_record(record, || Some(name)) {
+                if !filter.matches_record_in(read, record, Some(name)) {
                     continue;
                 }
                 top.offer(ordinal as usize, 1, name);
@@ -139,32 +141,40 @@ pub fn search_index(
         .filter_map(|candidate| {
             let view = read.view(crate::compact_index::EntryId(candidate.ordinal))?;
             let name = view.name;
-
+            let name_nfc = crate::cjk::normalize_nfc_cow(name);
+            let name_is_ascii = name.is_ascii();
             let mut match_positions = Vec::new();
+            let push_span = |spans: &mut Vec<(usize, usize)>, s: usize, e: usize| {
+                if name_is_ascii {
+                    spans.push((s, e));
+                } else if let Some(orig_span) = super::map_norm_span_to_orig(name, &name_nfc, s, e) {
+                    spans.push(orig_span);
+                }
+            };
 
             if capture_count > 1 {
                 // 模式 A：用户显式定义了捕获组（如 /(test_\d+)/ 或 prefix_(.+)_suffix）
                 // 优先提取 1..N 捕获组区间，为用户提供靶向投影高亮
-                for caps in regex.captures_iter(name) {
+                for caps in regex.captures_iter(&name_nfc) {
                     let mut captured_any = false;
                     for i in 1..caps.len() {
                         if let Some(m) = caps.get(i) {
                             if !m.as_str().is_empty() {
-                                match_positions.push((m.start(), m.end()));
+                                push_span(&mut match_positions, m.start(), m.end());
                                 captured_any = true;
                             }
                         }
                     }
                     if !captured_any {
                         if let Some(m0) = caps.get(0) {
-                            match_positions.push((m0.start(), m0.end()));
+                            push_span(&mut match_positions, m0.start(), m0.end());
                         }
                     }
                 }
             } else {
                 // 模式 B：普通正则，提取所有匹配到的整体区间（支持单文件名内多处命中）
-                for m in regex.find_iter(name) {
-                    match_positions.push((m.start(), m.end()));
+                for m in regex.find_iter(&name_nfc) {
+                    push_span(&mut match_positions, m.start(), m.end());
                 }
             }
 

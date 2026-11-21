@@ -61,7 +61,9 @@
 "prefs.excludePatterns.editor.confirm" = "Save";
 "prefs.excludePatterns.editor.cancel" = "Cancel";
 "prefs.includeHidden" = "Index hidden files";
-"prefs.includeHidden.description" = "Include dotfiles and hidden folders such as `.ssh` and `.config`.";
+"prefs.includeHidden.description" = "Include dotfiles and hidden folders such as .config and .zshrc.";
+"prefs.excludeSensitive" = "Protect credentials";
+"prefs.excludeSensitive.description" = "Keep .ssh, .gnupg, .aws, .kube and other credential folders out of the index.";
 "prefs.networkRescan" = "Network volume rescan";
 "prefs.networkRescan.description" = "Changes made remotely on network shares can't be seen live, so indexed folders on non-local volumes are rescanned at this interval.";
 "prefs.networkRescan.minutes" = "%d min";
@@ -121,6 +123,12 @@
 "search.indexReady" = "Index ready";
 "search.empty.title" = "No Matching Files";
 "search.empty.subtitle" = "Check spelling, try fuzzy matching, or press ⌥F to adjust filters";
+"search.empty.excluded.title" = "This Location Isn’t Indexed";
+"search.empty.excluded.subtitle" = "The search path matches an index exclusion rule. Files in this location can’t be searched yet.";
+"search.empty.excluded.tag" = "Exclusion Rule";
+"search.empty.manageRules" = "Manage Index Rules";
+"search.empty.indexing.title" = "Building the Index";
+"search.empty.indexing.subtitle" = "Indexing is still in progress. Some files can’t be searched yet. Please wait.";
 "search.toolbar.pin" = "Pin Window";
 "search.caseSensitivity.auto" = "Match Case: Auto";
 "search.caseSensitivity.autoActive" = "Match Case: Auto (Uppercase Detected)";
@@ -187,6 +195,9 @@
 /* Preferences - About & Group Titles */
 "prefs.tab.about" = "About";
 "prefs.index.group.paths" = "Index Paths";
+"prefs.index.applications" = "Index Applications";
+"prefs.index.applications.description" = "Add /Applications and the system application folders; app bundle internals stay out of the index.";
+"prefs.index.applications.conflict" = "The toggle is on, but these folders are covered by your exclude paths or names, so nothing is indexed.";
 "prefs.index.group.excludes" = "Exclude Patterns";
 "prefs.index.group.excludePaths" = "Excluded Paths";
 "prefs.index.group.excludePaths.description" = "Skip traversal of entire directory trees matching these path prefixes.";

@@ -111,7 +111,83 @@ public final class FilterQuerySyncCoordinator {
         return tokens.joined(separator: " ")
     }
 
-    /// 从复合查询字符串中提取剥离内联语法后的纯检索关键字，并还原结构化 FilterState
+    /// 查找成对双引号的闭合索引（忽略 `\"` 转义引号），未闭合返回 nil。
+    private static func findClosingDoubleQuote(in query: String, from start: String.Index) -> String.Index? {
+        var j = start
+        while j < query.endIndex {
+            if query[j] == "\\" {
+                let next = query.index(after: j)
+                j = next < query.endIndex ? query.index(after: next) : next
+                continue
+            }
+            if query[j] == "\"" {
+                return j
+            }
+            j = query.index(after: j)
+        }
+        return nil
+    }
+
+    /// 扫描查询串的原始词元区间及引号/否定保护标记，供反序列化与语法高亮共享词法状态机。
+    private static func scanSyntaxTokens(in query: String) -> [(raw: String, nsRange: NSRange, isProtected: Bool)] {
+        var results: [(raw: String, nsRange: NSRange, isProtected: Bool)] = []
+        var i = query.startIndex
+
+        while i < query.endIndex {
+            while i < query.endIndex && query[i].isWhitespace {
+                i = query.index(after: i)
+            }
+            if i >= query.endIndex {
+                break
+            }
+
+            let tokenStart = i
+            var hasPairedQuote = false
+            var hasEscapedMeta = false
+            var startsWithNegation = false
+
+            if query[i] == "!" {
+                startsWithNegation = true
+                i = query.index(after: i)
+            }
+
+            while i < query.endIndex && !query[i].isWhitespace {
+                if query[i] == "\"" {
+                    let afterOpen = query.index(after: i)
+                    if let close = findClosingDoubleQuote(in: query, from: afterOpen) {
+                        hasPairedQuote = true
+                        i = query.index(after: close)
+                        continue
+                    }
+                    i = afterOpen
+                    continue
+                }
+                if query[i] == "\\" {
+                    let next = query.index(after: i)
+                    if next < query.endIndex {
+                        let nextChar = query[next]
+                        if nextChar == "\"" || nextChar == "!" || nextChar == "|" {
+                            hasEscapedMeta = true
+                            i = query.index(after: next)
+                            continue
+                        }
+                    }
+                    i = next
+                    continue
+                }
+                i = query.index(after: i)
+            }
+
+            let range = tokenStart..<i
+            let raw = String(query[range])
+            let isProtected = startsWithNegation || hasPairedQuote || hasEscapedMeta || raw.lowercased().hasPrefix("regex:")
+            results.append((raw: raw, nsRange: NSRange(range, in: query), isProtected: isProtected))
+        }
+
+        return results
+    }
+
+    /// 从复合查询字符串中提取剥离内联语法后的纯检索关键字，并还原结构化 FilterState（保留双引号与否定保护词元原貌）
     public static func deserialize(query: String) -> (keyword: String, state: FilterState) {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty {
@@ -121,9 +197,13 @@ public final class FilterQuerySyncCoordinator {
         var remainingTerms: [String] = []
         var state = FilterState()
 
-        let rawTerms = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+        for token in scanSyntaxTokens(in: trimmed) {
+            let term = token.raw
+            if token.isProtected {
+                remainingTerms.append(term)
+                continue
+            }
 
-        for term in rawTerms {
             let lower = term.lowercased()
 
             // 1. type:<category>（支持逗号切分的复合分类，如 type:code,doc）
@@ -381,6 +461,15 @@ public final class FilterQuerySyncCoordinator {
 
     // MARK: - 语法高亮与限定词胶囊格式化
 
+    /// 限定词语法：(type|size|ext):(\S*)；高亮格式化与「是否需要触碰 textStorage」的判定共用一份，避免模式漂移
+    private static let filterSyntaxRegex = try? NSRegularExpression(pattern: "(?i)\\b(type|size|ext):([^\\s]*)")
+
+    /// 判断给定的检索表达式中是否包含限定词语法（type: / size: / ext:）
+    public static func containsFilterSyntax(_ query: String) -> Bool {
+        let fullRange = NSRange(location: 0, length: (query as NSString).length)
+        return filterSyntaxRegex?.firstMatch(in: query, range: fullRange) != nil
+    }
+
     /// 将检索字符串格式化为具备语法高亮与属性胶囊标记的带属性字符串。
     /// - 语法键名（type: / size: / ext:）：采用次要文本色，弱化视觉噪音；
     /// - 属性值（如 code, >10m, pdf）：采用强调前景色与微透明强调衬底胶囊样式，并在冒号处施加微字距以留出圆角呼吸空间；
@@ -399,17 +488,28 @@ public final class FilterQuerySyncCoordinator {
             .foregroundColor: NSColor.labelColor
         ], range: fullRange)
 
-        // 匹配限定词语法：(type|size|ext):(\S*)
-        let pattern = "(?i)\\b(type|size|ext):([^\\s]*)"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        guard let regex = filterSyntaxRegex else {
             return result
         }
 
-        let matches = regex.matches(in: query, range: fullRange)
-        for match in matches {
-            let keyRange = match.range(at: 1)
+        let pillBackground = NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return isDark
+                ? NSColor.controlAccentColor.withAlphaComponent(0.24)
+                : NSColor.controlAccentColor.withAlphaComponent(0.14)
+        }
+
+        for token in scanSyntaxTokens(in: query) where !token.isProtected {
+            let tokenLocalRange = NSRange(location: 0, length: token.nsRange.length)
+            guard let match = regex.firstMatch(in: token.raw, range: tokenLocalRange) else {
+                continue
+            }
+            let localKeyRange = match.range(at: 1)
+            let localValRange = match.range(at: 2)
+
+            let keyRange = NSRange(location: token.nsRange.location + localKeyRange.location, length: localKeyRange.length)
             let colonRange = NSRange(location: keyRange.location + keyRange.length, length: 1)
-            let valRange = match.range(at: 2)
+            let valRange = NSRange(location: token.nsRange.location + localValRange.location, length: localValRange.length)
 
             let prefixRange = NSRange(location: keyRange.location, length: keyRange.length + colonRange.length)
 
@@ -422,12 +522,6 @@ public final class FilterQuerySyncCoordinator {
                 // 在冒号后增加 2pt 字距，使右侧圆角胶囊左缘不紧贴冒号
                 result.addAttribute(.kern, value: 2.0, range: colonRange)
 
-                let pillBackground = NSColor(name: nil) { appearance in
-                    let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                    return isDark
-                        ? NSColor.controlAccentColor.withAlphaComponent(0.24)
-                        : NSColor.controlAccentColor.withAlphaComponent(0.14)
-                }
                 result.addAttribute(.foregroundColor, value: NSColor.controlAccentColor, range: valRange)
                 result.addAttribute(.backgroundColor, value: pillBackground, range: valRange)
                 result.addAttribute(.font, value: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .medium), range: valRange)
@@ -474,7 +568,9 @@ public final class FilterQuerySyncCoordinator {
             storage.setAttributedString(formatted)
             storage.endEditing()
             let textLength = (newQuery as NSString).length
-            fieldEditor.selectedRange = NSRange(location: textLength, length: 0)
+            let selection = NSRange(location: textLength, length: 0)
+            fieldEditor.selectedRange = selection
+            fieldEditor.scrollRangeToVisible(selection)
         }
 
         performSearch(newQuery)
@@ -519,7 +615,14 @@ public final class PillLayoutManager: NSLayoutManager {
               !(textView.layoutManager is PillLayoutManager) else {
             return
         }
+        let clipView = textView.superview as? NSClipView
+        let savedOrigin = clipView?.bounds.origin
+        let savedRange = textView.selectedRange
         container.replaceLayoutManager(PillLayoutManager())
+        if let savedOrigin = savedOrigin {
+            clipView?.scroll(to: savedOrigin)
+        }
+        textView.selectedRange = savedRange
     }
 
     public override func fillBackgroundRectArray(
