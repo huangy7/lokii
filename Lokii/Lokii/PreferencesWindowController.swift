@@ -1,6 +1,27 @@
 import AppKit
 import SwiftUI
 
+/// 设置窗口子类：点击当前编辑文本框之外的空白处或其他非文本区域时主动结束编辑态，
+/// 使数值输入框等控件立即失焦、隐藏焦点环并触发提交校验。
+private final class PreferencesWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown,
+           let editor = firstResponder as? NSTextView {
+            let hitView = contentView?.hitTest(event.locationInWindow)
+            let delegateView = editor.delegate as? NSView
+            let clickedInsideEditor = hitView != nil && (
+                hitView === editor
+                || hitView!.isDescendant(of: editor)
+                || (delegateView != nil && (hitView === delegateView || hitView!.isDescendant(of: delegateView!)))
+            )
+            if !clickedInsideEditor {
+                makeFirstResponder(nil)
+            }
+        }
+        super.sendEvent(event)
+    }
+}
+
 final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
     private let engine: SearchEngine
     private var viewModel: PreferencesViewModel?
@@ -13,7 +34,7 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         self.viewModel = vm
 
         let host = NSHostingController(rootView: PreferencesView(viewModel: vm))
-        let window = NSWindow(contentViewController: host)
+        let window = PreferencesWindow(contentViewController: host)
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.title = L("prefs.windowTitle")
         window.toolbarStyle = .unified
