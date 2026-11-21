@@ -6,12 +6,14 @@ use crate::indexer::IndexStore;
 use crate::string_pool::NameSignature;
 
 /// 从通配符模式中提取所有不跨越 `*`/`?`/`[`/`]`/`{`/`}` 的字面量片段并生成签名超集掩码。
-pub(crate) fn required_signature_for_glob(pattern_lower: &str) -> NameSignature {
-    if pattern_lower.contains('[') || pattern_lower.contains('{') || pattern_lower.contains('\\') {
+/// 进入提取前先执行 Unicode NFC 与繁简/大小写折叠，避免 NFD 字符先入签名造成假阴性剪枝。
+pub(crate) fn required_signature_for_glob(pattern: &str) -> NameSignature {
+    let folded = crate::cjk::fold_cow(pattern);
+    if folded.contains('[') || folded.contains('{') || folded.contains('\\') {
         return NameSignature::default();
     }
     let mut sig = NameSignature::default();
-    for segment in pattern_lower.split(['*', '?']) {
+    for segment in folded.split(['*', '?']) {
         if !segment.is_empty() {
             sig = sig.union(NameSignature::from_substring_query(segment));
         }
@@ -47,7 +49,7 @@ pub fn search_index(
         return Vec::new();
     }
     let pattern = if case_sensitive {
-        crate::cjk::to_simplified_str(raw_pattern).into_owned()
+        crate::cjk::normalize_and_simplify_cow(raw_pattern).into_owned()
     } else {
         crate::cjk::fold_str(raw_pattern)
     };
@@ -58,7 +60,7 @@ pub fn search_index(
         let records = read.records();
         for (ordinal, record) in records.iter().enumerate() {
             let name = read.record_name(record);
-            if !filter.matches_record(record, || Some(name)) {
+            if !filter.matches_record_in(read, record, Some(name)) {
                 continue;
             }
             top.offer(ordinal, record.modified, name);
@@ -81,8 +83,7 @@ pub fn search_index(
             .collect();
     }
 
-    let pattern_lower = raw_pattern.to_lowercase();
-    let req = required_signature_for_glob(&pattern_lower);
+    let req = required_signature_for_glob(&pattern);
 
     // 针对纯 `*.ext` 模式（无其他通配符），直接跳过 `glob_match` 字符串自动机，做后缀字节比对
     let simple_suffix = pattern.strip_prefix("*.").filter(|rest| {
@@ -104,13 +105,14 @@ pub fn search_index(
             continue;
         };
         let matched = if case_sensitive {
+            let name_norm = crate::cjk::normalize_and_simplify_cow(name);
             if let Some(ext) = simple_suffix {
                 let suffix_len = ext.len() + 1;
-                name.len() >= suffix_len
-                    && name.as_bytes()[name.len() - suffix_len] == b'.'
-                    && &name[name.len() - ext.len()..] == ext
+                name_norm.len() >= suffix_len
+                    && name_norm.as_bytes()[name_norm.len() - suffix_len] == b'.'
+                    && &name_norm[name_norm.len() - ext.len()..] == ext
             } else {
-                glob_match(&pattern, name)
+                glob_match(&pattern, &name_norm)
             }
         } else if let Some(ext) = simple_suffix {
             let suffix_len = ext.len() + 1;
@@ -140,7 +142,7 @@ pub fn search_index(
         if matched {
             for &ordinal in read.entries_for_name(name_id) {
                 let record = &read.records()[ordinal as usize];
-                if !filter.matches_record(record, || Some(name)) {
+                if !filter.matches_record_in(read, record, Some(name)) {
                     continue;
                 }
                 top.offer(ordinal as usize, 1, name);

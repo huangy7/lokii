@@ -1,5 +1,5 @@
-use crate::search::filter::is_dotfile_query;
-use crate::search::{detect_mode, resolve_case_sensitive, CaseSensitivity};
+use crate::search::filter::{is_dotfile_query, parse_query_structured, ParsedQuery, QueryFilter};
+use crate::search::{detect_mode_from_tokens, resolve_case_sensitive_tokens, CaseSensitivity};
 use crate::string_pool::NameSignature;
 
 /// 表示并集检索中的单个子句元数据。
@@ -11,10 +11,14 @@ pub struct OrClause {
     pub is_case_sensitive: bool,
     /// 候选文件扩展名（小写，不含前导点号）；`Some` 即代表扩展名匹配子句
     pub extension: Option<String>,
-    /// 参与匹配与高亮计算的关键词集合
+    /// 参与匹配与高亮计算的关键词集合（大小写已按敏感态规范化）
     pub keywords: Vec<String>,
+    /// 保留原始大小写（经 NFC 规范化）的关键词集合，供排序精确大小写加分判定使用
+    pub(crate) raw_keywords: Vec<String>,
     /// 基于子句关键词计算出的 128 位超集必需签名掩码，用于索引预筛选
     pub(crate) required_sig: NameSignature,
+    /// 该子句作用域内的内联过滤条件与否定排除约束（如 `type:` / `!term` / `!.ext` / `!dir/`）
+    pub filter: QueryFilter,
 }
 
 /// 并集检索查询模型。
@@ -24,70 +28,76 @@ pub struct DisjunctionQuery {
 }
 
 impl DisjunctionQuery {
-    /// 解析输入查询字符串并构建子句模型。
-    ///
-    /// `global_case` 为 `None` 时，每个子句基于自身词元独立执行 Smart Case 启发式判定；
-    /// 为 `Some(true)` 或 `Some(false)` 时，所有子句继承全局显式锁定的大小写敏感策略。
-    pub fn parse(query: &str, global_case: Option<bool>) -> Self {
-        let parts = split_query_pipes(query);
-        let mut clauses = Vec::with_capacity(parts.len());
+    /// 基于已完成结构化词法分析的单个子句构建 `OrClause`（供 `parse` 与调用方预解析未知扩展回退共用）。
+    pub fn build_clause(raw: String, parsed: ParsedQuery, global_case: Option<bool>) -> OrClause {
         let case_setting = match global_case {
             Some(true) => CaseSensitivity::Sensitive,
             Some(false) => CaseSensitivity::Insensitive,
             None => CaseSensitivity::Auto,
         };
 
-        for raw in parts {
-            let (is_extension, extension) = parse_clause_extension(&raw);
-            let search_mode = detect_mode(&raw);
-            let is_case_sensitive = resolve_case_sensitive(&raw, case_setting, search_mode);
-
-            let unescaped = unescape_literal_pipes(&raw);
-            let trimmed = unescaped.trim();
-            let stripped = if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
-                || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
-            {
-                &trimmed[1..trimmed.len() - 1]
+        let (is_extension, extension) =
+            if parsed.positive_tokens.len() == 1 && !parsed.positive_tokens[0].quoted {
+                parse_clause_extension(&parsed.positive_tokens[0].text)
             } else {
-                trimmed
+                (false, None)
             };
 
-            let keywords: Vec<String> = if is_extension {
-                Vec::new()
-            } else {
-                stripped
-                    .split_whitespace()
-                    .map(|s| {
-                        let clean = s.trim_matches(|c| c == '"' || c == '\'');
-                        if is_case_sensitive {
-                            clean.to_string()
-                        } else {
-                            clean.to_lowercase()
-                        }
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
+        let search_mode = detect_mode_from_tokens(&parsed.positive_tokens);
+        let is_case_sensitive =
+            resolve_case_sensitive_tokens(&parsed.positive_tokens, case_setting, search_mode);
 
-            let required_sig = if is_extension {
-                extension
-                    .as_deref()
-                    .map_or_else(NameSignature::default, extension_signature)
-            } else {
-                let mut sig = NameSignature::default();
-                for kw in &keywords {
-                    sig = sig.union(NameSignature::from_substring_query(&kw.to_lowercase()));
+        let mut keywords = Vec::new();
+        let mut raw_keywords = Vec::new();
+        if !is_extension {
+            for token in &parsed.positive_tokens {
+                let clean = token.text.as_str();
+                if clean.is_empty() {
+                    continue;
                 }
-                sig
-            };
+                raw_keywords.push(crate::cjk::normalize_nfc_cow(clean).into_owned());
+                keywords.push(if is_case_sensitive {
+                    crate::cjk::normalize_and_simplify_cow(clean).into_owned()
+                } else {
+                    crate::cjk::fold_str(clean)
+                });
+            }
+        }
 
-            clauses.push(OrClause {
-                raw_query: raw,
-                is_case_sensitive,
-                extension,
-                keywords,
-                required_sig,
-            });
+        let required_sig = if is_extension {
+            extension
+                .as_deref()
+                .map_or_else(NameSignature::default, extension_signature)
+        } else {
+            let mut sig = NameSignature::default();
+            for kw in &keywords {
+                sig = sig.union(NameSignature::from_substring_query(kw));
+            }
+            sig
+        };
+
+        OrClause {
+            raw_query: raw,
+            is_case_sensitive,
+            extension,
+            keywords,
+            raw_keywords,
+            required_sig,
+            filter: parsed.filter,
+        }
+    }
+
+    /// 解析输入查询字符串并构建子句模型。
+    ///
+    /// `global_case` 为 `None` 时，每个子句基于自身正向词元独立执行 Smart Case 启发式判定；
+    /// 为 `Some(true)` 或 `Some(false)` 时，所有子句继承全局显式锁定的大小写敏感策略。
+    pub fn parse(query: &str, global_case: Option<bool>) -> Self {
+        let parts = split_query_pipes(query);
+        let mut clauses = Vec::with_capacity(parts.len());
+
+        for raw in parts {
+            let parsed = parse_query_structured(&raw);
+            clauses.push(Self::build_clause(raw, parsed, global_case));
         }
 
         Self { clauses }
@@ -107,7 +117,7 @@ pub fn parse_clause_extension(term: &str) -> (bool, Option<String>) {
     let trimmed = term.trim();
     if let Some(ext) = trimmed.strip_prefix("*.") {
         if !ext.contains(' ') && !ext.contains('/') {
-            return (true, Some(ext.to_lowercase()));
+            return (true, Some(crate::cjk::fold_str(ext)));
         }
     }
     if trimmed.starts_with('.')
@@ -115,7 +125,7 @@ pub fn parse_clause_extension(term: &str) -> (bool, Option<String>) {
         && !trimmed.contains(' ')
         && !trimmed.contains('/')
     {
-        return (true, Some(trimmed[1..].to_lowercase()));
+        return (true, Some(crate::cjk::fold_str(&trimmed[1..])));
     }
     (false, None)
 }
@@ -146,108 +156,95 @@ pub(crate) fn extension_matches(
         name.rsplit_once('.')
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(extension))
     } else {
-        name.rsplit_once('.').is_some_and(|(_, ext)| ext == extension)
+        name.rsplit_once('.')
+            .is_some_and(|(_, ext)| super::filter::ext_matches_folded(ext, extension))
     }
 }
 
-/// 检测查询字符串中是否包含处于引号保护区之外且未被转义的管道符 `|`。
+/// 扫描查询串中位于成对双引号 `"..."` 保护区之外且未被反斜杠转义的顶层管道符 `|`，
+/// 按字节偏移依次回调 `on_pipe`；当回调返回 `true` 时提前终止扫描。
+///
+/// 仅当未转义 `"` 在后续切片中存在匹配的未转义闭合 `"` 时才跳过引号内部；
+/// 未闭合的孤立 `"` 与词法状态机一致退回普通字面字符，不屏蔽后续 `|` 切分。
+fn for_each_top_level_pipe(query: &str, mut on_pipe: impl FnMut(usize) -> bool) {
+    let mut i = 0usize;
+    let len = query.len();
+    let mut backslash_count = 0usize;
+    let mut has_closing_quote = true;
+
+    while i < len {
+        let ch = query[i..].chars().next().unwrap();
+        let next_i = i + ch.len_utf8();
+
+        if ch == '\\' {
+            backslash_count += 1;
+            i = next_i;
+            continue;
+        }
+
+        let is_escaped = !backslash_count.is_multiple_of(2);
+        backslash_count = 0;
+
+        if ch == '"' && !is_escaped {
+            if has_closing_quote {
+                if let Some(close_idx) = super::filter::find_closing_quote(query, next_i) {
+                    i = close_idx + 1;
+                    continue;
+                }
+                has_closing_quote = false;
+            }
+            i = next_i;
+            continue;
+        }
+
+        if ch == '|' && !is_escaped && on_pipe(i) {
+            return;
+        }
+
+        i = next_i;
+    }
+}
+
+/// 检测查询字符串中是否包含处于成对双引号保护区之外且未被转义的管道符 `|`。
 ///
 /// 遵循极速短路策略：
 /// 1. 若字符串不包含任何 `|` 字符，快速返回 `false`；
-/// 2. 状态机追踪单引号 `'` 与双引号 `"` 保护区，处于引号内的管道符被保护忽略；
+/// 2. 仅追踪存在闭合双引号的成对 `"` 保护区（单引号 `'` 与未闭合双引号均视为普通字面字符），成对引号内的管道符被保护忽略；
 /// 3. 统计反斜杠 `\` 连续数量：奇数反斜杠表示转义（不视作有效管道符），偶数反斜杠表示反斜杠自转义（有效管道符）；
-/// 4. 一旦扫描到处于引号外且未转义的 `|`，立即短路返回 `true`。
+/// 4. 一旦扫描到处于保护区外且未转义的 `|`，立即短路返回 `true`。
 pub fn has_unescaped_pipe(query: &str) -> bool {
     if !query.contains('|') {
         return false;
     }
 
-    let mut in_quote: Option<char> = None;
-    let mut backslash_count: usize = 0;
-
-    for c in query.chars() {
-        if c == '\\' {
-            backslash_count += 1;
-            continue;
-        }
-
-        if c == '\'' || c == '"' {
-            let is_escaped = (backslash_count % 2) != 0;
-            if !is_escaped {
-                if in_quote == Some(c) {
-                    in_quote = None;
-                } else if in_quote.is_none() {
-                    in_quote = Some(c);
-                }
-            }
-            backslash_count = 0;
-            continue;
-        }
-
-        if c == '|' {
-            let is_escaped = (backslash_count % 2) != 0;
-            if in_quote.is_none() && !is_escaped {
-                return true;
-            }
-        }
-
-        backslash_count = 0;
-    }
-
-    false
+    let mut found = false;
+    for_each_top_level_pipe(query, |_| {
+        found = true;
+        true
+    });
+    found
 }
 
 /// 根据管道符 `|` 将并集检索语句切分为多个子句。
 ///
 /// 状态机机制：
-/// 1. 跟踪单引号 `'` 与双引号 `"` 保护区，处于引号内的管道符不被拆分；
+/// 1. 仅跟踪存在闭合双引号的成对 `"` 保护区（单引号 `'` 与未闭合双引号均视为普通字面字符），成对双引号内的管道符不被拆分；
 /// 2. 统计管道符前驱连续反斜杠数量：奇数反斜杠表示转义管道符（不拆分），偶数反斜杠表示字面量反斜杠（执行拆分）；
 /// 3. 对切分后的各子句执行首尾空白剔除，忽略空子句。
 pub fn split_query_pipes(query: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut current = String::with_capacity(query.len());
-    let mut in_quote: Option<char> = None;
-    let mut backslash_count: usize = 0;
+    let mut part_start = 0usize;
 
-    for c in query.chars() {
-        if c == '\\' {
-            backslash_count += 1;
-            current.push(c);
-            continue;
+    for_each_top_level_pipe(query, |pipe_idx| {
+        let trimmed = query[part_start..pipe_idx].trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
         }
+        part_start = pipe_idx + 1;
+        false
+    });
 
-        if c == '\'' || c == '"' {
-            let is_escaped = (backslash_count % 2) != 0;
-            if !is_escaped {
-                if in_quote == Some(c) {
-                    in_quote = None;
-                } else if in_quote.is_none() {
-                    in_quote = Some(c);
-                }
-            }
-            backslash_count = 0;
-            current.push(c);
-            continue;
-        }
-
-        if c == '|' {
-            let is_escaped = (backslash_count % 2) != 0;
-            if in_quote.is_none() && !is_escaped {
-                let trimmed = current.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-                current.clear();
-                backslash_count = 0;
-                continue;
-            }
-        }
-
-        backslash_count = 0;
-        current.push(c);
-    }
-
-    let trimmed = current.trim();
+    let trimmed = query[part_start..].trim();
     if !trimmed.is_empty() {
         parts.push(trimmed.to_string());
     }
@@ -439,6 +436,36 @@ mod tests {
         assert!(!has_unescaped_pipe("main \\| test"));
         assert!(has_unescaped_pipe("main \\\\| test"));
         assert!(!has_unescaped_pipe("\"main | test\""));
-        assert!(!has_unescaped_pipe("'main | test'"));
+        assert!(has_unescaped_pipe("'main | test'"));
+        assert!(has_unescaped_pipe("John's | Bob's"));
+        assert!(has_unescaped_pipe(r#""unclosed | foo"#));
+        assert!(!has_unescaped_pipe(r#""a|b""#));
+    }
+
+    #[test]
+    fn test_unclosed_quote_splits_pipe_consistently_with_tokenize() {
+        assert_eq!(split_query_pipes(r#""a|b""#), vec![r#""a|b""#]);
+        assert_eq!(
+            split_query_pipes(r#""unclosed | foo"#),
+            vec![r#""unclosed"#, "foo"]
+        );
+        assert_eq!(
+            split_query_pipes(r#""a|b" | "unclosed | c"#),
+            vec![r#""a|b""#, r#""unclosed"#, "c"]
+        );
+        assert_eq!(
+            split_query_pipes(r#""a | \"b\" | c""#),
+            vec![r#""a | \"b\" | c""#]
+        );
+        assert_eq!(
+            split_query_pipes(r#""a | b\\" | c"#),
+            vec![r#""a | b\\""#, "c"]
+        );
+        assert_eq!(split_query_pipes(r#"\"a | b"#), vec![r#"\"a"#, "b"]);
+
+        let q = DisjunctionQuery::parse(r#""unclosed | foo"#, None);
+        assert_eq!(q.clauses.len(), 2);
+        assert_eq!(q.clauses[0].keywords, vec!["\"unclosed"]);
+        assert_eq!(q.clauses[1].keywords, vec!["foo"]);
     }
 }

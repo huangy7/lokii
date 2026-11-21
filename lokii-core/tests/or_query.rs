@@ -109,7 +109,8 @@ fn test_or_query_highlights_and_ranking() {
     let q_rank = DisjunctionQuery::parse("summary | exact_match.txt", None);
     let res_rank = substring::search_disjunction(&read, &q_rank, &filter, 10, false);
     assert_eq!(res_rank[0].entry.name, "exact_match.txt");
-    assert_eq!(res_rank[0].score, 1.0); // Exact score
+    assert!(res_rank[0].score > 0.9 && res_rank[0].score <= 1.0);
+    assert!(res_rank.windows(2).all(|w| w[0].score >= w[1].score));
 }
 
 #[test]
@@ -128,9 +129,9 @@ fn test_split_query_pipes_quote_protection() {
     let parts = split_query_pipes(r#""main | helper" | worker"#);
     assert_eq!(parts, vec![r#""main | helper""#, "worker"]);
 
-    // 未闭合引号作为前缀容错
+    // 未闭合双引号与词法器一致退回字面量字符 '"'，不再抑制管道符切分
     let parts_unclosed = split_query_pipes(r#""main | helper"#);
-    assert_eq!(parts_unclosed, vec![r#""main | helper"#]);
+    assert_eq!(parts_unclosed, vec![r#""main"#, "helper"]);
 }
 
 #[test]
@@ -220,5 +221,68 @@ fn test_has_unescaped_pipe_semantics() {
     assert!(!has_unescaped_pipe("main \\| test"));
     assert!(has_unescaped_pipe("main \\\\| test"));
     assert!(!has_unescaped_pipe("\"main | test\""));
-    assert!(!has_unescaped_pipe("'main | test'"));
+    assert!(has_unescaped_pipe("'main | test'"));
+    assert!(has_unescaped_pipe("John's | Bob's"));
+}
+
+#[test]
+fn test_or_query_quotes_and_per_clause_exclusions() {
+    let store = IndexStore::new();
+    store.replace(vec![
+        make_entry("a|b.txt", "/docs/a|b.txt", false),
+        make_entry("a.txt", "/docs/a.txt", false),
+        make_entry("b.txt", "/docs/b.txt", false),
+        make_entry("foo_x.rs", "/src/foo_x.rs", false),
+        make_entry("foo_y.rs", "/src/foo_y.rs", false),
+        make_entry("bar_x.rs", "/src/bar_x.rs", false),
+        make_entry("bar_y.rs", "/src/bar_y.rs", false),
+        make_entry("bar_x.txt", "/docs/bar_x.txt", false),
+        make_entry("John's note.txt", "/docs/John's note.txt", false),
+        make_entry("Bob's plan.txt", "/docs/Bob's plan.txt", false),
+        make_entry("\"unclosed.txt", "/docs/\"unclosed.txt", false),
+        make_entry("foo.txt", "/docs/foo.txt", false),
+    ]);
+
+    // Quoted "a|b" stays literal without OR splitting
+    let (res_quoted, _, _) =
+        dispatch_with_options(&store, r#""a|b""#, SearchMode::Auto, CaseSensitivity::Auto, 10);
+    let names_quoted: Vec<_> = res_quoted.iter().map(|r| r.entry.name.as_str()).collect();
+    assert_eq!(names_quoted, vec!["a|b.txt"]);
+
+    // Unclosed double quote falls back to literal '"' and splits on '|'
+    let (res_unclosed, _, _) =
+        dispatch_with_options(&store, r#""unclosed | foo"#, SearchMode::Auto, CaseSensitivity::Auto, 10);
+    let names_unclosed: Vec<_> = res_unclosed.iter().map(|r| r.entry.name.as_str()).collect();
+    assert!(names_unclosed.contains(&"\"unclosed.txt"));
+    assert!(names_unclosed.contains(&"foo.txt"));
+
+    // Single quotes remain literal so two clauses with apostrophes still split on '|'
+    let (res_apos, _, _) = dispatch_with_options(
+        &store,
+        "John's | Bob's",
+        SearchMode::Auto,
+        CaseSensitivity::Auto,
+        10,
+    );
+    let names_apos: Vec<_> = res_apos.iter().map(|r| r.entry.name.as_str()).collect();
+    assert_eq!(names_apos.len(), 2);
+    assert!(names_apos.contains(&"John's note.txt"));
+    assert!(names_apos.contains(&"Bob's plan.txt"));
+
+    // Per-clause !exclude scoping: foo !x | bar !y (plus inherited caller filter)
+    let (res_scoped, _, _, _) = lokii_core::search::dispatch_with_filter(
+        &store,
+        "foo !x | bar !y",
+        SearchMode::Auto,
+        lokii_core::search::QueryFilter {
+            file_type: lokii_core::search::FileType::Code,
+            ..Default::default()
+        },
+        CaseSensitivity::Auto,
+        10,
+    );
+    let names_scoped: Vec<_> = res_scoped.iter().map(|r| r.entry.name.as_str()).collect();
+    assert_eq!(names_scoped.len(), 2);
+    assert!(names_scoped.contains(&"foo_y.rs"));
+    assert!(names_scoped.contains(&"bar_x.rs"));
 }

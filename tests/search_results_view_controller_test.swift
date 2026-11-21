@@ -142,6 +142,34 @@ UserDefaults.standard.removeObject(forKey: "NSTableView Columns SearchResultsTab
 let controller = SearchResultsViewController()
 let _ = controller.view // 触发 loadView 与 viewDidLoad
 
+assertTrue(controller.emptyStateContainer.isHidden, "首次结果集到达前不应闪现未找到匹配项")
+controller.displayResults([], preserveSelection: false)
+assertTrue(!controller.emptyStateContainer.isHidden, "没有结果时应显示空态说明")
+assertEqual(controller.emptyTitleLabel.stringValue, L("search.empty.title"), "普通无结果应显示匹配项标题")
+assertEqual(controller.emptySubtitleLabel.stringValue, L("search.empty.subtitle"), "普通无结果应显示检索建议")
+assertTrue(controller.emptyRuleRow.isHidden, "普通无结果应隐藏排除规则信息")
+
+controller.emptyState = .excluded(rule: "Contents")
+assertEqual(controller.emptyTitleLabel.stringValue, L("search.empty.excluded.title"), "排除路径应显示未索引标题")
+assertEqual(controller.emptyRuleNameLabel.stringValue, "Contents", "规则名应保留后端返回的命中片段")
+assertTrue(!controller.emptyRuleRow.isHidden, "排除路径应显示规则信息")
+let manageRulesButton = controller.emptyStateContainer.arrangedSubviews.compactMap { $0 as? NSButton }.first!
+assertTrue(!manageRulesButton.isHidden, "排除路径应提供管理规则入口")
+var manageRulesCallCount = 0
+controller.onManageIndexRules = { manageRulesCallCount += 1 }
+manageRulesButton.sendAction(manageRulesButton.action!, to: manageRulesButton.target)
+assertEqual(manageRulesCallCount, 1, "点击管理按钮应派发设置导航回调")
+controller.emptyTitleLabel.stringValue = "旧语言标题"
+controller.onLanguageChanged()
+assertEqual(controller.emptyTitleLabel.stringValue, L("search.empty.excluded.title"), "语言变化应重新渲染当前空态")
+assertEqual(controller.emptyRuleNameLabel.stringValue, "Contents", "语言变化不应丢失命中规则")
+
+controller.emptyState = .indexing
+assertEqual(controller.emptyTitleLabel.stringValue, L("search.empty.indexing.title"), "索引未完成时应显示建库标题")
+assertEqual(controller.emptySubtitleLabel.stringValue, L("search.empty.indexing.subtitle"), "建库期间应说明暂时无法搜索的原因")
+assertTrue(controller.emptyRuleRow.isHidden && manageRulesButton.isHidden, "建库期间应隐藏规则信息与管理按钮")
+controller.emptyState = .noMatches
+
 assertTrue(controller.view.subviews.contains(controller.tableScrollView), "根视图应包含 tableScrollView")
 assertTrue(controller.view.subviews.contains(controller.separator), "根视图应包含分割线")
 assertTrue(controller.view.subviews.contains(controller.bottomBar), "根视图应包含 bottomBar")
@@ -176,6 +204,7 @@ let sampleItems = [
 ]
 
 controller.displayResults(sampleItems, preserveSelection: false)
+assertTrue(controller.emptyStateContainer.isHidden, "返回结果后应立即隐藏空态")
 assertEqual(controller.results.count, 3, "控制器结果集合应包含 3 个条目")
 assertEqual(controller.numberOfRows(in: controller.tableView), 3, "表格数据源行数应为 3")
 
@@ -267,27 +296,28 @@ guard let menu = controller.tableView.menu else {
     fputs("断言失败: tableView.menu 不能为空\\n", stderr)
     exit(1)
 }
-assertEqual(menu.items.count, 14, "右键上下文菜单应包含 11 个功能项加 3 个分隔线")
+assertEqual(menu.items.count, 15, "右键上下文菜单应包含 12 个功能项加 3 个分隔线")
 assertEqual(menu.items[0].action, #selector(controller.openSelected), "第 0 项应绑定 openSelected")
 assertTrue(menu.items[1].hasSubmenu, "第 1 项应为打开方式子菜单")
 assertEqual(menu.items[2].action, #selector(controller.quickLookSelected), "第 2 项应绑定 quickLookSelected")
 assertEqual(menu.items[2].keyEquivalent, " ", "quickLookSelected 快捷键应为 Space")
 assertTrue(menu.items[2].keyEquivalentModifierMask.isEmpty, "quickLookSelected 修饰键掩码应为空")
 assertEqual(menu.items[3].action, #selector(controller.revealSelected), "第 3 项应绑定 revealSelected")
-assertEqual(menu.items[4].action, #selector(controller.openInTerminalSelected), "第 4 项应绑定 openInTerminalSelected")
-assertEqual(menu.items[5].action, #selector(controller.showInfoSelected), "第 5 项应绑定 showInfoSelected")
-assertEqual(menu.items[5].keyEquivalent, "i", "showInfoSelected 快捷键应为 i")
-assertTrue(menu.items[6].isSeparatorItem, "第 6 项应为分隔线")
-assertEqual(menu.items[7].action, #selector(controller.copyFile), "第 7 项应绑定 copyFile")
-assertEqual(menu.items[7].keyEquivalent, "c", "copyFile 快捷键应为 c")
-assertEqual(menu.items[8].action, #selector(controller.copyPath), "第 8 项应绑定 copyPath")
-assertEqual(menu.items[9].action, #selector(controller.copyName), "第 9 项应绑定 copyName")
-assertTrue(menu.items[10].isSeparatorItem, "第 10 项应为分隔线")
-assertEqual(menu.items[11].action, #selector(controller.excludeDirectorySelected), "第 11 项应绑定 excludeDirectorySelected")
-assertTrue(menu.items[12].isSeparatorItem, "第 12 项应为分隔线")
-assertEqual(menu.items[13].action, #selector(controller.moveToTrashSelected), "第 13 项应绑定 moveToTrashSelected")
-assertEqual(menu.items[13].keyEquivalent, String(format: "%c", NSDeleteCharacter), "moveToTrashSelected 快捷键应为 Delete")
-assertEqual(menu.items[13].keyEquivalentModifierMask, [.command], "moveToTrashSelected 修饰键应为 Command")
+assertEqual(menu.items[4].action, #selector(controller.filterByDirectorySelected), "第 4 项应绑定 filterByDirectorySelected")
+assertEqual(menu.items[5].action, #selector(controller.openInTerminalSelected), "第 5 项应绑定 openInTerminalSelected")
+assertEqual(menu.items[6].action, #selector(controller.showInfoSelected), "第 6 项应绑定 showInfoSelected")
+assertEqual(menu.items[6].keyEquivalent, "i", "showInfoSelected 快捷键应为 i")
+assertTrue(menu.items[7].isSeparatorItem, "第 7 项应为分隔线")
+assertEqual(menu.items[8].action, #selector(controller.copyFile), "第 8 项应绑定 copyFile")
+assertEqual(menu.items[8].keyEquivalent, "c", "copyFile 快捷键应为 c")
+assertEqual(menu.items[9].action, #selector(controller.copyPath), "第 9 项应绑定 copyPath")
+assertEqual(menu.items[10].action, #selector(controller.copyName), "第 10 项应绑定 copyName")
+assertTrue(menu.items[11].isSeparatorItem, "第 11 项应为分隔线")
+assertEqual(menu.items[12].action, #selector(controller.excludeDirectorySelected), "第 12 项应绑定 excludeDirectorySelected")
+assertTrue(menu.items[13].isSeparatorItem, "第 13 项应为分隔线")
+assertEqual(menu.items[14].action, #selector(controller.moveToTrashSelected), "第 14 项应绑定 moveToTrashSelected")
+assertEqual(menu.items[14].keyEquivalent, String(format: "%c", NSDeleteCharacter), "moveToTrashSelected 快捷键应为 Delete")
+assertEqual(menu.items[14].keyEquivalentModifierMask, [.command], "moveToTrashSelected 修饰键应为 Command")
 assertTrue(menu.allowsContextMenuPlugIns, "tableView.menu 必须开启 allowsContextMenuPlugIns 以由 AppKit 原生托管系统服务")
 
 // 校验菜单项可用性验证逻辑 (validateMenuItem)

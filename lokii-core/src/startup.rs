@@ -47,6 +47,9 @@ pub fn scope_fingerprint(config: &AppConfig) -> u64 {
     config.resolve_exclude_paths().hash(&mut hasher);
     config.index.exclude.hash(&mut hasher);
     config.index.include_hidden.hash(&mut hasher);
+    config.index.exclude_sensitive.hash(&mut hasher);
+    config.index.sensitive_names.hash(&mut hasher);
+    config.index.index_apps.hash(&mut hasher);
     crate::permissions::has_full_disk_access().hash(&mut hasher);
     hasher.finish()
 }

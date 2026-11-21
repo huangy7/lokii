@@ -9,6 +9,14 @@ pub struct Candidate<'a, K> {
     name: &'a str,
 }
 
+impl<'a, K> Candidate<'a, K> {
+    /// 返回候选条目的文件名，用于与当前堆顶最差项做字典序上界剪枝判断。
+    #[inline]
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+}
+
 impl<K: Ord> Ord for Candidate<'_, K> {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -61,6 +69,16 @@ impl<'a, K: Ord> TopK<'a, K> {
     #[inline]
     pub fn is_full(&self) -> bool {
         self.limit > 0 && self.candidates.len() >= self.limit
+    }
+
+    /// 候选堆已满时返回当前堆顶最差元素，供调用方基于分数上界提前剪枝。
+    #[inline]
+    pub fn worst(&self) -> Option<&Candidate<'a, K>> {
+        if self.is_full() {
+            self.candidates.peek()
+        } else {
+            None
+        }
     }
 
     pub fn finish(self) -> Vec<Candidate<'a, K>> {

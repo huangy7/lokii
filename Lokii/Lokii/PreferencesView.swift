@@ -93,16 +93,21 @@ class PreferencesViewModel: ObservableObject {
     
     // Draft states for index configurations
     @Published var indexPaths: [String] = []
+    @Published var indexApps: Bool = false
     @Published var excludePatterns: [String] = []
     @Published var excludePaths: [String] = []
     @Published var includeHidden: Bool = false
+    @Published var excludeSensitive: Bool = true
     @Published var networkRescanMinutes: Int = 5
-    
+
     // Saved configurations for diffing
     @Published var savedIndexPaths: [String] = []
+    @Published var savedIndexApps: Bool = false
     @Published var savedExcludePatterns: [String] = []
     @Published var savedExcludePaths: [String] = []
     @Published var savedIncludeHidden: Bool = false
+    @Published var savedExcludeSensitive: Bool = true
+    private var sensitiveNames: [String] = []
     @Published var savedNetworkRescanMinutes: Int = 5
     
     @Published var hasFullDiskAccess: Bool = false
@@ -360,15 +365,20 @@ class PreferencesViewModel: ObservableObject {
         self.theme = ThemeManager.shared.currentTheme
         
         self.indexPaths = config.index.indexPaths
+        self.indexApps = config.index.indexApps
         self.excludePatterns = config.index.exclude
         self.excludePaths = config.index.excludePaths
         self.includeHidden = config.index.includeHidden
+        self.excludeSensitive = config.index.excludeSensitive
         self.networkRescanMinutes = config.index.networkRescanMinutes
         
         self.savedIndexPaths = config.index.indexPaths
+        self.savedIndexApps = config.index.indexApps
         self.savedExcludePatterns = config.index.exclude
         self.savedExcludePaths = config.index.excludePaths
         self.savedIncludeHidden = config.index.includeHidden
+        self.savedExcludeSensitive = config.index.excludeSensitive
+        self.sensitiveNames = config.index.sensitiveNames
         self.savedNetworkRescanMinutes = config.index.networkRescanMinutes
         isLoading = false
         refreshAvailableTerminals()
@@ -380,9 +390,12 @@ class PreferencesViewModel: ObservableObject {
             general: .init(language: language, showInDock: showInDock, terminalBundleId: terminalBundleId),
             index: .init(
                 indexPaths: savedIndexPaths,
+                indexApps: savedIndexApps,
                 exclude: savedExcludePatterns,
                 excludePaths: savedExcludePaths,
                 includeHidden: savedIncludeHidden,
+                excludeSensitive: savedExcludeSensitive,
+                sensitiveNames: sensitiveNames,
                 maxResults: maxResults,
                 networkRescanMinutes: savedNetworkRescanMinutes
             ),
@@ -395,9 +408,11 @@ class PreferencesViewModel: ObservableObject {
     
     var isIndexDirty: Bool {
         indexPaths != savedIndexPaths ||
+        indexApps != savedIndexApps ||
         excludePatterns != savedExcludePatterns ||
         excludePaths != savedExcludePaths ||
         includeHidden != savedIncludeHidden ||
+        excludeSensitive != savedExcludeSensitive ||
         networkRescanMinutes != savedNetworkRescanMinutes
     }
     
@@ -407,23 +422,29 @@ class PreferencesViewModel: ObservableObject {
         // 当仅向 excludePaths 追加新排除目录时，内核可就地毫秒级直接剔除记录，无需全量重扫；
         // 其余任何变更（取消排除目录、变更索引根路径、切换隐藏文件开关、变更排除通配模式）均需触发后台重建以重新录入文件。
         let onlyAddedExcludePaths = (indexPaths == savedIndexPaths) &&
+                                    (indexApps == savedIndexApps) &&
                                     (includeHidden == savedIncludeHidden) &&
+                                    (excludeSensitive == savedExcludeSensitive) &&
                                     (excludePatterns == savedExcludePatterns) &&
                                     (savedExcludePaths.allSatisfy { excludePaths.contains($0) })
         let needsRebuild = isIndexDirty && !onlyAddedExcludePaths
 
         config.index.indexPaths = indexPaths
+        config.index.indexApps = indexApps
         config.index.exclude = excludePatterns
         config.index.excludePaths = excludePaths
         config.index.includeHidden = includeHidden
+        config.index.excludeSensitive = excludeSensitive
         config.index.networkRescanMinutes = networkRescanMinutes
         
         let success = engine.updateConfig(config)
         if success {
             savedIndexPaths = indexPaths
+            savedIndexApps = indexApps
             savedExcludePatterns = excludePatterns
             savedExcludePaths = excludePaths
             savedIncludeHidden = includeHidden
+            savedExcludeSensitive = excludeSensitive
             savedNetworkRescanMinutes = networkRescanMinutes
             if needsRebuild {
                 engine.rebuildIndex()
@@ -434,18 +455,38 @@ class PreferencesViewModel: ObservableObject {
     
     func discardIndexChanges() {
         indexPaths = savedIndexPaths
+        indexApps = savedIndexApps
         excludePatterns = savedExcludePatterns
         excludePaths = savedExcludePaths
         includeHidden = savedIncludeHidden
+        excludeSensitive = savedExcludeSensitive
         networkRescanMinutes = savedNetworkRescanMinutes
     }
     
     func restoreIndexDefaults() {
         indexPaths = Self.defaultIndexPaths
+        indexApps = false
         excludePatterns = Self.defaultExcludePatterns
         excludePaths = Self.defaultExcludePaths
         includeHidden = false
+        excludeSensitive = true
         networkRescanMinutes = Self.defaultNetworkRescanMinutes
+    }
+
+    /// 系统应用目录：开关打开时加入索引根，关闭时精确移除。
+    /// 开关打开时内核追加的索引根；此处仅用于提示与排除规则的冲突，实际根由 Rust 侧追加。
+    static let appIndexRoots = ["/Applications", "/System/Applications", "/System/Cryptexes/App/System/Applications"]
+
+    /// 开关已打开，但相关目录被排除路径或排除名单挡住，实际不会生效。
+    var appIndexConflicted: Bool {
+        guard indexApps else { return false }
+        if excludePatterns.contains("Applications") { return true }
+        return Self.appIndexRoots.contains { root in
+            excludePaths.contains { raw in
+                let path = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
+                return root == path || root.hasPrefix(path + "/")
+            }
+        }
     }
 
     /// 索引配置的出厂默认值，与 Rust 侧 IndexConfig::default 保持一致。
@@ -481,7 +522,7 @@ class PreferencesViewModel: ObservableObject {
         indexPaths == Self.defaultIndexPaths &&
         excludePatterns == Self.defaultExcludePatterns &&
         excludePaths == Self.defaultExcludePaths &&
-        !includeHidden &&
+        includeHidden &&
         networkRescanMinutes == Self.defaultNetworkRescanMinutes
     }
 }
@@ -979,10 +1020,31 @@ struct PreferencesView: View {
 
                     // Group 4: 扫描选项
                     SettingsGroup(L("prefs.index.group.options")) {
-                        SettingsRow(L("prefs.includeHidden"), description: L("prefs.includeHidden.description")) {
-                            Toggle("", isOn: $viewModel.includeHidden)
+                        SettingsRow(
+                            L("prefs.index.applications"),
+                            description: viewModel.appIndexConflicted
+                                ? L("prefs.index.applications.conflict")
+                                : L("prefs.index.applications.description")
+                        ) {
+                            Toggle("", isOn: $viewModel.indexApps)
                                 .toggleStyle(.switch)
                                 .labelsHidden()
+                        }
+                        SettingsRowDivider()
+                        SettingsRow(L("prefs.includeHidden"), description: L("prefs.includeHidden.description")) {
+                            Toggle("", isOn: $viewModel.includeHidden.animation(.easeInOut(duration: 0.15)))
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                        }
+                        if viewModel.includeHidden {
+                            Divider()
+                                .padding(.leading, 32)
+                            SettingsRow(L("prefs.excludeSensitive"), description: L("prefs.excludeSensitive.description")) {
+                                Toggle("", isOn: $viewModel.excludeSensitive)
+                                    .toggleStyle(.switch)
+                                    .labelsHidden()
+                            }
+                            .padding(.leading, 18)
                         }
                         SettingsRowDivider()
                         SettingsRow(L("prefs.networkRescan"), description: L("prefs.networkRescan.description")) {

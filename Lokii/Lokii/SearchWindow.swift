@@ -112,7 +112,9 @@ final class SearchWindow: NSWindowController {
     /// Tracks why the loading overlay is showing, so `onIndexReady` from
     /// a concurrent initialize/verify doesn't accidentally dismiss a rebuild overlay.
     private enum IndexingState { case idle, initializing, rebuilding, failed }
-    private var indexingState: IndexingState = .initializing
+    private var indexingState: IndexingState = .initializing {
+        didSet { updateEmptyState() }
+    }
 
     init(engine: SearchEngine) {
         self.engine = engine
@@ -160,7 +162,11 @@ final class SearchWindow: NSWindowController {
         setupRecentSearchesMenu()
         setupNotifications()
         onLanguageChanged()
+        updateEmptyState()
 
+        searchResultsViewController.onManageIndexRules = {
+            (NSApp.delegate as? AppDelegate)?.openIndexPreferences()
+        }
         searchResultsViewController.onOpenFDAGuide = {
             FDAGuideWindowController.show()
         }
@@ -287,6 +293,10 @@ final class SearchWindow: NSWindowController {
         searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.placeholderString = L("search.placeholder")
         searchField.font = .systemFont(ofSize: 14)
+        // 启用单行文本原生水平滚动，确保输入与粘贴超长路径时光标始终在末尾可视区
+        searchField.cell?.isScrollable = true
+        searchField.cell?.wraps = false
+        searchField.cell?.lineBreakMode = .byClipping
         // 禁用内层独立外焦点环，由外层工具栏胶囊统一承载边缘轮廓，消除双重线框嵌套
         searchField.focusRingType = .none
         searchField.delegate = self
@@ -964,7 +974,8 @@ final class SearchWindow: NSWindowController {
                     self.performSearch(query: currentText)
                     return
                 }
-                self.searchResultsViewController.hasActiveSearchQuery = false
+                self.lastExclusionHint = nil
+                self.updateEmptyState()
                 self.splitViewController.updateSearchResults(rawResults: items, tree: tree)
                 self.searchMatchText = nil
                 self.updateStatusLabel()
@@ -987,7 +998,8 @@ final class SearchWindow: NSWindowController {
             DispatchQueue.main.async {
                 self.isSearching = false
                 guard self.indexingState != .failed else { return }
-                self.searchResultsViewController.hasActiveSearchQuery = !query.isEmpty
+                self.lastExclusionHint = response.hint
+                self.updateEmptyState()
                 self.splitViewController.updateSearchResults(rawResults: response.results, tree: tree)
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
                 self.updateCaseSensitivityButtonState(responseCaseSensitive: response.isCaseSensitive)
@@ -1077,22 +1089,155 @@ final class SearchWindow: NSWindowController {
     }
 
     static func hasEffectiveUppercase(query: String) -> Bool {
-        for word in query.split(separator: " ") {
-            if word.hasPrefix("in:") || word.hasPrefix("type:") || word.hasPrefix("ext:") || word.hasPrefix("size:") {
+        func findClosingQuote(in s: String, from start: String.Index) -> String.Index? {
+            var j = start
+            while j < s.endIndex {
+                if s[j] == "\\" {
+                    let next = s.index(after: j)
+                    j = next < s.endIndex ? s.index(after: next) : next
+                    continue
+                }
+                if s[j] == "\"" {
+                    return j
+                }
+                j = s.index(after: j)
+            }
+            return nil
+        }
+
+        func hasRegexEffectiveUppercase(_ pattern: String) -> Bool {
+            var idx = pattern.startIndex
+            while idx < pattern.endIndex {
+                let c = pattern[idx]
+                idx = pattern.index(after: idx)
+                if c == "\\" {
+                    if idx < pattern.endIndex {
+                        idx = pattern.index(after: idx)
+                    }
+                    continue
+                }
+                if c.isUppercase {
+                    return true
+                }
+            }
+            return false
+        }
+
+        var i = query.startIndex
+        while i < query.endIndex {
+            while i < query.endIndex && query[i].isWhitespace {
+                i = query.index(after: i)
+            }
+            if i >= query.endIndex { break }
+
+            // regex: 前缀整词原样保留，跳过内部反斜杠元字符后检查大写
+            if query[i...].hasPrefix("regex:") {
+                var end = i
+                while end < query.endIndex && !query[end].isWhitespace {
+                    end = query.index(after: end)
+                }
+                let payload = String(query[query.index(i, offsetBy: 6)..<end])
+                if hasRegexEffectiveUppercase(payload) {
+                    return true
+                }
+                i = end
                 continue
             }
-            if word.contains("/") {
-                if word.hasSuffix("/") { continue }
-                if let last = word.split(separator: "/").last,
+
+            var negated = false
+            if query[i] == "!" {
+                negated = true
+                i = query.index(after: i)
+                if i >= query.endIndex || query[i].isWhitespace {
+                    continue
+                }
+            }
+
+            let bodyStart = i
+            var text = ""
+            var startedWithQuote = false
+            var hasUnquotedContent = false
+
+            while i < query.endIndex && !query[i].isWhitespace {
+                let ch = query[i]
+                if ch == "\"" {
+                    let afterOpen = query.index(after: i)
+                    if let closeIdx = findClosingQuote(in: query, from: afterOpen) {
+                        if i == bodyStart {
+                            startedWithQuote = true
+                        }
+                        var innerIdx = afterOpen
+                        while innerIdx < closeIdx {
+                            let ic = query[innerIdx]
+                            let nextInner = query.index(after: innerIdx)
+                            if ic == "\\" && nextInner < closeIdx && query[nextInner] == "\"" {
+                                text.append("\"")
+                                innerIdx = query.index(after: nextInner)
+                            } else {
+                                text.append(ic)
+                                innerIdx = nextInner
+                            }
+                        }
+                        i = query.index(after: closeIdx)
+                        continue
+                    }
+                    text.append("\"")
+                    hasUnquotedContent = true
+                    i = afterOpen
+                    continue
+                }
+
+                if ch == "\\" {
+                    let next = query.index(after: i)
+                    if next < query.endIndex {
+                        let nextCh = query[next]
+                        if nextCh == "\"" || nextCh == "!" || nextCh == "|" {
+                            text.append(nextCh)
+                            hasUnquotedContent = true
+                            i = query.index(after: next)
+                            continue
+                        }
+                    }
+                    text.append("\\")
+                    hasUnquotedContent = true
+                    i = next
+                    continue
+                }
+
+                text.append(ch)
+                hasUnquotedContent = true
+                i = query.index(after: i)
+            }
+
+            if text.isEmpty || negated {
+                continue
+            }
+
+            let quoted = startedWithQuote && !hasUnquotedContent
+            if quoted {
+                if text.contains(where: { $0.isUppercase }) {
+                    return true
+                }
+                continue
+            }
+
+            let lower = text.lowercased()
+            if lower.hasPrefix("in:") || lower.hasPrefix("type:") || lower.hasPrefix("ext:") || lower.hasPrefix("size:") {
+                continue
+            }
+            if text.contains("/") {
+                if text.hasSuffix("/") { continue }
+                if let last = text.split(separator: "/").last,
+                   !last.isEmpty,
                    last.contains(where: { $0.isUppercase }) {
                     return true
                 }
                 continue
             }
-            if word.hasPrefix(".") && !word.hasPrefix("..") {
+            if text.hasPrefix(".") && !text.hasPrefix("..") {
                 continue
             }
-            if word.contains(where: { $0.isUppercase }) {
+            if text.contains(where: { $0.isUppercase }) {
                 return true
             }
         }
@@ -1209,6 +1354,25 @@ final class SearchWindow: NSWindowController {
 
     // MARK: - Syntax Highlighting
 
+    /// 最近一次空结果检索命中的排除规则；索引状态变化后重算空态时沿用它，避免退回普通无结果
+    private var lastExclusionHint: String?
+
+    private func updateEmptyState() {
+        switch indexingState {
+        case .initializing, .rebuilding:
+            searchResultsViewController.emptyState = .indexing
+        case .idle, .failed:
+            // 失败有自己的告警与底栏状态，空态不冒充"正在建立索引"
+            if let hint = lastExclusionHint {
+                searchResultsViewController.emptyState = .excluded(rule: hint)
+            } else {
+                searchResultsViewController.emptyState = .noMatches
+            }
+        }
+    }
+
+    private var hasAppliedFilterSyntaxHighlighting: Bool = false
+
     /// 针对搜索框内限定词（type: / size: / ext:）即时应用语法胶囊高亮
     private func applyQuerySyntaxHighlighting() {
         guard let fieldEditor = searchField.currentEditor() as? NSTextView,
@@ -1217,17 +1381,31 @@ final class SearchWindow: NSWindowController {
             return
         }
 
+        let query = fieldEditor.string
+        let hasFilterSyntax = FilterQuerySyncCoordinator.containsFilterSyntax(query)
+
+        // 若当前输入没有限定词语法，且之前未应用过限定词高亮，完全不触碰 textStorage，
+        // 彻底交由 AppKit 原生单行滚动与光标机制接管，保证直接粘贴超长路径时光标始终在末尾可视区
+        if !hasFilterSyntax && !hasAppliedFilterSyntaxHighlighting {
+            return
+        }
+
         PillLayoutManager.ensureInstalled(on: fieldEditor)
 
-        let query = fieldEditor.string
         let formatted = FilterQuerySyncCoordinator.formatQuerySyntax(
             query,
             baseFont: searchField.font ?? .systemFont(ofSize: 14)
         )
 
+        hasAppliedFilterSyntaxHighlighting = hasFilterSyntax
+
+        guard formatted.length == storage.length else { return }
+        let fullRange = NSRange(location: 0, length: storage.length)
         let savedRange = fieldEditor.selectedRange
         storage.beginEditing()
-        storage.setAttributedString(formatted)
+        formatted.enumerateAttributes(in: fullRange) { attributes, range, _ in
+            storage.setAttributes(attributes, range: range)
+        }
         storage.endEditing()
         fieldEditor.selectedRange = savedRange
     }
@@ -1263,11 +1441,13 @@ final class SearchWindow: NSWindowController {
     func focusSearchField() {
         guard let window = window, let searchField = searchField else { return }
         window.makeFirstResponder(searchField)
-        applyQuerySyntaxHighlighting()
-        if let editor = searchField.currentEditor() {
+        if let editor = searchField.currentEditor() as? NSTextView {
             let length = (searchField.stringValue as NSString).length
-            editor.selectedRange = NSRange(location: length, length: 0)
+            let targetRange = NSRange(location: length, length: 0)
+            editor.selectedRange = targetRange
+            editor.scrollRangeToVisible(targetRange)
         }
+        applyQuerySyntaxHighlighting()
     }
 }
 

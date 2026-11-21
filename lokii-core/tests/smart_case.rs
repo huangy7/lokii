@@ -330,4 +330,13 @@ fn test_explicit_lock_path_pinyin_isolation() {
     assert_eq!(res_auto.len(), 2);
 }
 
+#[test]
+fn test_smart_case_quotes_and_negations() {
+    assert!(!resolve_case_sensitive("!Test", CaseSensitivity::Auto, SearchMode::Auto));
+    assert!(!resolve_case_sensitive(r#"!"Test""#, CaseSensitivity::Auto, SearchMode::Auto));
+    assert!(resolve_case_sensitive(r#""Test""#, CaseSensitivity::Auto, SearchMode::Auto));
+    assert!(!resolve_case_sensitive("main !Test", CaseSensitivity::Auto, SearchMode::Auto));
+    assert!(resolve_case_sensitive("Main !Test", CaseSensitivity::Auto, SearchMode::Auto));
+}
+
 

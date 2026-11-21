@@ -240,8 +240,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openPreferences() {
+        showPreferences()
+    }
+
+    /// 从搜索结果空态直达索引页
+    func openIndexPreferences() {
+        showPreferences(tab: "index")
+    }
+
+    private func showPreferences(tab: String? = nil) {
         if preferencesController == nil {
             preferencesController = PreferencesWindowController(engine: engine)
+        }
+        if let tab {
+            preferencesController?.selectTab(tab)
         }
         preferencesController?.showWindow(nil)
         preferencesController?.window?.makeKeyAndOrderFront(nil)

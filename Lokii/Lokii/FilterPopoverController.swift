@@ -155,7 +155,9 @@ public final class FilterPopoverController: NSObject, NSPopoverDelegate {
         if let editor = field.currentEditor() as? NSTextView {
             PillLayoutManager.ensureInstalled(on: editor)
             let length = (field.stringValue as NSString).length
-            editor.selectedRange = NSRange(location: length, length: 0)
+            let selection = NSRange(location: length, length: 0)
+            editor.selectedRange = selection
+            editor.scrollRangeToVisible(selection)
         }
     }
 
