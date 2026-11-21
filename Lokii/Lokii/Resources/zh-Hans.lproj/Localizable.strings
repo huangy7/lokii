@@ -49,6 +49,7 @@
 
 "prefs.section.language" = "语言";
 "prefs.language" = "语言";
+"prefs.language.description" = "设置应用显示语言";
 "prefs.language.zh-Hans" = "中文";
 "prefs.language.en" = "English";
 
@@ -67,6 +68,7 @@
 "prefs.networkRescan" = "网络卷重扫间隔";
 "prefs.networkRescan.description" = "网络共享等非本地卷上的远端改动无法实时感知，按此间隔整体重扫这些索引目录。";
 "prefs.networkRescan.minutes" = "%d 分钟";
+"prefs.networkRescan.unit" = "分钟";
 "prefs.networkRescan.off" = "关闭";
 "prefs.index.unsaved" = "有未保存的更改";
 "prefs.resetToDefaults" = "恢复默认";
@@ -232,6 +234,7 @@
 
 /* Preferences - Appearance */
 "prefs.section.appearance" = "外观";
+"prefs.section.appearanceAndLanguage" = "外观与语言";
 "prefs.appearance" = "外观";
 "prefs.appearance.description" = "选择 Lokii 的显示外观";
 "prefs.appearance.system" = "跟随系统";
@@ -288,7 +291,10 @@
 "prefs.cli.conflict" = "%@ 已存在且不是软链接，请先手动移除。";
 "prefs.cli.status.installed" = "已安装";
 "prefs.cli.status.notInstalled" = "未安装";
-"prefs.cli.uninstall" = "移除";
+"prefs.cli.uninstall" = "移除…";
+"prefs.cli.uninstallConfirm.title" = "移除命令行工具？";
+"prefs.cli.uninstallConfirm.message" = "将移除 %@ 软链接，不会影响 Lokii 应用本身。";
+"prefs.cli.uninstallConfirm.confirm" = "移除";
 "prefs.cli.notOurSymlink" = "%@ 指向的目标不是 Lokii 的内置命令行程序，已中止移除以防止误删。";
 "prefs.cli.readLinkFailed" = "无法解析 %@ 软链接的目标地址。";
 "prefs.section.terminalAndIntegration" = "终端与集成";

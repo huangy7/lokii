@@ -49,6 +49,7 @@
 
 "prefs.section.language" = "Language";
 "prefs.language" = "Language";
+"prefs.language.description" = "Choose the display language for Lokii";
 "prefs.language.zh-Hans" = "中文";
 "prefs.language.en" = "English";
 
@@ -67,6 +68,7 @@
 "prefs.networkRescan" = "Network volume rescan";
 "prefs.networkRescan.description" = "Changes made remotely on network shares can't be seen live, so indexed folders on non-local volumes are rescanned at this interval.";
 "prefs.networkRescan.minutes" = "%d min";
+"prefs.networkRescan.unit" = "min";
 "prefs.networkRescan.off" = "Off";
 "prefs.index.unsaved" = "Unsaved changes";
 "prefs.resetToDefaults" = "Restore Defaults";
@@ -232,6 +234,7 @@
 
 /* Preferences - Appearance */
 "prefs.section.appearance" = "Appearance";
+"prefs.section.appearanceAndLanguage" = "Appearance & Language";
 "prefs.appearance" = "Appearance";
 "prefs.appearance.description" = "Choose the display appearance for Lokii";
 "prefs.appearance.system" = "System";
@@ -288,7 +291,10 @@
 "prefs.cli.conflict" = "%@ already exists and is not a symlink. Please remove it first.";
 "prefs.cli.status.installed" = "Installed";
 "prefs.cli.status.notInstalled" = "Not Installed";
-"prefs.cli.uninstall" = "Remove";
+"prefs.cli.uninstall" = "Remove…";
+"prefs.cli.uninstallConfirm.title" = "Remove Command Line Tool?";
+"prefs.cli.uninstallConfirm.message" = "This removes the %@ symlink without affecting the Lokii app.";
+"prefs.cli.uninstallConfirm.confirm" = "Remove";
 "prefs.cli.notOurSymlink" = "%@ does not target Lokii's command line tool. Removal aborted to avoid accidental deletion.";
 "prefs.cli.readLinkFailed" = "Failed to resolve symlink destination for %@.";
 "prefs.section.terminalAndIntegration" = "Terminal & Integration";
