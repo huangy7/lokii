@@ -84,5 +84,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/lokii.rb
+          if git diff --cached --quiet; then
+            echo "[INFO] Casks/lokii.rb 已是 v${{ steps.get_version.outputs.version }} 最新状态，跳过重复提交"
+            exit 0
+          fi
           git commit -m "chore: update lokii cask to v${{ steps.get_version.outputs.version }}"
           git push
