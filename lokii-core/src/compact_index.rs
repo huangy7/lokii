@@ -335,6 +335,48 @@ impl CsrTable {
     }
 }
 
+/// `QueryIndex::parent_meta` 单字节位布局：
+/// - bits 0..=5 (`0x3F`): 父目录路径深度（截断至 32，与排序深度上限 `ranking::MAX_DEPTH` 对齐）
+/// - bit  6     (`0x40`): 槽位有效位（`0` 表示尚未计算或槽位已被释放）
+/// - bit  7     (`0x80`): 父目录是否存在任意以 `.` 开头的隐藏段
+const PARENT_META_DEPTH_MASK: u8 = 0x3F;
+const PARENT_META_MAX_DEPTH: usize = 32;
+const PARENT_META_VALID: u8 = 0x40;
+const PARENT_META_HIDDEN: u8 = 0x80;
+
+/// 零分配统计父路径中的非空目录层级数。
+#[inline]
+pub(crate) fn parent_depth(parent: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_seg = false;
+    for &b in parent.as_bytes() {
+        if b == b'/' || b == b'\\' {
+            in_seg = false;
+        } else if !in_seg {
+            in_seg = true;
+            count += 1;
+        }
+    }
+    count
+}
+
+/// 零分配检测父路径任意段是否以 `.` 开头（即位于隐藏目录子树下）。
+#[inline]
+pub(crate) fn is_parent_hidden(parent_bytes: &[u8]) -> bool {
+    parent_bytes.first() == Some(&b'.') || parent_bytes.windows(2).any(|w| w == b"/.")
+}
+
+#[inline]
+fn encode_parent_meta(parent: &str) -> u8 {
+    let depth = parent_depth(parent).min(PARENT_META_MAX_DEPTH) as u8;
+    let hidden = if is_parent_hidden(parent.as_bytes()) {
+        PARENT_META_HIDDEN
+    } else {
+        0
+    };
+    PARENT_META_VALID | hidden | (depth & PARENT_META_DEPTH_MASK)
+}
+
 pub(crate) struct QueryIndex {
     /// 按需构建并支持增量溢出的 CSR 反表。
     csr: std::sync::OnceLock<CsrTable>,
@@ -344,6 +386,9 @@ pub(crate) struct QueryIndex {
     signatures: Vec<crate::string_pool::NameSignature>,
     /// `signatures` 的有效位；签名本身可能全零，不能拿零值当“未计算”。
     signature_ready: Vec<u64>,
+    /// 按父目录池槽位缓存的单字节元数据（深度 + 隐藏标记 + 有效位），
+    /// 让重名桶展开时的 `score_record` 退化为 O(1) 字节查表，免除父路径字符串解引用与双遍扫描。
+    parent_meta: Vec<u8>,
     /// 等分查询（通配/正则/扩展名）需要的字典序名字表；按需构建，变更后失效。
     sorted: std::sync::Mutex<Option<std::sync::Arc<SortedNames>>>,
     /// 仅缓存“小写折叠后与原串不同”的非 ASCII 名字；CJK 小写恒等，不再复制一份。
@@ -357,6 +402,7 @@ impl Default for QueryIndex {
             csr_scratch: std::sync::Mutex::new(None),
             signatures: Vec::new(),
             signature_ready: Vec::new(),
+            parent_meta: Vec::new(),
             sorted: std::sync::Mutex::new(None),
             folded_non_ascii: std::collections::HashMap::new(),
         }
@@ -364,7 +410,11 @@ impl Default for QueryIndex {
 }
 
 impl QueryIndex {
-    fn build(records: &[CompactRecord], names: &crate::string_pool::StringPool) -> Self {
+    fn build(
+        records: &[CompactRecord],
+        names: &crate::string_pool::StringPool,
+        parents: &crate::string_pool::StringPool,
+    ) -> Self {
         let mut index = Self::default();
         let slots = names.slot_len();
         index
@@ -375,6 +425,14 @@ impl QueryIndex {
         for name_id in 0..slots as u32 {
             if let Some(name) = names.get(name_id) {
                 index.set_name(name_id, name);
+            }
+        }
+
+        let parent_slots = parents.slot_len();
+        index.parent_meta.resize(parent_slots, 0);
+        for parent_id in 0..parent_slots as u32 {
+            if let Some(parent) = parents.get(parent_id) {
+                index.parent_meta[parent_id as usize] = encode_parent_meta(parent);
             }
         }
 
@@ -455,6 +513,46 @@ impl QueryIndex {
         self.csr.get().map_or(&[], |table| table.entries(name_id))
     }
 
+    #[inline]
+    pub(crate) fn parent_meta(&self, parent_id: u32) -> Option<(usize, bool)> {
+        let meta = *self.parent_meta.get(parent_id as usize)?;
+        if (meta & PARENT_META_VALID) == 0 {
+            return None;
+        }
+        Some((
+            (meta & PARENT_META_DEPTH_MASK) as usize,
+            (meta & PARENT_META_HIDDEN) != 0,
+        ))
+    }
+
+    fn set_parent(&mut self, parent_id: u32, parent: &str) {
+        let slot = parent_id as usize;
+        if slot >= self.parent_meta.len() {
+            self.parent_meta.resize(slot + 1, 0);
+        }
+        self.parent_meta[slot] = encode_parent_meta(parent);
+    }
+
+    fn clear_parent(&mut self, parent_id: u32) {
+        if let Some(meta) = self.parent_meta.get_mut(parent_id as usize) {
+            *meta = 0;
+        }
+    }
+
+    fn register_parent(&mut self, parent_id: u32, parents: &crate::string_pool::StringPool) {
+        let slot = parent_id as usize;
+        if self
+            .parent_meta
+            .get(slot)
+            .is_some_and(|&meta| (meta & PARENT_META_VALID) != 0)
+        {
+            return;
+        }
+        if let Some(parent) = parents.get(parent_id) {
+            self.set_parent(parent_id, parent);
+        }
+    }
+
     fn set_name(&mut self, name_id: u32, name: &str) {
         let folded = if name.is_ascii() || !crate::cjk::needs_fold(name) {
             None
@@ -503,12 +601,13 @@ impl QueryIndex {
         *sorted = None;
     }
 
-    /// 仅为本批次新注册的 `candidate_ids` 补算签名并增量归并到字典序名字表，
+    /// 仅为本批次新注册的 `candidate_ids` 补算签名与父目录元数据并增量归并到字典序名字表，
     /// 耗时严格正比于本次新增记录数 `O(batch)`，不再遍历全池槽位。
     fn register_records(
         &mut self,
         records: &[CompactRecord],
         names: &crate::string_pool::StringPool,
+        parents: &crate::string_pool::StringPool,
     ) {
         let slots = names.slot_len();
         if self.signatures.len() < slots {
@@ -519,6 +618,10 @@ impl QueryIndex {
         if self.signature_ready.len() < words {
             self.signature_ready.resize(words, 0);
         }
+        let parent_slots = parents.slot_len();
+        if self.parent_meta.len() < parent_slots {
+            self.parent_meta.resize(parent_slots, 0);
+        }
 
         let mut new_ids = Vec::new();
         for record in records {
@@ -528,6 +631,9 @@ impl QueryIndex {
                     self.set_name(name_id, name);
                     new_ids.push(name_id);
                 }
+            }
+            if !record.raw_path {
+                self.register_parent(record.path, parents);
             }
         }
 
@@ -629,6 +735,7 @@ impl QueryIndex {
         csr_bytes
             + self.signatures.capacity() * std::mem::size_of::<crate::string_pool::NameSignature>()
             + self.signature_ready.capacity() * 8
+            + self.parent_meta.capacity()
             + folded_bytes
             + sorted_bytes
     }
@@ -812,6 +919,11 @@ impl CompactIndex {
             self.raw_paths.release(record.path);
         } else {
             self.parents.release(record.path);
+            if self.parents.ref_count(record.path) == 0 {
+                if let Some(index) = self.query_index.get_mut() {
+                    index.clear_parent(record.path);
+                }
+            }
         }
         // 槽位可能随后被新名字复用；旧签名/折叠串必须先失效，
         // 否则下一次查询会把新名字当成旧名字的缓存。
@@ -834,10 +946,13 @@ impl CompactIndex {
             return;
         }
         let Self {
-            query_index, names, ..
+            query_index,
+            names,
+            parents,
+            ..
         } = self;
         if let Some(index) = query_index.get_mut() {
-            index.register_records(added, names);
+            index.register_records(added, names, parents);
             if let Some(csr) = index.csr.get_mut() {
                 for (offset, record) in added.iter().enumerate() {
                     csr.append_record(record.name, (base_ordinal + offset) as u32);
@@ -869,7 +984,7 @@ impl CompactIndex {
     fn ensure_query_index(&self) -> &QueryIndex {
         let index = self
             .query_index
-            .get_or_init(|| QueryIndex::build(&self.records, &self.names));
+            .get_or_init(|| QueryIndex::build(&self.records, &self.names, &self.parents));
         index.ensure_csr(&self.records, self.names.slot_len());
         index
     }
@@ -1066,8 +1181,21 @@ impl CompactIndex {
         }
     }
 
-    pub(crate) fn extension(&self, id: u32) -> Option<&str> {
-        self.extensions.get(id)
+    /// O(1) 获取记录父目录的 `(depth, is_hidden)` 排序元数据：
+    /// 池化记录直接读取 `QueryIndex::parent_meta` 单字节表，原始路径或未命中槽位安全回退现场计算。
+    #[inline]
+    pub(crate) fn record_parent_meta(
+        &self,
+        record: &CompactRecord,
+        query_index: &QueryIndex,
+    ) -> (usize, bool) {
+        if !record.raw_path {
+            if let Some(meta) = query_index.parent_meta(record.path) {
+                return meta;
+            }
+        }
+        let parent = self.record_parent(record);
+        (parent_depth(parent), is_parent_hidden(parent.as_bytes()))
     }
 
     /// 查找扩展名在池中的槽位编号。
@@ -1258,12 +1386,21 @@ impl CompactIndex {
                 }
             }
             self.release(previous);
-            if previous.name != record.name {
+            let parent_changed =
+                !record.raw_path && (previous.raw_path || previous.path != record.path);
+            if previous.name != record.name || parent_changed {
                 let Self {
-                    query_index, names, ..
+                    query_index,
+                    names,
+                    parents,
+                    ..
                 } = self;
                 if let Some(index) = query_index.get_mut() {
-                    index.register_records(std::slice::from_ref(&record), names);
+                    if previous.name != record.name {
+                        index.register_records(std::slice::from_ref(&record), names, parents);
+                    } else if parent_changed {
+                        index.register_parent(record.path, parents);
+                    }
                 }
             }
         }
@@ -1522,12 +1659,21 @@ impl CompactIndex {
                 }
             }
             self.release(previous);
-            if previous.name != replacement.name {
+            let parent_changed = !replacement.raw_path
+                && (previous.raw_path || previous.path != replacement.path);
+            if previous.name != replacement.name || parent_changed {
                 let Self {
-                    query_index, names, ..
+                    query_index,
+                    names,
+                    parents,
+                    ..
                 } = self;
                 if let Some(index) = query_index.get_mut() {
-                    index.register_records(std::slice::from_ref(&replacement), names);
+                    if previous.name != replacement.name {
+                        index.register_records(std::slice::from_ref(&replacement), names, parents);
+                    } else if parent_changed {
+                        index.register_parent(replacement.path, parents);
+                    }
                 }
             }
         }

@@ -134,10 +134,24 @@ pub(crate) fn map_norm_span_to_orig(
     }
 
     // 当极少数 Unicode 大写字符折叠后裂变为多个基本字母簇（如 'ẞ' -> "ss"）时，按每簇折叠长度步进投影
+    map_norm_span_with_graphemes(&orig_graphemes, norm, norm_start, norm_end)
+}
+
+/// 复用已切分的 `orig_graphemes` 将归一化/折叠串字节区间按字符簇步进投影回原串，
+/// 避免批量高亮映射（如 `fuzzy` 逐索引投影）在循环内重复分配字素簇数组。
+pub(crate) fn map_norm_span_with_graphemes(
+    orig_graphemes: &[(usize, &str)],
+    norm: &str,
+    norm_start: usize,
+    norm_end: usize,
+) -> Option<(usize, usize)> {
+    if norm_start >= norm_end || norm_end > norm.len() {
+        return None;
+    }
     let mut mapped_start = None;
     let mut mapped_end = 0usize;
     let mut norm_cursor = 0usize;
-    for (og_start, og) in orig_graphemes {
+    for &(og_start, og) in orig_graphemes {
         let adv = if norm[norm_cursor..].starts_with(og) {
             og.len()
         } else {
@@ -220,9 +234,16 @@ pub(crate) fn rank_unique_names<'a>(
             if !passthrough && !filter.matches_record_in(index, record, Some(name)) {
                 continue;
             }
-            let parent = index.record_parent(record);
-            let final_score =
-                ranking::score_record(base, record.is_dir, parent, rank_ctx, targets_hidden);
+            let (parent_depth, parent_hidden) = index.record_parent_meta(record, query_index);
+            let final_score = ranking::score_record_with_meta(
+                base,
+                record.is_dir,
+                parent_depth,
+                parent_hidden,
+                rank_ctx,
+                targets_hidden,
+                0,
+            );
             top.offer(ordinal as usize, final_score, name);
         }
     }
@@ -253,6 +274,32 @@ pub enum CaseSensitivity {
     Insensitive,
 }
 
+/// 在剥离否定词与未加引号的 `in:<scope>` 词元后，提取行内正则语法糖 `/pattern/[i]`。
+/// 使 `in:src /^test_.*\.rs/`、`in:"/My Docs" /(foo|bar)/i` 等正交组合都能被稳定识别为正则模式。
+fn extract_regex_sugar_from_tokens(tokens: &[QueryToken]) -> Option<RegexSugar> {
+    let mut non_scope = Vec::new();
+    for token in tokens {
+        if token.negated || token.text.is_empty() {
+            continue;
+        }
+        if !token.quoted && token.text.starts_with("in:") {
+            continue;
+        }
+        if token.quoted || token.had_escaped_meta || token.was_sanitized_pasted_path {
+            return None;
+        }
+        non_scope.push(token.text.as_str());
+    }
+    if non_scope.is_empty() {
+        return None;
+    }
+    if non_scope.len() == 1 {
+        parse_regex_sugar(non_scope[0])
+    } else {
+        parse_regex_sugar(&non_scope.join(" "))
+    }
+}
+
 /// 基于结构化正向词元提取参与 Smart Case 判定的有效文件名词元。
 ///
 /// 跳过否定排除词（`!Test` / `!"Test"`）、`in:` 作用域与父路径前缀，
@@ -267,6 +314,9 @@ pub(crate) fn extract_content_terms_from_tokens(
             if token.negated || token.text.is_empty() {
                 continue;
             }
+            if !token.quoted && token.text.starts_with("in:") {
+                continue;
+            }
             let raw = if raw_terms.is_empty() {
                 token.text.strip_prefix("regex:").unwrap_or(&token.text)
             } else {
@@ -274,6 +324,11 @@ pub(crate) fn extract_content_terms_from_tokens(
             };
             if !raw.is_empty() {
                 raw_terms.push(raw.to_string());
+            }
+        }
+        if raw_terms.len() == 1 {
+            if let Some(sugar) = parse_regex_sugar(&raw_terms[0]) {
+                raw_terms[0] = sugar.pattern;
             }
         }
         return raw_terms;
@@ -400,18 +455,8 @@ pub(crate) fn detect_mode_from_tokens(tokens: &[QueryToken]) -> SearchMode {
         return SearchMode::Auto;
     }
 
-    let all_unquoted = tokens
-        .iter()
-        .all(|t| !t.quoted && !t.negated && !t.had_escaped_meta && !t.was_sanitized_pasted_path);
-    if all_unquoted {
-        let joined: String = tokens
-            .iter()
-            .map(|t| t.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if joined.starts_with("regex:") || parse_regex_sugar(&joined).is_some() {
-            return SearchMode::Regex;
-        }
+    if extract_regex_sugar_from_tokens(tokens).is_some() {
+        return SearchMode::Regex;
     }
 
     if tokens.iter().any(|t| {
@@ -469,45 +514,62 @@ pub fn detect_mode(query: &str) -> SearchMode {
     detect_mode_from_tokens(&parsed.positive_tokens)
 }
 
-/// 校验证伪隐式扩展名在当前索引中是否存在；若不存在则移出过滤条件并归还至正向检索词元。
+/// 校验证伪隐式扩展名（含正/负向长扩展名候选）在当前索引中是否存在；
+/// 若不存在则移出扩展名过滤并归还至正向检索词元或否定排除词元。
 fn resolve_inferred_exts(parsed: &mut ParsedQuery, has_extension: impl Fn(&str) -> bool) {
-    if parsed.filter.inferred_exts.is_empty() {
-        return;
-    }
-    let inferred = std::mem::take(&mut parsed.filter.inferred_exts);
-    let mut restored_tokens = false;
-    for (inferred_ext, raw_token) in inferred {
-        if !has_extension(&inferred_ext) {
-            parsed.filter.custom_exts.retain(|e| e != &inferred_ext);
-            if parsed.filter.custom_ext.as_deref() == Some(inferred_ext.as_str()) {
-                parsed.filter.custom_ext = parsed.filter.custom_exts.first().cloned();
-            }
-            if parsed.clean_query.is_empty() {
-                parsed.clean_query = raw_token.clone();
+    if !parsed.filter.inferred_exts.is_empty() {
+        let inferred = std::mem::take(&mut parsed.filter.inferred_exts);
+        let mut restored_tokens = false;
+        for (inferred_ext, raw_token) in inferred {
+            if !has_extension(&inferred_ext) {
+                parsed.filter.custom_exts.retain(|e| e != &inferred_ext);
+                if parsed.filter.custom_ext.as_deref() == Some(inferred_ext.as_str()) {
+                    parsed.filter.custom_ext = parsed.filter.custom_exts.first().cloned();
+                }
+                if parsed.clean_query.is_empty() {
+                    parsed.clean_query = raw_token.clone();
+                } else {
+                    parsed.clean_query.push(' ');
+                    parsed.clean_query.push_str(&raw_token);
+                }
+                parsed.positive_tokens.push(QueryToken {
+                    text: raw_token.clone(),
+                    quoted: false,
+                    negated: false,
+                    raw: raw_token,
+                    had_escaped_meta: false,
+                    was_sanitized_pasted_path: false,
+                });
+                restored_tokens = true;
             } else {
-                parsed.clean_query.push(' ');
-                parsed.clean_query.push_str(&raw_token);
+                parsed.filter.inferred_exts.push((inferred_ext, raw_token));
             }
-            parsed.positive_tokens.push(QueryToken {
-                text: raw_token.clone(),
-                quoted: false,
-                negated: false,
-                raw: raw_token,
-                had_escaped_meta: false,
-                was_sanitized_pasted_path: false,
-            });
-            restored_tokens = true;
-        } else {
-            parsed.filter.inferred_exts.push((inferred_ext, raw_token));
+        }
+        if restored_tokens {
+            parsed.clean_query = parsed
+                .positive_tokens
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
         }
     }
-    if restored_tokens {
-        parsed.clean_query = parsed
-            .positive_tokens
-            .iter()
-            .map(|t| t.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
+
+    if !parsed.filter.inferred_exclude_exts.is_empty() {
+        let inferred_neg = std::mem::take(&mut parsed.filter.inferred_exclude_exts);
+        for (inferred_ext, raw_token) in inferred_neg {
+            if !has_extension(&inferred_ext) {
+                parsed.filter.exclude_exts.retain(|e| e != &inferred_ext);
+                if !parsed.filter.exclude_terms.contains(&raw_token) {
+                    parsed.filter.exclude_terms.push(raw_token);
+                }
+            } else {
+                parsed
+                    .filter
+                    .inferred_exclude_exts
+                    .push((inferred_ext, raw_token));
+            }
+        }
     }
 }
 
@@ -800,14 +862,15 @@ fn prepare_search(
     has_extension: impl Fn(&str) -> bool,
 ) -> PreparedSearch {
     let mut parsed = parse_query_structured(query);
+    let has_regex_prefix = parsed.positive_tokens.iter().any(|t| {
+        !t.negated
+            && !t.quoted
+            && !t.was_sanitized_pasted_path
+            && t.text.starts_with("regex:")
+    });
     let top_level_regex = mode == SearchMode::Regex
-        || (!parsed.positive_tokens.iter().any(|t| t.quoted)
-            && (parsed
-                .positive_tokens
-                .iter()
-                .any(|t| t.text.starts_with("regex:"))
-                || (!parsed.positive_tokens.iter().any(|t| t.had_escaped_meta)
-                    && parse_regex_sugar(&parsed.clean_query).is_some())));
+        || has_regex_prefix
+        || extract_regex_sugar_from_tokens(&parsed.positive_tokens).is_some();
 
     // 并集检索（OR 查询）路由：在自动且非顶层正则模式下，先按双引号/转义感知的 `|` 切分，再逐子句解析过滤器。
     let disjunction = if mode == SearchMode::Auto && !top_level_regex && has_unescaped_pipe(query) {
@@ -884,10 +947,26 @@ fn dispatch_with_filter_inner(
             .iter()
             .map(|clause| {
                 let clause_filter = clause.filter.merged_with(filter);
-                CompiledRecordFilter::compile_with_case(
+                let clause_scopes = if let Some((shard, _)) = shard_context {
+                    if let (Some(configured), Some(active)) =
+                        (shard.configured_path, shard.active_path)
+                    {
+                        path_query::rewrite_scope_candidates_drift_alias(
+                            &clause.scope_candidates,
+                            configured,
+                            active,
+                        )
+                    } else {
+                        clause.scope_candidates.clone()
+                    }
+                } else {
+                    clause.scope_candidates.clone()
+                };
+                CompiledRecordFilter::compile_with_case_and_scope(
                     read,
                     &clause_filter,
                     clause.is_case_sensitive,
+                    &clause_scopes,
                 )
             })
             .collect();
@@ -907,14 +986,9 @@ fn dispatch_with_filter_inner(
     let parsed = &prepared.parsed;
     let effective_filter = parsed.filter.merged_with(filter);
 
-    // 识别行内正则语法糖（仅在 Auto 且无双引号/转义元字符/粘贴路径保护时推导）
-    let regex_sugar = if mode == SearchMode::Auto
-        && !parsed
-            .positive_tokens
-            .iter()
-            .any(|t| t.quoted || t.had_escaped_meta || t.was_sanitized_pasted_path)
-    {
-        parse_regex_sugar(&parsed.clean_query)
+    // 识别行内正则语法糖（剥离 `in:<scope>` 后提取，支持 `in:src /^test_.*\.rs/` 正交组合）
+    let regex_sugar = if mode == SearchMode::Auto {
+        extract_regex_sugar_from_tokens(&parsed.positive_tokens)
     } else {
         None
     };
@@ -923,11 +997,12 @@ fn dispatch_with_filter_inner(
     let effective_mode = match mode {
         SearchMode::Auto => {
             if regex_sugar.is_some()
-                || (!parsed.positive_tokens.iter().any(|t| t.quoted)
-                    && parsed
-                        .positive_tokens
-                        .iter()
-                        .any(|t| t.text.starts_with("regex:")))
+                || parsed.positive_tokens.iter().any(|t| {
+                    !t.negated
+                        && !t.quoted
+                        && !t.was_sanitized_pasted_path
+                        && t.text.starts_with("regex:")
+                })
             {
                 SearchMode::Regex
             } else {
@@ -968,11 +1043,40 @@ fn dispatch_with_filter_inner(
         (None, case_sens)
     };
 
-    let compiled_filter =
-        CompiledRecordFilter::compile_with_case(&read, &effective_filter, is_case_sensitive);
+    // 为正则模式以及仅带 `in:<scope>`（无 `/` 路径段）的模糊模式编译父目录作用域掩码，
+    // 确保 `in:` 作用域与正则、模糊检索完全正交，且兼容挂载卷漂移别名重写。
+    let has_unquoted_slash = parsed
+        .positive_tokens
+        .iter()
+        .any(|t| !t.negated && !t.quoted && !t.text.starts_with("in:") && t.text.contains('/'));
+    let filter_scope_candidates = if effective_mode == SearchMode::Regex
+        || (effective_mode == SearchMode::Fuzzy && !has_unquoted_slash)
+    {
+        let raw_scopes = path_query::build_scope_candidates_from_tokens(&parsed.positive_tokens);
+        if let Some((shard, _)) = shard_context {
+            if let (Some(configured), Some(active)) = (shard.configured_path, shard.active_path) {
+                path_query::rewrite_scope_candidates_drift_alias(&raw_scopes, configured, active)
+            } else {
+                raw_scopes
+            }
+        } else {
+            raw_scopes
+        }
+    } else {
+        Vec::new()
+    };
 
-    // 含未加引号路径语法（'/' 或 'in:'）时交由路径检索器。
-    if effective_mode != SearchMode::Regex {
+    let compiled_filter = CompiledRecordFilter::compile_with_case_and_scope(
+        read,
+        &effective_filter,
+        is_case_sensitive,
+        &filter_scope_candidates,
+    );
+
+    // 含未加引号路径语法（'/' 或 'in:'）时交由路径检索器（正则及纯 `in:` 模糊已通过作用域掩码正交处理）。
+    let bypass_path_query = effective_mode == SearchMode::Regex
+        || (effective_mode == SearchMode::Fuzzy && !has_unquoted_slash && !filter_scope_candidates.is_empty());
+    if !bypass_path_query {
         if let Some(mut path_query) =
             path_query::PathQuery::parse_from_tokens(&parsed.positive_tokens, is_case_sensitive)
         {
@@ -998,7 +1102,7 @@ fn dispatch_with_filter_inner(
             }
 
             if let Some((colon_results, fallback_cs)) = try_posix_colon_fallback(
-                &read,
+                read,
                 &parsed.positive_tokens,
                 &path_query,
                 &effective_filter,
@@ -1031,7 +1135,7 @@ fn dispatch_with_filter_inner(
 
     // For Auto that detected as Auto (no special chars), run substring search.
     // 保持高确定性与精准度：普通文本输入严格按连续子串匹配，搜不到即返回空列表，避免无脑降级为模糊跳字匹配。
-    let (results, error) = match effective_mode {
+    let (mut results, error) = match effective_mode {
         SearchMode::Auto | SearchMode::Substring => {
             let results = substring::search_index_tokens_with_hybrid(
                 read,
@@ -1046,9 +1150,9 @@ fn dispatch_with_filter_inner(
             (results, None)
         }
         SearchMode::Wildcard => {
-            let results = wildcard::search_index(
-                &read,
-                &parsed.clean_query,
+            let results = wildcard::search_index_tokens(
+                read,
+                &parsed.positive_tokens,
                 &compiled_filter,
                 max_results,
                 is_case_sensitive,
@@ -1058,7 +1162,7 @@ fn dispatch_with_filter_inner(
         SearchMode::Regex => {
             let pattern = pattern_to_run.as_deref().unwrap_or(&parsed.clean_query);
             regex_search::search_index(
-                &read,
+                read,
                 pattern,
                 &compiled_filter,
                 max_results,
@@ -1066,24 +1170,47 @@ fn dispatch_with_filter_inner(
             )
         }
         SearchMode::Fuzzy => {
+            let stripped_tokens: Vec<QueryToken>;
+            let fuzzy_tokens: &[QueryToken] = if filter_scope_candidates.is_empty() {
+                &parsed.positive_tokens
+            } else {
+                stripped_tokens = parsed
+                    .positive_tokens
+                    .iter()
+                    .filter(|t| !(!t.quoted && t.text.starts_with("in:")))
+                    .cloned()
+                    .collect();
+                &stripped_tokens
+            };
             if let FuzzyPass::Jump { seen, output } = fuzzy_pass {
                 if prepared.single_extension_exists == Some(true) {
                     return (Vec::new(), is_case_sensitive, None, effective_mode);
                 }
-                *output = fuzzy::search_index_tokens_raw(
+                let mut raw = fuzzy::search_index_tokens_raw(
                     read,
-                    &parsed.positive_tokens,
+                    fuzzy_tokens,
                     &compiled_filter,
                     max_results,
                     is_case_sensitive,
                     seen,
                 );
+                if !filter_scope_candidates.is_empty() {
+                    for (item, _) in &mut raw {
+                        let parent = crate::compact_index::split_path(&item.entry.path).0;
+                        if let Some(span) =
+                            path_search::find_scope_highlight_range(parent, &filter_scope_candidates)
+                        {
+                            item.parent_match_positions = vec![span];
+                        }
+                    }
+                }
+                *output = raw;
                 return (Vec::new(), is_case_sensitive, None, effective_mode);
             }
             // 模糊模式是 Auto 的放宽：子串/混合/拼音命中在前，跳字命中去重后补足剩余名额
             let mut results = substring::search_index_tokens_with_hybrid(
                 read,
-                &parsed.positive_tokens,
+                fuzzy_tokens,
                 &compiled_filter,
                 max_results,
                 is_case_sensitive,
@@ -1093,6 +1220,19 @@ fn dispatch_with_filter_inner(
             );
             let remaining = max_results.saturating_sub(results.len());
             if remaining == 0 || matches!(fuzzy_pass, FuzzyPass::Precise) {
+                if !filter_scope_candidates.is_empty() {
+                    for item in &mut results {
+                        if item.parent_match_positions.is_empty() {
+                            let parent = crate::compact_index::split_path(&item.entry.path).0;
+                            if let Some(span) = path_search::find_scope_highlight_range(
+                                parent,
+                                &filter_scope_candidates,
+                            ) {
+                                item.parent_match_positions = vec![span];
+                            }
+                        }
+                    }
+                }
                 return (results, is_case_sensitive, None, effective_mode);
             }
             let seen: std::collections::HashSet<String> =
@@ -1100,7 +1240,7 @@ fn dispatch_with_filter_inner(
             results.extend(
                 fuzzy::search_index_tokens(
                     read,
-                    &parsed.positive_tokens,
+                    fuzzy_tokens,
                     &compiled_filter,
                     max_results,
                     is_case_sensitive,
@@ -1112,6 +1252,19 @@ fn dispatch_with_filter_inner(
             (results, None)
         }
     };
+
+    if !filter_scope_candidates.is_empty() {
+        for item in &mut results {
+            if item.parent_match_positions.is_empty() {
+                let parent = crate::compact_index::split_path(&item.entry.path).0;
+                if let Some(span) =
+                    path_search::find_scope_highlight_range(parent, &filter_scope_candidates)
+                {
+                    item.parent_match_positions = vec![span];
+                }
+            }
+        }
+    }
 
     (results, is_case_sensitive, error, effective_mode)
 }

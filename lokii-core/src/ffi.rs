@@ -802,7 +802,8 @@ impl LokiiCore {
     /// wake Finder or stall on a disconnected share.
     fn ensure_path_accessible(&self, path: &str) -> Result<(), FfiError> {
         let statuses = self.volumes.statuses();
-        let live_mounts = self.volumes.mounted_volumes();
+        // 可达性检查仅依赖挂载点路径，走免 getattrlist 的轻量内核快照，杜绝唤醒休眠外置机械硬盘
+        let live_mounts = self.volumes.mounted_volumes_fast();
         ensure_path_accessible_with(path, &statuses, &live_mounts, &|top_entry| {
             read_volumes_boot_symlink(top_entry, &live_mounts)
         })

@@ -158,11 +158,17 @@ impl IndexScopePolicy {
     /// Build a compiled scope policy from `AppConfig`.
     /// Path normalization (tilde expansion, absolute path) happens here.
     pub fn from_config(config: &AppConfig) -> Self {
-        let include_roots = config
-            .resolve_paths()
-            .into_iter()
-            .map(NormalizedPrefix::new)
-            .collect();
+        Self::from_resolved_roots(config, config.resolve_paths())
+    }
+
+    /// 零磁盘 I/O 的纯词法策略构建器：不调用 `Path::exists()`，专供检索热路径解释排除原因，
+    /// 防止已配置的离线 SMB/外置挂载点在搜索空结果时触发阻塞式 `stat`。
+    pub fn from_config_lexical(config: &AppConfig) -> Self {
+        Self::from_resolved_roots(config, config.resolve_paths_lexical())
+    }
+
+    fn from_resolved_roots(config: &AppConfig, roots: Vec<PathBuf>) -> Self {
+        let include_roots = roots.into_iter().map(NormalizedPrefix::new).collect();
         let excluded_prefixes = config
             .resolve_exclude_paths()
             .into_iter()
@@ -381,10 +387,11 @@ pub fn exclusion_hint(query: &str, config: &AppConfig) -> Option<String> {
         .split_whitespace()
         .map(|word| word.strip_prefix("in:").unwrap_or(word))
         .filter(|word| word.contains('/'));
-    // 没有带 '/' 的词元就不可能命中排除规则，先免掉编译过滤器（含索引根 stat）的开销
+    // 没有带 '/' 的词元就不可能命中排除规则，先免掉纯词法策略构建的开销
     let first = path_words.next()?;
 
-    let filter = CompiledFilter::from_config(config);
+    // 采用纯词法路径展开，确保搜索热路径 100% 零磁盘系统调用
+    let filter = CompiledFilter::from_config_lexical(config);
     std::iter::once(first).chain(path_words).find_map(|word| {
         let path = crate::search::path_query::expand_tilde(word);
         let in_depth = deepest_matching_depth(&filter.include_roots, &path).unwrap_or(0);
@@ -926,6 +933,30 @@ mod tests {
                 false
             ),
             ScopeDecision::HardDrop
+        );
+    }
+
+    #[test]
+    fn test_exclusion_hint_lexical_respects_unmounted_include_root() {
+        let mut config = AppConfig::default();
+        config.index.index_paths = vec!["/Volumes/OfflineNAS_NonExistent/Workspace".to_string()];
+        config.index.exclude_paths =
+            vec!["/Volumes/OfflineNAS_NonExistent/Workspace/Build".to_string()];
+        config.index.exclude = vec!["node_modules".to_string()];
+
+        assert_eq!(
+            exclusion_hint(
+                "/Volumes/OfflineNAS_NonExistent/Workspace/Build/out.bin",
+                &config
+            ),
+            Some("/Volumes/OfflineNAS_NonExistent/Workspace/Build".to_string())
+        );
+        assert_eq!(
+            exclusion_hint(
+                "/Volumes/OfflineNAS_NonExistent/Workspace/app/node_modules/pkg.js",
+                &config
+            ),
+            Some("node_modules".to_string())
         );
     }
 }

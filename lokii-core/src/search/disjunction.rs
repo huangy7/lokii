@@ -1,5 +1,6 @@
 use crate::search::filter::{is_dotfile_query, parse_query_structured, ParsedQuery, QueryFilter};
-use crate::search::{detect_mode_from_tokens, resolve_case_sensitive_tokens, CaseSensitivity};
+use crate::search::path_query::{build_scope_candidates_from_tokens, PathCandidate};
+use crate::search::{detect_mode_from_tokens, resolve_case_sensitive_tokens, CaseSensitivity, SearchMode};
 use crate::string_pool::NameSignature;
 
 /// 表示并集检索中的单个子句元数据。
@@ -11,6 +12,8 @@ pub struct OrClause {
     pub is_case_sensitive: bool,
     /// 候选文件扩展名（小写，不含前导点号）；`Some` 即代表扩展名匹配子句
     pub extension: Option<String>,
+    /// 该子句是否为非纯扩展名通配符子句（如 `test_*` / `report *2026*.pdf`）
+    pub(crate) is_wildcard: bool,
     /// 参与匹配与高亮计算的关键词集合（大小写已按敏感态规范化）
     pub keywords: Vec<String>,
     /// 保留原始大小写（经 NFC 规范化）的关键词集合，供排序精确大小写加分判定使用
@@ -19,6 +22,8 @@ pub struct OrClause {
     pub(crate) required_sig: NameSignature,
     /// 该子句作用域内的内联过滤条件与否定排除约束（如 `type:` / `!term` / `!.ext` / `!dir/`）
     pub filter: QueryFilter,
+    /// 该子句内的 `in:<scope>` 目录作用域候选列表
+    pub(crate) scope_candidates: Vec<PathCandidate>,
 }
 
 /// 并集检索查询模型。
@@ -45,10 +50,16 @@ impl DisjunctionQuery {
             None => CaseSensitivity::Auto,
         };
 
-        let (is_extension, extension) = if parsed.positive_tokens.len() == 1
-            && !parsed.positive_tokens[0].quoted
-        {
-            let token = parsed.positive_tokens[0].text.trim();
+        let scope_candidates = build_scope_candidates_from_tokens(&parsed.positive_tokens);
+        let content_tokens: Vec<_> = parsed
+            .positive_tokens
+            .iter()
+            .filter(|t| !(!t.quoted && t.text.starts_with("in:")))
+            .cloned()
+            .collect();
+
+        let (is_extension, extension) = if content_tokens.len() == 1 && !content_tokens[0].quoted {
+            let token = content_tokens[0].text.trim();
             let (is_extension, extension) = parse_clause_extension(token);
             if token.starts_with('.') && extension.as_deref().is_some_and(|ext| !has_extension(ext))
             {
@@ -60,14 +71,15 @@ impl DisjunctionQuery {
             (false, None)
         };
 
-        let search_mode = detect_mode_from_tokens(&parsed.positive_tokens);
+        let search_mode = detect_mode_from_tokens(&content_tokens);
+        let is_wildcard = !is_extension && search_mode == SearchMode::Wildcard;
         let is_case_sensitive =
-            resolve_case_sensitive_tokens(&parsed.positive_tokens, case_setting, search_mode);
+            resolve_case_sensitive_tokens(&content_tokens, case_setting, search_mode);
 
         let mut keywords = Vec::new();
         let mut raw_keywords = Vec::new();
         if !is_extension {
-            for token in &parsed.positive_tokens {
+            for token in &content_tokens {
                 let clean = token.text.as_str();
                 if clean.is_empty() {
                     continue;
@@ -85,6 +97,16 @@ impl DisjunctionQuery {
             extension
                 .as_deref()
                 .map_or_else(NameSignature::default, extension_signature)
+        } else if is_wildcard {
+            let mut sig = NameSignature::default();
+            for kw in &keywords {
+                sig = sig.union(if super::wildcard::has_glob_meta(kw) {
+                    super::wildcard::required_signature_for_glob(kw)
+                } else {
+                    NameSignature::from_substring_query(kw)
+                });
+            }
+            sig
         } else {
             let mut sig = NameSignature::default();
             for kw in &keywords {
@@ -97,10 +119,12 @@ impl DisjunctionQuery {
             raw_query: raw,
             is_case_sensitive,
             extension,
+            is_wildcard,
             keywords,
             raw_keywords,
             required_sig,
             filter: parsed.filter,
+            scope_candidates,
         }
     }
 

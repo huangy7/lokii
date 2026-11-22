@@ -25,9 +25,14 @@ pub fn search(
 }
 
 /// 将 `nucleo_matcher` 产出的索引位置转换为原始字符串 `orig` 中的安全 UTF-8 字符簇字节区间。
-/// 纯 ASCII 走零分配直接坐标映射；非 ASCII 根据 haystack 底层编码形态（全 ASCII 起首簇走字节偏移，
-/// Unicode 簇流走 UAX #29 字符簇序号）定位归一化字节区间后通过 `map_norm_span_to_orig` 投影。
-fn map_fuzzy_indices_to_orig(orig: &str, norm: &str, haystack: Utf32Str<'_>, indices: &[u32]) -> Vec<(usize, usize)> {
+/// 纯 ASCII 走零分配直接坐标映射；非 ASCII 外层单次收集 `orig` 与 `norm` 字符簇数组，
+/// 消除循环内重复 `grapheme_indices().collect()` 堆分配。
+fn map_fuzzy_indices_to_orig(
+    orig: &str,
+    norm: &str,
+    haystack: Utf32Str<'_>,
+    indices: &[u32],
+) -> Vec<(usize, usize)> {
     if orig.is_ascii() && norm.is_ascii() && orig.len() == norm.len() {
         return indices
             .iter()
@@ -38,16 +43,39 @@ fn map_fuzzy_indices_to_orig(orig: &str, norm: &str, haystack: Utf32Str<'_>, ind
             .collect();
     }
     use unicode_segmentation::UnicodeSegmentation;
+    let orig_graphemes: Vec<(usize, &str)> = orig.grapheme_indices(true).collect();
     let norm_graphemes: Vec<(usize, &str)> = norm.grapheme_indices(true).collect();
     let is_ascii_haystack = matches!(haystack, Utf32Str::Ascii(_));
+
+    if orig_graphemes.len() == norm_graphemes.len() {
+        return indices
+            .iter()
+            .filter_map(|&idx| {
+                let idx = idx as usize;
+                let g_idx = if is_ascii_haystack {
+                    let pos = norm_graphemes.partition_point(|&(gs, _)| gs < idx);
+                    norm_graphemes
+                        .get(pos)
+                        .filter(|&&(gs, _)| gs == idx)
+                        .map(|_| pos)?
+                } else {
+                    idx
+                };
+                let &(og_start, og) = orig_graphemes.get(g_idx)?;
+                Some((og_start, og_start + og.len()))
+            })
+            .collect();
+    }
+
     indices
         .iter()
         .filter_map(|&idx| {
             let idx = idx as usize;
             let (norm_start, norm_end) = if is_ascii_haystack {
+                let pos = norm_graphemes.partition_point(|&(gs, _)| gs < idx);
                 let end = norm_graphemes
-                    .iter()
-                    .find(|&&(gs, _)| gs == idx)
+                    .get(pos)
+                    .filter(|&&(gs, _)| gs == idx)
                     .map(|&(gs, g)| gs + g.len())
                     .unwrap_or_else(|| (idx + 1).min(norm.len()));
                 (idx, end)
@@ -55,7 +83,12 @@ fn map_fuzzy_indices_to_orig(orig: &str, norm: &str, haystack: Utf32Str<'_>, ind
                 let &(gs, g) = norm_graphemes.get(idx)?;
                 (gs, gs + g.len())
             };
-            super::map_norm_span_to_orig(orig, norm, norm_start, norm_end)
+            super::map_norm_span_with_graphemes(
+                &orig_graphemes,
+                norm,
+                norm_start,
+                norm_end,
+            )
         })
         .collect()
 }
@@ -160,14 +193,31 @@ fn search_index_tokens_inner(
     let targets_hidden = positive_tokens.iter().any(|t| t.text.starts_with('.'));
     let rank_ctx = super::ranking::RecordRankContext::default();
     let mut buffer = Vec::new();
-    let mut score_name = |name: &str| {
-        let name_norm = crate::cjk::normalize_and_simplify_cow(name);
-        let haystack = Utf32Str::new(&name_norm, &mut buffer);
+    let mut score_name = |name: &str, folded: Option<&str>| {
+        // 大小写无关模式下直接复用 QueryIndex 预缓存的非 ASCII 折叠串（已完成 NFC 合成与繁简转换），
+        // 避免对每个 macOS NFD 文件名重复做堆分配归一化；ASCII 名直接借用原串保留驼峰边界奖励。
+        let name_target: std::borrow::Cow<'_, str> = if !case_sensitive {
+            if let Some(f) = folded {
+                std::borrow::Cow::Borrowed(f)
+            } else if name.is_ascii() {
+                std::borrow::Cow::Borrowed(name)
+            } else {
+                crate::cjk::normalize_and_simplify_cow(name)
+            }
+        } else if name.is_ascii() {
+            std::borrow::Cow::Borrowed(name)
+        } else {
+            crate::cjk::normalize_and_simplify_cow(name)
+        };
+        let haystack = Utf32Str::new(&name_target, &mut buffer);
         pattern.score(haystack, &mut matcher)
     };
     let matches: Vec<_> = if let Some(seen) = raw_order_excluding {
         let mut top = super::top_k::TopK::new(max_results);
         let mut path = String::new();
+        let query_index = read.query_index();
+        let records = read.records();
+        let passthrough = filter.is_passthrough();
         for &name_id in &read.sorted_names().ids {
             if read
                 .name_signature(name_id)
@@ -175,15 +225,16 @@ fn search_index_tokens_inner(
             {
                 continue;
             }
-            let Some((name, _)) = read.name_entry(name_id) else {
+            let Some((name, folded)) = read.name_entry(name_id) else {
                 continue;
             };
-            let Some(raw_score) = score_name(name) else {
+            let Some(raw_score) = score_name(name, folded) else {
                 continue;
             };
             for &ordinal in read.entries_for_name(name_id) {
                 let ordinal = ordinal as usize;
-                if !filter.matches_record_in(read, &read.records()[ordinal], Some(name)) {
+                let record = &records[ordinal];
+                if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
                     continue;
                 }
                 let Some(view) = read.view(crate::compact_index::EntryId(ordinal)) else {
@@ -201,16 +252,18 @@ fn search_index_tokens_inner(
         top.finish()
             .into_iter()
             .map(|candidate| {
-                let view = read
-                    .view(crate::compact_index::EntryId(candidate.ordinal))
-                    .unwrap();
-                let base = super::ranking::BaseNameScore::for_fuzzy(view.name, candidate.score);
-                let display_score = super::ranking::score_record(
+                let record = &records[candidate.ordinal];
+                let name = read.record_name(record);
+                let base = super::ranking::BaseNameScore::for_fuzzy(name, candidate.score);
+                let (parent_depth, parent_hidden) = read.record_parent_meta(record, query_index);
+                let display_score = super::ranking::score_record_with_meta(
                     base,
-                    view.is_dir,
-                    view.parent,
+                    record.is_dir,
+                    parent_depth,
+                    parent_hidden,
                     &rank_ctx,
                     targets_hidden,
+                    0,
                 );
                 (candidate.ordinal, display_score, candidate.score)
             })
@@ -223,8 +276,9 @@ fn search_index_tokens_inner(
             req,
             targets_hidden,
             &rank_ctx,
-            |name, _| {
-                score_name(name).map(|raw| super::ranking::BaseNameScore::for_fuzzy(name, raw))
+            |name, folded| {
+                score_name(name, folded)
+                    .map(|raw| super::ranking::BaseNameScore::for_fuzzy(name, raw))
             },
         )
         .into_iter()
@@ -240,7 +294,16 @@ fn search_index_tokens_inner(
             let haystack = Utf32Str::new(&name_norm, &mut buffer);
             indices.clear();
             pattern.indices(haystack, &mut matcher, &mut indices);
-            let positions = map_fuzzy_indices_to_orig(view.name, &name_norm, haystack, &indices);
+            let positions = if !indices.is_empty() || case_sensitive {
+                map_fuzzy_indices_to_orig(view.name, &name_norm, haystack, &indices)
+            } else {
+                // 极少数特殊大小写折叠字符（如 'İ'）在折叠串命中后回退至折叠串反投影高亮
+                let name_folded = crate::cjk::fold_cow(view.name);
+                let folded_haystack = Utf32Str::new(&name_folded, &mut buffer);
+                indices.clear();
+                pattern.indices(folded_haystack, &mut matcher, &mut indices);
+                map_fuzzy_indices_to_orig(view.name, &name_folded, folded_haystack, &indices)
+            };
             let result = AdvancedSearchResult {
                 entry: view.materialize(),
                 score: score.to_f64(),

@@ -319,3 +319,47 @@ fn test_pinyin_polyphones_simplified_and_traditional() {
         );
     }
 }
+
+#[test]
+fn test_cjk_and_pinyin_mixed_queries() {
+    let entries = vec![
+        make_entry("2026年财务预算表.xlsx", "/Users/test/Docs/2026年财务预算表.xlsx"),
+        make_entry("工作汇报.docx", "/Users/test/Docs/工作汇报.docx"),
+        make_entry("工作匯報.docx", "/Users/test/Docs/工作匯報.docx"),
+    ];
+
+    let store = IndexStore::new();
+    store.replace(entries);
+    let filter = CompiledRecordFilter::default();
+
+    // 1. 多词汉字+拼音："2026年 cwysb"
+    let r1 = search(&store, "2026年 cwysb", &filter, 10);
+    assert_eq!(r1.len(), 1);
+    assert_eq!(r1[0].entry.name, "2026年财务预算表.xlsx");
+    assert_eq!(r1[0].match_positions.len(), 2);
+    let s1_0 = &r1[0].entry.name[r1[0].match_positions[0].0..r1[0].match_positions[0].1];
+    let s1_1 = &r1[0].entry.name[r1[0].match_positions[1].0..r1[0].match_positions[1].1];
+    assert_eq!(s1_0, "2026年");
+    assert_eq!(s1_1, "财务预算表");
+
+    // 2. 多词汉字+拼音："财务 ysb"
+    let r2 = search(&store, "财务 ysb", &filter, 10);
+    assert_eq!(r2.len(), 1);
+    assert_eq!(r2[0].entry.name, "2026年财务预算表.xlsx");
+    assert_eq!(r2[0].match_positions.len(), 2);
+
+    // 3. 单词内汉字+拼音混合："工作hb" 同时命中简体与繁体，并高亮完整 "工作汇报"/"工作匯報"
+    let r3 = search(&store, "工作hb", &filter, 10);
+    assert_eq!(r3.len(), 2);
+    for hit in &r3 {
+        assert_eq!(hit.match_positions, vec![(0, "工作汇报".len())]);
+    }
+
+    // 4. 单词内汉字+全拼："工作huibao"
+    let r4 = search(&store, "工作huibao", &filter, 10);
+    assert_eq!(r4.len(), 2);
+
+    // 5. 纯汉字不匹配词依然返回空，杜绝误入拼音通道
+    let r5 = search(&store, "中文", &filter, 10);
+    assert!(r5.is_empty());
+}

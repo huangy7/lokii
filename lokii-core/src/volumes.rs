@@ -256,7 +256,7 @@ fn get_volume_uuid(mount_point: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn list_mounted_volumes() -> Vec<MountedFsInfo> {
+fn list_mounted_volumes_impl(fetch_uuid: bool) -> Vec<MountedFsInfo> {
     let mut results = Vec::new();
     let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
     if count <= 0 {
@@ -305,8 +305,9 @@ pub fn list_mounted_volumes() -> Vec<MountedFsInfo> {
             mount_point.clone()
         };
 
-        // 系统根卷与 /System/Volumes/* 不参与外置卷分片匹配，跳过 getattrlist 减少后台轮询开销
-        let uuid = if is_local && !is_system_mount_point(&mount_point) {
+        // 系统根卷与 /System/Volumes/* 不参与外置卷分片匹配，跳过 getattrlist 减少后台轮询开销；
+        // 轻量挂载点检查模式（fetch_uuid == false）彻底跳过 getattrlist，避免打开普通本地文件时唤醒休眠外置机械硬盘。
+        let uuid = if fetch_uuid && is_local && !is_system_mount_point(&mount_point) {
             get_volume_uuid(&mount_point)
         } else {
             None
@@ -325,8 +326,25 @@ pub fn list_mounted_volumes() -> Vec<MountedFsInfo> {
     results
 }
 
+#[cfg(target_os = "macos")]
+pub fn list_mounted_volumes() -> Vec<MountedFsInfo> {
+    list_mounted_volumes_impl(true)
+}
+
+/// 轻量非阻塞挂载表快照：仅读取内核 `getfsstat(MNT_NOWAIT)` 缓存表，不调用 `getattrlist` 查询卷 UUID，
+/// 确保打开或定位任意本地文件时绝不触碰外置盘或网络卷。
+#[cfg(target_os = "macos")]
+pub fn list_mounted_volumes_fast() -> Vec<MountedFsInfo> {
+    list_mounted_volumes_impl(false)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn list_mounted_volumes() -> Vec<MountedFsInfo> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn list_mounted_volumes_fast() -> Vec<MountedFsInfo> {
     Vec::new()
 }
 
@@ -824,6 +842,20 @@ mod tests {
         assert_eq!(
             resolve_volumes_entry_symlink(&link_to_mount.join("docs"), &mounts_with_nas, root),
             None
+        );
+    }
+
+    #[test]
+    fn test_list_mounted_volumes_fast_skips_uuid_lookup() {
+        let fast = list_mounted_volumes_fast();
+        assert!(
+            fast.iter().all(|m| m.uuid.is_none()),
+            "fast mount listing must not invoke getattrlist UUID lookup"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            fast.iter().any(|m| m.mount_point == "/"),
+            "fast mount listing on macOS must include root mount"
         );
     }
 }

@@ -10,9 +10,9 @@ use crate::search::{
     self, CaseSensitivity, MultiSearchResult, QueryFilter, SearchMode, SearchShard,
 };
 use crate::volumes::{
-    list_mounted_volumes, normalize_network_source, partition_index_paths, MountedFsInfo,
-    MountedPathTarget, ResolvedMountMatch, VolumeIdentity, VolumeKind, VolumeManifest,
-    VolumeRecord,
+    list_mounted_volumes, list_mounted_volumes_fast, normalize_network_source,
+    partition_index_paths, MountedFsInfo, MountedPathTarget, ResolvedMountMatch, VolumeIdentity,
+    VolumeKind, VolumeManifest, VolumeRecord,
 };
 use crate::watcher::{
     self, apply_batch, resolve_changes, Change, DEFAULT_DEBOUNCE_MS, MAX_BATCH_SIZE, MAX_DEBOUNCE,
@@ -458,6 +458,7 @@ pub struct VolumeCoordinator {
     inner: Arc<RwLock<CoordinatorInner>>,
     manifest_save_lock: Arc<Mutex<()>>,
     mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
+    fast_mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
     worker_queue: Arc<WorkerQueue>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
     monitor_stop: Arc<(Mutex<bool>, Condvar)>,
@@ -466,7 +467,11 @@ pub struct VolumeCoordinator {
 
 impl VolumeCoordinator {
     pub fn new(cache_dir: PathBuf) -> Self {
-        Self::with_mount_lister_impl(cache_dir, Arc::new(list_mounted_volumes))
+        Self::with_mount_lister_impl(
+            cache_dir,
+            Arc::new(list_mounted_volumes),
+            Arc::new(list_mounted_volumes_fast),
+        )
     }
 
     #[cfg(test)]
@@ -474,12 +479,14 @@ impl VolumeCoordinator {
         cache_dir: PathBuf,
         mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
     ) -> Self {
-        Self::with_mount_lister_impl(cache_dir, mount_lister)
+        let fast_mount_lister = Arc::clone(&mount_lister);
+        Self::with_mount_lister_impl(cache_dir, mount_lister, fast_mount_lister)
     }
 
     fn with_mount_lister_impl(
         cache_dir: PathBuf,
         mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
+        fast_mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
     ) -> Self {
         let inner = Arc::new(RwLock::new(CoordinatorInner {
             config: AppConfig::default(),
@@ -493,6 +500,7 @@ impl VolumeCoordinator {
             inner,
             manifest_save_lock: Arc::new(Mutex::new(())),
             mount_lister,
+            fast_mount_lister,
             worker_queue,
             worker_threads: Mutex::new(Vec::new()),
             monitor_stop: Arc::new((Mutex::new(false), Condvar::new())),
@@ -551,6 +559,12 @@ impl VolumeCoordinator {
     /// Return mounted filesystems via the coordinator's mount lister.
     pub fn mounted_volumes(&self) -> Vec<MountedFsInfo> {
         (self.mount_lister)()
+    }
+
+    /// 轻量挂载表查询（生产环境仅读取内核 `getfsstat(MNT_NOWAIT)`，跳过外置卷 UUID `getattrlist`），
+    /// 供文件打开/定位可达性校验调用，避免唤醒休眠机械硬盘。
+    pub fn mounted_volumes_fast(&self) -> Vec<MountedFsInfo> {
+        (self.fast_mount_lister)()
     }
 
     pub fn initialize(

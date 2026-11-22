@@ -16,8 +16,35 @@ const CN_EN_DIR_ALIASES: &[(&str, &str)] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PathCandidate {
     pub pattern: String,
+    /// 预拼接前导斜杠的模式（`"/{pattern}"`），供段边界匹配热路径直接借用，免除每次 `format!` 堆分配。
+    pub slashed_pattern: String,
     pub is_absolute: bool,
     pub require_segment_boundary: bool,
+}
+
+impl PathCandidate {
+    pub(crate) fn new(pattern: String, is_absolute: bool, require_segment_boundary: bool) -> Self {
+        let slashed_pattern = if is_absolute {
+            String::new()
+        } else {
+            format!("/{pattern}")
+        };
+        Self {
+            pattern,
+            slashed_pattern,
+            is_absolute,
+            require_segment_boundary,
+        }
+    }
+
+    pub(crate) fn set_pattern(&mut self, pattern: String) {
+        self.slashed_pattern = if self.is_absolute {
+            String::new()
+        } else {
+            format!("/{pattern}")
+        };
+        self.pattern = pattern;
+    }
 }
 
 /// 路径感知查询：父目录约束与终端文件名词元分离。
@@ -249,7 +276,8 @@ impl PathQuery {
             .filter(|candidate| candidate.is_absolute)
         {
             if let Some(updated) = candidate.pattern.strip_prefix(&cfg_prefix) {
-                candidate.pattern = format!("{act_prefix}{updated}");
+                let new_pat = format!("{act_prefix}{updated}");
+                candidate.set_pattern(new_pat);
             }
         }
         rewritten.scope_prefix = rewritten
@@ -270,6 +298,65 @@ impl PathQuery {
 
         rewritten
     }
+}
+
+/// 从结构化正向词元中提取所有未加引号的 `in:<scope>` 作用域候选（含 `~` 与中英系统目录别名展开），
+/// 供正则、模糊、并集等非 `PathQuery` 引擎共享编译为父目录掩码。
+pub(crate) fn build_scope_candidates_from_tokens(tokens: &[QueryToken]) -> Vec<PathCandidate> {
+    let mut scope_candidates = Vec::new();
+    for token in tokens {
+        if token.negated || token.quoted {
+            continue;
+        }
+        if let Some(scope_raw) = token.text.strip_prefix("in:") {
+            let mut cands = build_dir_candidates(scope_raw, true);
+            push_unique_candidates(&mut scope_candidates, &mut cands);
+        }
+    }
+    scope_candidates
+}
+
+/// 针对挂载路径漂移分片重写一组独立的 `in:` 作用域候选前缀（与 `PathQuery::rewrite_drift_alias` 保持同一边界安全规则）。
+pub(crate) fn rewrite_scope_candidates_drift_alias(
+    candidates: &[PathCandidate],
+    configured_path: &str,
+    active_path: &str,
+) -> Vec<PathCandidate> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let cfg_clean = collapse_consecutive_slashes(configured_path.trim_end_matches('/'));
+    let act_clean = collapse_consecutive_slashes(active_path.trim_end_matches('/'));
+    if cfg_clean.is_empty() || act_clean.is_empty() || eq_ignore_case(&cfg_clean, &act_clean) {
+        return candidates.to_vec();
+    }
+    let mut cfg_segments: Vec<&str> = cfg_clean.split('/').filter(|s| !s.is_empty()).collect();
+    let mut act_segments: Vec<&str> = act_clean.split('/').filter(|s| !s.is_empty()).collect();
+    if cfg_segments.is_empty() || act_segments.is_empty() {
+        return candidates.to_vec();
+    }
+    while cfg_segments.len() > 2 && act_segments.len() > 2 {
+        let cfg_tail = cfg_segments.last().copied().unwrap();
+        let act_tail = act_segments.last().copied().unwrap();
+        if !eq_ignore_case(cfg_tail, act_tail) {
+            break;
+        }
+        cfg_segments.pop();
+        act_segments.pop();
+    }
+    let cfg_prefix = format_segments_prefix(&cfg_clean, &cfg_segments);
+    let act_prefix = format_segments_prefix(&act_clean, &act_segments);
+    if cfg_prefix == act_prefix {
+        return candidates.to_vec();
+    }
+    let mut rewritten = candidates.to_vec();
+    for candidate in rewritten.iter_mut().filter(|c| c.is_absolute) {
+        if let Some(updated) = candidate.pattern.strip_prefix(&cfg_prefix) {
+            let new_pat = format!("{act_prefix}{updated}");
+            candidate.set_pattern(new_pat);
+        }
+    }
+    rewritten
 }
 
 fn eq_ignore_case(a: &str, b: &str) -> bool {
@@ -355,11 +442,7 @@ fn expand_dir_segment_aliases(folded_dir: &str, is_absolute: bool) -> Vec<PathCa
             .iter()
             .any(|c: &PathCandidate| c.pattern == pat && c.is_absolute == is_absolute)
         {
-            out.push(PathCandidate {
-                pattern: pat,
-                is_absolute,
-                require_segment_boundary,
-            });
+            out.push(PathCandidate::new(pat, is_absolute, require_segment_boundary));
         }
     }
     out

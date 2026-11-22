@@ -40,16 +40,18 @@ enum SyllableMatchKind {
 
 enum Token {
     Cjk {
+        simp_char: char,
         variants: &'static [&'static str],
         byte_start: usize,
         byte_end: usize,
     },
-    Literal {
+    AsciiLiteral {
         byte_lower: u8,
         byte_start: usize,
         byte_end: usize,
     },
-    Barrier {
+    NonAsciiLiteral {
+        ch: char,
         byte_start: usize,
         byte_end: usize,
     },
@@ -60,8 +62,8 @@ impl Token {
     fn byte_start(&self) -> usize {
         match *self {
             Self::Cjk { byte_start, .. }
-            | Self::Literal { byte_start, .. }
-            | Self::Barrier { byte_start, .. } => byte_start,
+            | Self::AsciiLiteral { byte_start, .. }
+            | Self::NonAsciiLiteral { byte_start, .. } => byte_start,
         }
     }
 
@@ -69,8 +71,8 @@ impl Token {
     fn byte_end(&self) -> usize {
         match *self {
             Self::Cjk { byte_end, .. }
-            | Self::Literal { byte_end, .. }
-            | Self::Barrier { byte_end, .. } => byte_end,
+            | Self::AsciiLiteral { byte_end, .. }
+            | Self::NonAsciiLiteral { byte_end, .. } => byte_end,
         }
     }
 }
@@ -118,6 +120,28 @@ impl DpScratch {
             kw_lower: Vec::new(),
         }
     }
+}
+
+/// 线程局部拼音分词与 DP 复用缓冲区：消除高频检索时对每个非 ASCII 文件名重复在堆上分配 `Vec<Token>`。
+struct PinyinScratch {
+    tokens: Vec<Token>,
+    dp: DpScratch,
+    kw_chars: Vec<char>,
+}
+
+impl PinyinScratch {
+    fn new() -> Self {
+        Self {
+            tokens: Vec::with_capacity(64),
+            dp: DpScratch::new(),
+            kw_chars: Vec::with_capacity(32),
+        }
+    }
+}
+
+thread_local! {
+    static PINYIN_SCRATCH: std::cell::RefCell<PinyinScratch> =
+        std::cell::RefCell::new(PinyinScratch::new());
 }
 
 /// 返回单个汉字的全部小写 ASCII 拼音读音切片（首项为主读音）。
@@ -210,26 +234,33 @@ fn transition_state(prev: u8, kind: SyllableMatchKind) -> u8 {
 
 fn tokenize_into(name: &str, tokens: &mut Vec<Token>) -> bool {
     tokens.clear();
+    if name.is_ascii() {
+        return false;
+    }
     let mut has_cjk = false;
     for (byte_start, ch) in name.char_indices() {
         let byte_end = byte_start + ch.len_utf8();
         if ch.is_ascii() {
-            tokens.push(Token::Literal {
+            tokens.push(Token::AsciiLiteral {
                 byte_lower: (ch as u8).to_ascii_lowercase(),
                 byte_start,
                 byte_end,
             });
         } else {
-            let variants = char_pinyin_variants(ch);
+            let simp = crate::cjk::to_simplified_char(ch);
+            let variants = char_pinyin_variants(simp);
             if !variants.is_empty() {
                 has_cjk = true;
                 tokens.push(Token::Cjk {
+                    simp_char: simp,
                     variants,
                     byte_start,
                     byte_end,
                 });
             } else {
-                tokens.push(Token::Barrier {
+                let folded = simp.to_lowercase().next().unwrap_or(simp);
+                tokens.push(Token::NonAsciiLiteral {
+                    ch: folded,
                     byte_start,
                     byte_end,
                 });
@@ -240,17 +271,49 @@ fn tokenize_into(name: &str, tokens: &mut Vec<Token>) -> bool {
 }
 
 #[inline]
-fn can_start_at(token: &Token, first_lower: u8) -> bool {
+fn can_start_at_ascii(token: &Token, first_lower: u8) -> bool {
     match token {
-        Token::Literal { byte_lower, .. } => *byte_lower == first_lower,
+        Token::AsciiLiteral { byte_lower, .. } => *byte_lower == first_lower,
         Token::Cjk { variants, .. } => variants
             .iter()
             .any(|syl| syl.as_bytes().first() == Some(&first_lower)),
-        Token::Barrier { .. } => false,
+        Token::NonAsciiLiteral { .. } => false,
+    }
+}
+
+#[inline]
+fn can_start_at_char(token: &Token, first_ch: char) -> bool {
+    match token {
+        Token::AsciiLiteral { byte_lower, .. } => first_ch == (*byte_lower as char),
+        Token::NonAsciiLiteral { ch, .. } => first_ch == *ch,
+        Token::Cjk {
+            simp_char,
+            variants,
+            ..
+        } => {
+            first_ch == *simp_char
+                || (first_ch.is_ascii_lowercase()
+                    && variants
+                        .iter()
+                        .any(|syl| syl.as_bytes().first() == Some(&(first_ch as u8))))
+        }
     }
 }
 
 fn dp_match_keyword(
+    tokens: &[Token],
+    kw: &str,
+    scratch: &mut DpScratch,
+    kw_chars_buf: &mut Vec<char>,
+) -> Option<DpKeywordMatch> {
+    if kw.is_ascii() {
+        dp_match_keyword_ascii(tokens, kw, scratch)
+    } else {
+        dp_match_keyword_unicode(tokens, kw, scratch, kw_chars_buf)
+    }
+}
+
+fn dp_match_keyword_ascii(
     tokens: &[Token],
     kw: &str,
     scratch: &mut DpScratch,
@@ -292,7 +355,7 @@ fn dp_match_keyword(
         if (tokens.len() - start_tok).saturating_mul(6) < kw_len {
             break;
         }
-        if !can_start_at(&tokens[start_tok], first_lower) {
+        if !can_start_at_ascii(&tokens[start_tok], first_lower) {
             continue;
         }
 
@@ -303,7 +366,7 @@ fn dp_match_keyword(
 
         for (offset, token) in tokens[start_tok..].iter().enumerate() {
             let tok_idx = start_tok + offset;
-            if matches!(token, Token::Barrier { .. }) {
+            if matches!(token, Token::NonAsciiLiteral { .. }) {
                 break;
             }
 
@@ -312,7 +375,7 @@ fn dp_match_keyword(
             let mut next_hi = 0usize;
 
             match token {
-                Token::Literal { byte_lower, .. } => {
+                Token::AsciiLiteral { byte_lower, .. } => {
                     for j in active_lo..=active_hi {
                         let st = cur_dp[j];
                         if st == STATE_UNREACHABLE || *byte_lower != kw_lower[j] {
@@ -380,7 +443,7 @@ fn dp_match_keyword(
                         }
                     }
                 }
-                Token::Barrier { .. } => unreachable!(),
+                Token::NonAsciiLiteral { .. } => unreachable!(),
             }
 
             let end_state = next_dp[kw_len];
@@ -409,72 +472,276 @@ fn dp_match_keyword(
     best
 }
 
-#[inline]
-fn prepare_pinyin_tokens(name: &str) -> Option<Vec<Token>> {
-    if !has_cjk_characters(name) {
+/// 支持汉字与拼音混合推进的字符级动态规划（如单词 `"工作hb"` 或多词中的 `"2026年"`、`"财务"`）：
+/// 汉字字面命中保持状态不变（不置为拼音态），仅 ASCII 字母命中 CJK 音节时才推进拼音状态，
+/// 保证纯汉字查询不会误入拼音通道。
+fn dp_match_keyword_unicode(
+    tokens: &[Token],
+    kw: &str,
+    scratch: &mut DpScratch,
+    kw_chars_buf: &mut Vec<char>,
+) -> Option<DpKeywordMatch> {
+    if kw.is_empty() || tokens.is_empty() {
         return None;
     }
-    let mut tokens = Vec::with_capacity(name.len());
-    tokenize_into(name, &mut tokens).then_some(tokens)
+
+    let kw_nfc = crate::cjk::normalize_nfc_cow(kw);
+    kw_chars_buf.clear();
+    for ch in kw_nfc.chars() {
+        if ch.is_ascii() {
+            kw_chars_buf.push(ch.to_ascii_lowercase());
+        } else {
+            let simp = crate::cjk::to_simplified_char(ch);
+            for lc in simp.to_lowercase() {
+                kw_chars_buf.push(lc);
+            }
+        }
+    }
+    let kw_chars = kw_chars_buf.as_slice();
+    let kw_len = kw_chars.len();
+    if kw_len == 0 {
+        return None;
+    }
+
+    let mut stack_cur = [0u8; STACK_DP_CAP];
+    let mut stack_next = [0u8; STACK_DP_CAP];
+    let dp_len = kw_len + 1;
+    let (cur_dp, next_dp): (&mut [u8], &mut [u8]) = if dp_len <= STACK_DP_CAP {
+        (&mut stack_cur[..dp_len], &mut stack_next[..dp_len])
+    } else {
+        scratch.cur.resize(dp_len, 0);
+        scratch.next.resize(dp_len, 0);
+        (&mut scratch.cur[..dp_len], &mut scratch.next[..dp_len])
+    };
+
+    let first_ch = kw_chars[0];
+    let mut best: Option<DpKeywordMatch> = None;
+
+    for start_tok in 0..tokens.len() {
+        if (tokens.len() - start_tok).saturating_mul(6) < kw_len {
+            break;
+        }
+        if !can_start_at_char(&tokens[start_tok], first_ch) {
+            continue;
+        }
+
+        cur_dp.fill(STATE_UNREACHABLE);
+        cur_dp[0] = STATE_START;
+        let mut active_lo = 0usize;
+        let mut active_hi = 0usize;
+
+        for (offset, token) in tokens[start_tok..].iter().enumerate() {
+            let tok_idx = start_tok + offset;
+
+            next_dp.fill(STATE_UNREACHABLE);
+            let mut next_lo = usize::MAX;
+            let mut next_hi = 0usize;
+
+            match token {
+                Token::AsciiLiteral { byte_lower, .. } => {
+                    let tok_ch = *byte_lower as char;
+                    for j in active_lo..=active_hi {
+                        let st = cur_dp[j];
+                        if st == STATE_UNREACHABLE || kw_chars[j] != tok_ch {
+                            continue;
+                        }
+                        let nj = j + 1;
+                        if st > next_dp[nj] {
+                            next_dp[nj] = st;
+                        }
+                        next_lo = next_lo.min(nj);
+                        next_hi = next_hi.max(nj);
+                    }
+                }
+                Token::NonAsciiLiteral { ch, .. } => {
+                    for j in active_lo..=active_hi {
+                        let st = cur_dp[j];
+                        if st == STATE_UNREACHABLE || kw_chars[j] != *ch {
+                            continue;
+                        }
+                        let nj = j + 1;
+                        if st > next_dp[nj] {
+                            next_dp[nj] = st;
+                        }
+                        next_lo = next_lo.min(nj);
+                        next_hi = next_hi.max(nj);
+                    }
+                }
+                Token::Cjk {
+                    simp_char,
+                    variants,
+                    ..
+                } => {
+                    for j in active_lo..=active_hi {
+                        let st = cur_dp[j];
+                        if st == STATE_UNREACHABLE {
+                            continue;
+                        }
+                        let target_ch = kw_chars[j];
+                        if target_ch == *simp_char {
+                            let nj = j + 1;
+                            if st > next_dp[nj] {
+                                next_dp[nj] = st;
+                            }
+                            next_lo = next_lo.min(nj);
+                            next_hi = next_hi.max(nj);
+                        }
+                        if !target_ch.is_ascii_lowercase() {
+                            continue;
+                        }
+                        let remaining = kw_len - j;
+                        let target_first = target_ch as u8;
+                        for &syl in *variants {
+                            let syl_bytes = syl.as_bytes();
+                            if syl_bytes[0] != target_first {
+                                continue;
+                            }
+                            let allow_vu = is_v_u_syllable(syl);
+                            let max_k = syl_bytes.len().min(remaining);
+
+                            let kind1 = if syl_bytes.len() == 1 {
+                                SyllableMatchKind::Full
+                            } else {
+                                SyllableMatchKind::SingleInitial
+                            };
+                            let st1 = transition_state(st, kind1);
+                            let nj1 = j + 1;
+                            if st1 > next_dp[nj1] {
+                                next_dp[nj1] = st1;
+                            }
+                            next_lo = next_lo.min(nj1);
+                            next_hi = next_hi.max(nj1);
+
+                            for k in 2..=max_k {
+                                let idx = k - 1;
+                                let kc = kw_chars[j + idx];
+                                if !kc.is_ascii() {
+                                    break;
+                                }
+                                let sb = syl_bytes[idx];
+                                let kb = kc as u8;
+                                let byte_ok =
+                                    sb == kb || (allow_vu && idx == 1 && sb == b'u' && kb == b'v');
+                                if !byte_ok {
+                                    break;
+                                }
+                                let kind = if k == syl_bytes.len() {
+                                    SyllableMatchKind::Full
+                                } else {
+                                    SyllableMatchKind::MultiPrefix
+                                };
+                                let stk = transition_state(st, kind);
+                                let nj = j + k;
+                                if stk > next_dp[nj] {
+                                    next_dp[nj] = stk;
+                                }
+                                next_lo = next_lo.min(nj);
+                                next_hi = next_hi.max(nj);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let end_state = next_dp[kw_len];
+            if end_state != STATE_UNREACHABLE {
+                let candidate = DpKeywordMatch {
+                    state: end_state,
+                    start_tok,
+                    end_tok: tok_idx + 1,
+                    byte_start: tokens[start_tok].byte_start(),
+                    byte_end: token.byte_end(),
+                };
+                if best.is_none_or(|prev| candidate.rank_key() > prev.rank_key()) {
+                    best = Some(candidate);
+                }
+            }
+
+            if next_lo >= kw_len {
+                break;
+            }
+            cur_dp.copy_from_slice(next_dp);
+            active_lo = next_lo;
+            active_hi = next_hi.min(kw_len - 1);
+        }
+    }
+
+    best
 }
 
 /// 音节前缀动态规划拼音打分，返回精细的匹配层级与起始位置特征。
 ///
-/// 单个词元允许纯字面推进（`state == STATE_START`）以支持 `"2026 cwysb"` 等混合查询，
-/// 但整体查询切片必须至少在一个词元内命中至少 1 个 CJK 汉字（`any_cjk == true`），
-/// 确保纯 ASCII 字面查询不会误走拼音通道。
+/// 支持纯 ASCII 拼音、多词汉字+拼音混合（如 `"2026年 cwysb"`、`"财务 ysb"`）以及单词内汉字+拼音混合（如 `"工作hb"`）；
+/// 整体查询必须至少在一个词元内通过拼音音节命中至少 1 个 CJK 汉字（`any_cjk == true`），
+/// 确保纯字面 ASCII 或纯汉字查询不会误走拼音通道。
 pub(crate) fn score_pinyin_detail(name: &str, keywords: &[String]) -> Option<PinyinMatchDetail> {
-    if keywords.is_empty() || !keywords.iter().all(|k| k.is_ascii()) {
-        return None;
-    }
-    let tokens = prepare_pinyin_tokens(name)?;
-
-    let mut scratch = DpScratch::new();
-    let mut first_match: Option<DpKeywordMatch> = None;
-    let mut any_non_empty = false;
-    let mut any_cjk = false;
-    let mut all_cjk_full = true;
-    let mut all_cjk_initials = true;
-
-    for kw in keywords {
-        if kw.is_empty() {
-            continue;
-        }
-        any_non_empty = true;
-        let matched = dp_match_keyword(&tokens, kw.as_str(), &mut scratch)?;
-        if first_match.is_none() {
-            first_match = Some(matched);
-        }
-        if matched.state != STATE_START {
-            any_cjk = true;
-            if matched.state != STATE_ALL_FULL {
-                all_cjk_full = false;
-            }
-            if matched.state != STATE_SINGLE_INITIAL {
-                all_cjk_initials = false;
-            }
-        }
-    }
-
-    if !any_non_empty || !any_cjk {
+    if keywords.is_empty()
+        || name.is_ascii()
+        || !keywords
+            .iter()
+            .any(|k| k.bytes().any(|b| b.is_ascii_alphabetic()))
+    {
         return None;
     }
 
-    let first = first_match?;
-    let is_prefix = first.start_tok == 0;
-    let tier = match (is_prefix, all_cjk_full, all_cjk_initials) {
-        (true, true, _) => PinyinMatchTier::PrefixFull,
-        (true, false, true) => PinyinMatchTier::PrefixInitials,
-        (true, false, false) => PinyinMatchTier::PrefixMixed,
-        (false, true, _) => PinyinMatchTier::SubstringFull,
-        (false, false, true) => PinyinMatchTier::SubstringInitials,
-        (false, false, false) => PinyinMatchTier::SubstringMixed,
-    };
+    PINYIN_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let PinyinScratch {
+            tokens,
+            dp,
+            kw_chars,
+        } = &mut *scratch;
+        if !tokenize_into(name, tokens) {
+            return None;
+        }
 
-    Some(PinyinMatchDetail {
-        tier,
-        is_prefix,
-        first_match_byte_start: first.byte_start,
+        let mut any_non_empty = false;
+        let mut any_cjk = false;
+        let mut any_prefix = false;
+        let mut earliest_byte_start = usize::MAX;
+        let mut all_cjk_full = true;
+        let mut all_cjk_initials = true;
+
+        for kw in keywords {
+            if kw.is_empty() {
+                continue;
+            }
+            any_non_empty = true;
+            let matched = dp_match_keyword(tokens, kw.as_str(), dp, kw_chars)?;
+            if matched.start_tok == 0 {
+                any_prefix = true;
+            }
+            earliest_byte_start = earliest_byte_start.min(matched.byte_start);
+            if matched.state != STATE_START {
+                any_cjk = true;
+                if matched.state != STATE_ALL_FULL {
+                    all_cjk_full = false;
+                }
+                if matched.state != STATE_SINGLE_INITIAL {
+                    all_cjk_initials = false;
+                }
+            }
+        }
+
+        if !any_non_empty || !any_cjk {
+            return None;
+        }
+
+        let is_prefix = any_prefix;
+        let tier = match (is_prefix, all_cjk_full, all_cjk_initials) {
+            (true, true, _) => PinyinMatchTier::PrefixFull,
+            (true, false, true) => PinyinMatchTier::PrefixInitials,
+            (true, false, false) => PinyinMatchTier::PrefixMixed,
+            (false, true, _) => PinyinMatchTier::SubstringFull,
+            (false, false, true) => PinyinMatchTier::SubstringInitials,
+            (false, false, false) => PinyinMatchTier::SubstringMixed,
+        };
+
+        Some(PinyinMatchDetail {
+            tier,
+            is_prefix,
+            first_match_byte_start: earliest_byte_start,
+        })
     })
 }
 
@@ -491,37 +758,50 @@ pub(crate) fn score_pinyin_match(name: &str, keywords: &[String]) -> Option<Matc
 
 /// 仅对进入 Top-K 的命中结果计算拼音对应原始文件名的 UTF-8 字节区间，供界面高亮。
 pub(crate) fn find_pinyin_positions<S: AsRef<str>>(name: &str, keywords: &[S]) -> Vec<(usize, usize)> {
-    if keywords.is_empty() {
+    if keywords.is_empty()
+        || name.is_ascii()
+        || !keywords
+            .iter()
+            .any(|k| k.as_ref().bytes().any(|b| b.is_ascii_alphabetic()))
+    {
         return Vec::new();
     }
-    let Some(tokens) = prepare_pinyin_tokens(name) else {
-        return Vec::new();
-    };
 
-    let mut scratch = DpScratch::new();
-    let mut positions = Vec::new();
-    let mut any_cjk = false;
-
-    for kw in keywords {
-        let kw_str = kw.as_ref();
-        if kw_str.is_empty() || !kw_str.is_ascii() {
-            continue;
+    PINYIN_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let PinyinScratch {
+            tokens,
+            dp,
+            kw_chars,
+        } = &mut *scratch;
+        if !tokenize_into(name, tokens) {
+            return Vec::new();
         }
-        if let Some(matched) = dp_match_keyword(&tokens, kw_str, &mut scratch) {
-            if matched.state != STATE_START {
-                any_cjk = true;
+
+        let mut positions = Vec::new();
+        let mut any_cjk = false;
+
+        for kw in keywords {
+            let kw_str = kw.as_ref();
+            if kw_str.is_empty() {
+                continue;
             }
-            positions.push((matched.byte_start, matched.byte_end));
+            if let Some(matched) = dp_match_keyword(tokens, kw_str, dp, kw_chars) {
+                if matched.state != STATE_START {
+                    any_cjk = true;
+                }
+                positions.push((matched.byte_start, matched.byte_end));
+            }
         }
-    }
 
-    if !any_cjk {
-        return Vec::new();
-    }
+        if !any_cjk {
+            return Vec::new();
+        }
 
-    positions.sort_by_key(|&(s, e)| (s, e));
-    positions.dedup();
-    positions
+        positions.sort_by_key(|&(s, e)| (s, e));
+        positions.dedup();
+        positions
+    })
 }
 
 #[cfg(test)]

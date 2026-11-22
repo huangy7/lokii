@@ -285,11 +285,8 @@ fn test_unicode_nfd_nfc_cross_matching_across_engines() {
         assert!(err.is_none(), "query={query} mode={mode:?} err={err:?}");
         assert_eq!(res.len(), 1, "query={query} mode={mode:?} res={res:?}");
         assert_eq!(res[0].entry.name, nfd_hangul);
-        let expected_end = if mode == SearchMode::Wildcard {
-            nfd_hangul.len()
-        } else {
-            "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}".len()
-        };
+        // 全引擎（含通配符字面片段高亮）均应精准投影到 NFD 韩文双音节的完整 18 字节 Jamo 组合簇边界
+        let expected_end = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}".len();
         assert_eq!(res[0].match_positions, vec![(0, expected_end)], "query={query} mode={mode:?}");
     }
 

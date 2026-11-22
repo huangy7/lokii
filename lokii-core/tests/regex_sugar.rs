@@ -195,4 +195,87 @@ fn test_dispatch_with_details_effective_mode() {
     assert_eq!(mode3, SearchMode::Auto);
 }
 
+#[test]
+fn test_in_scope_orthogonal_with_regex_sugar_and_prefix() {
+    let store = IndexStore::new();
+    store.replace(vec![
+        make_entry("test_alpha.rs", "/repo/src/test_alpha.rs"),
+        make_entry("test_beta.rs", "/repo/tests/test_beta.rs"),
+        make_entry("foo.rs", "/repo/src/foo.rs"),
+        make_entry("BAR.rs", "/repo/src/BAR.rs"),
+        make_entry("foo.rs", "/repo/other/foo.rs"),
+        make_entry("main.rs", "/repo/src/main.rs"),
+        make_entry("main.rs", "/repo/other/main.rs"),
+    ]);
+
+    // 1. in:src /^test_.*\.rs/ 在 Auto 模式下正确识别为 Regex 并限制在 src 目录下，且带父目录高亮
+    let (res1, cs1, err1, mode1) = dispatch_with_details(
+        &store,
+        r"in:src /^test_.*\.rs/",
+        SearchMode::Auto,
+        CaseSensitivity::Auto,
+        10,
+    );
+    assert!(err1.is_none());
+    assert_eq!(mode1, SearchMode::Regex);
+    assert!(!cs1);
+    assert_eq!(res1.len(), 1);
+    assert_eq!(res1[0].entry.path, "/repo/src/test_alpha.rs");
+    assert!(!res1[0].match_positions.is_empty());
+    assert!(!res1[0].parent_match_positions.is_empty());
+
+    // 2. in:src /(foo|bar)\.rs/i 不被管道符拆成并集，且尊重 /i 忽略大小写标志
+    let (res2, cs2, err2, mode2) = dispatch_with_details(
+        &store,
+        r"in:src /(foo|bar)\.rs/i",
+        SearchMode::Auto,
+        CaseSensitivity::Sensitive,
+        10,
+    );
+    assert!(err2.is_none());
+    assert_eq!(mode2, SearchMode::Regex);
+    assert!(!cs2);
+    let paths2: Vec<_> = res2.iter().map(|r| r.entry.path.as_str()).collect();
+    assert_eq!(paths2.len(), 2);
+    assert!(paths2.contains(&"/repo/src/foo.rs"));
+    assert!(paths2.contains(&"/repo/src/BAR.rs"));
+
+    // 3. in:src regex:^main 与显式 Regex 模式 in:src ^main 均生效
+    let (res3, _, err3, mode3) = dispatch_with_details(
+        &store,
+        "in:src regex:^main",
+        SearchMode::Auto,
+        CaseSensitivity::Auto,
+        10,
+    );
+    assert!(err3.is_none());
+    assert_eq!(mode3, SearchMode::Regex);
+    assert_eq!(res3.len(), 1);
+    assert_eq!(res3[0].entry.path, "/repo/src/main.rs");
+
+    let (res4, _, err4, _) = dispatch_with_details(
+        &store,
+        "in:src ^main",
+        SearchMode::Regex,
+        CaseSensitivity::Auto,
+        10,
+    );
+    assert!(err4.is_none());
+    assert_eq!(res4.len(), 1);
+    assert_eq!(res4[0].entry.path, "/repo/src/main.rs");
+
+    // 4. 大写目录作用域 in:SRC 不误触发正则 Smart Case
+    let (res5, cs5, err5, _) = dispatch_with_details(
+        &store,
+        r"in:SRC /^test_.*\.rs/",
+        SearchMode::Auto,
+        CaseSensitivity::Auto,
+        10,
+    );
+    assert!(err5.is_none());
+    assert!(!cs5);
+    assert_eq!(res5.len(), 1);
+    assert_eq!(res5[0].entry.path, "/repo/src/test_alpha.rs");
+}
+
 
