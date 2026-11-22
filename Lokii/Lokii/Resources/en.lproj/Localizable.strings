@@ -1,9 +1,13 @@
 /* AppDelegate - tray menu */
+"tray.preferences" = "Preferences…";
+"tray.rebuildIndex" = "Rebuild Index";
+"tray.checkUpdates" = "Check for Updates…";
+"tray.quit" = "Quit";
+
+/* AppDelegate - main menu: app */
 "menu.preferences" = "Preferences…";
 "menu.rebuildIndex" = "Rebuild Index";
 "menu.quit" = "Quit Lokii";
-
-/* AppDelegate - main menu: app */
 "menu.about" = "About Lokii";
 
 /* AppDelegate - main menu: edit */

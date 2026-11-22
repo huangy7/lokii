@@ -26,7 +26,7 @@ struct LokiiConfig: Codable {
             language: String = "zh-Hans",
             showInDock: Bool = true,
             terminalBundleId: String = "com.apple.Terminal",
-            hideResultsWhenEmpty: Bool = false
+            hideResultsWhenEmpty: Bool = true
         ) {
             self.language = language
             self.showInDock = showInDock
@@ -39,7 +39,7 @@ struct LokiiConfig: Codable {
             self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? "zh-Hans"
             self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? true
             self.terminalBundleId = try container.decodeIfPresent(String.self, forKey: .terminalBundleId) ?? "com.apple.Terminal"
-            self.hideResultsWhenEmpty = try container.decodeIfPresent(Bool.self, forKey: .hideResultsWhenEmpty) ?? false
+            self.hideResultsWhenEmpty = try container.decodeIfPresent(Bool.self, forKey: .hideResultsWhenEmpty) ?? true
         }
     }
 

@@ -1,9 +1,13 @@
 /* AppDelegate - tray menu */
+"tray.preferences" = "偏好设置…";
+"tray.rebuildIndex" = "重建索引";
+"tray.checkUpdates" = "检查更新…";
+"tray.quit" = "退出";
+
+/* AppDelegate - main menu: app */
 "menu.preferences" = "偏好设置…";
 "menu.rebuildIndex" = "重建索引";
 "menu.quit" = "退出 Lokii";
-
-/* AppDelegate - main menu: app */
 "menu.about" = "关于 Lokii";
 
 /* AppDelegate - main menu: edit */

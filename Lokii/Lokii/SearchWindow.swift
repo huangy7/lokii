@@ -845,7 +845,7 @@ final class SearchWindow: NSWindowController {
     /// 窗口位置记忆开关与空搜索隐藏列表开关的本地缓存，随配置重载刷新。
     /// 拖动与缩放回调按显示刷新率触发，若每次实时跨 FFI 解码整份配置将产生大量冗余开销。
     private var shouldRememberWindowPosition = false
-    private var hideResultsWhenEmpty = false
+    private var hideResultsWhenEmpty = true
 
     private var shouldShowIdleEmptyState: Bool {
         // 以搜索框权威文本反序列化得到的过滤状态为准，避免过滤浮层收起后其内部残留状态永久阻塞空态
@@ -864,7 +864,7 @@ final class SearchWindow: NSWindowController {
     private func reloadWindowBehavior() {
         let cfg = engine.getConfig()
         shouldRememberWindowPosition = cfg?.window.rememberPosition ?? false
-        hideResultsWhenEmpty = cfg?.general.hideResultsWhenEmpty ?? false
+        hideResultsWhenEmpty = cfg?.general.hideResultsWhenEmpty ?? true
     }
 
     private func saveWindowSizeIfNeeded() {
