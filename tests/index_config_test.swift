@@ -338,19 +338,20 @@ do {
     assertTrue(batchMatcher.match(path: "/Users/local/file.txt") == nil, "非卷本地路径应返回 nil")
 
     // GeneralConfig.hideResultsWhenEmpty 缺省兼容与往返编解码
+    assertEqual(LokiiConfig.GeneralConfig().hideResultsWhenEmpty, true, "GeneralConfig 默认构造时 hideResultsWhenEmpty 应默认开启")
     let legacyGeneralData = \"\"\"
     {"language": "zh-Hans", "show_in_dock": true}
     \"\"\".data(using: .utf8)!
     let decodedLegacyGeneral = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: legacyGeneralData)
-    assertEqual(decodedLegacyGeneral.hideResultsWhenEmpty, false, "旧版配置缺失 hide_results_when_empty 时应默认回退为 false")
+    assertEqual(decodedLegacyGeneral.hideResultsWhenEmpty, true, "旧版配置缺失 hide_results_when_empty 时应默认回退为 true")
 
-    let enabledGeneralData = \"\"\"
-    {"language": "en", "show_in_dock": true, "hide_results_when_empty": true}
+    let disabledGeneralData = \"\"\"
+    {"language": "en", "show_in_dock": true, "hide_results_when_empty": false}
     \"\"\".data(using: .utf8)!
-    let decodedEnabledGeneral = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: enabledGeneralData)
-    assertEqual(decodedEnabledGeneral.hideResultsWhenEmpty, true, "hide_results_when_empty = true 应准确解码")
-    let encodedGeneral = String(data: try JSONEncoder().encode(decodedEnabledGeneral), encoding: .utf8) ?? ""
-    assertTrue(encodedGeneral.contains("\\"hide_results_when_empty\\":true"), "编码后的 JSON 应保留 hide_results_when_empty 键")
+    let decodedDisabledGeneral = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: disabledGeneralData)
+    assertEqual(decodedDisabledGeneral.hideResultsWhenEmpty, false, "hide_results_when_empty = false 应准确解码")
+    let encodedGeneral = String(data: try JSONEncoder().encode(decodedDisabledGeneral), encoding: .utf8) ?? ""
+    assertTrue(encodedGeneral.contains("\\"hide_results_when_empty\\":false"), "编码后的 JSON 应保留 hide_results_when_empty 键")
 
     // 主索引重建判定：仅修改卷开关/网络重扫间隔/追加排除路径时不触发主索引重建；修改本地目录或全局扫描选项时触发 (Review Focus #5)
     let mountedVols = [MountedVolumeEntry(path: "/Volumes/NAS", displayName: "NAS", kind: "network")]
@@ -455,6 +456,94 @@ do {
         "移除已有排除路径必须判定为需要主索引重建"
     )
 
+    print("[7/7] 测试磁盘映像（DMG/ISO）精确识别与物理外置设备（U 盘/SSD/SD 卡）零误杀...")
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["AppleDiskImageDevice", "AppleDiskImagesController"],
+            deviceModel: "Disk Image",
+            deviceProtocol: "Virtual Interface"
+        ),
+        true,
+        "DiskImages2 挂载的 HFS+ DMG 必须识别为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["AppleAPFSVolume", "AppleAPFSContainer", "AppleAPFSMedia", "AppleDiskImageDevice", "AppleDiskImagesController"],
+            deviceModel: "Disk Image",
+            deviceProtocol: "Disk Image"
+        ),
+        true,
+        "APFS 合成容器格式的 DMG 必须识别为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["IOHDIXHDDriveOutKernel", "IOHDIXController"],
+            deviceModel: nil,
+            deviceProtocol: nil
+        ),
+        true,
+        "传统 IOHDIX 驱动挂载的 DMG / SparseImage 必须识别为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["IOSCSIPeripheralDeviceNub", "IOUSBMassStorageInterfaceNub", "IOUSBHostDevice"],
+            deviceModel: "SanDisk Ultra",
+            deviceProtocol: "USB"
+        ),
+        false,
+        "物理 USB 闪存盘绝不能误判为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["AppleAPFSVolume", "AppleAPFSContainer", "IOUSBMassStorageDriver", "AppleUSBXHCI"],
+            deviceModel: "Disk Image",
+            deviceProtocol: "Virtual Interface"
+        ),
+        false,
+        "即使外接 USB APFS 硬盘盒固件误报 Virtual Interface / Disk Image，命中物理 USB 总线祖先时也绝不能误杀"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["AppleAPFSVolume", "AppleAPFSContainer", "IONVMeController", "IOThunderboltSwitch"],
+            deviceModel: "Samsung SSD 980 PRO",
+            deviceProtocol: "PCI-Express"
+        ),
+        false,
+        "雷电 NVMe 外置固态硬盘绝不能误判为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ["AppleSDXCBlockStorageDevice"],
+            deviceModel: "SD Card Reader",
+            deviceProtocol: "Secure Digital"
+        ),
+        false,
+        "内置 SD 卡槽存储卡绝不能误判为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: [],
+            deviceModel: "Disk Image",
+            deviceProtocol: "Virtual Interface"
+        ),
+        true,
+        "IOKit 祖先链为空时，明确标明 Disk Image 型号应回退判定为磁盘映像"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: [],
+            deviceModel: "External SSD",
+            deviceProtocol: "Virtual Interface"
+        ),
+        false,
+        "仅报 Virtual Interface 但未标明 Disk Image 时应保守放行，避免误伤第三方外接盘"
+    )
+
+    let dmgEntry = MountedVolumeEntry(path: "/Volumes/Lokii", displayName: "Lokii", kind: "local_external", isDiskImage: true)
+    assertEqual(dmgEntry.isDiskImage, true, "MountedVolumeEntry 应支持记录 isDiskImage 标志")
+    let usbEntry = MountedVolumeEntry(path: "/Volumes/MyUSB", displayName: "MyUSB", kind: "local_external")
+    assertEqual(usbEntry.isDiskImage, false, "MountedVolumeEntry 默认 isDiskImage 应为 false")
+
     print("IndexConfig 编解码、卷状态解析与通知测试全部通过！")
 } catch {
     fputs("测试执行抛出异常: \\(error)\\n", stderr)
@@ -511,6 +600,17 @@ for requiredPrefsSymbol in [
 ] {
     guard indexPaneSource.contains(requiredPrefsSymbol) else {
         fputs("断言失败: PreferencesIndexPane.swift 缺少 \(requiredPrefsSymbol)\n", stderr)
+        exit(1)
+    }
+}
+for requiredViewModelSymbol in [
+    "import DiskArbitration",
+    "import IOKit",
+    "probeIsDiskImage",
+    "where !mounted.isDiskImage"
+] {
+    guard preferencesSource.contains(requiredViewModelSymbol) else {
+        fputs("断言失败: PreferencesViewModel.swift 缺少 \(requiredViewModelSymbol)\n", stderr)
         exit(1)
     }
 }

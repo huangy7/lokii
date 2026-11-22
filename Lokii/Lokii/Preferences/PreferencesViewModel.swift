@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import Combine
+import DiskArbitration
+import IOKit
 import ServiceManagement
 
 // MARK: - CLI Tool Install State
@@ -243,6 +245,55 @@ enum SettingsPathStatusResolver {
             && (savedExcludePaths.allSatisfy { draftExcludePaths.contains($0) })
         return !onlyNonRebuildChanges
     }
+
+    /// 根据内核 IOKit 驱动祖先链与 DiskArbitration 设备元数据，精确判定挂载卷是否为磁盘映像（DMG / ISO / SparseImage）。
+    ///
+    /// 判定优先级：
+    /// 1. 祖先链命中磁盘映像内核驱动（DiskImages2 的 AppleDiskImageDevice/AppleDiskImagesController
+    ///    或传统 IOHDIXHDDrive/IOHDIXController）直接判为 true；
+    /// 2. 祖先链命中真实物理总线（USB / Thunderbolt / NVMe / SATA / SCSI / SD / FireWire）直接判为 false，
+    ///    杜绝外接 APFS 硬盘盒固件误报 Virtual Interface 时被误杀；
+    /// 3. 仅在 IOKit 祖先链为空时保守回退至 DiskArbitration 显式声明的 `Disk Image` 型号或协议。
+    static func isDiskImageVolume(
+        ancestorIOKitClasses: [String],
+        deviceModel: String?,
+        deviceProtocol: String?
+    ) -> Bool {
+        let diskImageClassMarkers = [
+            "AppleDiskImageDevice",
+            "AppleDiskImagesController",
+            "IOHDIXHDDrive",
+            "IOHDIXController",
+        ]
+        if ancestorIOKitClasses.contains(where: { cls in
+            diskImageClassMarkers.contains { cls == $0 || cls.hasPrefix($0) }
+        }) {
+            return true
+        }
+
+        let physicalBusClassMarkers = [
+            "IOUSB",
+            "AppleUSB",
+            "IOThunderbolt",
+            "AppleThunderbolt",
+            "IONVMe",
+            "IOEmbeddedNVMe",
+            "IOAHCI",
+            "IOSCSI",
+            "AppleSDXC",
+            "IOSDHost",
+            "IOFireWire",
+        ]
+        if ancestorIOKitClasses.contains(where: { cls in
+            physicalBusClassMarkers.contains { cls.hasPrefix($0) }
+        }) {
+            return false
+        }
+
+        let model = deviceModel?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let proto = deviceProtocol?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return model == "disk image" || proto == "disk image"
+    }
 }
 
 /// 后台从内核挂载表探测到的当前在线外部卷或网络卷摘要
@@ -250,6 +301,14 @@ struct MountedVolumeEntry: Equatable {
     let path: String
     let displayName: String
     let kind: String
+    let isDiskImage: Bool
+
+    init(path: String, displayName: String, kind: String, isDiskImage: Bool = false) {
+        self.path = path
+        self.displayName = displayName
+        self.kind = kind
+        self.isDiskImage = isDiskImage
+    }
 }
 
 /// 设置页「外置磁盘与网络卷」分组的统一展示条目（融合在线挂载卷、后端卷状态与用户草稿配置）
@@ -305,7 +364,7 @@ class PreferencesViewModel: ObservableObject {
         }
     }
 
-    @Published var hideResultsWhenEmpty: Bool = false {
+    @Published var hideResultsWhenEmpty: Bool = true {
         didSet {
             saveGeneralConfig()
         }
@@ -587,8 +646,8 @@ class PreferencesViewModel: ObservableObject {
             ))
         }
 
-        // 3. 纳入本机当前已挂载、尚未加入索引的外部卷或网络卷，方便用户一键开启
-        for mounted in mountedVolumes {
+        // 3. 纳入本机当前已挂载、尚未加入索引的真实外置磁盘或网络卷（自动过滤临时挂载的 DMG/ISO 磁盘映像）
+        for mounted in mountedVolumes where !mounted.isDiskImage {
             let key = mounted.path.lowercased()
             guard !coveredMountedKeys.contains(key),
                   seenConfiguredKeys.insert(key).inserted else { continue }
@@ -640,6 +699,7 @@ class PreferencesViewModel: ObservableObject {
                 options: [.skipHiddenVolumes]
             ) ?? []
 
+            let daSession = DASessionCreate(kCFAllocatorDefault)
             var entries: [MountedVolumeEntry] = []
             var seenKeys: Set<String> = []
             for url in urls {
@@ -653,8 +713,9 @@ class PreferencesViewModel: ObservableObject {
                 }
                 let isLocal = values?.volumeIsLocal ?? true
                 let kind = isLocal ? "local_external" : "network"
+                let isDiskImage = isLocal ? Self.probeIsDiskImage(volumeURL: url, session: daSession) : false
                 let name = values?.volumeName ?? (normalized as NSString).lastPathComponent
-                entries.append(MountedVolumeEntry(path: normalized, displayName: name, kind: kind))
+                entries.append(MountedVolumeEntry(path: normalized, displayName: name, kind: kind, isDiskImage: isDiskImage))
             }
 
             DispatchQueue.main.async {
@@ -664,6 +725,47 @@ class PreferencesViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// 通过 DiskArbitration + IOKit 驱动祖先链在后台零磁盘 I/O 判定挂载点是否为磁盘映像（DMG / ISO / SparseImage）
+    private static func probeIsDiskImage(volumeURL: URL, session: DASession?) -> Bool {
+        guard let session,
+              let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, volumeURL as CFURL) else {
+            return false
+        }
+
+        var ancestorClasses: [String] = []
+        var media = DADiskCopyIOMedia(disk)
+        if media == 0, let wholeDisk = DADiskCopyWholeDisk(disk) {
+            media = DADiskCopyIOMedia(wholeDisk)
+        }
+        if media != 0 {
+            defer { IOObjectRelease(media) }
+            var iterator: io_iterator_t = 0
+            let options = IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents)
+            if IORegistryEntryCreateIterator(media, kIOServicePlane, options, &iterator) == KERN_SUCCESS {
+                defer { IOObjectRelease(iterator) }
+                var entry = IOIteratorNext(iterator)
+                while entry != 0 {
+                    var className = [CChar](repeating: 0, count: 128)
+                    if IOObjectGetClass(entry, &className) == KERN_SUCCESS {
+                        ancestorClasses.append(String(cString: className))
+                    }
+                    IOObjectRelease(entry)
+                    entry = IOIteratorNext(iterator)
+                }
+            }
+        }
+
+        let desc = DADiskCopyDescription(disk) as? [String: Any]
+        let deviceModel = desc?[kDADiskDescriptionDeviceModelKey as String] as? String
+        let deviceProtocol = desc?[kDADiskDescriptionDeviceProtocolKey as String] as? String
+
+        return SettingsPathStatusResolver.isDiskImageVolume(
+            ancestorIOKitClasses: ancestorClasses,
+            deviceModel: deviceModel,
+            deviceProtocol: deviceProtocol
+        )
     }
 
     /// 精确匹配已保存索引路径对应的后端卷槽位，用于安全绑定行级「重新扫描 / 清除缓存」动作

@@ -34,7 +34,7 @@ impl Default for GeneralConfig {
             language: "zh-Hans".to_string(),
             show_in_dock: true,
             terminal_bundle_id: "com.apple.Terminal".to_string(),
-            hide_results_when_empty: false,
+            hide_results_when_empty: true,
         }
     }
 }
@@ -331,7 +331,7 @@ language = "zh-Hans"
 show_in_dock = true
 
 # 未输入搜索词时是否隐藏默认文件列表
-hide_results_when_empty = false
+hide_results_when_empty = true
 
 [index]
 # 索引目录列表（支持 ~ 表示用户主目录）
@@ -890,10 +890,10 @@ max_results = 200
     }
 
     #[test]
-    fn hide_results_when_empty_defaults_false_and_roundtrips() {
+    fn hide_results_when_empty_defaults_true_and_roundtrips() {
         let default = AppConfig::default();
-        assert!(!default.general.hide_results_when_empty);
-        assert!(DEFAULT_CONFIG_TOML.contains("hide_results_when_empty = false"));
+        assert!(default.general.hide_results_when_empty);
+        assert!(DEFAULT_CONFIG_TOML.contains("hide_results_when_empty = true"));
 
         let legacy_toml = r#"
 [general]
@@ -901,18 +901,18 @@ language = "zh-Hans"
 show_in_dock = true
 "#;
         let legacy = AppConfig::from_toml(legacy_toml).expect("legacy toml must parse");
-        assert!(!legacy.general.hide_results_when_empty);
+        assert!(legacy.general.hide_results_when_empty);
 
-        let enabled_toml = r#"
+        let disabled_toml = r#"
 [general]
 language = "en"
-hide_results_when_empty = true
+hide_results_when_empty = false
 "#;
-        let enabled = AppConfig::from_toml(enabled_toml).expect("enabled toml must parse");
-        assert!(enabled.general.hide_results_when_empty);
+        let disabled = AppConfig::from_toml(disabled_toml).expect("disabled toml must parse");
+        assert!(!disabled.general.hide_results_when_empty);
 
-        let json = serde_json::to_string(&enabled).expect("serialize");
+        let json = serde_json::to_string(&disabled).expect("serialize");
         let roundtrip: AppConfig = serde_json::from_str(&json).expect("deserialize");
-        assert!(roundtrip.general.hide_results_when_empty);
+        assert!(!roundtrip.general.hide_results_when_empty);
     }
 }

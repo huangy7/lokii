@@ -36,6 +36,10 @@ do {
     }
 
     let requiredKeys = [
+        "tray.preferences",
+        "tray.rebuildIndex",
+        "tray.checkUpdates",
+        "tray.quit",
         "search.toggleSidebar",
         "search.matchedCount",
         "search.matchedCount.one",
@@ -73,6 +77,12 @@ do {
 
     assertTrue(!zhContent.contains("search.toggleInspector"), "zh-Hans 不应包含已下线的 search.toggleInspector")
     assertTrue(!enContent.contains("search.toggleInspector"), "en 不应包含已下线的 search.toggleInspector")
+    assertTrue(zhContent.contains("\"tray.preferences\" = \"偏好设置…\";"), "托盘偏好设置文案应保留省略号")
+    assertTrue(zhContent.contains("\"tray.checkUpdates\" = \"检查更新…\";"), "托盘检查更新文案应保留省略号")
+    assertTrue(zhContent.contains("\"tray.quit\" = \"退出\";"), "托盘退出文案应简洁为退出")
+    assertTrue(enContent.contains("\"tray.preferences\" = \"Preferences…\";"), "英文托盘偏好设置文案应保留省略号")
+    assertTrue(enContent.contains("\"tray.checkUpdates\" = \"Check for Updates…\";"), "英文托盘检查更新文案应保留省略号")
+    assertTrue(enContent.contains("\"tray.quit\" = \"Quit\";"), "英文托盘退出文案应简洁为 Quit")
 }
 
 print("[3/5] 测试底部状态栏统计文案复合格式化逻辑...")

@@ -94,33 +94,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func statusItemClicked() {
         guard let event = NSApp.currentEvent else { return }
         if event.type == .rightMouseUp {
-            let menu = NSMenu()
-
-            let trayPrefsItem = NSMenuItem(title: L("menu.preferences"), action: #selector(openPreferences), keyEquivalent: "")
-            trayPrefsItem.target = self
-            menu.addItem(trayPrefsItem)
-
-            let trayRebuildItem = NSMenuItem(title: L("menu.rebuildIndex"), action: #selector(rebuildIndex), keyEquivalent: "")
-            trayRebuildItem.target = self
-            trayRebuildItem.isEnabled = mainWindow?.canTriggerRebuild ?? false
-            menu.addItem(trayRebuildItem)
-
-            let checkUpdatesItem = NSMenuItem(title: L("menu.checkUpdates"), action: #selector(checkForUpdates), keyEquivalent: "")
-            checkUpdatesItem.target = self
-            menu.addItem(checkUpdatesItem)
-
-            menu.addItem(NSMenuItem.separator())
-
-            let quitItem = NSMenuItem(title: L("menu.quit"), action: #selector(quitApp), keyEquivalent: "")
-            quitItem.target = self
-            menu.addItem(quitItem)
-
+            let menu = buildTrayMenu()
             menu.delegate = self
             statusItem?.menu = menu
             statusItem?.button?.performClick(nil)
         } else {
             toggleWindow()
         }
+    }
+
+    private func buildTrayMenu() -> NSMenu {
+        let menu = NSMenu()
+        let iconConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+
+        func makeItem(key: String, symbol: String, action: Selector) -> NSMenuItem {
+            let item = NSMenuItem(title: L(key), action: action, keyEquivalent: "")
+            item.target = self
+            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(iconConfig) {
+                image.isTemplate = true
+                item.image = image
+            }
+            return item
+        }
+
+        menu.addItem(makeItem(key: "tray.preferences", symbol: "gearshape", action: #selector(openPreferences)))
+
+        let trayRebuildItem = makeItem(key: "tray.rebuildIndex", symbol: "arrow.clockwise", action: #selector(rebuildIndex))
+        trayRebuildItem.isEnabled = mainWindow?.canTriggerRebuild ?? false
+        menu.addItem(trayRebuildItem)
+
+        menu.addItem(makeItem(key: "tray.checkUpdates", symbol: "arrow.down.circle", action: #selector(checkForUpdates)))
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(makeItem(key: "tray.quit", symbol: "power", action: #selector(quitApp)))
+        return menu
     }
 
     // MARK: - Full Disk Access
