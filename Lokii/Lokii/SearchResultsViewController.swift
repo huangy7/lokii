@@ -1184,25 +1184,35 @@ final class SearchResultsViewController: NSViewController {
     /// 直接依据已选中的检索条目 O(1) 更新底栏文件路径展示，消除结果集线性扫描
     func updateBottomPath(for result: FfiSearchResult?) {
         guard let result else {
-            applyBottomPath(path: nil, isDir: false, isOffline: false)
+            applyBottomPath(path: nil, isDir: false, fileExtension: nil, isOffline: false)
             return
         }
-        applyBottomPath(path: result.path, isDir: result.isDir, isOffline: isResultOffline(result))
+        applyBottomPath(
+            path: result.path,
+            isDir: result.isDir,
+            fileExtension: result.extension,
+            isOffline: isResultOffline(result)
+        )
     }
 
     /// 更新底栏文件路径展示并协同控制与权限提示的互斥显隐
     func updateBottomPath(with path: String?) {
         guard let path else {
-            applyBottomPath(path: nil, isDir: false, isOffline: false)
+            applyBottomPath(path: nil, isDir: false, fileExtension: nil, isOffline: false)
             return
         }
         let matched = results.first(where: { $0.path == path })
         let isTargetOffline = matched.map { isResultOffline($0) } ?? isPathOffline(path)
         let isTargetDir = matched?.isDir ?? false
-        applyBottomPath(path: path, isDir: isTargetDir, isOffline: isTargetOffline)
+        applyBottomPath(
+            path: path,
+            isDir: isTargetDir,
+            fileExtension: matched?.extension,
+            isOffline: isTargetOffline
+        )
     }
 
-    private func applyBottomPath(path: String?, isDir: Bool, isOffline: Bool) {
+    private func applyBottomPath(path: String?, isDir: Bool, fileExtension: String?, isOffline: Bool) {
         if hasRenderedBottomPath,
            lastRenderedBottomPath == path,
            lastRenderedBottomOffline == isOffline {
@@ -1214,42 +1224,79 @@ final class SearchResultsViewController: NSViewController {
         lastRenderedBottomOffline = isOffline
 
         if let path, isOffline {
-            // Build offline breadcrumb items purely in memory without assigning URLs on NSPathControl
-            // or NSPathComponentCell so AppKit never stats stale mount points.
-            applyOfflinePathItems(for: path, isDir: isDir)
+            // 离线面包屑纯内存构建，绝不向 NSPathControl 写入 url 触发挂死挂载点 stat；
+            // 图标使用系统 UTType 全彩图标并配合柔和降透明态，视觉与原生访达路径栏保持统一。
+            applyOfflinePathItems(for: path, isDir: isDir, fileExtension: fileExtension)
+            pathBar.alphaValue = 0.68
         } else {
             pathBar.clearOfflineState()
             if path == nil {
                 pathBar.pathItems = []
             }
             pathBar.url = path.map { URL(fileURLWithPath: $0) }
+            pathBar.alphaValue = 1.0
         }
         pathBar.toolTip = path
         updateBottomBarVisibility()
     }
 
-    private func applyOfflinePathItems(for path: String, isDir isTargetDir: Bool) {
-        let folderIcon = offlineFallbackIcon(isDir: true)
+    private static let bootVolumeDisplayName: String = {
+        let name = FileManager.default.displayName(atPath: "/")
+        return name.isEmpty ? "/" : name
+    }()
+
+    private func applyOfflinePathItems(for path: String, isDir isTargetDir: Bool, fileExtension: String?) {
+        let folderIcon = nonBlockingTypeIcon(for: "", isDir: true)
+        let volumeIcon = nonBlockingVolumeIcon()
         let components = (path as NSString).pathComponents.filter { $0 != "/" }
         var items: [NSPathControlItem] = []
         var urls: [URL] = []
 
-        let rootItem = NSPathControlItem()
-        rootItem.title = "/"
-        rootItem.image = folderIcon
-        items.append(rootItem)
-        urls.append(URL(fileURLWithPath: "/", isDirectory: true))
+        // `/Volumes/<卷名>/...` 与 macOS 访达路径栏保持一致：直接以卷名与磁盘图标起头，省去生硬的 `/ > Volumes >` 前缀
+        let startIndex: Int
+        var current: String
+        if components.count >= 2 && components[0].caseInsensitiveCompare("Volumes") == .orderedSame {
+            let volumeName = components[1]
+            let volumePath = "/\(components[0])/\(volumeName)"
+            let volumeItem = NSPathControlItem()
+            volumeItem.title = volumeName
+            volumeItem.image = volumeIcon
+            items.append(volumeItem)
+            urls.append(URL(fileURLWithPath: volumePath, isDirectory: true))
+            startIndex = 2
+            current = volumePath
+        } else {
+            let rootItem = NSPathControlItem()
+            rootItem.title = Self.bootVolumeDisplayName
+            rootItem.image = volumeIcon
+            items.append(rootItem)
+            urls.append(URL(fileURLWithPath: "/", isDirectory: true))
+            startIndex = 0
+            current = ""
+        }
 
-        var current = ""
-        for (idx, component) in components.enumerated() {
-            current += "/" + component
-            let isLast = idx == components.count - 1
-            let itemIsDir = isLast ? isTargetDir : true
-            let item = NSPathControlItem()
-            item.title = component
-            item.image = itemIsDir ? folderIcon : offlineFallbackIcon(isDir: false)
-            items.append(item)
-            urls.append(URL(fileURLWithPath: current, isDirectory: itemIsDir))
+        if startIndex < components.count {
+            for idx in startIndex..<components.count {
+                let component = components[idx]
+                current += "/" + component
+                let isLast = idx == components.count - 1
+                let itemIsDir = isLast ? isTargetDir : true
+                let item = NSPathControlItem()
+                item.title = component
+                if itemIsDir {
+                    item.image = (isLast && Self.needsCustomBundleIcon(path: current))
+                        ? nonBlockingTypeIcon(for: current, isDir: true, fileExtension: fileExtension)
+                        : folderIcon
+                } else {
+                    item.image = nonBlockingTypeIcon(
+                        for: current,
+                        isDir: false,
+                        fileExtension: isLast ? fileExtension : nil
+                    )
+                }
+                items.append(item)
+                urls.append(URL(fileURLWithPath: current, isDirectory: itemIsDir))
+            }
         }
 
         pathBar.setOfflineItems(items, urls: urls)
@@ -1919,11 +1966,10 @@ final class SearchResultsViewController: NSViewController {
         return ext == "app" || ext == "prefpane"
     }
 
-    private func offlineFallbackIcon(isDir: Bool) -> NSImage {
-        let key = isDir ? "__offline__dir__" : "__offline__file__"
+    private func nonBlockingVolumeIcon() -> NSImage {
+        let key = "__type_icon_volume__"
         if let cached = typeIconCache[key] { return cached }
-        let symbolName = isDir ? "folder" : "doc"
-        let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) ?? NSImage()
+        let icon = NSWorkspace.shared.icon(for: .volume)
         typeIconCache[key] = icon
         return icon
     }
@@ -1946,11 +1992,11 @@ final class SearchResultsViewController: NSViewController {
     }
 
     func iconForFile(at path: String, isDir: Bool = false, isOffline: Bool = false, fileExtension: String? = nil) -> NSImage {
+        // 离线条目与 `/Volumes/*` 绝不触发磁盘 stat 或自定义应用包磁盘图标查询，
+        // 统一走基于扩展名/UTType 的 O(1) 纯内存全彩系统图标缓存，兼顾零阻塞与原生视觉一致性。
         if isOffline || isPathOffline(path) {
-            return offlineFallbackIcon(isDir: isDir)
+            return nonBlockingTypeIcon(for: path, isDir: isDir, fileExtension: fileExtension)
         }
-        // `/Volumes/*` 与常规文件/目录在主线程表格渲染期间严禁同步调用 NSWorkspace.icon(forFile:)，
-        // 统一走基于扩展名/UTType 的 O(1) 纯内存类型图标缓存，消除高频磁盘 stat 与云盘阻塞。
         if !Self.isUnderVolumesNamespace(path),
            Self.needsCustomBundleIcon(path: path),
            let cached = iconCache.object(forKey: path as NSString) {

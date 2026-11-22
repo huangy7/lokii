@@ -261,6 +261,26 @@ do {
         "~ 前缀路径应与展开后的绝对路径一致匹配"
     )
 
+    // 校验离线占位槽位（如手动删除 volumes/ 目录或缓存缺失，state == .offline 但 entryCount == 0）必须归类为未缓存离线，不可误报“索引已保留”
+    let uncachedOfflineSlot = FfiVolumeStatus(
+        configuredPath: "/Volumes/Home1",
+        activePath: nil,
+        displayName: "Home1",
+        kind: "network",
+        state: .offline,
+        entryCount: 0,
+        lastSyncAt: nil
+    )
+    assertEqual(
+        SettingsPathStatusResolver.resolve(
+            path: "/Volumes/Home1",
+            volumeStatuses: [uncachedOfflineSlot],
+            localAvailabilityCache: [:]
+        ),
+        .volumeUncachedOffline,
+        "entryCount == 0 的离线占位卷应解析为 volumeUncachedOffline，绝不可误报为已保留缓存"
+    )
+
     // 校验清除卷缓存后（volumeStatuses 为空或未命中）的 /Volumes/<Name> 路径保持离线未索引状态而非误判为 localMissing
     assertEqual(
         SettingsPathStatusResolver.resolve(
@@ -336,6 +356,17 @@ guard !rowBody.contains("FileManager.default.fileExists") else {
     fputs("断言失败: SettingsPathRow 视图渲染内禁止同步调用 FileManager.default.fileExists\n", stderr)
     exit(1)
 }
+guard let managedRowStart = indexPaneSource.range(of: "private struct ManagedVolumeRow: View {"),
+      let paneStart = indexPaneSource.range(of: "// MARK: - Index Preferences Pane") else {
+    fputs("tests/index_config_test.swift: error: 无法定位 ManagedVolumeRow 代码片段\n", stderr)
+    exit(1)
+}
+let managedRowBody = String(indexPaneSource[managedRowStart.lowerBound..<paneStart.lowerBound])
+guard !managedRowBody.contains("prefs.volume.status.offlineNoCount") else {
+    fputs("断言失败: ManagedVolumeRow 在 entryCount == 0 时必须展示 offlineUncached 而非 offlineNoCount\n", stderr)
+    exit(1)
+}
+
 for requiredSymbol in [
     "peekStartupIsColdStart",
     "didMountNotification",
