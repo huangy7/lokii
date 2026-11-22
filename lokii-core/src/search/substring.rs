@@ -6,9 +6,10 @@ use crate::string_pool::NameSignature;
 
 use super::disjunction::{extension_matches, extension_signature};
 use super::filter::QueryToken;
+use super::path_query::PathCandidate;
 use super::ranking::{
-    bucket_slices, keywords_target_hidden, score_name_rank, score_record, BaseNameScore,
-    RankScore, RecordRankContext,
+    bucket_slices, keywords_target_hidden, score_name_rank, score_record_with_meta, BaseNameScore,
+    MatchTier, RankScore, RecordRankContext,
 };
 use super::{
     find_positions, is_dotfile_query, map_norm_span_to_orig, merge_highlight_spans,
@@ -29,13 +30,13 @@ pub fn search(
 }
 
 /// 扩展名池槽位匹配器：纯 ASCII 退化为单一整数 ID 等值比较；非 ASCII 使用位图覆盖多规范化变体槽位。
-enum ExtMatcher {
+pub(crate) enum ExtMatcher {
     ExactId(u32),
     Mask(Vec<bool>),
 }
 
 impl ExtMatcher {
-    fn compile(read: &CompactIndex, extension: &str) -> Option<Self> {
+    pub(crate) fn compile(read: &CompactIndex, extension: &str) -> Option<Self> {
         if extension.is_ascii() {
             read.extension_id(extension).map(Self::ExactId)
         } else {
@@ -47,7 +48,7 @@ impl ExtMatcher {
     }
 
     #[inline]
-    fn matches(&self, ext_id: u32) -> bool {
+    pub(crate) fn matches(&self, ext_id: u32) -> bool {
         match self {
             Self::ExactId(id) => ext_id == *id,
             Self::Mask(mask) => mask.get(ext_id as usize).copied().unwrap_or(false),
@@ -207,6 +208,7 @@ fn search_index_tokens_with_ordinals(
             let req = extension_signature(extension);
             let ext_ascii = extension.is_ascii();
             let mut top = super::top_k::TopK::new(max_results);
+            let query_index = read.query_index();
             let sorted = read.sorted_names();
             let records = read.records();
             let passthrough = filter.is_passthrough();
@@ -245,8 +247,17 @@ fn search_index_tokens_with_ordinals(
                         if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
                             continue;
                         }
-                        let parent = read.record_parent(record);
-                        let score = score_record(base, record.is_dir, parent, &rank_ctx, false);
+                        let (parent_depth, parent_hidden) =
+                            read.record_parent_meta(record, query_index);
+                        let score = score_record_with_meta(
+                            base,
+                            record.is_dir,
+                            parent_depth,
+                            parent_hidden,
+                            &rank_ctx,
+                            false,
+                            0,
+                        );
                         top.offer(ordinal as usize, score, name);
                     }
                 }
@@ -260,6 +271,7 @@ fn search_index_tokens_with_ordinals(
                     Vec::new()
                 } else {
                     let mut top = super::top_k::TopK::new(max_results);
+                    let query_index = read.query_index();
                     let records = read.records();
                     for (id, name) in read.names() {
                         let Some(record) = records.get(id.0) else {
@@ -269,8 +281,17 @@ fn search_index_tokens_with_ordinals(
                             continue;
                         }
                         let base = BaseNameScore::for_exact_fast_path(name);
-                        let parent = read.record_parent(record);
-                        let score = score_record(base, record.is_dir, parent, &rank_ctx, false);
+                        let (parent_depth, parent_hidden) =
+                            read.record_parent_meta(record, query_index);
+                        let score = score_record_with_meta(
+                            base,
+                            record.is_dir,
+                            parent_depth,
+                            parent_hidden,
+                            &rank_ctx,
+                            false,
+                            0,
+                        );
                         top.offer(id.0, score, name);
                     }
                     top.finish()
@@ -339,6 +360,7 @@ fn search_index_tokens_with_ordinals(
 
 struct HybridSplitPlan {
     parent_terms: Vec<String>,
+    all_parent_ascii: bool,
     name_keywords: Vec<String>,
     name_raw_keywords: Vec<String>,
     all_name_ascii: bool,
@@ -347,9 +369,75 @@ struct HybridSplitPlan {
     required_sig: NameSignature,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HybridParentMatch {
+    Miss = 0,
+    Substring = 1,
+    WordBoundary = 2,
+}
+
 #[inline]
 fn is_parent_word_boundary(haystack_bytes: &[u8], pos: usize) -> bool {
     pos == 0 || matches!(haystack_bytes[pos - 1], b'/' | b'_' | b'-' | b' ' | b'.')
+}
+
+/// 在剔除末尾 `/` 后的父路径上检查是否包含所有 `parent_terms`，并判别是否全部命中在段/词边界。
+/// 纯 ASCII 父路径走零分配大小写无关字节匹配，消除父目录池预评估阶段的字符串堆分配。
+fn evaluate_hybrid_parent_raw(
+    parent: &str,
+    parent_terms: &[String],
+    all_parent_ascii: bool,
+) -> HybridParentMatch {
+    let parent_no_slash = parent.trim_end_matches('/');
+    if parent_no_slash.is_empty() {
+        return HybridParentMatch::Miss;
+    }
+
+    if all_parent_ascii && parent_no_slash.is_ascii() {
+        let bytes = parent_no_slash.as_bytes();
+        let mut all_boundary = true;
+        for term in parent_terms {
+            if term.is_empty() {
+                continue;
+            }
+            let tb = term.as_bytes();
+            let mut found_any = false;
+            let mut found_boundary = false;
+            let mut offset = 0usize;
+            while offset + tb.len() <= bytes.len() {
+                let Some(rel) = crate::string_pool::find_ascii_ignore_case(&bytes[offset..], tb)
+                else {
+                    break;
+                };
+                let abs = offset + rel;
+                found_any = true;
+                if is_parent_word_boundary(bytes, abs) {
+                    found_boundary = true;
+                    break;
+                }
+                offset = abs + 1;
+            }
+            if !found_any {
+                return HybridParentMatch::Miss;
+            }
+            if !found_boundary {
+                all_boundary = false;
+            }
+        }
+        return if all_boundary {
+            HybridParentMatch::WordBoundary
+        } else {
+            HybridParentMatch::Substring
+        };
+    }
+
+    let parent_folded = crate::cjk::fold_cow(parent_no_slash);
+    match evaluate_hybrid_parent(&parent_folded, parent_terms) {
+        Some(true) => HybridParentMatch::WordBoundary,
+        Some(false) => HybridParentMatch::Substring,
+        None => HybridParentMatch::Miss,
+    }
 }
 
 /// 在剔除末尾 `/` 后的父路径上检查是否包含所有 `parent_terms`，并判别是否全部命中在段/词边界。
@@ -438,6 +526,7 @@ fn append_hybrid_parent_name_hits(
             continue;
         }
         let parent_terms: Vec<String> = lead.iter().map(|t| crate::cjk::fold_str(&t.text)).collect();
+        let all_parent_ascii = parent_terms.iter().all(|t| t.is_ascii());
         let name_cs =
             resolve_case_sensitive_tokens(tail, case_sensitivity, SearchMode::Substring);
         let name_explicit_lock = case_sensitivity == CaseSensitivity::Sensitive;
@@ -467,6 +556,7 @@ fn append_hybrid_parent_name_hits(
         }
         plans.push(HybridSplitPlan {
             parent_terms,
+            all_parent_ascii,
             name_keywords,
             name_raw_keywords,
             all_name_ascii,
@@ -491,11 +581,25 @@ fn append_hybrid_parent_name_hits(
     let query_index = read.query_index();
     let records = read.records();
     let passthrough = filter.is_passthrough();
+    let allow_dirs = filter.allow_dirs();
+    let has_raw_paths = read.pool_counts().3 > 0;
 
-    // ordinal -> (best_plan_idx, best_score, name_str)
-    let mut best_by_ordinal: HashMap<usize, (usize, RankScore, &str)> = HashMap::new();
+    // 针对最常见的双词查询（单一划分子计划）：先按父目录池预评估一次，再直接流式写入 TopK 并启用桶级上界剪枝，
+    // 彻底消除记录级 `fold_cow(parent)` 堆分配与无界 `HashMap` 膨胀。
+    if plans.len() == 1 {
+        let plan = &plans[0];
+        let parent_matches = read.evaluate_parents(HybridParentMatch::Miss, |parent| {
+            evaluate_hybrid_parent_raw(parent, &plan.parent_terms, plan.all_parent_ascii)
+        });
+        if !has_raw_paths
+            && !parent_matches
+                .iter()
+                .any(|&m| m != HybridParentMatch::Miss)
+        {
+            return;
+        }
 
-    for (plan_idx, plan) in plans.iter().enumerate() {
+        let mut top = super::top_k::TopK::new(remaining);
         for name_id in 0..query_index.slot_count() as u32 {
             let sig = query_index.signature_at(name_id);
             if sig == NameSignature::default() && !query_index.is_ready(name_id) {
@@ -511,9 +615,157 @@ fn append_hybrid_parent_name_hits(
             let Some(name) = read.name_text(name_id) else {
                 continue;
             };
+            let folded = if name.is_ascii() {
+                None
+            } else {
+                query_index.folded(name_id)
+            };
             let Some(name_base) = score_name_rank(
                 name,
-                query_index.folded(name_id),
+                folded,
+                &plan.name_keywords,
+                &plan.name_raw_keywords,
+                plan.all_name_ascii,
+                plan.name_case_sensitive,
+                plan.name_explicit_lock,
+            ) else {
+                continue;
+            };
+
+            let name_quality_bonus =
+                ((name_base.tier as i64) * 2_000) + ((name_base.sub_tier as i64) * 200);
+            let upper = BaseNameScore::for_hybrid_parent_name(name, true, name_quality_bonus)
+                .upper_bound(&rank_ctx, allow_dirs, targets_hidden);
+            if let Some(worst) = top.worst() {
+                if upper < worst.score || (upper == worst.score && name > worst.name()) {
+                    continue;
+                }
+            }
+
+            let (head, tail_slice) = bucket_slices(entries);
+            for &ordinal in head.iter().chain(tail_slice.iter()) {
+                let ord_usize = ordinal as usize;
+                if pure_seen.contains(&ord_usize) {
+                    continue;
+                }
+                let Some(record) = records.get(ord_usize) else {
+                    continue;
+                };
+                let pmatch = if record.raw_path {
+                    evaluate_hybrid_parent_raw(
+                        read.record_parent(record),
+                        &plan.parent_terms,
+                        plan.all_parent_ascii,
+                    )
+                } else {
+                    parent_matches
+                        .get(record.path as usize)
+                        .copied()
+                        .unwrap_or(HybridParentMatch::Miss)
+                };
+                if pmatch == HybridParentMatch::Miss {
+                    continue;
+                }
+                if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                    continue;
+                }
+                let is_word_boundary = pmatch == HybridParentMatch::WordBoundary;
+                let hybrid_base = BaseNameScore::for_hybrid_parent_name(
+                    name,
+                    is_word_boundary,
+                    name_quality_bonus,
+                );
+                let (parent_depth, parent_hidden) = read.record_parent_meta(record, query_index);
+                let score = score_record_with_meta(
+                    hybrid_base,
+                    record.is_dir,
+                    parent_depth,
+                    parent_hidden,
+                    &rank_ctx,
+                    targets_hidden,
+                    0,
+                );
+                top.offer(ord_usize, score, name);
+            }
+        }
+
+        let chosen = top.finish();
+        if chosen.is_empty() {
+            return;
+        }
+        let prepared_kw: Vec<(&str, String)> = plan
+            .name_keywords
+            .iter()
+            .map(|k| (k.as_str(), crate::cjk::fold_str(k)))
+            .collect();
+        let kw_refs: Vec<(&str, &str)> = prepared_kw
+            .iter()
+            .map(|(raw, lower)| (*raw, lower.as_str()))
+            .collect();
+
+        for candidate in chosen {
+            let view = read
+                .view(crate::compact_index::EntryId(candidate.ordinal))
+                .expect("valid compact reference");
+            let name_folded = crate::cjk::fold_cow(view.name);
+            let match_positions = find_positions(view.name, name_folded.as_ref(), &kw_refs);
+            let parent = if view.raw_path().is_some() {
+                read.record_parent(&records[candidate.ordinal])
+            } else {
+                view.parent
+            };
+            let parent_match_positions =
+                compute_parent_match_positions(parent, &plan.parent_terms);
+
+            results.push(AdvancedSearchResult {
+                entry: view.materialize(),
+                score: candidate.score.to_f64(),
+                match_positions,
+                parent_match_positions,
+                search_mode: SearchMode::Substring,
+            });
+        }
+        return;
+    }
+
+    // 多切分计划（3 词及以上）：每个计划预先在父目录池上完成一次零分配评估，按记录取各计划最高分
+    let mut best_by_ordinal: HashMap<usize, (usize, RankScore, &str)> = HashMap::new();
+
+    for (plan_idx, plan) in plans.iter().enumerate() {
+        let parent_matches = read.evaluate_parents(HybridParentMatch::Miss, |parent| {
+            evaluate_hybrid_parent_raw(parent, &plan.parent_terms, plan.all_parent_ascii)
+        });
+        if !has_raw_paths
+            && !parent_matches
+                .iter()
+                .any(|&m| m != HybridParentMatch::Miss)
+        {
+            continue;
+        }
+
+        for name_id in 0..query_index.slot_count() as u32 {
+            let sig = query_index.signature_at(name_id);
+            if sig == NameSignature::default() && !query_index.is_ready(name_id) {
+                continue;
+            }
+            if !sig.contains(plan.required_sig) {
+                continue;
+            }
+            let entries = query_index.entries(name_id);
+            if entries.is_empty() {
+                continue;
+            }
+            let Some(name) = read.name_text(name_id) else {
+                continue;
+            };
+            let folded = if name.is_ascii() {
+                None
+            } else {
+                query_index.folded(name_id)
+            };
+            let Some(name_base) = score_name_rank(
+                name,
+                folded,
                 &plan.name_keywords,
                 &plan.name_raw_keywords,
                 plan.all_name_ascii,
@@ -535,27 +787,41 @@ fn append_hybrid_parent_name_hits(
                 let Some(record) = records.get(ord_usize) else {
                     continue;
                 };
+                let pmatch = if record.raw_path {
+                    evaluate_hybrid_parent_raw(
+                        read.record_parent(record),
+                        &plan.parent_terms,
+                        plan.all_parent_ascii,
+                    )
+                } else {
+                    parent_matches
+                        .get(record.path as usize)
+                        .copied()
+                        .unwrap_or(HybridParentMatch::Miss)
+                };
+                if pmatch == HybridParentMatch::Miss {
+                    continue;
+                }
                 if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
                     continue;
                 }
-                let parent = read.record_parent(record);
-                let parent_no_slash = parent.trim_end_matches('/');
-                if parent_no_slash.is_empty() {
-                    continue;
-                }
-                let parent_folded = crate::cjk::fold_cow(parent_no_slash);
-                let Some(is_word_boundary) =
-                    evaluate_hybrid_parent(&parent_folded, &plan.parent_terms)
-                else {
-                    continue;
-                };
 
+                let is_word_boundary = pmatch == HybridParentMatch::WordBoundary;
                 let hybrid_base = BaseNameScore::for_hybrid_parent_name(
                     name,
                     is_word_boundary,
                     name_quality_bonus,
                 );
-                let score = score_record(hybrid_base, record.is_dir, parent, &rank_ctx, targets_hidden);
+                let (parent_depth, parent_hidden) = read.record_parent_meta(record, query_index);
+                let score = score_record_with_meta(
+                    hybrid_base,
+                    record.is_dir,
+                    parent_depth,
+                    parent_hidden,
+                    &rank_ctx,
+                    targets_hidden,
+                    0,
+                );
                 match best_by_ordinal.get_mut(&ord_usize) {
                     Some((prev_plan, prev_score, _)) => {
                         if score > *prev_score {
@@ -626,6 +892,9 @@ fn append_hybrid_parent_name_hits(
 struct PreparedDisjunctionClause<'a> {
     clause_idx: usize,
     is_extension: bool,
+    is_wildcard: bool,
+    multi_and_wildcard: bool,
+    simple_suffix: Option<String>,
     extension: Option<&'a str>,
     ext_matcher: Option<ExtMatcher>,
     ext_ascii: bool,
@@ -636,6 +905,7 @@ struct PreparedDisjunctionClause<'a> {
     targets_hidden: bool,
     required_sig: NameSignature,
     kw_prepared: Vec<(&'a str, String)>,
+    scope_candidates: &'a [PathCandidate],
 }
 
 /// 并集检索执行引擎：支持带管道符多子句的单趟签名位运算预筛、上界剪枝与双层复合打分。
@@ -649,7 +919,7 @@ pub fn search_disjunction(
     search_disjunction_with_filters(read, query, filter, None, max_results, explicit_lock)
 }
 
-/// 支持按子句独立作用域编译过滤器的并集检索引擎（如 `foo !a | bar !b` 各子句独立过滤与高亮隔离）。
+/// 支持按子句独立作用域编译过滤器的并集检索引擎（如 `foo !a | bar !b`、`test_* | *_spec.rs`、`in:src foo | in:tests bar`）。
 ///
 /// 算法核心机制：
 /// 1. 单趟 128 位超集签名预筛：多子句签名求或（Any），零堆分配短路快速跳过无关名字；
@@ -684,6 +954,21 @@ pub fn search_disjunction_with_filters(
         let raw_keywords = clause.raw_keywords.clone();
         let all_ascii = keywords.iter().all(|k| k.is_ascii());
         let targets_hidden = keywords_target_hidden(is_extension, &keywords);
+        let is_wildcard = clause.is_wildcard;
+        let multi_and_wildcard = is_wildcard && keywords.len() > 1;
+        let simple_suffix = if is_wildcard && !multi_and_wildcard {
+            keywords.first().and_then(|p| {
+                p.strip_prefix("*.")
+                    .filter(|rest| {
+                        !rest.is_empty()
+                            && !rest.contains(['*', '?', '[', ']', '{', '}', '\\'])
+                            && rest.is_ascii()
+                    })
+                    .map(str::to_owned)
+            })
+        } else {
+            None
+        };
 
         let kw_prepared: Vec<(&str, String)> = clause
             .keywords
@@ -694,6 +979,9 @@ pub fn search_disjunction_with_filters(
         prepared_clauses.push(PreparedDisjunctionClause {
             clause_idx,
             is_extension,
+            is_wildcard,
+            multi_and_wildcard,
+            simple_suffix,
             extension: ext_str,
             ext_matcher,
             ext_ascii,
@@ -704,6 +992,7 @@ pub fn search_disjunction_with_filters(
             targets_hidden,
             required_sig: clause.required_sig,
             kw_prepared,
+            scope_candidates: &clause.scope_candidates,
         });
     }
 
@@ -711,10 +1000,12 @@ pub fn search_disjunction_with_filters(
         return Vec::new();
     }
 
+    let query_index = read.query_index();
     let sorted = read.sorted_names();
     let mut top = super::top_k::TopK::new(max_results);
     let rank_ctx = RecordRankContext::default();
     let records = read.records();
+    let mut ascii_buf = Vec::with_capacity(128);
     let mut matched_clauses: Vec<(usize, Option<BaseNameScore>, Option<&ExtMatcher>)> =
         Vec::with_capacity(prepared_clauses.len());
 
@@ -751,6 +1042,22 @@ pub fn search_disjunction_with_filters(
                     if extension_matches(name, folded, ext, clause.ext_ascii) {
                         matched_clauses.push((prep_idx, None, Some(matcher)));
                     }
+                }
+            } else if clause.is_wildcard {
+                if super::wildcard::matches_wildcard_terms(
+                    name,
+                    folded,
+                    &clause.keywords,
+                    clause.multi_and_wildcard,
+                    clause.simple_suffix.as_deref(),
+                    clause.case_sensitive,
+                    &mut ascii_buf,
+                ) {
+                    matched_clauses.push((
+                        prep_idx,
+                        Some(BaseNameScore::for_tier_only(name, MatchTier::Prefix, 0)),
+                        None,
+                    ));
                 }
             } else if let Some(base) = score_name_rank(
                 name,
@@ -803,7 +1110,7 @@ pub fn search_disjunction_with_filters(
                 continue;
             };
 
-            let parent = read.record_parent(record);
+            let (parent_depth, parent_hidden) = read.record_parent_meta(record, query_index);
             let mut best_record_score: Option<RankScore> = None;
 
             for &(prep_idx, base_opt, ext_opt) in &matched_clauses {
@@ -818,13 +1125,29 @@ pub fn search_disjunction_with_filters(
                 if let Some(matcher) = ext_opt {
                     if !record.is_dir && matcher.matches(record.extension) {
                         if let Some(base) = ext_base {
-                            let s = score_record(base, false, parent, &rank_ctx, false);
+                            let s = score_record_with_meta(
+                                base,
+                                false,
+                                parent_depth,
+                                parent_hidden,
+                                &rank_ctx,
+                                false,
+                                0,
+                            );
                             best_record_score = Some(best_record_score.map_or(s, |cur| cur.max(s)));
                         }
                     }
                 }
                 if let Some(base) = base_opt {
-                    let s = score_record(base, record.is_dir, parent, &rank_ctx, c.targets_hidden);
+                    let s = score_record_with_meta(
+                        base,
+                        record.is_dir,
+                        parent_depth,
+                        parent_hidden,
+                        &rank_ctx,
+                        c.targets_hidden,
+                        0,
+                    );
                     best_record_score = Some(best_record_score.map_or(s, |cur| cur.max(s)));
                 }
             }
@@ -849,8 +1172,12 @@ pub fn search_disjunction_with_filters(
         let folded = read.name_entry(record.name).and_then(|(_, f)| f);
 
         let mut all_spans = Vec::new();
+        let mut parent_spans = Vec::new();
         for clause in &prepared_clauses {
-            if clause.is_extension || clause.keywords.is_empty() {
+            if clause.is_extension && clause.scope_candidates.is_empty() {
+                continue;
+            }
+            if !clause.is_extension && clause.keywords.is_empty() {
                 continue;
             }
             let cf = clause_filters
@@ -859,25 +1186,56 @@ pub fn search_disjunction_with_filters(
             if !cf.is_passthrough() && !cf.matches_record_in(read, record, Some(name)) {
                 continue;
             }
-            let matched = score_name_rank(
-                name,
-                folded,
-                &clause.keywords,
-                &clause.raw_keywords,
-                clause.all_ascii,
-                clause.case_sensitive,
-                explicit_lock,
-            )
-            .is_some();
+            let matched = if clause.is_extension {
+                clause.ext_matcher.as_ref().is_some_and(|m| !record.is_dir && m.matches(record.extension))
+            } else if clause.is_wildcard {
+                super::wildcard::matches_wildcard_terms(
+                    name,
+                    folded,
+                    &clause.keywords,
+                    clause.multi_and_wildcard,
+                    clause.simple_suffix.as_deref(),
+                    clause.case_sensitive,
+                    &mut ascii_buf,
+                )
+            } else {
+                score_name_rank(
+                    name,
+                    folded,
+                    &clause.keywords,
+                    &clause.raw_keywords,
+                    clause.all_ascii,
+                    clause.case_sensitive,
+                    explicit_lock,
+                )
+                .is_some()
+            };
 
             if matched {
-                let kw_refs: Vec<(&str, &str)> = clause
-                    .kw_prepared
-                    .iter()
-                    .map(|(raw, lower)| (*raw, lower.as_str()))
-                    .collect();
-                let spans = find_positions(name, name_folded.as_ref(), &kw_refs);
-                all_spans.extend(spans);
+                if clause.is_wildcard {
+                    all_spans.extend(super::wildcard::find_wildcard_positions(
+                        name,
+                        &clause.keywords,
+                        clause.case_sensitive,
+                    ));
+                } else if !clause.is_extension {
+                    let kw_refs: Vec<(&str, &str)> = clause
+                        .kw_prepared
+                        .iter()
+                        .map(|(raw, lower)| (*raw, lower.as_str()))
+                        .collect();
+                    let spans = find_positions(name, name_folded.as_ref(), &kw_refs);
+                    all_spans.extend(spans);
+                }
+                if !clause.scope_candidates.is_empty() {
+                    let parent = read.record_parent(record);
+                    if let Some(pspan) = super::path_search::find_scope_highlight_range(
+                        parent,
+                        clause.scope_candidates,
+                    ) {
+                        parent_spans.push(pspan);
+                    }
+                }
             }
         }
 
@@ -888,12 +1246,18 @@ pub fn search_disjunction_with_filters(
                 && name.is_char_boundary(e)
         });
         let match_positions = merge_highlight_spans(all_spans, name.len());
+        let parent_match_positions = if parent_spans.is_empty() {
+            Vec::new()
+        } else {
+            let parent = read.record_parent(record).trim_end_matches('/');
+            merge_highlight_spans(parent_spans, parent.len())
+        };
 
         results.push(AdvancedSearchResult {
             entry: view.materialize(),
             score: candidate.score.to_f64(),
             match_positions,
-            parent_match_positions: Vec::new(),
+            parent_match_positions,
             search_mode: SearchMode::Substring,
         });
     }

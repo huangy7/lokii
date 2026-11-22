@@ -109,11 +109,14 @@ pub fn score_match_zero_alloc(
             return None;
         }
 
-        // Auto 敏感模式下，若存在非 ASCII 字符且关键词全为 ASCII，允许拼音匹配但降权为 Substring
-        if all_keywords_ascii && name.as_bytes().iter().any(|&b| b >= 0x80) {
-            if crate::pinyin::score_pinyin_match(name, keywords).is_some() {
-                return Some(MatchScore::Substring);
-            }
+        // Auto 敏感模式下，若名字含非 ASCII 字符且查询包含 ASCII 字母，允许拼音（含汉字+拼音混合）匹配但降权为 Substring
+        if !name.is_ascii()
+            && keywords
+                .iter()
+                .any(|k| k.bytes().any(|b| b.is_ascii_alphabetic()))
+            && crate::pinyin::score_pinyin_match(name, keywords).is_some()
+        {
+            return Some(MatchScore::Substring);
         }
         return None;
     }
@@ -122,7 +125,10 @@ pub fn score_match_zero_alloc(
         if let Some(score) = score_match(folded, keywords) {
             return Some(score);
         }
-        if all_keywords_ascii {
+        if keywords
+            .iter()
+            .any(|k| k.bytes().any(|b| b.is_ascii_alphabetic()))
+        {
             if let Some(pinyin_score) = crate::pinyin::score_pinyin_match(name, keywords) {
                 return Some(pinyin_score);
             }
@@ -132,11 +138,19 @@ pub fn score_match_zero_alloc(
     if !all_keywords_ascii {
         // `folded_non_ascii` 只在“折叠后与原名不同”时存在；这里为 None
         // 意味着名字已经是小写等价形式（CJK、小写重音字母等），直接按原名比较。
-        return if name.is_ascii() {
-            None
-        } else {
-            score_match(name, keywords)
-        };
+        if name.is_ascii() {
+            return None;
+        }
+        if let Some(score) = score_match(name, keywords) {
+            return Some(score);
+        }
+        if keywords
+            .iter()
+            .any(|k| k.bytes().any(|b| b.is_ascii_alphabetic()))
+        {
+            return crate::pinyin::score_pinyin_match(name, keywords);
+        }
+        return None;
     }
     let name_bytes = name.as_bytes();
     let mut all_match = true;
@@ -272,6 +286,7 @@ impl IndexStore {
                 };
                 let ext_ascii = extension.is_ascii();
                 let mut top = crate::search::top_k::TopK::new(max_results);
+                let query_index = read.query_index();
                 let sorted = read.sorted_names();
                 let records = read.records();
                 for &name_id in &sorted.ids {
@@ -311,13 +326,16 @@ impl IndexStore {
                             let Some(record) = records.get(ordinal as usize) else {
                                 continue;
                             };
-                            let parent = read.record_parent(record);
-                            let score = crate::search::ranking::score_record(
+                            let (parent_depth, parent_hidden) =
+                                read.record_parent_meta(record, query_index);
+                            let score = crate::search::ranking::score_record_with_meta(
                                 base,
                                 record.is_dir,
-                                parent,
+                                parent_depth,
+                                parent_hidden,
                                 &rank_ctx,
                                 false,
+                                0,
                             );
                             top.offer(ordinal as usize, score, name);
                         }

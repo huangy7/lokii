@@ -244,6 +244,29 @@ pub fn score_record_with_extra(
     base: BaseNameScore,
     is_dir: bool,
     parent: &str,
+    ctx: &RecordRankContext,
+    targets_hidden: bool,
+    extra_adj: i64,
+) -> RankScore {
+    score_record_with_meta(
+        base,
+        is_dir,
+        parent_depth(parent),
+        is_parent_hidden(parent.as_bytes()),
+        ctx,
+        targets_hidden,
+        extra_adj,
+    )
+}
+
+/// 直接消费预计算的 `(parent_depth, parent_hidden)` 元数据合成最终排序分，
+/// 供 `QueryIndex::parent_meta` 单字节查表热路径调用，免除父目录字符串解引用与双遍字节扫描。
+#[inline]
+pub fn score_record_with_meta(
+    base: BaseNameScore,
+    is_dir: bool,
+    parent_depth: usize,
+    parent_hidden: bool,
     _ctx: &RecordRankContext,
     targets_hidden: bool,
     extra_adj: i64,
@@ -256,8 +279,7 @@ pub fn score_record_with_extra(
         } else {
             base.tier
         };
-    let depth = parent_depth(parent);
-    let depth_penalty = -((depth.min(MAX_DEPTH)) as i64) * DEPTH_PENALTY_STEP;
+    let depth_penalty = -((parent_depth.min(MAX_DEPTH)) as i64) * DEPTH_PENALTY_STEP;
     let dir_bonus = if is_dir { DIR_BONUS } else { 0 };
     let app_bonus = if is_dir && base.is_app_bundle_name {
         APP_BUNDLE_BONUS
@@ -265,8 +287,7 @@ pub fn score_record_with_extra(
         0
     };
     let record_adj = depth_penalty + dir_bonus + app_bonus + extra_adj;
-    let hidden_demoted =
-        !targets_hidden && (base.is_name_hidden || is_parent_hidden(parent.as_bytes()));
+    let hidden_demoted = !targets_hidden && (base.is_name_hidden || parent_hidden);
     RankScore::assemble(
         effective_tier,
         base.sub_tier,
@@ -303,7 +324,7 @@ pub fn is_app_bundle_name(name: &str) -> bool {
 /// 零分配检测父路径任意段是否以 `.` 开头（即位于隐藏目录子树下）。
 #[inline]
 pub fn is_parent_hidden(parent_bytes: &[u8]) -> bool {
-    parent_bytes.first() == Some(&b'.') || parent_bytes.windows(2).any(|w| w == b"/.")
+    crate::compact_index::is_parent_hidden(parent_bytes)
 }
 
 /// 检测整条记录（文件名或任意祖先目录）是否属于隐藏项。
@@ -321,17 +342,7 @@ pub fn keywords_target_hidden(is_extension_mode: bool, keywords: &[String]) -> b
 /// 零分配统计父路径中的非空目录层级数。
 #[inline]
 pub fn parent_depth(parent: &str) -> usize {
-    let mut count = 0usize;
-    let mut in_seg = false;
-    for &b in parent.as_bytes() {
-        if b == b'/' || b == b'\\' {
-            in_seg = false;
-        } else if !in_seg {
-            in_seg = true;
-            count += 1;
-        }
-    }
-    count
+    crate::compact_index::parent_depth(parent)
 }
 
 #[inline]
@@ -447,6 +458,292 @@ pub fn score_name_rank(
     )
 }
 
+#[derive(Clone, Copy)]
+struct KeywordHit {
+    tier: MatchTier,
+    sub_tier: u8,
+    start: usize,
+    end: usize,
+    exact_case: bool,
+    is_start_boundary: bool,
+    is_end_boundary: bool,
+}
+
+#[inline]
+fn eval_ascii_keyword(orig_name: &str, kw: &str, raw_kw: &str) -> Option<KeywordHit> {
+    let name_bytes = orig_name.as_bytes();
+    let kb = kw.as_bytes();
+    if orig_name.eq_ignore_ascii_case(kw) {
+        return Some(KeywordHit {
+            tier: MatchTier::FullExact,
+            sub_tier: 0,
+            start: 0,
+            end: name_bytes.len(),
+            exact_case: orig_name == raw_kw,
+            is_start_boundary: true,
+            is_end_boundary: true,
+        });
+    }
+    if let Some(stem) = valid_stem(orig_name) {
+        if stem.eq_ignore_ascii_case(kw) {
+            return Some(KeywordHit {
+                tier: MatchTier::StemExact,
+                sub_tier: 0,
+                start: 0,
+                end: stem.len(),
+                exact_case: stem == raw_kw,
+                is_start_boundary: true,
+                is_end_boundary: true,
+            });
+        }
+    }
+    if name_bytes.len() >= kb.len() && name_bytes[..kb.len()].eq_ignore_ascii_case(kb) {
+        let end_ok = is_end_boundary(orig_name, kb.len());
+        return Some(KeywordHit {
+            tier: MatchTier::Prefix,
+            sub_tier: u8::from(end_ok),
+            start: 0,
+            end: kb.len(),
+            exact_case: &orig_name[..kb.len()] == raw_kw,
+            is_start_boundary: true,
+            is_end_boundary: end_ok,
+        });
+    }
+
+    let mut best: Option<KeywordHit> = None;
+    let mut cursor = 0usize;
+    while cursor + kb.len() <= name_bytes.len() {
+        let Some(rel) = find_ascii_ignore_case(&name_bytes[cursor..], kb) else {
+            break;
+        };
+        let idx = cursor + rel;
+        let end = idx + kb.len();
+        let start_ok = is_start_boundary(orig_name, idx);
+        let end_ok = start_ok && is_end_boundary(orig_name, end);
+        let (cand_tier, cand_sub) = if start_ok {
+            (MatchTier::WordBoundary, u8::from(end_ok))
+        } else {
+            (MatchTier::Substring, 0)
+        };
+        let cand_exact = &orig_name[idx..end] == raw_kw;
+        let replace = match best {
+            None => true,
+            Some(prev) => (cand_tier, cand_sub) > (prev.tier, prev.sub_tier),
+        };
+        if replace {
+            best = Some(KeywordHit {
+                tier: cand_tier,
+                sub_tier: cand_sub,
+                start: idx,
+                end,
+                exact_case: cand_exact,
+                is_start_boundary: start_ok,
+                is_end_boundary: end_ok,
+            });
+        }
+        cursor = idx + 1;
+    }
+    best
+}
+
+#[inline]
+fn eval_general_keyword(
+    hs: &str,
+    cp: &str,
+    orig_nfc: &str,
+    kw: &str,
+    raw_kw: &str,
+) -> Option<KeywordHit> {
+    let raw_kw_nfc = cjk::normalize_nfc_cow(raw_kw);
+    if hs == kw {
+        return Some(KeywordHit {
+            tier: MatchTier::FullExact,
+            sub_tier: 0,
+            start: 0,
+            end: hs.len(),
+            exact_case: orig_nfc == raw_kw_nfc.as_ref(),
+            is_start_boundary: true,
+            is_end_boundary: true,
+        });
+    }
+    if let Some(stem) = valid_stem(hs) {
+        if stem == kw {
+            let exact = valid_stem(orig_nfc).is_some_and(|s| s == raw_kw_nfc.as_ref());
+            return Some(KeywordHit {
+                tier: MatchTier::StemExact,
+                sub_tier: 0,
+                start: 0,
+                end: stem.len(),
+                exact_case: exact,
+                is_start_boundary: true,
+                is_end_boundary: true,
+            });
+        }
+    }
+    if hs.starts_with(kw) {
+        let (_, cp_end) = map_span(cp, hs, 0, kw.len());
+        let end_ok = is_end_boundary(cp, cp_end);
+        let exact = orig_nfc.starts_with(raw_kw_nfc.as_ref());
+        return Some(KeywordHit {
+            tier: MatchTier::Prefix,
+            sub_tier: u8::from(end_ok),
+            start: 0,
+            end: kw.len(),
+            exact_case: exact,
+            is_start_boundary: true,
+            is_end_boundary: end_ok,
+        });
+    }
+
+    let mut best: Option<KeywordHit> = None;
+    let mut cursor = 0usize;
+    while cursor + kw.len() <= hs.len() {
+        let Some(rel) = hs[cursor..].find(kw) else {
+            break;
+        };
+        let idx = cursor + rel;
+        let end = idx + kw.len();
+        let (cp_s, cp_e) = map_span(cp, hs, idx, end);
+        let start_ok = is_start_boundary(cp, cp_s);
+        let end_ok = start_ok && is_end_boundary(cp, cp_e);
+        let (cand_tier, cand_sub) = if start_ok {
+            (MatchTier::WordBoundary, u8::from(end_ok))
+        } else {
+            (MatchTier::Substring, 0)
+        };
+        let (nfc_s, nfc_e) = map_span(orig_nfc, hs, idx, end);
+        let cand_exact = orig_nfc
+            .get(nfc_s..nfc_e)
+            .is_some_and(|slice| slice == raw_kw_nfc.as_ref());
+        let replace = match best {
+            None => true,
+            Some(prev) => (cand_tier, cand_sub) > (prev.tier, prev.sub_tier),
+        };
+        if replace {
+            best = Some(KeywordHit {
+                tier: cand_tier,
+                sub_tier: cand_sub,
+                start: idx,
+                end,
+                exact_case: cand_exact,
+                is_start_boundary: start_ok,
+                is_end_boundary: end_ok,
+            });
+        }
+        let step = hs[idx..].chars().next().map_or(1, char::len_utf8);
+        cursor = idx + step;
+    }
+    best
+}
+
+/// 零堆分配判定多词命中的字节区间是否完整覆盖文件名主干（stem）中的所有字母/数字/汉字字符。
+/// 当所有词元均对齐词边界且合力覆盖整个主干（如 `"user config"` 命中 `"user_config.json"`）时返回 `true`。
+#[inline]
+fn spans_cover_stem_ascii(name: &str, spans: &[(usize, usize)]) -> bool {
+    let stem = valid_stem(name).unwrap_or(name);
+    let mut has_alnum = false;
+    for (idx, &b) in stem.as_bytes().iter().enumerate() {
+        if b.is_ascii_alphanumeric() {
+            has_alnum = true;
+            if !spans.iter().any(|&(s, e)| idx >= s && idx < e) {
+                return false;
+            }
+        }
+    }
+    has_alnum
+}
+
+#[inline]
+fn spans_cover_stem_unicode(hs: &str, spans: &[(usize, usize)]) -> bool {
+    let stem = valid_stem(hs).unwrap_or(hs);
+    let mut has_alnum = false;
+    for (idx, ch) in stem.char_indices() {
+        if ch.is_alphanumeric() {
+            has_alnum = true;
+            if !spans.iter().any(|&(s, e)| idx >= s && idx < e) {
+                return false;
+            }
+        }
+    }
+    has_alnum
+}
+
+/// 聚合多关键词命中特征，实现词序无关的 `Prefix` 晋升与主干完整覆盖次层级加分。
+#[inline]
+fn aggregate_multi_keyword_hits(
+    hits: &[KeywordHit],
+    full_stem_covered: bool,
+) -> (MatchTier, u8, usize, bool, usize) {
+    let mut all_start_boundary = true;
+    let mut any_boundary = false;
+    let mut any_start_zero = false;
+    let mut all_end_boundary = true;
+    let mut max_tier = MatchTier::Substring;
+    let mut earliest_start = usize::MAX;
+    let mut all_exact_case = true;
+    let mut boundary_count = 0usize;
+
+    for hit in hits {
+        if hit.is_start_boundary {
+            any_boundary = true;
+            boundary_count += 1;
+        } else {
+            all_start_boundary = false;
+        }
+        if !hit.is_end_boundary {
+            all_end_boundary = false;
+        }
+        if hit.start == 0 {
+            any_start_zero = true;
+        }
+        if hit.tier > max_tier {
+            max_tier = hit.tier;
+        }
+        earliest_start = earliest_start.min(hit.start);
+        if !hit.exact_case {
+            all_exact_case = false;
+        }
+    }
+
+    let (tier, sub_tier) = if all_start_boundary {
+        if max_tier == MatchTier::FullExact {
+            (MatchTier::FullExact, 0)
+        } else if max_tier == MatchTier::StemExact {
+            (MatchTier::StemExact, 0)
+        } else if any_start_zero {
+            let sub = if full_stem_covered {
+                2
+            } else if all_end_boundary {
+                1
+            } else {
+                0
+            };
+            (MatchTier::Prefix, sub)
+        } else {
+            let sub = if full_stem_covered {
+                2
+            } else if all_end_boundary {
+                1
+            } else {
+                0
+            };
+            (MatchTier::WordBoundary, sub)
+        }
+    } else if any_boundary {
+        (MatchTier::WordBoundary, 0)
+    } else {
+        (MatchTier::Substring, 0)
+    };
+
+    (
+        tier,
+        sub_tier,
+        earliest_start,
+        all_exact_case,
+        boundary_count.saturating_sub(1),
+    )
+}
+
 fn score_ascii_name(
     orig_name: &str,
     keywords: &[String],
@@ -459,69 +756,48 @@ fn score_ascii_name(
         }
     }
 
-    let kw0 = keywords[0].as_bytes();
-    let raw_kw0 = raw_keywords.first().map_or("", String::as_str);
-
-    let (tier, sub_tier, first_match_byte, exact_case) = if orig_name.eq_ignore_ascii_case(&keywords[0])
-    {
-        (MatchTier::FullExact, 0u8, 0usize, orig_name == raw_kw0)
-    } else if valid_stem(orig_name).is_some_and(|stem| stem.eq_ignore_ascii_case(&keywords[0])) {
-        let stem = valid_stem(orig_name).unwrap_or("");
-        (MatchTier::StemExact, 0, 0, stem == raw_kw0)
-    } else if name_bytes.len() >= kw0.len() && name_bytes[..kw0.len()].eq_ignore_ascii_case(kw0) {
-        let end_ok = is_end_boundary(orig_name, kw0.len());
-        (
-            MatchTier::Prefix,
-            u8::from(end_ok),
-            0,
-            &orig_name[..kw0.len()] == raw_kw0,
-        )
-    } else {
-        // 扫描首关键词的所有出现位置，择取最佳词边界质量与最靠前的起始字节
-        let mut best: Option<(MatchTier, u8, usize, bool)> = None;
-        let mut cursor = 0usize;
-        while cursor + kw0.len() <= name_bytes.len() {
-            let Some(rel) = find_ascii_ignore_case(&name_bytes[cursor..], kw0) else {
-                break;
-            };
-            let idx = cursor + rel;
-            let end = idx + kw0.len();
-            let (cand_tier, cand_sub) = if is_start_boundary(orig_name, idx) {
-                (MatchTier::WordBoundary, u8::from(is_end_boundary(orig_name, end)))
-            } else {
-                (MatchTier::Substring, 0)
-            };
-            let cand_exact = &orig_name[idx..end] == raw_kw0;
-            let replace = match best {
-                None => true,
-                Some((bt, bs, _, _)) => (cand_tier, cand_sub) > (bt, bs),
-            };
-            if replace {
-                best = Some((cand_tier, cand_sub, idx, cand_exact));
-            }
-            cursor = idx + 1;
-        }
-        best?
-    };
-
-    let extra_boundary_count = keywords[1..]
-        .iter()
-        .filter(|kw| {
-            let kb = kw.as_bytes();
-            let mut pos = 0usize;
-            while pos + kb.len() <= name_bytes.len() {
-                let Some(rel) = find_ascii_ignore_case(&name_bytes[pos..], kb) else {
-                    return false;
-                };
-                let idx = pos + rel;
-                if is_start_boundary(orig_name, idx) {
-                    return true;
+    let (tier, sub_tier, first_match_byte, exact_case, extra_boundary_count) =
+        if keywords.len() == 1 {
+            let raw_kw0 = raw_keywords.first().map_or("", String::as_str);
+            let hit = eval_ascii_keyword(orig_name, &keywords[0], raw_kw0)?;
+            (hit.tier, hit.sub_tier, hit.start, hit.exact_case, 0usize)
+        } else {
+            let mut stack_hits = [KeywordHit {
+                tier: MatchTier::Substring,
+                sub_tier: 0,
+                start: 0,
+                end: 0,
+                exact_case: false,
+                is_start_boundary: false,
+                is_end_boundary: false,
+            }; 8];
+            let mut stack_spans = [(0usize, 0usize); 8];
+            if keywords.len() <= 8 {
+                for (i, kw) in keywords.iter().enumerate() {
+                    let raw_kw = raw_keywords.get(i).map_or("", String::as_str);
+                    let hit = eval_ascii_keyword(orig_name, kw, raw_kw)?;
+                    stack_hits[i] = hit;
+                    stack_spans[i] = (hit.start, hit.end);
                 }
-                pos = idx + 1;
+                let hits = &stack_hits[..keywords.len()];
+                let all_boundary = hits.iter().all(|h| h.is_start_boundary);
+                let full_stem = all_boundary
+                    && spans_cover_stem_ascii(orig_name, &stack_spans[..keywords.len()]);
+                aggregate_multi_keyword_hits(hits, full_stem)
+            } else {
+                let mut hits = Vec::with_capacity(keywords.len());
+                let mut spans = Vec::with_capacity(keywords.len());
+                for (i, kw) in keywords.iter().enumerate() {
+                    let raw_kw = raw_keywords.get(i).map_or("", String::as_str);
+                    let hit = eval_ascii_keyword(orig_name, kw, raw_kw)?;
+                    spans.push((hit.start, hit.end));
+                    hits.push(hit);
+                }
+                let all_boundary = hits.iter().all(|h| h.is_start_boundary);
+                let full_stem = all_boundary && spans_cover_stem_ascii(orig_name, &spans);
+                aggregate_multi_keyword_hits(&hits, full_stem)
             }
-            false
-        })
-        .count();
+        };
 
     let name_sub = len_penalty(orig_name)
         + if exact_case { EXACT_CASE_BONUS } else { 0 }
@@ -567,10 +843,13 @@ fn score_general_name(
         .all(|kw| haystack.contains(kw.as_str()));
 
     if !all_literal_match {
-        // 拼音降级兜底：仅当所有关键词均属纯 ASCII 且名字含非 ASCII 字符、
+        // 拼音降级兜底：当名字含非 ASCII 字符、查询中至少包含一个 ASCII 字母（支持纯拼音及汉字+拼音混合），
         // 且未被显式敏感锁强制屏蔽时启用。
+        let has_ascii_letter = keywords
+            .iter()
+            .any(|k| k.bytes().any(|b| b.is_ascii_alphabetic()));
         let allow_pinyin = (!case_sensitive || !explicit_sensitive_lock)
-            && all_keywords_ascii
+            && has_ascii_letter
             && !orig_name.is_ascii();
         if allow_pinyin {
             if let Some(detail) = score_pinyin_detail(orig_name, keywords) {
@@ -602,80 +881,51 @@ fn score_general_name(
         cjk::normalize_and_simplify_cow(orig_name)
     };
     let orig_nfc: Cow<'_, str> = cjk::normalize_nfc_cow(orig_name);
-    let raw_kw0 = raw_keywords.first().map_or("", String::as_str);
-    let raw_kw0_nfc: Cow<'_, str> = cjk::normalize_nfc_cow(raw_kw0);
-
-    let kw0 = &keywords[0];
     let hs = haystack.as_ref();
     let cp = case_preserved.as_ref();
 
-    let (tier, sub_tier, first_match_byte, exact_case) = if hs == kw0.as_str() {
-        (
-            MatchTier::FullExact,
-            0u8,
-            0usize,
-            orig_nfc.as_ref() == raw_kw0_nfc.as_ref(),
-        )
-    } else if valid_stem(hs).is_some_and(|stem| stem == kw0.as_str()) {
-        let exact = valid_stem(orig_nfc.as_ref()).is_some_and(|s| s == raw_kw0_nfc.as_ref());
-        (MatchTier::StemExact, 0, 0, exact)
-    } else if hs.starts_with(kw0.as_str()) {
-        let (_, cp_end) = map_span(cp, hs, 0, kw0.len());
-        let end_ok = is_end_boundary(cp, cp_end);
-        let exact = orig_nfc.starts_with(raw_kw0_nfc.as_ref());
-        (MatchTier::Prefix, u8::from(end_ok), 0, exact)
-    } else {
-        let mut best: Option<(MatchTier, u8, usize, bool)> = None;
-        let mut cursor = 0usize;
-        while cursor + kw0.len() <= hs.len() {
-            let Some(rel) = hs[cursor..].find(kw0.as_str()) else {
-                break;
-            };
-            let idx = cursor + rel;
-            let end = idx + kw0.len();
-            let (cp_s, cp_e) = map_span(cp, hs, idx, end);
-            let (cand_tier, cand_sub) = if is_start_boundary(cp, cp_s) {
-                (MatchTier::WordBoundary, u8::from(is_end_boundary(cp, cp_e)))
-            } else {
-                (MatchTier::Substring, 0)
-            };
-            let (nfc_s, nfc_e) = map_span(orig_nfc.as_ref(), hs, idx, end);
-            let cand_exact = orig_nfc
-                .get(nfc_s..nfc_e)
-                .is_some_and(|slice| slice == raw_kw0_nfc.as_ref());
-
-            let replace = match best {
-                None => true,
-                Some((bt, bs, _, _)) => (cand_tier, cand_sub) > (bt, bs),
-            };
-            if replace {
-                best = Some((cand_tier, cand_sub, idx, cand_exact));
-            }
-            let step = hs[idx..].chars().next().map_or(1, char::len_utf8);
-            cursor = idx + step;
-        }
-        best?
-    };
-
-    let extra_boundary_count = keywords[1..]
-        .iter()
-        .filter(|kw| {
-            let mut pos = 0usize;
-            while pos + kw.len() <= hs.len() {
-                let Some(rel) = hs[pos..].find(kw.as_str()) else {
-                    return false;
-                };
-                let idx = pos + rel;
-                let (cp_s, _) = map_span(cp, hs, idx, idx + kw.len());
-                if is_start_boundary(cp, cp_s) {
-                    return true;
+    let (tier, sub_tier, first_match_byte, exact_case, extra_boundary_count) =
+        if keywords.len() == 1 {
+            let raw_kw0 = raw_keywords.first().map_or("", String::as_str);
+            let hit = eval_general_keyword(hs, cp, orig_nfc.as_ref(), &keywords[0], raw_kw0)?;
+            (hit.tier, hit.sub_tier, hit.start, hit.exact_case, 0usize)
+        } else {
+            let mut stack_hits = [KeywordHit {
+                tier: MatchTier::Substring,
+                sub_tier: 0,
+                start: 0,
+                end: 0,
+                exact_case: false,
+                is_start_boundary: false,
+                is_end_boundary: false,
+            }; 8];
+            let mut stack_spans = [(0usize, 0usize); 8];
+            if keywords.len() <= 8 {
+                for (i, kw) in keywords.iter().enumerate() {
+                    let raw_kw = raw_keywords.get(i).map_or("", String::as_str);
+                    let hit = eval_general_keyword(hs, cp, orig_nfc.as_ref(), kw, raw_kw)?;
+                    stack_hits[i] = hit;
+                    stack_spans[i] = (hit.start, hit.end);
                 }
-                let step = hs[idx..].chars().next().map_or(1, char::len_utf8);
-                pos = idx + step;
+                let hits = &stack_hits[..keywords.len()];
+                let all_boundary = hits.iter().all(|h| h.is_start_boundary);
+                let full_stem = all_boundary
+                    && spans_cover_stem_unicode(hs, &stack_spans[..keywords.len()]);
+                aggregate_multi_keyword_hits(hits, full_stem)
+            } else {
+                let mut hits = Vec::with_capacity(keywords.len());
+                let mut spans = Vec::with_capacity(keywords.len());
+                for (i, kw) in keywords.iter().enumerate() {
+                    let raw_kw = raw_keywords.get(i).map_or("", String::as_str);
+                    let hit = eval_general_keyword(hs, cp, orig_nfc.as_ref(), kw, raw_kw)?;
+                    spans.push((hit.start, hit.end));
+                    hits.push(hit);
+                }
+                let all_boundary = hits.iter().all(|h| h.is_start_boundary);
+                let full_stem = all_boundary && spans_cover_stem_unicode(hs, &spans);
+                aggregate_multi_keyword_hits(&hits, full_stem)
             }
-            false
-        })
-        .count();
+        };
 
     let name_sub = len_penalty(orig_name)
         + if exact_case { EXACT_CASE_BONUS } else { 0 }

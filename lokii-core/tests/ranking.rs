@@ -389,3 +389,97 @@ fn pinyin_fuzzy_and_path_search_respect_composite_ranking_and_hidden_rules() {
         MatchScore::Substring
     );
 }
+
+#[test]
+fn wildcard_and_regex_outrank_shallow_non_hidden_over_deep_and_hidden() {
+    let mut entries = Vec::with_capacity(620);
+    // 构造 600 条字典序更靠前但位于隐藏/深层目录的噪声文件，验证不会饿死浅层核心文件
+    for i in 0..300 {
+        entries.push(make_entry(
+            &format!("A_main_{i:03}.rs"),
+            &format!("/.cargo/registry/src/a/b/c/A_main_{i:03}.rs"),
+            false,
+        ));
+    }
+    for i in 0..300 {
+        entries.push(make_entry(
+            &format!("B_main_{i:03}.rs"),
+            &format!("/workspace/deep/a/b/c/d/e/B_main_{i:03}.rs"),
+            false,
+        ));
+    }
+    entries.push(make_entry("z_main.rs", "/src/z_main.rs", false));
+
+    let store = IndexStore::new();
+    store.replace(entries);
+
+    // 1. 通配符 *.rs 在 limit = 10 时，浅层非隐藏的 /src/z_main.rs 必须位列第一
+    let (wc_res, wc_err) = dispatch(&store, "*.rs", SearchMode::Wildcard, 10);
+    assert!(wc_err.is_none());
+    assert_eq!(wc_res.len(), 10);
+    assert_eq!(wc_res[0].entry.path, "/src/z_main.rs");
+    assert!(wc_res.windows(2).all(|w| w[0].score >= w[1].score));
+
+    // 2. 正则 regex:main 在 limit = 10 时，浅层非隐藏的 /src/z_main.rs 同样位列第一
+    let (rx_res, rx_err) = dispatch(&store, "regex:main", SearchMode::Regex, 10);
+    assert!(rx_err.is_none());
+    assert_eq!(rx_res.len(), 10);
+    assert_eq!(rx_res[0].entry.path, "/src/z_main.rs");
+    assert!(rx_res.windows(2).all(|w| w[0].score >= w[1].score));
+}
+
+#[test]
+fn multi_keyword_order_independence_and_full_stem_coverage() {
+    let store = IndexStore::new();
+    store.replace(vec![
+        make_entry("user_config.json", "/src/user_config.json", false),
+        make_entry("user_config_extra.json", "/src/user_config_extra.json", false),
+        make_entry("my_user_config.json", "/src/my_user_config.json", false),
+        make_entry("user_myconfig.json", "/src/user_myconfig.json", false),
+        make_entry("search_mod.rs", "/src/search_mod.rs", false),
+        make_entry("my_search_mod.rs", "/src/my_search_mod.rs", false),
+        make_entry("2026年财务预算表.xlsx", "/docs/2026年财务预算表.xlsx", false),
+    ]);
+
+    // 1. 交换词序 "user config" 与 "config user" 产生完全一致的排序与主干完整覆盖优势
+    let (fwd, _) = dispatch(&store, "user config", SearchMode::Auto, 10);
+    let (rev, _) = dispatch(&store, "config user", SearchMode::Auto, 10);
+    let fwd_names: Vec<_> = fwd.iter().map(|r| r.entry.name.as_str()).collect();
+    let rev_names: Vec<_> = rev.iter().map(|r| r.entry.name.as_str()).collect();
+    assert_eq!(
+        fwd_names,
+        vec![
+            "user_config.json",
+            "user_config_extra.json",
+            "my_user_config.json",
+            "user_myconfig.json"
+        ]
+    );
+    assert_eq!(fwd_names, rev_names);
+    assert!(
+        (fwd[0].score - rev[0].score).abs() < 1e-12,
+        "swapped keyword order should yield identical score for user_config.json: {} vs {}",
+        fwd[0].score,
+        rev[0].score
+    );
+    assert!(
+        fwd[0].score > fwd[1].score,
+        "full stem coverage user_config.json ({}) must strictly beat user_config_extra.json ({})",
+        fwd[0].score,
+        fwd[1].score
+    );
+
+    // 2. "search mod" 与 "mod search" 在 search_mod.rs 上分数完全一致且稳定胜过 my_search_mod.rs
+    let (sm_fwd, _) = dispatch(&store, "search mod", SearchMode::Auto, 10);
+    let (sm_rev, _) = dispatch(&store, "mod search", SearchMode::Auto, 10);
+    assert_eq!(sm_fwd[0].entry.name, "search_mod.rs");
+    assert_eq!(sm_rev[0].entry.name, "search_mod.rs");
+    assert!((sm_fwd[0].score - sm_rev[0].score).abs() < 1e-12);
+
+    // 3. 拼音多词交换词序 "2026 cwysb" 与 "cwysb 2026" 保持前缀分数一致
+    let (py_fwd, _) = dispatch(&store, "2026 cwysb", SearchMode::Auto, 10);
+    let (py_rev, _) = dispatch(&store, "cwysb 2026", SearchMode::Auto, 10);
+    assert_eq!(py_fwd.len(), 1);
+    assert_eq!(py_rev.len(), 1);
+    assert!((py_fwd[0].score - py_rev[0].score).abs() < 1e-12);
+}

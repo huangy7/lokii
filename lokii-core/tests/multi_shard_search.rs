@@ -1031,3 +1031,51 @@ fn test_multi_shard_live_fallback_respects_offline_filter() {
     assert_eq!(search(&[primary]).len(), 1);
     assert!(search(&[primary, offline]).is_empty());
 }
+
+#[test]
+fn test_multi_shard_in_scope_with_regex_drift_alias() {
+    let shard_primary = CompactIndex::from_entries(vec![
+        make_entry("/Users/dev/report_2026.pdf", 100),
+    ])
+    .unwrap();
+    let shard_volume = CompactIndex::from_entries(vec![
+        make_entry("/Volumes/Share-1/docs/report_2026.pdf", 200),
+        make_entry("/Volumes/Share-1/docs/notes.txt", 201),
+    ])
+    .unwrap();
+
+    let shards = vec![
+        SearchShard {
+            index: &shard_primary,
+            configured_path: None,
+            active_path: None,
+            volume_name: None,
+            is_offline: false,
+        },
+        SearchShard {
+            index: &shard_volume,
+            configured_path: Some("/Volumes/Share"),
+            active_path: Some("/Volumes/Share-1"),
+            volume_name: Some("Share"),
+            is_offline: false,
+        },
+    ];
+
+    let (res, _, err, mode) = dispatch_multi(
+        &shards,
+        r"in:/Volumes/Share /^report_\d+\.pdf/",
+        SearchMode::Auto,
+        QueryFilter::default(),
+        CaseSensitivity::Auto,
+        10,
+        true,
+    );
+    assert!(err.is_none());
+    assert_eq!(mode, SearchMode::Regex);
+    assert_eq!(res.len(), 1);
+    assert_eq!(
+        res[0].result.entry.path,
+        "/Volumes/Share-1/docs/report_2026.pdf"
+    );
+    assert!(!res[0].result.parent_match_positions.is_empty());
+}

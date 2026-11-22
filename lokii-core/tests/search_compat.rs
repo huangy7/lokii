@@ -182,24 +182,20 @@ fn all_modes_match_frozen_legacy() {
                         dispatch_with_options(&current, query, mode, CaseSensitivity::Insensitive, limit);
                     assert_eq!(err, None);
                     let expected = legacy::search::dispatch(&old, query, old_mode, limit);
-                    if mode == SearchMode::Auto || mode == SearchMode::Substring {
-                        assert_eq!(insensitive.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
-                        assert!(insensitive.windows(2).all(|w| w[0].score >= w[1].score));
-                        if limit >= 500 {
-                            let mut act_paths: Vec<_> =
-                                insensitive.iter().map(|r| r.entry.path.as_str()).collect();
-                            let mut exp_paths: Vec<_> =
-                                expected.0.iter().map(|r| r.entry.path.as_str()).collect();
-                            act_paths.sort_unstable();
-                            exp_paths.sort_unstable();
-                            assert_eq!(act_paths, exp_paths, "{mode:?}/{query}/{limit}");
-                        }
-                    } else {
-                        assert_eq!(
-                            serde_json::to_value(insensitive).unwrap(),
-                            serde_json::to_value(expected.0).unwrap(),
-                            "{mode:?}/{query}/{limit}"
-                        );
+                    assert_eq!(insensitive.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
+                    assert!(
+                        insensitive.iter().all(|r| r.score >= 1e-6 && r.score <= 1.0),
+                        "{mode:?}/{query}/{limit}"
+                    );
+                    assert!(insensitive.windows(2).all(|w| w[0].score >= w[1].score));
+                    if limit >= 500 {
+                        let mut act_paths: Vec<_> =
+                            insensitive.iter().map(|r| r.entry.path.as_str()).collect();
+                        let mut exp_paths: Vec<_> =
+                            expected.0.iter().map(|r| r.entry.path.as_str()).collect();
+                        act_paths.sort_unstable();
+                        exp_paths.sort_unstable();
+                        assert_eq!(act_paths, exp_paths, "{mode:?}/{query}/{limit}");
                     }
                 }
                 continue;
@@ -266,23 +262,27 @@ fn all_modes_match_frozen_legacy() {
                 continue;
             }
 
-            // 正则模式全命中区间合并：对于单字符通配正则（如 "."），旧版仅提取单次 find 匹配首字，
-            // 现重构为 find_iter 提取全量匹配并平滑合并为连续高亮区间。
+            // 正则模式全命中区间合并与双层复合排序：对于单字符通配正则（如 "."），
+            // 全量匹配区间合并为 (0, name.len()) 并按路径深度、隐藏降权与名字长度排序。
             if mode == SearchMode::Regex && query == "." {
                 for limit in [0, 1, 2, 500, usize::MAX] {
                     let actual = dispatch(&current, query, mode, limit);
                     let expected = legacy::search::dispatch(&old, query, old_mode, limit);
                     assert_eq!(actual.1, expected.1, "{mode:?}/{query}/{limit}");
                     assert_eq!(actual.0.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
-                    for (act, exp) in actual.0.iter().zip(expected.0.iter()) {
-                        assert_eq!(
-                            serde_json::to_value(&act.entry).unwrap(),
-                            serde_json::to_value(&exp.entry).unwrap()
-                        );
-                        assert_eq!(act.score, exp.score);
+                    assert!(actual.0.windows(2).all(|w| w[0].score >= w[1].score));
+                    for act in &actual.0 {
+                        assert!(act.score >= 1e-6 && act.score <= 1.0);
                         assert_eq!(act.match_positions, vec![(0, act.entry.name.len())]);
-                        assert_eq!(exp.match_positions.len(), 1);
-                        assert_eq!(exp.match_positions[0].0, 0);
+                    }
+                    if limit >= 500 {
+                        let mut act_paths: Vec<_> =
+                            actual.0.iter().map(|r| r.entry.path.as_str()).collect();
+                        let mut exp_paths: Vec<_> =
+                            expected.0.iter().map(|r| r.entry.path.as_str()).collect();
+                        act_paths.sort_unstable();
+                        exp_paths.sort_unstable();
+                        assert_eq!(act_paths, exp_paths, "{mode:?}/{query}/{limit}");
                     }
                 }
                 continue;
@@ -292,17 +292,38 @@ fn all_modes_match_frozen_legacy() {
                 let actual = dispatch(&current, query, mode, limit);
                 let expected = legacy::search::dispatch(&old, query, old_mode, limit);
                 assert_eq!(actual.1, expected.1, "{mode:?}/{query}/{limit}");
-                if mode == SearchMode::Auto || mode == SearchMode::Substring {
-                    assert_eq!(actual.0.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
-                    assert!(
-                        actual
-                            .0
-                            .iter()
-                            .all(|r| r.score >= 1e-6 && r.score <= 1.0),
-                        "{mode:?}/{query}/{limit}"
-                    );
-                    assert!(actual.0.windows(2).all(|w| w[0].score >= w[1].score));
-                    if limit >= 500 {
+                assert_eq!(actual.0.len(), expected.0.len(), "{mode:?}/{query}/{limit}");
+                assert!(
+                    actual
+                        .0
+                        .iter()
+                        .all(|r| r.score >= 1e-6 && r.score <= 1.0),
+                    "{mode:?}/{query}/{limit}"
+                );
+                assert!(actual.0.windows(2).all(|w| w[0].score >= w[1].score));
+                for item in &actual.0 {
+                    for &(s, e) in &item.match_positions {
+                        assert!(
+                            item.entry.name.get(s..e).is_some(),
+                            "invalid UTF-8 highlight ({s}, {e}) on {:?} for {mode:?}/{query}",
+                            item.entry.name
+                        );
+                    }
+                }
+                if limit >= 500 {
+                    let is_wildcard_query = mode == SearchMode::Wildcard
+                        || (mode == SearchMode::Auto
+                            && (query.contains('*') || query.contains('?')));
+                    if is_wildcard_query {
+                        // 通配符现精准高亮非通配字面片段，核验完整命中路径集合一致
+                        let mut act_paths: Vec<_> =
+                            actual.0.iter().map(|r| r.entry.path.as_str()).collect();
+                        let mut exp_paths: Vec<_> =
+                            expected.0.iter().map(|r| r.entry.path.as_str()).collect();
+                        act_paths.sort_unstable();
+                        exp_paths.sort_unstable();
+                        assert_eq!(act_paths, exp_paths, "{mode:?}/{query}/{limit}");
+                    } else {
                         let mut act_items: Vec<_> = actual
                             .0
                             .iter()
@@ -317,12 +338,6 @@ fn all_modes_match_frozen_legacy() {
                         exp_items.sort();
                         assert_eq!(act_items, exp_items, "{mode:?}/{query}/{limit}");
                     }
-                } else {
-                    assert_eq!(
-                        serde_json::to_value(actual.0).unwrap(),
-                        serde_json::to_value(expected.0).unwrap(),
-                        "{mode:?}/{query}/{limit}"
-                    );
                 }
             }
         }

@@ -1,5 +1,6 @@
 use regex::RegexBuilder;
 
+use super::ranking::{BaseNameScore, MatchTier, RecordRankContext};
 use super::{AdvancedSearchResult, CompiledRecordFilter, SearchMode};
 use crate::compact_index::CompactIndex;
 use crate::indexer::IndexStore;
@@ -106,37 +107,30 @@ pub fn search_index(
         Err(error) => return (Vec::new(), Some(format!("Invalid regex: {error}"))),
     };
     let req = required_signature_for_regex(&pattern_nfc);
-    let mut top = super::top_k::TopK::new(max_results);
-    let sorted = read.sorted_names();
-    for &name_id in &sorted.ids {
-        if let Some(sig) = read.name_signature(name_id) {
-            if !sig.contains(req) {
-                continue;
+    let targets_hidden = raw_pattern.starts_with(r"\.") || raw_pattern.starts_with(r"^\.");
+    let rank_ctx = RecordRankContext::default();
+    let candidates = super::rank_unique_names(
+        read,
+        filter,
+        max_results,
+        req,
+        targets_hidden,
+        &rank_ctx,
+        |name, _folded| {
+            let name_nfc = crate::cjk::normalize_nfc_cow(name);
+            if !regex.is_match(&name_nfc) {
+                return None;
             }
-        }
-        let Some((name, _)) = read.name_entry(name_id) else {
-            continue;
-        };
-        let name_nfc = crate::cjk::normalize_nfc_cow(name);
-        if regex.is_match(&name_nfc) {
-            for &ordinal in read.entries_for_name(name_id) {
-                let record = &read.records()[ordinal as usize];
-                if !filter.matches_record_in(read, record, Some(name)) {
-                    continue;
-                }
-                top.offer(ordinal as usize, 1, name);
-                if top.is_full() {
-                    break;
-                }
-            }
-            if top.is_full() {
-                break;
-            }
-        }
-    }
+            let tier = match regex.find(&name_nfc) {
+                Some(m) if m.start() == 0 && m.end() == name_nfc.len() => MatchTier::FullExact,
+                Some(m) if m.start() == 0 => MatchTier::Prefix,
+                _ => MatchTier::Substring,
+            };
+            Some(BaseNameScore::for_tier_only(name, tier, 0))
+        },
+    );
     let capture_count = regex.captures_len();
-    let results = top
-        .finish()
+    let results = candidates
         .into_iter()
         .filter_map(|candidate| {
             let view = read.view(crate::compact_index::EntryId(candidate.ordinal))?;
@@ -183,7 +177,7 @@ pub fn search_index(
 
             Some(AdvancedSearchResult {
                 entry: view.materialize(),
-                score: 1.0,
+                score: candidate.score.to_f64(),
                 match_positions: merged_positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Regex,
@@ -429,6 +423,7 @@ mod tests {
         let (results, error) = search(&store, r"regex:^a\.?b$", &filter, 500);
         assert!(error.is_none());
         let names: Vec<_> = results.into_iter().map(|r| r.entry.name).collect();
-        assert_eq!(names, ["a.b", "ab"]);
+        // 接入双层复合排序后，更凝练的全名精确命中 "ab" 排在 "a.b" 之前
+        assert_eq!(names, ["ab", "a.b"]);
     }
 }

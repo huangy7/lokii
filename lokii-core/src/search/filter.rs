@@ -166,6 +166,9 @@ pub struct QueryFilter {
     pub has_explicit_type_all: bool,
     /// 由独立 `.ext` 语法隐式推断出的候选扩展名与原始词元 (extension, raw_token)
     pub inferred_exts: Vec<(String, String)>,
+    /// 由否定 `!.ext` 推断的长扩展名候选（>5 字符，如 `.markdown` / `.hidden`），
+    /// 供分发层依据索引扩展名池裁决：若该扩展名不存在于索引中，自动回退为 `exclude_terms` 词元排除。
+    pub inferred_exclude_exts: Vec<(String, String)>,
     /// 通过 `!term` / `!"phrase"` / `!.gitignore` 指定排除的文件名或路径子串词元。
     pub exclude_terms: Vec<String>,
     /// 通过 `!.ext` 指定排除的扩展名（不含前导点号，已归一化小写/折叠）。
@@ -242,6 +245,7 @@ impl QueryFilter {
             size_filter: effective_size_filter,
             has_explicit_type_all: self.has_explicit_type_all || caller.has_explicit_type_all,
             inferred_exts: self.inferred_exts.clone(),
+            inferred_exclude_exts: self.inferred_exclude_exts.clone(),
             exclude_terms,
             exclude_exts,
             exclude_paths,
@@ -945,7 +949,7 @@ pub(crate) fn parse_size_token(payload: &str) -> Option<SizeFilter> {
         });
     }
 
-    // 2. 下限前缀：>= 或 >
+    // 2. 下限前缀：>=（闭区间）或 >（严格开区间，如 size:>0 排除 0 字节空文件）
     if let Some(rest) = payload.strip_prefix(">=") {
         let val = parse_size_bytes(rest)?;
         return Some(SizeFilter {
@@ -955,13 +959,20 @@ pub(crate) fn parse_size_token(payload: &str) -> Option<SizeFilter> {
     }
     if let Some(rest) = payload.strip_prefix('>') {
         let val = parse_size_bytes(rest)?;
-        return Some(SizeFilter {
-            min_bytes: Some(val),
-            max_bytes: None,
+        return Some(if val == u64::MAX {
+            SizeFilter {
+                min_bytes: Some(1),
+                max_bytes: Some(0),
+            }
+        } else {
+            SizeFilter {
+                min_bytes: Some(val + 1),
+                max_bytes: None,
+            }
         });
     }
 
-    // 3. 上限前缀：<= 或 <
+    // 3. 上限前缀：<=（闭区间）或 <（严格开区间，如 size:<0 返回空区间）
     if let Some(rest) = payload.strip_prefix("<=") {
         let val = parse_size_bytes(rest)?;
         return Some(SizeFilter {
@@ -971,9 +982,16 @@ pub(crate) fn parse_size_token(payload: &str) -> Option<SizeFilter> {
     }
     if let Some(rest) = payload.strip_prefix('<') {
         let val = parse_size_bytes(rest)?;
-        return Some(SizeFilter {
-            min_bytes: None,
-            max_bytes: Some(val),
+        return Some(if val == 0 {
+            SizeFilter {
+                min_bytes: Some(1),
+                max_bytes: Some(0),
+            }
+        } else {
+            SizeFilter {
+                min_bytes: None,
+                max_bytes: Some(val - 1),
+            }
         });
     }
 
@@ -1106,6 +1124,7 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
     let mut file_types = Vec::new();
     let mut custom_exts = Vec::new();
     let mut inferred_exts = Vec::new();
+    let mut inferred_exclude_exts = Vec::new();
     let mut size_filter = SizeFilter::default();
     let mut has_explicit_type_all = false;
     let mut exclude_terms = Vec::new();
@@ -1119,13 +1138,20 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
                 && !is_dotfile_query(payload)
                 && payload.starts_with('.')
                 && payload.len() > 1
-                && payload.len() <= 6
                 && !payload.contains('/')
-                && payload[1..].chars().all(|c| c.is_ascii_alphanumeric())
+                && payload[1..].chars().count() <= 16
+                && payload[1..].chars().all(|c| c.is_alphanumeric())
             {
                 let ext = normalize_ext_filter(payload);
-                if !ext.is_empty() && !exclude_exts.contains(&ext) {
-                    exclude_exts.push(ext);
+                if !ext.is_empty() {
+                    if !exclude_exts.contains(&ext) {
+                        exclude_exts.push(ext.clone());
+                    }
+                    // 超过 5 字符的否定点词（如 !.markdown 与 !.hidden）登记为待索引校验候选，
+                    // 避免误把点文件前缀排除成不存在的扩展名。
+                    if payload[1..].chars().count() > 5 {
+                        inferred_exclude_exts.push((ext, payload.to_string()));
+                    }
                 }
             } else if payload.contains('/') {
                 let norm = normalize_exclude_path_pattern(payload);
@@ -1213,11 +1239,11 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
             continue;
         }
 
-        // 4. 独立 .ext（非隐藏点文件与相对路径守卫）
+        // 4. 独立 .ext（非隐藏点文件与相对路径守卫；上限 16 字符以兼容 .markdown/.numbers/.xcodeproj 等长扩展名，
+        // 后续由 `resolve_inferred_exts` 依托索引真实扩展名池裁决）
         if positive_candidate_count > 1
             && term.starts_with('.')
             && term.len() > 1
-            && term.len() <= 6
             && !term.contains('/')
         {
             if is_dotfile_query(term) {
@@ -1225,13 +1251,18 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
                 continue;
             }
             let candidate = &term[1..];
-            if !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
-                let lower = candidate.to_ascii_lowercase();
-                if !custom_exts.contains(&lower) {
-                    custom_exts.push(lower.clone());
+            if !candidate.is_empty()
+                && candidate.chars().count() <= 16
+                && candidate.chars().all(|c| c.is_alphanumeric())
+            {
+                let lower = normalize_ext_filter(candidate);
+                if !lower.is_empty() {
+                    if !custom_exts.contains(&lower) {
+                        custom_exts.push(lower.clone());
+                    }
+                    inferred_exts.push((lower, term.to_string()));
+                    continue;
                 }
-                inferred_exts.push((lower, term.to_string()));
-                continue;
             }
         }
 
@@ -1257,6 +1288,7 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
             size_filter,
             has_explicit_type_all,
             inferred_exts,
+            inferred_exclude_exts,
             exclude_terms,
             exclude_exts,
             exclude_paths,
@@ -1406,6 +1438,10 @@ pub struct CompiledRecordFilter {
     max_size_bytes: u64,
     has_size_filter: bool,
     has_explicit_type_all: bool,
+    has_scope_filter: bool,
+    scope_candidates: Vec<super::path_query::PathCandidate>,
+    scope_parent_mask: Vec<bool>,
+    scope_raw_path_mask: Vec<bool>,
     has_negative_filter: bool,
     exclude_case_sensitive: bool,
     exclude_terms: Vec<String>,
@@ -1437,6 +1473,10 @@ impl Default for CompiledRecordFilter {
             max_size_bytes: u64::MAX,
             has_size_filter: false,
             has_explicit_type_all: false,
+            has_scope_filter: false,
+            scope_candidates: Vec::new(),
+            scope_parent_mask: Vec::new(),
+            scope_raw_path_mask: Vec::new(),
             has_negative_filter: false,
             exclude_case_sensitive: false,
             exclude_terms: Vec::new(),
@@ -1454,10 +1494,10 @@ impl Default for CompiledRecordFilter {
 }
 
 impl CompiledRecordFilter {
-    /// 是否存在正向约束条件（类别、扩展名或大小过滤）。
+    /// 是否存在正向约束条件（类别、扩展名、大小或 `in:` 作用域过滤）。
     #[inline]
     pub fn has_positive_filter(&self) -> bool {
-        self.has_type_filter || self.has_custom_ext || self.has_size_filter
+        self.has_type_filter || self.has_custom_ext || self.has_size_filter || self.has_scope_filter
     }
 
     /// 是否存在 `!` 否定排除条件。
@@ -1506,6 +1546,17 @@ impl CompiledRecordFilter {
         index: &CompactIndex,
         filter: &QueryFilter,
         case_sensitive: bool,
+    ) -> Self {
+        Self::compile_with_case_and_scope(index, filter, case_sensitive, &[])
+    }
+
+    /// 针对特定紧凑索引、大小写敏感状态与 `in:<scope>` 作用域候选编译记录过滤器。
+    /// 将 `in:` 目录约束预投影为 `parents` / `raw_paths` 位掩码，使正则、模糊、并集等模式均以 O(1) 查表正交复用作用域过滤。
+    pub(crate) fn compile_with_case_and_scope(
+        index: &CompactIndex,
+        filter: &QueryFilter,
+        case_sensitive: bool,
+        scope_candidates: &[super::path_query::PathCandidate],
     ) -> Self {
         let empty_ext_id = index.extension_id("");
 
@@ -1709,6 +1760,25 @@ impl CompiledRecordFilter {
             })
         };
 
+        // 4. 编译 `in:<scope>` 作用域位掩码（使非 PathQuery 检索模式以 O(1) 查表正交复用作用域过滤）
+        let has_scope_filter = !scope_candidates.is_empty();
+        let (scope_parent_mask, scope_raw_path_mask) = if has_scope_filter {
+            let parent_mask = index.evaluate_parent_mask(|parent| {
+                let parent_folded = crate::cjk::fold_cow(parent);
+                super::path_search::match_scope_candidates(&parent_folded, scope_candidates)
+                    .is_some()
+            });
+            let raw_mask = index.evaluate_raw_path_mask(|raw| {
+                let (parent, _) = crate::compact_index::split_path(raw);
+                let parent_folded = crate::cjk::fold_cow(parent);
+                super::path_search::match_scope_candidates(&parent_folded, scope_candidates)
+                    .is_some()
+            });
+            (parent_mask, raw_mask)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         Self {
             has_custom_ext,
             empty_ext_id,
@@ -1723,6 +1793,10 @@ impl CompiledRecordFilter {
             max_size_bytes,
             has_size_filter,
             has_explicit_type_all: filter.has_explicit_type_all,
+            has_scope_filter,
+            scope_candidates: scope_candidates.to_vec(),
+            scope_parent_mask,
+            scope_raw_path_mask,
             has_negative_filter,
             exclude_case_sensitive: case_sensitive,
             exclude_terms,
@@ -1744,7 +1818,21 @@ impl CompiledRecordFilter {
             return true;
         }
 
-        // 0. 否定排除优先拦截（必须先于正向直通或目录放行执行）
+        // 0. `in:<scope>` 作用域校验
+        if self.has_scope_filter {
+            let parent = match view.raw_path() {
+                Some(raw) => crate::compact_index::split_path(raw).0,
+                None => view.parent,
+            };
+            let parent_folded = crate::cjk::fold_cow(parent);
+            if super::path_search::match_scope_candidates(&parent_folded, &self.scope_candidates)
+                .is_none()
+            {
+                return false;
+            }
+        }
+
+        // 1. 否定排除优先拦截（必须先于正向直通或目录放行执行）
         if self.has_negative_filter {
             if !self.exclude_exts.is_empty()
                 && self
@@ -1791,7 +1879,7 @@ impl CompiledRecordFilter {
             }
         }
 
-        if !self.has_positive_filter() {
+        if !self.has_type_filter && !self.has_custom_ext && !self.has_size_filter {
             return true;
         }
         if view.is_dir {
@@ -1872,7 +1960,25 @@ impl CompiledRecordFilter {
             return true;
         }
 
-        // 0. 否定排除优先拦截（必须先于仅大小放行、目录放行与无正向约束放行）
+        // 0a. `in:<scope>` 作用域位图初筛（单次数组寻址）
+        if self.has_scope_filter {
+            let in_scope = if record.raw_path {
+                self.scope_raw_path_mask
+                    .get(record.path as usize)
+                    .copied()
+                    .unwrap_or(false)
+            } else {
+                self.scope_parent_mask
+                    .get(record.path as usize)
+                    .copied()
+                    .unwrap_or(false)
+            };
+            if !in_scope {
+                return false;
+            }
+        }
+
+        // 0b. 否定排除优先拦截（必须先于仅大小放行、目录放行与无正向约束放行）
         if self.has_negative_filter {
             if self
                 .exclude_ext_mask
@@ -1936,7 +2042,7 @@ impl CompiledRecordFilter {
             }
         }
 
-        if !self.has_positive_filter() {
+        if !self.has_type_filter && !self.has_custom_ext && !self.has_size_filter {
             return true;
         }
 
@@ -2738,18 +2844,30 @@ mod tests {
     fn test_parse_size_filters() {
         let (c1, f1) = parse_query_filter("test size:>10m");
         assert_eq!(c1, "test");
-        assert_eq!(f1.size_filter.min_bytes, Some(10_000_000));
+        assert_eq!(f1.size_filter.min_bytes, Some(10_000_001));
         assert_eq!(f1.size_filter.max_bytes, None);
 
         let (c2, f2) = parse_query_filter("test size:<500k");
         assert_eq!(c2, "test");
         assert_eq!(f2.size_filter.min_bytes, None);
-        assert_eq!(f2.size_filter.max_bytes, Some(500_000));
+        assert_eq!(f2.size_filter.max_bytes, Some(499_999));
 
         let (c3, f3) = parse_query_filter("test size:1.5m..100m");
         assert_eq!(c3, "test");
         assert_eq!(f3.size_filter.min_bytes, Some(1_500_000));
         assert_eq!(f3.size_filter.max_bytes, Some(100_000_000));
+
+        let (_, f_ge) = parse_query_filter("test size:>=10m size:<=500k");
+        assert_eq!(f_ge.size_filter.min_bytes, Some(10_000_000));
+        assert_eq!(f_ge.size_filter.max_bytes, Some(500_000));
+
+        let (_, f_gt0) = parse_query_filter("test size:>0");
+        assert_eq!(f_gt0.size_filter.min_bytes, Some(1));
+        assert_eq!(f_gt0.size_filter.max_bytes, None);
+
+        let (_, f_lt0) = parse_query_filter("test size:<0");
+        assert_eq!(f_lt0.size_filter.min_bytes, Some(1));
+        assert_eq!(f_lt0.size_filter.max_bytes, Some(0));
     }
 
     #[test]
@@ -2798,17 +2916,17 @@ mod tests {
 
     #[test]
     fn test_parse_size_filters_compound_and_inverted() {
-        // 多条件收敛交集
+        // 多条件收敛交集（严格不等号）
         let (clean1, f1) = parse_query_filter("test size:>10m size:<50m");
         assert_eq!(clean1, "test");
-        assert_eq!(f1.size_filter.min_bytes, Some(10_000_000));
-        assert_eq!(f1.size_filter.max_bytes, Some(50_000_000));
+        assert_eq!(f1.size_filter.min_bytes, Some(10_000_001));
+        assert_eq!(f1.size_filter.max_bytes, Some(49_999_999));
 
         // 倒置区间
         let (clean2, f2) = parse_query_filter("test size:>100m size:<10m");
         assert_eq!(clean2, "test");
-        assert_eq!(f2.size_filter.min_bytes, Some(100_000_000));
-        assert_eq!(f2.size_filter.max_bytes, Some(10_000_000));
+        assert_eq!(f2.size_filter.min_bytes, Some(100_000_001));
+        assert_eq!(f2.size_filter.max_bytes, Some(9_999_999));
 
         // 单点等值
         let (clean3, f3) = parse_query_filter("report size:10m");
@@ -2830,8 +2948,8 @@ mod tests {
         // 大小写与复合单位
         let (clean6, f6) = parse_query_filter("doc size:>1.5M size:<2GB");
         assert_eq!(clean6, "doc");
-        assert_eq!(f6.size_filter.min_bytes, Some(1_500_000));
-        assert_eq!(f6.size_filter.max_bytes, Some(2_000_000_000));
+        assert_eq!(f6.size_filter.min_bytes, Some(1_500_001));
+        assert_eq!(f6.size_filter.max_bytes, Some(1_999_999_999));
 
         // 无效大小语法回退为检索词
         let (clean7, f7) = parse_query_filter("doc size:unknown");
@@ -3539,5 +3657,69 @@ mod tests {
         );
         assert_eq!(sanitize_path_input(r#""100% done""#), r#""100% done""#);
         assert_eq!(sanitize_path_input("regex:^main_\\d+"), "regex:^main_\\d+");
+    }
+
+    #[test]
+    fn test_strict_size_inequalities_and_long_inferred_extensions() {
+        let store = crate::indexer::IndexStore::new();
+        let make = |name: &str, path: &str, size: u64, ext: &str| FileEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir: false,
+            size,
+            modified: 0,
+            created_at: 0,
+            extension: ext.to_string(),
+        };
+        store.replace(vec![
+            make("empty.txt", "/empty.txt", 0, "txt"),
+            make("one.txt", "/one.txt", 1, "txt"),
+            make("exact100.txt", "/exact100.txt", 100, "txt"),
+            make("notes.markdown", "/notes.markdown", 50, "markdown"),
+            make("notes.md", "/notes.md", 50, "md"),
+            make("budget.numbers", "/budget.numbers", 50, "numbers"),
+            make("Demo.xcodeproj", "/Demo.xcodeproj", 50, "xcodeproj"),
+            make(".hidden_notes.md", "/.hidden_notes.md", 50, "md"),
+        ]);
+
+        // 严格大于 0：排除 0 字节空文件
+        let (gt0, _) = crate::search::dispatch(&store, ".txt size:>0", crate::search::SearchMode::Auto, 10);
+        let gt0_names: Vec<_> = gt0.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(!gt0_names.contains(&"empty.txt"));
+        assert!(gt0_names.contains(&"one.txt"));
+        assert!(gt0_names.contains(&"exact100.txt"));
+
+        // 严格小于 100：排除恰好 100 字节文件；<=100 则包含
+        let (lt100, _) = crate::search::dispatch(&store, ".txt size:<100", crate::search::SearchMode::Auto, 10);
+        let lt100_names: Vec<_> = lt100.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(lt100_names.contains(&"empty.txt"));
+        assert!(lt100_names.contains(&"one.txt"));
+        assert!(!lt100_names.contains(&"exact100.txt"));
+
+        let (le100, _) = crate::search::dispatch(&store, ".txt size:<=100", crate::search::SearchMode::Auto, 10);
+        assert!(le100.iter().any(|r| r.entry.name == "exact100.txt"));
+
+        // size:<0 返回空结果
+        let (lt0, _) = crate::search::dispatch(&store, ".txt size:<0", crate::search::SearchMode::Auto, 10);
+        assert!(lt0.is_empty());
+
+        // 多词长扩展名推断（.markdown / .numbers / .xcodeproj）
+        let (md_res, _) = crate::search::dispatch(&store, "notes .markdown", crate::search::SearchMode::Auto, 10);
+        assert_eq!(md_res.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(), vec!["notes.markdown"]);
+
+        let (num_res, _) = crate::search::dispatch(&store, "budget .numbers", crate::search::SearchMode::Auto, 10);
+        assert_eq!(num_res.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(), vec!["budget.numbers"]);
+
+        let (xc_res, _) = crate::search::dispatch(&store, "demo .xcodeproj", crate::search::SearchMode::Auto, 10);
+        assert_eq!(xc_res.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(), vec!["Demo.xcodeproj"]);
+
+        // 否定长扩展名 !.markdown 精准排除扩展名；而索引中不存在扩展名 .hidden 时自动回退排除点文件名
+        let (no_md, _) = crate::search::dispatch(&store, "notes !.markdown", crate::search::SearchMode::Auto, 10);
+        assert!(!no_md.iter().any(|r| r.entry.name == "notes.markdown"));
+        assert!(no_md.iter().any(|r| r.entry.name == "notes.md"));
+
+        let (no_hidden, _) = crate::search::dispatch(&store, "notes !.hidden", crate::search::SearchMode::Auto, 10);
+        assert!(!no_hidden.iter().any(|r| r.entry.name == ".hidden_notes.md"));
+        assert!(no_hidden.iter().any(|r| r.entry.name == "notes.md"));
     }
 }

@@ -257,6 +257,27 @@ impl AppConfig {
         paths
     }
 
+    /// 纯词法展开索引根目录，仅执行 `~` 替换与去重，绝不触发任何磁盘 `stat` / `exists()` 系统调用。
+    /// 供检索热路径（如空结果排除原因推断）调用，避免失联网络卷或休眠外置盘阻塞搜索线程。
+    pub fn resolve_paths_lexical(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(self.index.index_paths.len());
+        for p in &self.index.index_paths {
+            let resolved = expand_tilde(p);
+            if !paths.contains(&resolved) {
+                paths.push(resolved);
+            }
+        }
+        if self.index.index_apps {
+            for root in APP_INDEX_ROOTS {
+                let path = PathBuf::from(root);
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+
     pub(crate) fn resolve_app_roots(&self) -> impl Iterator<Item = PathBuf> {
         let enabled = self.index.index_apps;
         APP_INDEX_ROOTS
@@ -741,6 +762,29 @@ max_results = 200
         assert_eq!(paths[0], home);
         assert_eq!(paths[1], home.join("Documents"));
         assert_eq!(paths[2], PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn test_resolve_paths_lexical_keeps_nonexistent_and_app_roots_without_stat() {
+        let mut config = AppConfig::default();
+        config.index.index_apps = true;
+        config.index.index_paths = vec![
+            "~".to_string(),
+            "/Volumes/DefinitelyOfflineNAS_Test_NoStat/Share".to_string(),
+            "/Volumes/DefinitelyOfflineNAS_Test_NoStat/Share".to_string(),
+        ];
+
+        let lexical = config.resolve_paths_lexical();
+        let home = dirs::home_dir().expect("home dir should exist");
+        assert!(lexical.contains(&home));
+        let offline = PathBuf::from("/Volumes/DefinitelyOfflineNAS_Test_NoStat/Share");
+        assert_eq!(
+            lexical.iter().filter(|p| *p == &offline).count(),
+            1,
+            "lexical resolution must retain nonexistent paths and deduplicate them"
+        );
+        assert!(lexical.contains(&PathBuf::from("/Applications")));
+        assert!(lexical.contains(&PathBuf::from("/System/Applications")));
     }
 
     #[test]

@@ -286,3 +286,45 @@ fn test_or_query_quotes_and_per_clause_exclusions() {
     assert!(names_scoped.contains(&"foo_y.rs"));
     assert!(names_scoped.contains(&"bar_x.rs"));
 }
+
+#[test]
+fn test_or_query_with_wildcard_and_in_scope_clauses() {
+    let store = IndexStore::new();
+    store.replace(vec![
+        make_entry("test_login.rs", "/repo/tests/test_login.rs", false),
+        make_entry("auth_spec.rs", "/repo/tests/auth_spec.rs", false),
+        make_entry("main.rs", "/repo/src/main.rs", false),
+        make_entry("main.rs", "/repo/docs/main.rs", false),
+        make_entry("readme.md", "/repo/docs/readme.md", false),
+        make_entry("readme.md", "/repo/src/readme.md", false),
+    ]);
+
+    // 1. 并集子句支持通配符模式：test_* | *_spec.rs
+    let (wc_or, _, err1) = dispatch_with_options(
+        &store,
+        "test_* | *_spec.rs",
+        SearchMode::Auto,
+        CaseSensitivity::Auto,
+        10,
+    );
+    assert!(err1.is_none());
+    let wc_names: Vec<_> = wc_or.iter().map(|r| r.entry.name.as_str()).collect();
+    assert_eq!(wc_names.len(), 2);
+    assert!(wc_names.contains(&"test_login.rs"));
+    assert!(wc_names.contains(&"auth_spec.rs"));
+
+    // 2. 并集子句支持各自独立的 in:<scope> 目录作用域与父目录高亮
+    let (scope_or, _, err2) = dispatch_with_options(
+        &store,
+        "in:src main | in:docs readme",
+        SearchMode::Auto,
+        CaseSensitivity::Auto,
+        10,
+    );
+    assert!(err2.is_none());
+    let scope_paths: Vec<_> = scope_or.iter().map(|r| r.entry.path.as_str()).collect();
+    assert_eq!(scope_paths.len(), 2);
+    assert!(scope_paths.contains(&"/repo/src/main.rs"));
+    assert!(scope_paths.contains(&"/repo/docs/readme.md"));
+    assert!(scope_or.iter().all(|r| !r.parent_match_positions.is_empty()));
+}
