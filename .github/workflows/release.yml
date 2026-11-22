@@ -19,6 +19,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-tags: true
 
       - name: verify tag matches crate version
         shell: bash
@@ -51,20 +53,37 @@ jobs:
             echo "[INFO] draft release $GITHUB_REF_NAME 已存在，复用"
             exit 0
           fi
-          # 优先读取 tag 附注中的说明（可通过 git tag -a 创建）；若无附注则自动聚合提交记录，兜底使用默认文案
-          gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --title "Lokii $GITHUB_REF_NAME" \
-            --notes-from-tag \
-          || gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --title "Lokii $GITHUB_REF_NAME" \
-            --generate-notes \
-          || gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --title "Lokii $GITHUB_REF_NAME" \
-            --notes "See the assets to download this version and install." \
-          || gh release view "$GITHUB_REF_NAME" >/dev/null
+          # actions/checkout 默认按 commit SHA 写入轻量本地 ref，需强制拉取远端 tag 对象以还原附注说明
+          git fetch --force --depth=1 origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          TAG_OBJECT_TYPE="$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null || echo unknown)"
+          echo "[INFO] tag ${GITHUB_REF_NAME} 对象类型：${TAG_OBJECT_TYPE}"
+
+          # 附注标签优先直接提取更新说明；轻量标签直接走 --generate-notes，避免把发版 commit 文案写入更新日志
+          if [ "${TAG_OBJECT_TYPE}" = "tag" ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "Lokii $GITHUB_REF_NAME" \
+              --notes-from-tag \
+            || gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "Lokii $GITHUB_REF_NAME" \
+              --generate-notes \
+            || gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "Lokii $GITHUB_REF_NAME" \
+              --notes "See the assets to download this version and install." \
+            || gh release view "$GITHUB_REF_NAME" >/dev/null
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "Lokii $GITHUB_REF_NAME" \
+              --generate-notes \
+            || gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "Lokii $GITHUB_REF_NAME" \
+              --notes "See the assets to download this version and install." \
+            || gh release view "$GITHUB_REF_NAME" >/dev/null
+          fi
 
   release:
     name: 构建发布包（macOS ${{ matrix.arch }}）
@@ -169,7 +188,7 @@ jobs:
         run: |
           make package ARCH=${{ matrix.arch }}
 
-      # 上传至工作流 Artifact，便于构建日志追踪与产物留存
+      # 上传至工作流 Artifact，便于构建日志追踪与产物留存；启用 overwrite 以支持任务重跑
       - name: upload workflow artifact
         uses: actions/upload-artifact@v5
         with:
@@ -178,6 +197,7 @@ jobs:
             output/Lokii-*.dmg
             output/Lokii-*.zip
           if-no-files-found: error
+          overwrite: true
 
       # 挂载产物至 GitHub Draft Release
       - name: upload to release
@@ -253,6 +273,7 @@ jobs:
           name: verified-update-feeds
           path: feeds
           if-no-files-found: error
+          overwrite: true
 
   # 所有矩阵构建任务成功后，将 Draft Release 一键转为正式发布并标记为 Latest
   publish:
@@ -289,6 +310,7 @@ jobs:
       group: lokii-update-feed
       cancel-in-progress: false
     permissions:
+      actions: read
       contents: read
       pages: write
       id-token: write
@@ -312,10 +334,33 @@ jobs:
             swift scripts/verify-update-feed.swift "feeds/updates/$ARCH.xml" "downloaded/$NAME" "$PUBLIC_KEY" "${GITHUB_REF_NAME#v}" "$ARCH"
           done
       - uses: actions/configure-pages@v5
+      # 按运行重试次数隔离 Pages 产物名，避免重跑同一次 run 时出现多个同名 github-pages 产物导致部署失败
       - uses: actions/upload-pages-artifact@v3
         with:
+          name: github-pages-attempt-${{ github.run_attempt }}
           path: feeds
+      # 缓冲并轮询确认产物元数据已同步可见，规避刚上传后立即部署命中 GitHub Artifacts API 最终一致性延迟
+      - name: wait for pages artifact metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_NAME: github-pages-attempt-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          sleep 3
+          for i in $(seq 1 15); do
+            COUNT="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?name=${ARTIFACT_NAME}" --jq '.total_count' 2>/dev/null || echo 0)"
+            if [ "${COUNT:-0}" -ge 1 ]; then
+              echo "[INFO] Pages 产物 ${ARTIFACT_NAME} 元数据已就绪（count=${COUNT}）"
+              exit 0
+            fi
+            echo "[INFO] 等待 Pages 产物 ${ARTIFACT_NAME} 元数据同步（第 ${i}/15 次）..."
+            sleep 2
+          done
+          echo "[FAIL] 等待 Pages 产物 ${ARTIFACT_NAME} 元数据超时"
+          exit 1
       - name: deploy update feeds
         id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-attempt-${{ github.run_attempt }}
 
