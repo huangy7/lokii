@@ -21,6 +21,10 @@ pub enum VolumeIdentity {
         total_bytes: u64,
         volume_name: String,
         subpath: String,
+        /// 同一配置中存在多个同容量且剥离冲突后缀后同名的无 UUID 本地卷时置 true，
+        /// 改用未剥离的精确卷名生成卷 ID 与匹配挂载点，避免双盘互相覆写槽位与缓存。
+        #[serde(default)]
+        exact_name_key: bool,
     },
     Network {
         fstype: String,
@@ -41,19 +45,32 @@ impl VolumeIdentity {
             }
             VolumeIdentity::LocalFallback {
                 fstype,
-                source,
+                source: _,
                 total_bytes,
                 volume_name,
                 subpath,
+                exact_name_key,
             } => {
-                let key = format!(
-                    "local_fallback:{}:{}:{}:{}:{}",
-                    fstype.to_ascii_lowercase(),
-                    source,
-                    total_bytes,
-                    volume_name,
-                    subpath.trim_matches('/')
-                );
+                // 瞬态设备节点（/dev/diskXsY）与 macOS 挂载冲突序号（-1/-2）随拔插漂移；
+                // 单盘使用剥离后缀后的基础卷名生成稳定 ID，并发配置同名双盘时通过 exact_name_key 保留精确卷名消歧。
+                let key = if *exact_name_key {
+                    format!(
+                        "local_fallback_exact:{}:{}:{}:{}",
+                        fstype.to_ascii_lowercase(),
+                        total_bytes,
+                        volume_name.to_ascii_lowercase(),
+                        subpath.trim_matches('/')
+                    )
+                } else {
+                    let base_name = strip_mount_drift_suffix(volume_name).to_ascii_lowercase();
+                    format!(
+                        "local_fallback:{}:{}:{}:{}",
+                        fstype.to_ascii_lowercase(),
+                        total_bytes,
+                        base_name,
+                        subpath.trim_matches('/')
+                    )
+                };
                 fnv1a_dual(key.as_bytes())
             }
             VolumeIdentity::Network {
@@ -74,6 +91,27 @@ impl VolumeIdentity {
                 fnv1a_dual(key.as_bytes())
             }
         }
+    }
+}
+
+/// 剥离 macOS 挂载冲突自动追加的尾随正整数序号（例如 `USB-1` -> `USB`）。
+///
+/// 仅匹配 1..=99 且不含前导零的纯数字后缀，避免误伤年份卷名（如 `Photos-2025`）或版本号（如 `Disk-01`、`Disk-v2`）。
+pub(crate) fn strip_mount_drift_suffix(name: &str) -> &str {
+    let Some((base, suffix)) = name.rsplit_once('-') else {
+        return name;
+    };
+    if base.is_empty()
+        || suffix.is_empty()
+        || suffix.len() > 2
+        || suffix.starts_with('0')
+        || !suffix.bytes().all(|b| b.is_ascii_digit())
+    {
+        return name;
+    }
+    match suffix.parse::<u8>() {
+        Ok(1..=99) => base,
+        _ => name,
     }
 }
 
@@ -533,6 +571,7 @@ pub fn partition_index_paths(
                             total_bytes: m.total_bytes,
                             volume_name: m.volume_name.clone(),
                             subpath: subpath.clone(),
+                            exact_name_key: false,
                         }
                     }
                 }
@@ -594,7 +633,7 @@ pub fn partition_index_paths(
             unique_mounted.push(t);
         }
     }
-    let final_mounted: Vec<MountedPathTarget> = unique_mounted
+    let mut final_mounted: Vec<MountedPathTarget> = unique_mounted
         .iter()
         .filter(|candidate| {
             !unique_mounted.iter().any(|other| {
@@ -604,6 +643,57 @@ pub fn partition_index_paths(
         })
         .cloned()
         .collect();
+
+    // 当同一配置中包含多个剥离后缀后同名的本地无 UUID 目标（如 Backup-1 与 Backup-2）时，
+    // 升级为 exact_name_key 精确卷名标识，确保双盘拥有独立槽位与缓存文件且不随单盘离线翻转。
+    let mut configured_base_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut fallback_vid_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for target in &final_mounted {
+        if let Some(root_name) = target
+            .mounted
+            .as_ref()
+            .and_then(|m| m.mount_root.file_name())
+            .or_else(|| target.configured_path.file_name())
+        {
+            let base = strip_mount_drift_suffix(&root_name.to_string_lossy()).to_ascii_lowercase();
+            *configured_base_counts.entry(base).or_insert(0) += 1;
+        }
+        if let Some(ref m) = target.mounted {
+            if matches!(m.identity, VolumeIdentity::LocalFallback { .. }) {
+                *fallback_vid_counts.entry(m.identity.volume_id()).or_insert(0) += 1;
+            }
+        }
+    }
+    for target in &mut final_mounted {
+        let Some(ref mut m) = target.mounted else {
+            continue;
+        };
+        if let VolumeIdentity::LocalFallback {
+            total_bytes,
+            ref volume_name,
+            ref mut exact_name_key,
+            ..
+        } = m.identity
+        {
+            let vid = VolumeIdentity::LocalFallback {
+                fstype: m.fstype.clone(),
+                source: String::new(),
+                total_bytes,
+                volume_name: volume_name.clone(),
+                subpath: m.subpath.clone(),
+                exact_name_key: false,
+            }
+            .volume_id();
+            let base = strip_mount_drift_suffix(volume_name).to_ascii_lowercase();
+            if fallback_vid_counts.get(&vid).copied().unwrap_or(0) > 1
+                || configured_base_counts.get(&base).copied().unwrap_or(0) > 1
+            {
+                *exact_name_key = true;
+            }
+        }
+    }
 
     PathPartition {
         primary_paths: final_primary,
@@ -857,5 +947,39 @@ mod tests {
             fast.iter().any(|m| m.mount_point == "/"),
             "fast mount listing on macOS must include root mount"
         );
+    }
+
+    #[test]
+    fn strip_mount_drift_suffix_handles_macos_collision_numbers_only() {
+        assert_eq!(strip_mount_drift_suffix("USB-1"), "USB");
+        assert_eq!(strip_mount_drift_suffix("NO NAME-2"), "NO NAME");
+        assert_eq!(strip_mount_drift_suffix("Backup-99"), "Backup");
+        assert_eq!(strip_mount_drift_suffix("Photos-2025"), "Photos-2025");
+        assert_eq!(strip_mount_drift_suffix("Disk-01"), "Disk-01");
+        assert_eq!(strip_mount_drift_suffix("Disk-0"), "Disk-0");
+        assert_eq!(strip_mount_drift_suffix("Disk-100"), "Disk-100");
+        assert_eq!(strip_mount_drift_suffix("Disk-v2"), "Disk-v2");
+        assert_eq!(strip_mount_drift_suffix("-1"), "-1");
+    }
+
+    #[test]
+    fn local_fallback_volume_id_stable_across_device_node_and_drift_suffix() {
+        let original = VolumeIdentity::LocalFallback {
+            fstype: "exfat".into(),
+            source: "/dev/disk4s1".into(),
+            total_bytes: 64_000_000_000,
+            volume_name: "MyUSB".into(),
+            subpath: "Docs".into(),
+            exact_name_key: false,
+        };
+        let replugged_drifted = VolumeIdentity::LocalFallback {
+            fstype: "ExFAT".into(),
+            source: "/dev/disk6s1".into(),
+            total_bytes: 64_000_000_000,
+            volume_name: "MyUSB-1".into(),
+            subpath: "Docs".into(),
+            exact_name_key: false,
+        };
+        assert_eq!(original.volume_id(), replugged_drifted.volume_id());
     }
 }

@@ -11,8 +11,8 @@ use crate::search::{
 };
 use crate::volumes::{
     list_mounted_volumes, list_mounted_volumes_fast, normalize_network_source,
-    partition_index_paths, MountedFsInfo, MountedPathTarget, ResolvedMountMatch, VolumeIdentity,
-    VolumeKind, VolumeManifest, VolumeRecord,
+    partition_index_paths, strip_mount_drift_suffix, MountedFsInfo, MountedPathTarget,
+    ResolvedMountMatch, VolumeIdentity, VolumeKind, VolumeManifest, VolumeRecord,
 };
 use crate::watcher::{
     self, apply_batch, resolve_changes, Change, DEFAULT_DEBOUNCE_MS, MAX_BATCH_SIZE, MAX_DEBOUNCE,
@@ -1316,6 +1316,7 @@ fn build_identity_for_mount(m: &MountedFsInfo, subpath: &str) -> (VolumeKind, Vo
                 total_bytes: m.total_bytes,
                 volume_name: m.volume_name.clone(),
                 subpath: subpath.to_string(),
+                exact_name_key: false,
             },
         },
     };
@@ -1326,6 +1327,47 @@ fn match_mount_for_identity<'a>(
     identity: &VolumeIdentity,
     mounts: &'a [MountedFsInfo],
 ) -> Option<&'a MountedFsInfo> {
+    if let VolumeIdentity::LocalFallback {
+        fstype,
+        source,
+        total_bytes,
+        volume_name,
+        exact_name_key,
+        ..
+    } = identity
+    {
+        // 两级匹配：仅匹配同样无有效 UUID 的本地外置盘（防止劫持带 UUID 的同规格盘）；
+        // 先按精确卷名匹配（同规格双盘优先原设备节点），单盘模式（exact_name_key == false）未命中时再回退剥离 -1/-2 冲突后缀匹配。
+        let candidates = mounts.iter().filter(|m| {
+            !crate::volumes::is_system_mount_point(&m.mount_point)
+                && m.is_local
+                && m.uuid.is_none()
+                && m.fstype.eq_ignore_ascii_case(fstype)
+                && m.total_bytes == *total_bytes
+        });
+
+        let mut first_exact: Option<&MountedFsInfo> = None;
+        let mut first_drifted: Option<&MountedFsInfo> = None;
+        let target_base = strip_mount_drift_suffix(volume_name);
+
+        for m in candidates {
+            if m.volume_name.eq_ignore_ascii_case(volume_name) {
+                if m.from_name == *source {
+                    return Some(m);
+                }
+                if first_exact.is_none() {
+                    first_exact = Some(m);
+                }
+            } else if !exact_name_key
+                && first_drifted.is_none()
+                && strip_mount_drift_suffix(&m.volume_name).eq_ignore_ascii_case(target_base)
+            {
+                first_drifted = Some(m);
+            }
+        }
+        return first_exact.or(first_drifted);
+    }
+
     mounts.iter().find(|m| {
         if crate::volumes::is_system_mount_point(&m.mount_point) {
             return false;
@@ -1334,19 +1376,7 @@ fn match_mount_for_identity<'a>(
             VolumeIdentity::LocalUuid { uuid, .. } => {
                 m.is_local && m.uuid.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(uuid))
             }
-            VolumeIdentity::LocalFallback {
-                fstype,
-                source,
-                total_bytes,
-                volume_name,
-                ..
-            } => {
-                m.is_local
-                    && m.fstype.eq_ignore_ascii_case(fstype)
-                    && m.from_name == *source
-                    && m.total_bytes == *total_bytes
-                    && m.volume_name == *volume_name
-            }
+            VolumeIdentity::LocalFallback { .. } => unreachable!(),
             VolumeIdentity::Network {
                 fstype,
                 normalized_source,
@@ -1379,7 +1409,20 @@ fn resolve_mounted_for_target(
     };
 
     let m = match_mount_for_identity(identity, mounts)?;
-    let (kind, matched_identity) = build_identity_for_mount(m, subpath);
+    let (kind, mut matched_identity) = build_identity_for_mount(m, subpath);
+    if let (
+        VolumeIdentity::LocalFallback {
+            exact_name_key: orig_exact,
+            ..
+        },
+        VolumeIdentity::LocalFallback {
+            ref mut exact_name_key,
+            ..
+        },
+    ) = (identity, &mut matched_identity)
+    {
+        *exact_name_key = *orig_exact;
+    }
     let display_name = if subpath.is_empty() {
         if m.volume_name.is_empty() {
             stored_display_name.clone()
@@ -1487,7 +1530,20 @@ fn reset_slot_for_volume_swap(
 
 fn resolve_slot_mount(slot: &VolumeSlot, mounts: &[MountedFsInfo]) -> Option<ResolvedMountMatch> {
     if let Some(m) = match_mount_for_identity(&slot.identity, mounts) {
-        let (kind, identity) = build_identity_for_mount(m, &slot.subpath);
+        let (kind, mut identity) = build_identity_for_mount(m, &slot.subpath);
+        if let (
+            VolumeIdentity::LocalFallback {
+                exact_name_key: orig_exact,
+                ..
+            },
+            VolumeIdentity::LocalFallback {
+                ref mut exact_name_key,
+                ..
+            },
+        ) = (&slot.identity, &mut identity)
+        {
+            *exact_name_key = *orig_exact;
+        }
         return Some(ResolvedMountMatch {
             mount_root: PathBuf::from(&m.mount_point),
             subpath: slot.subpath.clone(),
@@ -1538,6 +1594,9 @@ fn reconcile_partition_locked(
     let mut loaded_total = 0u64;
     let mut manifest_changed = false;
     let mut status_changed = false;
+    // 将本轮对账产出的槽位先暂存至独立容器，循环结束后统一写回 inner.slots，
+    // 防止同批次不同配置路径在循环中途互相抢占刚完成对账的槽位。
+    let mut reconciled_slots = Vec::with_capacity(targets.len());
 
     for target in targets {
         let configured_str = target.configured_path.to_string_lossy().to_string();
@@ -1854,8 +1913,9 @@ fn reconcile_partition_locked(
         if slot.state != prev_state || slot.active_mount_root != prev_active {
             status_changed = true;
         }
-        inner.slots.push(slot);
+        reconciled_slots.push(slot);
     }
+    inner.slots.extend(reconciled_slots);
 
     if manifest_changed {
         effects.save_manifest = true;
@@ -4505,5 +4565,245 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].result.entry.name, "quarterly_report.pdf");
+    }
+
+    #[test]
+    fn local_fallback_matches_replugged_device_and_drifted_mount_without_collision() {
+        let identity = VolumeIdentity::LocalFallback {
+            fstype: "msdos".into(),
+            source: "/dev/disk4s1".into(),
+            total_bytes: 32_000_000_000,
+            volume_name: "MyUSB".into(),
+            subpath: String::new(),
+            exact_name_key: false,
+        };
+        let drifted_mount = MountedFsInfo {
+            mount_point: "/Volumes/MyUSB-1".into(),
+            fstype: "msdos".into(),
+            from_name: "/dev/disk5s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 32_000_000_000,
+            volume_name: "MyUSB-1".into(),
+        };
+        let exact_other = MountedFsInfo {
+            mount_point: "/Volumes/Photos-2025".into(),
+            fstype: "msdos".into(),
+            from_name: "/dev/disk6s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 32_000_000_000,
+            volume_name: "Photos-2025".into(),
+        };
+        assert_eq!(
+            match_mount_for_identity(&identity, &[exact_other.clone(), drifted_mount.clone()])
+                .map(|m| m.mount_point.as_str()),
+            Some("/Volumes/MyUSB-1")
+        );
+
+        let photos_id = VolumeIdentity::LocalFallback {
+            fstype: "msdos".into(),
+            source: "/dev/disk6s1".into(),
+            total_bytes: 32_000_000_000,
+            volume_name: "Photos".into(),
+            subpath: String::new(),
+            exact_name_key: false,
+        };
+        assert!(match_mount_for_identity(&photos_id, &[exact_other]).is_none());
+
+        // 两张同容量同卷名无 UUID 盘在线时，精确卷名与原设备节点优先
+        let same_name_other_dev = MountedFsInfo {
+            mount_point: "/Volumes/MyUSB".into(),
+            fstype: "msdos".into(),
+            from_name: "/dev/disk7s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 32_000_000_000,
+            volume_name: "MyUSB".into(),
+        };
+        let same_name_orig_dev = MountedFsInfo {
+            mount_point: "/Volumes/MyUSB-orig".into(),
+            fstype: "msdos".into(),
+            from_name: "/dev/disk4s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 32_000_000_000,
+            volume_name: "MyUSB".into(),
+        };
+        assert_eq!(
+            match_mount_for_identity(&identity, &[same_name_other_dev, same_name_orig_dev, drifted_mount])
+                .map(|m| m.from_name.as_str()),
+            Some("/dev/disk4s1")
+        );
+
+        // 带有效 UUID 的同规格同名卷绝不能被无 UUID 的 LocalFallback 身份误匹配劫持
+        let uuid_bearing_mount = MountedFsInfo {
+            mount_point: "/Volumes/MyUSB".into(),
+            fstype: "msdos".into(),
+            from_name: "/dev/disk8s1".into(),
+            is_local: true,
+            uuid: Some("REAL-EXFAT-UUID-1234".into()),
+            total_bytes: 32_000_000_000,
+            volume_name: "MyUSB".into(),
+        };
+        assert!(
+            match_mount_for_identity(&identity, &[uuid_bearing_mount]).is_none(),
+            "LocalFallback must never hijack a local mount that carries a valid UUID"
+        );
+    }
+
+    #[test]
+    fn twin_local_fallback_drives_do_not_collide_or_steal_slots() {
+        let cache_dir = TempDir::new().unwrap();
+        let mounts_parent = TempDir::new().unwrap();
+        let parent_canon = mounts_parent.path().canonicalize().unwrap();
+        let drive1_root = parent_canon.join("Backup-1");
+        let drive2_root = parent_canon.join("Backup-2");
+        std::fs::create_dir_all(&drive1_root).unwrap();
+        std::fs::create_dir_all(&drive2_root).unwrap();
+        std::fs::write(drive1_root.join("alpha.txt"), "one").unwrap();
+        std::fs::write(drive2_root.join("beta.txt"), "two").unwrap();
+
+        let drive1_str = drive1_root.to_string_lossy().to_string();
+        let drive2_str = drive2_root.to_string_lossy().to_string();
+
+        let mut config = AppConfig::default();
+        config.index.index_paths = vec![drive1_str.clone(), drive2_str.clone()];
+        config.index.include_hidden = true;
+
+        let mut twin_mounts = base_mounts();
+        twin_mounts.push(MountedFsInfo {
+            mount_point: drive1_str.clone(),
+            fstype: "exfat".into(),
+            from_name: "/dev/disk4s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 64_000_000_000,
+            volume_name: "Backup-1".into(),
+        });
+        twin_mounts.push(MountedFsInfo {
+            mount_point: drive2_str.clone(),
+            fstype: "exfat".into(),
+            from_name: "/dev/disk5s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 64_000_000_000,
+            volume_name: "Backup-2".into(),
+        });
+        let mounts = Arc::new(Mutex::new(twin_mounts));
+        let mounts_read = Arc::clone(&mounts);
+        let coord = VolumeCoordinator::with_mount_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(move || mounts_read.lock().clone()),
+        );
+
+        coord.initialize(&config, Arc::new(|| {}));
+        let statuses = coord.statuses();
+        assert_eq!(statuses.len(), 2, "两张同容量编号无 UUID 外置盘必须各自保留独立槽位");
+        assert_ne!(
+            statuses[0].volume_id, statuses[1].volume_id,
+            "两张并发配置的编号无 UUID 外置盘必须拥有互不冲突的 volume_id"
+        );
+        let active_paths: HashSet<String> = statuses
+            .iter()
+            .filter_map(|s| s.active_path.clone())
+            .collect();
+        assert!(active_paths.contains(&drive1_str));
+        assert!(active_paths.contains(&drive2_str));
+    }
+
+    #[test]
+    fn local_fallback_replug_drift_rebases_cached_slot_without_rescan() {
+        let cache_dir = TempDir::new().unwrap();
+        let volumes_dir = cache_dir.path().join("volumes");
+        let mounts_parent = TempDir::new().unwrap();
+        let parent_canon = mounts_parent.path().canonicalize().unwrap();
+        let orig_root = parent_canon.join("MyUSB");
+        let drifted_root = parent_canon.join("MyUSB-1");
+        std::fs::create_dir_all(&drifted_root).unwrap();
+
+        let orig_str = orig_root.to_string_lossy().to_string();
+        let drifted_str = drifted_root.to_string_lossy().to_string();
+        let live_journal = fsevents::journal_uuid_for_path(&drifted_root);
+        let live_event_id = fsevents::current_event_id();
+
+        let identity = VolumeIdentity::LocalFallback {
+            fstype: "exfat".into(),
+            source: "/dev/disk4s1".into(),
+            total_bytes: 64_000_000_000,
+            volume_name: "MyUSB".into(),
+            subpath: String::new(),
+            exact_name_key: false,
+        };
+        let record = VolumeRecord {
+            volume_id: identity.volume_id(),
+            configured_path: orig_str.clone(),
+            active_configured_path: orig_str.clone(),
+            active_mount_root: Some(orig_str.clone()),
+            subpath: String::new(),
+            display_name: "MyUSB".into(),
+            kind: VolumeKind::LocalExternal,
+            fstype: "exfat".into(),
+            identity,
+            last_sync_at: Some(1_700_000_000),
+            last_event_id: Some(live_event_id),
+            journal_uuid: live_journal,
+            entry_count: 2,
+            dirty_filter: false,
+        };
+        seed_volume_cache(
+            &volumes_dir,
+            &record,
+            vec![
+                make_entry("MyUSB", &orig_str, true),
+                make_entry("invoice.pdf", &format!("{orig_str}/invoice.pdf"), false),
+            ],
+        );
+        let mut manifest = VolumeManifest::default();
+        manifest.upsert(record.clone());
+        manifest.save_atomic(&volumes_dir).unwrap();
+
+        let mut config = AppConfig::default();
+        config.index.index_paths = vec![orig_str.clone()];
+
+        let mut replugged_mounts = base_mounts();
+        replugged_mounts.push(MountedFsInfo {
+            mount_point: drifted_str.clone(),
+            fstype: "exfat".into(),
+            from_name: "/dev/disk5s1".into(),
+            is_local: true,
+            uuid: None,
+            total_bytes: 64_000_000_000,
+            volume_name: "MyUSB-1".into(),
+        });
+        let mounts = Arc::new(Mutex::new(replugged_mounts));
+        let mounts_read = Arc::clone(&mounts);
+        let coord = VolumeCoordinator::with_mount_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(move || mounts_read.lock().clone()),
+        );
+
+        let loaded = coord.initialize(&config, Arc::new(|| {}));
+        assert_eq!(loaded, 2);
+
+        let statuses = coord.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, VolumeState::Online);
+        assert!(statuses[0].is_remounted);
+        assert_eq!(statuses[0].active_path.as_deref(), Some(drifted_str.as_str()));
+
+        let primary = IndexStore::new();
+        let (hits, _, err, _) = coord.search(
+            &primary,
+            "invoice.pdf",
+            SearchMode::Auto,
+            CaseSensitivity::Auto,
+            20,
+            true,
+        );
+        assert!(err.is_none());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].result.entry.path, format!("{drifted_str}/invoice.pdf"));
+        assert!(!hits[0].is_offline);
     }
 }

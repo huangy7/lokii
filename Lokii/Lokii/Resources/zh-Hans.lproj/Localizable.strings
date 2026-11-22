@@ -1,5 +1,6 @@
 /* AppDelegate - tray menu */
 "menu.preferences" = "偏好设置…";
+"menu.rebuildIndex" = "重建索引";
 "menu.quit" = "退出 Lokii";
 
 /* AppDelegate - main menu: app */
@@ -16,6 +17,7 @@
 "menu.window" = "窗口";
 "menu.close" = "关闭";
 "menu.minimize" = "最小化";
+"menu.resetWindowSize" = "恢复默认窗口大小";
 
 /* AppDelegate - about panel */
 "about.tagline" = "macOS 即时文件搜索";
@@ -35,12 +37,17 @@
 "prefs.hideOnBlur" = "失去焦点时隐藏";
 "prefs.hideOnBlur.description" = "切换到其他应用后自动收起窗口，保持桌面更清爽。";
 "prefs.rememberPosition" = "记住窗口位置";
-"prefs.rememberPosition.description" = "重新打开 Lokii 时恢复到你上次摆放的位置和大小。";
+"prefs.rememberPosition.description" = "关闭时，每次呼出窗口都会回到当前屏幕居中偏上位置；开启后则保持上次拖动的位置。";
+"prefs.windowSize" = "窗口大小";
+"prefs.windowSize.description" = "窗口尺寸按不同显示器分辨率独立记忆，在各屏幕呼出时自动适配。";
+"prefs.windowSize.reset" = "恢复默认大小";
 "prefs.defaultTerminal" = "默认终端";
 "prefs.defaultTerminal.description" = "指定在终端中打开目录时优先唤起的应用程序。";
 "prefs.defaultTerminal.chooseOther" = "选取其他应用...";
 
 "prefs.section.search" = "搜索";
+"prefs.hideResultsWhenEmpty" = "未输入时隐藏结果列表";
+"prefs.hideResultsWhenEmpty.description" = "打开窗口且搜索框为空时，不展示最近修改文件列表，改为显示常用搜索语法提示。";
 "prefs.maxResults" = "最大搜索结果数";
 "prefs.maxResults.description" = "结果越多，列表越完整；一般保持默认值即可。";
 
@@ -74,6 +81,9 @@
 "prefs.index.saveFailed" = "保存索引配置失败，请重试";
 "prefs.resetToDefaults" = "恢复默认";
 "prefs.save" = "保存";
+"prefs.saveAndRebuild" = "保存并重建";
+"prefs.index.rebuildNow" = "重建索引";
+"prefs.index.rebuildNow.help" = "立即重新扫描所有已保存的本地索引目录";
 "prefs.unsavedChanges.title" = "索引更改尚未保存";
 "prefs.unsavedChanges.message" = "你对索引路径、排除规则或隐藏文件选项的修改还没有保存。";
 "prefs.unsavedChanges.save" = "保存";
@@ -99,6 +109,7 @@
 /* SearchWindow - toolbar & view options */
 "search.toggleSidebar" = "切换侧边栏";
 "search.rebuildIndex" = "重建索引";
+"search.rebuildIndex.tooltip" = "重建索引 (⌘⇧R)";
 "window.viewOptions" = "视图选项";
 "window.resetSize" = "恢复默认窗口大小";
 "menu.zoomIn" = "放大字号";
@@ -124,14 +135,35 @@
 "search.matchedCount.one" = "已匹配 1 项";
 "search.statusWithMatches" = "%1$@ | %2$@";
 "search.indexReady" = "索引已就绪";
-"search.empty.title" = "未找到匹配项";
+"search.empty.title" = "没有找到匹配的文件";
 "search.empty.subtitle" = "请检查拼写、尝试使用模糊匹配模式，或按 ⌥F 调整过滤条件";
+"search.empty.subtitleWithQuery" = "没有找到与“%@”匹配的文件";
+"search.empty.action.checkKeyword.title" = "检查关键词";
+"search.empty.action.checkKeyword.subtitle" = "确认拼写或重新输入";
+"search.empty.action.tryFuzzy.title" = "尝试模糊匹配";
+"search.empty.action.tryFuzzy.subtitle" = "允许跳字容错匹配";
+"search.empty.action.tryFuzzy.activeSubtitle" = "已开启模糊匹配模式";
+"search.empty.action.checkFilters.title" = "检查过滤条件";
+"search.empty.action.checkFilters.subtitle" = "调整文件类型或大小筛选";
+"search.empty.action.checkScope.title" = "确认索引范围";
+"search.empty.action.checkScope.subtitle" = "检查目标目录是否已索引";
 "search.empty.excluded.title" = "此位置未被索引";
 "search.empty.excluded.subtitle" = "当前搜索路径命中了索引排除规则，暂时无法搜索此位置的文件。";
 "search.empty.excluded.tag" = "排除规则";
 "search.empty.manageRules" = "管理索引规则";
 "search.empty.indexing.title" = "正在建立索引";
 "search.empty.indexing.subtitle" = "索引尚未完成，部分文件暂时无法搜索，请稍候。";
+"search.empty.idle.title" = "搜索任何文件";
+"search.empty.idle.subtitle" = "输入文件名、扩展名或使用搜索语法";
+"search.empty.idle.section.syntax" = "试试这样搜索";
+"search.empty.idle.section.recent" = "最近搜索";
+"search.empty.idle.clearHistory" = "清空历史";
+"search.empty.idle.tip.wildcard" = "查找 PDF 文件";
+"search.empty.idle.tip.ext" = "按扩展名筛选";
+"search.empty.idle.tip.or" = "匹配任意关键词";
+"search.empty.idle.tip.size" = "按文件大小筛选";
+"search.empty.idle.tip.exclude" = "排除指定目录";
+"search.empty.idle.tip.scope" = "限定搜索范围";
 "search.toolbar.pin" = "置顶视窗";
 "search.caseSensitivity.auto" = "大小写敏感: 自动";
 "search.caseSensitivity.autoActive" = "大小写敏感: 自动 (检测到大写)";
@@ -182,7 +214,10 @@
 "search.col.name" = "名称";
 "search.col.path" = "路径";
 "search.col.dateModified" = "修改日期";
+"search.col.dateCreated" = "创建日期";
+"search.col.extension" = "扩展名";
 "search.col.size" = "大小";
+"search.col.resetDefault" = "恢复默认列";
 
 /* FDAGuideWindowController */
 "fda.windowTitle" = "将 Lokii 添加到完全磁盘访问权限";

@@ -192,6 +192,57 @@ enum SettingsPathStatusResolver {
             && components[1].caseInsensitiveCompare("Volumes") == .orderedSame
             && !components[2].isEmpty
     }
+
+    /// 判定当前索引配置草稿相对已保存状态是否需要触发本地主索引全量重建。
+    ///
+    /// 仅追加排除路径、仅调整网络卷定时重扫间隔、或仅增删已识别外置磁盘/网络卷均不触发主索引重建；
+    /// 其余本地目录范围变化、移除排除路径或全局过滤选项变化才需要重建。
+    static func requiresPrimaryRebuild(
+        draftIndexPaths: [String],
+        savedIndexPaths: [String],
+        draftIndexApps: Bool,
+        savedIndexApps: Bool,
+        draftIncludeHidden: Bool,
+        savedIncludeHidden: Bool,
+        draftExcludeSensitive: Bool,
+        savedExcludeSensitive: Bool,
+        draftExcludePatterns: [String],
+        savedExcludePatterns: [String],
+        draftExcludePaths: [String],
+        savedExcludePaths: [String],
+        mountedVolumes: [MountedVolumeEntry],
+        volumeStatuses: [FfiVolumeStatus]
+    ) -> Bool {
+        let normalizedDraft = Set(draftIndexPaths.map { normalizePath($0) })
+        let normalizedSaved = Set(savedIndexPaths.map { normalizePath($0) })
+        let addedPaths = normalizedDraft.subtracting(normalizedSaved)
+        let removedPaths = normalizedSaved.subtracting(normalizedDraft)
+
+        let isManagedVolumePath: (String, Bool) -> Bool = { path, isRemoval in
+            if mountedVolumes.contains(where: { isPath(path, insideOrEqual: $0.path) }) {
+                return true
+            }
+            if matchVolumeStatus(normalizedTarget: path, volumeStatuses: volumeStatuses) != nil {
+                return true
+            }
+            // 移除已清空缓存的离线 /Volumes/* 路径同样只归卷协调器管辖，不触发主索引全量重建
+            if isRemoval && isUnderVolumesNamespace(path) {
+                return true
+            }
+            return false
+        }
+
+        let primaryPathsUnchanged = addedPaths.allSatisfy { isManagedVolumePath($0, false) }
+            && removedPaths.allSatisfy { isManagedVolumePath($0, true) }
+
+        let onlyNonRebuildChanges = primaryPathsUnchanged
+            && (draftIndexApps == savedIndexApps)
+            && (draftIncludeHidden == savedIncludeHidden)
+            && (draftExcludeSensitive == savedExcludeSensitive)
+            && (draftExcludePatterns == savedExcludePatterns)
+            && (savedExcludePaths.allSatisfy { draftExcludePaths.contains($0) })
+        return !onlyNonRebuildChanges
+    }
 }
 
 /// 后台从内核挂载表探测到的当前在线外部卷或网络卷摘要
@@ -236,7 +287,25 @@ class PreferencesViewModel: ObservableObject {
         }
     }
 
+    @Published var hasCustomWindowSizes: Bool = WindowFrameManager().hasCustomSizes
+    private var windowSizeObserver: NSObjectProtocol?
+
+    func refreshWindowSizeState() {
+        hasCustomWindowSizes = WindowFrameManager().hasCustomSizes
+    }
+
+    func resetWindowSizes() {
+        NotificationCenter.default.post(name: .lokiiResetWindowSize, object: nil)
+        refreshWindowSizeState()
+    }
+
     @Published var maxResults: Int = 100 {
+        didSet {
+            saveGeneralConfig()
+        }
+    }
+
+    @Published var hideResultsWhenEmpty: Bool = false {
         didSet {
             saveGeneralConfig()
         }
@@ -410,6 +479,13 @@ class PreferencesViewModel: ObservableObject {
                 self.rebuildScannedCount = 0
             }
         }
+        windowSizeObserver = NotificationCenter.default.addObserver(
+            forName: .lokiiWindowSizesDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshWindowSizeState()
+        }
         let wsCenter = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
             let obs = wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -427,6 +503,9 @@ class PreferencesViewModel: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = indexReadyObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = windowSizeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         let wsCenter = NSWorkspace.shared.notificationCenter
@@ -913,6 +992,7 @@ class PreferencesViewModel: ObservableObject {
         self.hideOnBlur = config.window.hideOnBlur
         self.rememberPosition = config.window.rememberPosition
         self.showInDock = config.general.showInDock
+        self.hideResultsWhenEmpty = config.general.hideResultsWhenEmpty
         self.maxResults = config.index.maxResults
         self.language = config.general.language
         self.terminalBundleId = config.general.terminalBundleId
@@ -946,7 +1026,12 @@ class PreferencesViewModel: ObservableObject {
     private func saveGeneralConfig() {
         guard !isLoading else { return }
         _ = engine.updateConfig(LokiiConfig(
-            general: .init(language: language, showInDock: showInDock, terminalBundleId: terminalBundleId),
+            general: .init(
+                language: language,
+                showInDock: showInDock,
+                terminalBundleId: terminalBundleId,
+                hideResultsWhenEmpty: hideResultsWhenEmpty
+            ),
             index: .init(
                 indexPaths: savedIndexPaths,
                 indexApps: savedIndexApps,
@@ -975,45 +1060,42 @@ class PreferencesViewModel: ObservableObject {
         networkRescanMinutes != savedNetworkRescanMinutes
     }
 
+    /// 供设置页底部主按钮文案与保存流程共享同一重建判定，确保“保存”与“保存并重建”严格一致
+    var pendingSaveRequiresRebuild: Bool {
+        guard isIndexDirty else { return false }
+        return SettingsPathStatusResolver.requiresPrimaryRebuild(
+            draftIndexPaths: indexPaths,
+            savedIndexPaths: savedIndexPaths,
+            draftIndexApps: indexApps,
+            savedIndexApps: savedIndexApps,
+            draftIncludeHidden: includeHidden,
+            savedIncludeHidden: savedIncludeHidden,
+            draftExcludeSensitive: excludeSensitive,
+            savedExcludeSensitive: savedExcludeSensitive,
+            draftExcludePatterns: excludePatterns,
+            savedExcludePatterns: savedExcludePatterns,
+            draftExcludePaths: excludePaths,
+            savedExcludePaths: savedExcludePaths,
+            mountedVolumes: mountedVolumes,
+            volumeStatuses: volumeStatuses
+        )
+    }
+
+    func triggerManualRebuild() {
+        guard !isIndexDirty, !isRebuildingIndex, !engine.isScanning else { return }
+        indexSaveErrorMessage = nil
+        isRebuildingIndex = true
+        rebuildScannedCount = 0
+        engine.rebuildIndex()
+    }
+
     func saveIndexChanges() -> Bool {
         indexSaveErrorMessage = nil
         guard var config = engine.getConfig() else {
             indexSaveErrorMessage = L("prefs.index.saveFailed")
             return false
         }
-        // 判定是否需要触发本地主索引全量重建：
-        // 1. 仅追加新的排除路径（内核可就地毫秒级剔除）、
-        // 2. 仅调整网络卷定时重扫间隔、
-        // 3. 仅增删已识别的外置磁盘/网络卷（卷协调器在 updateConfig 时按独立分片自动扫描或移除），
-        // 以上场景均无需重建本地主索引；其余本地目录范围变化或全局过滤规则变化才触发重建。
-        let normalizedDraft = Set(indexPaths.map { SettingsPathStatusResolver.normalizePath($0) })
-        let normalizedSaved = Set(savedIndexPaths.map { SettingsPathStatusResolver.normalizePath($0) })
-        let addedPaths = normalizedDraft.subtracting(normalizedSaved)
-        let removedPaths = normalizedSaved.subtracting(normalizedDraft)
-
-        let isManagedVolumePath: (String, Bool) -> Bool = { path, isRemoval in
-            if self.mountedVolumes.contains(where: { SettingsPathStatusResolver.isPath(path, insideOrEqual: $0.path) }) {
-                return true
-            }
-            if SettingsPathStatusResolver.matchVolumeStatus(normalizedTarget: path, volumeStatuses: self.volumeStatuses) != nil {
-                return true
-            }
-            // 移除已清空缓存的离线 /Volumes/* 路径同样只归卷协调器管辖，不触发主索引全量重建
-            if isRemoval && SettingsPathStatusResolver.isUnderVolumesNamespace(path) {
-                return true
-            }
-            return false
-        }
-        let primaryPathsUnchanged = addedPaths.allSatisfy { isManagedVolumePath($0, false) }
-            && removedPaths.allSatisfy { isManagedVolumePath($0, true) }
-
-        let onlyNonRebuildChanges = primaryPathsUnchanged &&
-                                    (indexApps == savedIndexApps) &&
-                                    (includeHidden == savedIncludeHidden) &&
-                                    (excludeSensitive == savedExcludeSensitive) &&
-                                    (excludePatterns == savedExcludePatterns) &&
-                                    (savedExcludePaths.allSatisfy { excludePaths.contains($0) })
-        let needsRebuild = isIndexDirty && !onlyNonRebuildChanges
+        let needsRebuild = pendingSaveRequiresRebuild
 
         config.index.indexPaths = indexPaths
         config.index.indexApps = indexApps

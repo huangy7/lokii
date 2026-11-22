@@ -24,6 +24,8 @@ pub struct GeneralConfig {
     /// Preferred terminal application bundle identifier (e.g. "com.googlecode.iterm2")
     /// or absolute application bundle path. Defaults to "com.apple.Terminal".
     pub terminal_bundle_id: String,
+    /// 搜索框为空且未激活任何过滤条件时，隐藏默认文件列表并展示轻量搜索语法引导。
+    pub hide_results_when_empty: bool,
 }
 
 impl Default for GeneralConfig {
@@ -32,6 +34,7 @@ impl Default for GeneralConfig {
             language: "zh-Hans".to_string(),
             show_in_dock: true,
             terminal_bundle_id: "com.apple.Terminal".to_string(),
+            hide_results_when_empty: false,
         }
     }
 }
@@ -326,6 +329,9 @@ language = "zh-Hans"
 
 # 是否在程序坞中显示图标
 show_in_dock = true
+
+# 未输入搜索词时是否隐藏默认文件列表
+hide_results_when_empty = false
 
 [index]
 # 索引目录列表（支持 ~ 表示用户主目录）
@@ -881,5 +887,32 @@ max_results = 200
         let backup_path = tmp.path().join("config.toml.bak");
         assert!(backup_path.exists(), "corrupted config.toml must be backed up");
         assert_eq!(fs::read_to_string(&backup_path).unwrap(), corrupted);
+    }
+
+    #[test]
+    fn hide_results_when_empty_defaults_false_and_roundtrips() {
+        let default = AppConfig::default();
+        assert!(!default.general.hide_results_when_empty);
+        assert!(DEFAULT_CONFIG_TOML.contains("hide_results_when_empty = false"));
+
+        let legacy_toml = r#"
+[general]
+language = "zh-Hans"
+show_in_dock = true
+"#;
+        let legacy = AppConfig::from_toml(legacy_toml).expect("legacy toml must parse");
+        assert!(!legacy.general.hide_results_when_empty);
+
+        let enabled_toml = r#"
+[general]
+language = "en"
+hide_results_when_empty = true
+"#;
+        let enabled = AppConfig::from_toml(enabled_toml).expect("enabled toml must parse");
+        assert!(enabled.general.hide_results_when_empty);
+
+        let json = serde_json::to_string(&enabled).expect("serialize");
+        let roundtrip: AppConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(roundtrip.general.hide_results_when_empty);
     }
 }
