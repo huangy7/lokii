@@ -106,8 +106,14 @@ pub fn load_cache(path: &Path) -> Result<Vec<FileEntry>, CacheError> {
     bitcode::decode(&data[8..]).map_err(CacheError::Decode)
 }
 
-pub fn save_compact(
-    index: &crate::compact_index::CompactIndex,
+/// 仅在内存中将紧凑索引编码为缓存字节流，便于调用方尽快释放索引读锁后再执行磁盘写入与 `sync_data()`。
+pub fn encode_compact(index: &crate::compact_index::CompactIndex) -> Vec<u8> {
+    index.encode_cache()
+}
+
+/// 将已编码的紧凑索引字节流与可选回放检查点原子写入磁盘。
+pub fn save_encoded_compact(
+    encoded: &[u8],
     checkpoint: Option<Checkpoint>,
     path: &Path,
 ) -> Result<(), CacheError> {
@@ -121,17 +127,26 @@ pub fn save_compact(
         &[
             &checkpoint.event_id.to_le_bytes(),
             &checkpoint.fingerprint.to_le_bytes(),
-            &index.encode_cache(),
+            encoded,
         ],
         path,
     )
+}
+
+pub fn save_compact(
+    index: &crate::compact_index::CompactIndex,
+    checkpoint: Option<Checkpoint>,
+    path: &Path,
+) -> Result<(), CacheError> {
+    let encoded = encode_compact(index);
+    save_encoded_compact(&encoded, checkpoint, path)
 }
 
 pub fn load_compact(
     path: &Path,
 ) -> Result<(crate::compact_index::CompactIndex, Option<Checkpoint>), CacheError> {
     let (version, data) = read_cache(path)?;
-    match version {
+    let result = match version {
         CACHE_VERSION => {
             let entries: Vec<crate::compact_index::BorrowedFileEntry<'_>> =
                 bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
@@ -140,8 +155,9 @@ pub fn load_compact(
                 .map_err(CacheError::InvalidIndex)
         }
         CACHE_VERSION_COMPACT => {
-            let cache = bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
-            crate::compact_index::CompactIndex::from_cache(cache)
+            let cache: crate::compact_index::BorrowedCacheIndex<'_> =
+                bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
+            crate::compact_index::CompactIndex::from_borrowed_cache(cache)
                 .map(|index| (index, None))
                 .map_err(CacheError::InvalidIndex)
         }
@@ -154,8 +170,9 @@ pub fn load_compact(
                 event_id: word(8),
                 fingerprint: word(16),
             };
-            let cache = bitcode::decode(&data[24..]).map_err(CacheError::Decode)?;
-            crate::compact_index::CompactIndex::from_cache(cache)
+            let cache: crate::compact_index::BorrowedCacheIndex<'_> =
+                bitcode::decode(&data[24..]).map_err(CacheError::Decode)?;
+            crate::compact_index::CompactIndex::from_borrowed_cache(cache)
                 .map(|index| (index, (checkpoint.event_id != 0).then_some(checkpoint)))
                 .map_err(CacheError::InvalidIndex)
         }
@@ -163,7 +180,10 @@ pub fn load_compact(
             found,
             expected: CACHE_VERSION_CHECKPOINT,
         }),
-    }
+    };
+    // 零拷贝解码进入字符串池后立即释放原始文件字节缓冲，压低热启动峰值内存
+    drop(data);
+    result
 }
 
 /// Write `[4 bytes "LOKI"] [4 bytes version u32 LE] [payload parts...]` atomically.

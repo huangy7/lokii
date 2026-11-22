@@ -609,6 +609,8 @@ pub struct LokiiCore {
     metrics: Arc<WatcherMetrics>,
     /// True once initial startup has completed and `on_index_ready` has been emitted.
     initialized: Arc<AtomicBool>,
+    /// 启动读取 `config.toml` 时捕获的解析/读取错误，待 `initialize` 拿到 `EventHandler` 后上报。
+    startup_config_error: Mutex<Option<String>>,
 }
 
 #[uniffi::export]
@@ -616,7 +618,10 @@ impl LokiiCore {
     /// Create a new LokiiCore instance. Loads config from disk.
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
-        let (config, _error) = config::load_or_create_config();
+        let (config, config_error) = config::load_or_create_config();
+        if let Some(ref error) = config_error {
+            eprintln!("[Lokii] {error}");
+        }
         let cache_dir = AppConfig::config_dir();
         let config_store = ConfigStore::new(config);
         let store = IndexStore::new();
@@ -631,6 +636,7 @@ impl LokiiCore {
             scan_lock: Arc::new(Mutex::new(())),
             metrics: Arc::new(WatcherMetrics::new()),
             initialized: Arc::new(AtomicBool::new(false)),
+            startup_config_error: Mutex::new(config_error),
         })
     }
 
@@ -646,6 +652,14 @@ impl LokiiCore {
     /// This is blocking — call from a background thread on the Swift side.
     pub fn initialize(&self, event_handler: Arc<dyn EventHandler>) -> FfiStartupMode {
         self.initialized.store(false, Ordering::SeqCst);
+        if let Some(err) = self
+            .startup_config_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            event_handler.on_watcher_error(err);
+        }
         let config = self.config_store.read().clone();
         let cache_file = self.cache_dir.join("index.cache");
         let volumes_dir = self.cache_dir.join("volumes");
@@ -665,7 +679,7 @@ impl LokiiCore {
             event_handler.on_index_progress(phase.to_string(), count);
         };
 
-        let mode = match startup::initialize_primary_index_with_progress(
+        let (mode, cold_checkpoint) = match startup::initialize_primary_index_deferred_persist(
             &self.store,
             &config,
             &primary_roots,
@@ -674,8 +688,8 @@ impl LokiiCore {
             &mut on_progress,
             &cache_file,
         ) {
-            Ok(mode) => mode,
-            Err(startup::InitError::Index(error)) => startup::StartupMode::Failed(error),
+            Ok(res) => res,
+            Err(startup::InitError::Index(error)) => (startup::StartupMode::Failed(error), None),
             Err(startup::InitError::Io(message)) => {
                 drop(poller);
                 return FfiStartupMode::Failed {
@@ -685,7 +699,7 @@ impl LokiiCore {
         };
         drop(poller);
 
-        self.finish_initialization(mode, event_handler)
+        self.finish_initialization(mode, cold_checkpoint, event_handler)
     }
 }
 
@@ -709,6 +723,7 @@ impl LokiiCore {
             scan_lock: Arc::new(Mutex::new(())),
             metrics: Arc::new(WatcherMetrics::new()),
             initialized: Arc::new(AtomicBool::new(false)),
+            startup_config_error: Mutex::new(None),
         }
     }
 
@@ -747,6 +762,7 @@ impl LokiiCore {
     fn finish_initialization(
         &self,
         mode: startup::StartupMode,
+        cold_checkpoint: Option<cache::Checkpoint>,
         event_handler: Arc<dyn EventHandler>,
     ) -> FfiStartupMode {
         if let startup::StartupMode::Failed(error) = mode {
@@ -771,10 +787,16 @@ impl LokiiCore {
         let total = self.volumes.total_entry_count(&self.store);
         event_handler.on_index_ready(total);
 
-        // Build query-side CSR/signature/sort tables in the background after first paint so
-        // the UI becomes interactive immediately.
+        // 在首屏解锁后于后台统一预热主索引与全部已加载卷分片的查询侧结构（CSR/签名/排序表），
+        // 快照卷分片 IndexStore 避免后台线程持有 Arc<VolumeCoordinator> 干扰析构。
         let warm_store = self.store.clone();
-        std::thread::spawn(move || warm_store.warm_query_index());
+        let warm_volume_stores = self.volumes.loaded_stores();
+        std::thread::spawn(move || {
+            warm_store.warm_query_index();
+            for volume_store in warm_volume_stores {
+                volume_store.warm_query_index();
+            }
+        });
 
         // Hand off the replay checkpoint to the primary watcher service.
         *self.resume.lock().unwrap_or_else(|e| e.into_inner()) = Some(match mode {
@@ -786,6 +808,17 @@ impl LokiiCore {
             startup::StartupMode::ColdStart { event_id, .. } => watcher::Resume::From(event_id),
             startup::StartupMode::Failed(_) => unreachable!("failed startup returned before ready"),
         });
+
+        // 冷启动已在上面发布索引并派发 on_index_ready 解锁 UI，此刻在短读锁内编码并无锁落盘，
+        // 既不阻塞首屏搜索交互，又保证 initialize() 返回时缓存文件已原子就绪。
+        if let Some(checkpoint) = cold_checkpoint {
+            let encoded = {
+                let guard = self.store.read();
+                cache::encode_compact(&guard)
+            };
+            let cache_file = self.cache_dir.join("index.cache");
+            startup::save_encoded_index(&encoded, checkpoint, &cache_file);
+        }
 
         match mode {
             startup::StartupMode::HotStart { .. } => FfiStartupMode::HotStart {
@@ -861,9 +894,9 @@ impl LokiiCore {
                 let total = volumes.total_entry_count(&store_for_batch);
                 batch_handler.on_index_updated(total);
             },
-            move |index, checkpoint| {
+            move |encoded, checkpoint| {
                 let cache_file = cache_dir_for_persist.join("index.cache");
-                startup::save_index(index, checkpoint, &cache_file);
+                startup::save_encoded_index(encoded, checkpoint, &cache_file);
             },
         );
         *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -876,6 +909,7 @@ impl LokiiCore {
     /// Start the config file watcher for hot-reload.
     pub fn start_config_watcher(&self, event_handler: Arc<dyn EventHandler>) {
         let handler = Arc::clone(&event_handler);
+        let error_handler = Arc::clone(&event_handler);
         let weak_volumes = Arc::downgrade(&self.volumes);
 
         if let Err(e) = config::start_config_watcher(
@@ -888,6 +922,7 @@ impl LokiiCore {
             },
             move |msg| {
                 eprintln!("{msg}");
+                error_handler.on_watcher_error(msg);
             },
         ) {
             eprintln!("Failed to start config watcher: {e}");
@@ -1032,9 +1067,8 @@ impl LokiiCore {
             }
         };
 
-        // Save cache before publishing so multi-million entry encoding never holds the store lock.
-        let cache_file = self.cache_dir.join("index.cache");
-        let _ = cache::save_compact(&fresh, Some(checkpoint), &cache_file);
+        // 先在锁外对新索引完成内存编码，随后立即发布新索引并通知 UI 就绪，最后在完全无锁状态下写盘与 sync_data()。
+        let encoded = cache::encode_compact(&fresh);
 
         let watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let unswapped = match watcher {
@@ -1050,17 +1084,24 @@ impl LokiiCore {
 
         drop(guard);
         event_handler.on_index_ready(self.volumes.total_entry_count(&self.store));
+        let cache_file = self.cache_dir.join("index.cache");
+        let _ = cache::save_encoded_compact(&encoded, Some(checkpoint), &cache_file);
         true
     }
 
     /// Save the primary index checkpoint and all dirty volume shard caches/manifest.
     pub fn persist_index(&self) {
         if let Some(watcher) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            // Lock index before reading checkpoint so checkpoint never leads the locked snapshot.
-            let index = self.store.read();
-            if let Some(checkpoint) = watcher.checkpoint() {
+            // 先持索引读锁再取检查点并完成内存编码，确保检查点不超前于快照，随后立即释放读锁再落盘。
+            let snapshot = {
+                let index = self.store.read();
+                watcher
+                    .checkpoint()
+                    .map(|checkpoint| (cache::encode_compact(&index), checkpoint))
+            };
+            if let Some((encoded, checkpoint)) = snapshot {
                 let cache_file = self.cache_dir.join("index.cache");
-                startup::save_index(&index, checkpoint, &cache_file);
+                startup::save_encoded_index(&encoded, checkpoint, &cache_file);
             }
         }
         self.volumes.persist_all();
@@ -1362,8 +1403,11 @@ mod tests {
         for error in [IndexError::IdOverflow, IndexError::ReferenceOverflow] {
             let core = core();
             let handler = Arc::new(RecordingHandler::default());
-            let result =
-                core.finish_initialization(startup::StartupMode::Failed(error), handler.clone());
+            let result = core.finish_initialization(
+                startup::StartupMode::Failed(error),
+                None,
+                handler.clone(),
+            );
             let FfiStartupMode::Failed { message } = result else {
                 panic!("failed initialization must not report a successful startup");
             };
@@ -1383,6 +1427,7 @@ mod tests {
                 scanned_count: 0,
                 event_id: 7,
             },
+            None,
             handler.clone(),
         );
         assert!(matches!(
@@ -2365,5 +2410,39 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
         assert!(!core.is_scanning());
+    }
+
+    #[test]
+    fn startup_config_error_is_delivered_once_on_initialize() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![primary_dir.path().to_string_lossy().to_string()];
+        cfg.index.exclude_paths = vec![];
+
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg, Arc::new(Vec::new));
+        *core.startup_config_error.lock().unwrap() =
+            Some("Config parse error (backed up to config.toml.bak)".to_string());
+
+        let handler = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler.clone());
+        let events = handler.events.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "Config parse error (backed up to config.toml.bak)"),
+            "startup config parse error must be forwarded via on_watcher_error, got: {events:?}"
+        );
+
+        // 二次初始化不应重复消费已上报的启动错误
+        let handler2 = Arc::new(RecordingHandler::default());
+        let _ = core.initialize(handler2.clone());
+        let events2 = handler2.events.lock().unwrap().clone();
+        assert!(
+            !events2
+                .iter()
+                .any(|e| e.contains("config.toml.bak")),
+            "startup config error must only be delivered once"
+        );
     }
 }

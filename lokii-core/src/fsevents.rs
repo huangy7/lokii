@@ -29,9 +29,12 @@ pub(crate) fn journal_uuid_for_path(path: &std::path::Path) -> Option<String> {
         if str_ref.is_null() {
             return None;
         }
-        let bytes = cf_string_bytes(str_ref);
+        let uuid = cf_string_with_bytes(str_ref, |bytes| {
+            std::str::from_utf8(bytes).ok().map(str::to_owned)
+        })
+        .flatten();
         cf::CFRelease(str_ref);
-        bytes.and_then(|b| String::from_utf8(b).ok())
+        uuid
     }
 }
 
@@ -100,28 +103,46 @@ fn extended_keys() -> (cf::CFRef, cf::CFRef) {
     (path as cf::CFRef, inode as cf::CFRef)
 }
 
-unsafe fn cf_string_bytes(string: cf::CFRef) -> Option<Vec<u8>> {
+/// 从 CoreFoundation `CFStringRef` 直接提取 UTF-8 字节视图并交由回调消费：
+/// 常规长度（< 1024 字节）走栈缓冲零堆分配，仅超长字符串回退至单次堆缓冲。
+unsafe fn cf_string_with_bytes<R>(
+    string: cf::CFRef,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
     if string.is_null() {
         return None;
     }
+    const STACK_CAP: usize = 1024;
+    let mut stack_buf = [0u8; STACK_CAP];
+    if cf::CFStringGetCString(
+        string,
+        stack_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+        STACK_CAP as cf::CFIndex,
+        cf::kCFStringEncodingUTF8,
+    ) {
+        let bytes = CStr::from_bytes_until_nul(&stack_buf).ok()?.to_bytes();
+        return Some(f(bytes));
+    }
     let capacity =
         CFStringGetMaximumSizeForEncoding(CFStringGetLength(string), cf::kCFStringEncodingUTF8) + 1;
-    let mut buffer = vec![0u8; capacity as usize];
+    if capacity <= 0 {
+        return None;
+    }
+    let mut heap_buf = vec![0u8; capacity as usize];
     if !cf::CFStringGetCString(
         string,
-        buffer.as_mut_ptr() as *mut std::os::raw::c_char,
+        heap_buf.as_mut_ptr() as *mut std::os::raw::c_char,
         capacity,
         cf::kCFStringEncodingUTF8,
     ) {
         return None;
     }
-    let bytes = CStr::from_bytes_until_nul(&buffer).ok()?.to_bytes().to_vec();
-    Some(bytes)
+    let bytes = CStr::from_bytes_until_nul(&heap_buf).ok()?.to_bytes();
+    Some(f(bytes))
 }
 
 unsafe fn cf_string_path(string: cf::CFRef) -> Option<PathBuf> {
-    let bytes = cf_string_bytes(string)?;
-    Some(PathBuf::from(OsStr::from_bytes(&bytes)))
+    cf_string_with_bytes(string, |bytes| PathBuf::from(OsStr::from_bytes(bytes)))
 }
 
 extern "C" fn on_stream_events(
@@ -313,5 +334,31 @@ mod tests {
         );
         let missing = dir.path().join("definitely_missing_123456");
         assert_eq!(journal_uuid_for_path(&missing), None);
+    }
+
+    #[test]
+    fn cf_string_path_handles_short_cjk_and_long_paths() {
+        let long_path = format!("/Users/dev/{}/end.txt", "segment_0123456789/".repeat(80));
+        assert!(long_path.len() > 1024);
+        let cases = [
+            "/Users/dev/project/main.rs",
+            "/Users/测试用户/工作空间/年度报告.pdf",
+            long_path.as_str(),
+        ];
+        unsafe {
+            assert_eq!(cf_string_path(std::ptr::null_mut()), None);
+            for expected in cases {
+                let c_str = CString::new(expected).unwrap();
+                let cf_str = cf::CFStringCreateWithCString(
+                    cf::kCFAllocatorDefault,
+                    c_str.as_ptr(),
+                    cf::kCFStringEncodingUTF8,
+                );
+                assert!(!cf_str.is_null());
+                let parsed = cf_string_path(cf_str);
+                cf::CFRelease(cf_str);
+                assert_eq!(parsed, Some(PathBuf::from(expected)));
+            }
+        }
     }
 }

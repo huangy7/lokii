@@ -230,6 +230,13 @@ impl IndexStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn try_write(
+        &self,
+    ) -> Option<parking_lot::RwLockWriteGuard<'_, crate::compact_index::CompactIndex>> {
+        self.entries.try_write()
+    }
+
+    #[cfg(test)]
     pub fn entries(&self) -> Vec<FileEntry> {
         self.read()
             .iter()
@@ -244,9 +251,7 @@ impl IndexStore {
     }
 
     pub fn remove_paths(&self, paths: &HashSet<String>) {
-        self.entries
-            .write()
-            .remove_matching(|view| paths.iter().any(|path| view.path_equals(path)));
+        self.entries.write().remove_exact_paths(paths);
     }
 
     /// 批量从紧凑倒排索引中立即剔除指定排除目录树（含自身及所有子条目），并就地重整查询索引
