@@ -157,11 +157,16 @@ private struct SettingsPathRow: View {
         case let .volumeOffline(entryCount, _):
             HStack(spacing: 4) {
                 Circle()
-                    .fill(Color.secondary.opacity(0.6))
+                    .fill(Color.secondary.opacity(entryCount > 0 ? 0.6 : 0.45))
                     .frame(width: 6, height: 6)
-                let label = (showVolumeMetrics && entryCount > 0)
-                    ? String(format: L("prefs.volume.status.offline"), formatFileCount(entryCount))
-                    : L("prefs.volume.status.offlineNoCount")
+                let label: String = {
+                    if entryCount == 0 {
+                        return L("prefs.volume.state.offlineUncached")
+                    }
+                    return showVolumeMetrics
+                        ? String(format: L("prefs.volume.status.offline"), formatFileCount(entryCount))
+                        : L("prefs.volume.status.offlineNoCount")
+                }()
                 Text(label)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
@@ -495,11 +500,11 @@ private struct ManagedVolumeRow: View {
             case .offline:
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(Color.secondary.opacity(0.6))
+                        .fill(Color.secondary.opacity(status.entryCount > 0 ? 0.6 : 0.45))
                         .frame(width: 6, height: 6)
                     let label = status.entryCount > 0
                         ? String(format: L("prefs.volume.status.offline"), formatFileCount(status.entryCount))
-                        : L("prefs.volume.status.offlineNoCount")
+                        : L("prefs.volume.state.offlineUncached")
                     Text(label)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)

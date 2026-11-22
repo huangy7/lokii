@@ -923,12 +923,31 @@ assertEqual(autoSelectDelegate.selectedResult?.path, localCodeItem.path, "自动
 _ = controller.tableView(controller.tableView, viewFor: testNameCol, row: 0)
 assertTrue(!workspaceIconCalls.contains(localCodeItem.path), "普通代码文件应走纯内存 UTType 类型图标，严禁主线程同步查盘")
 
-// O(1) updateBottomPath(for:) 接口验证
+// O(1) updateBottomPath(for:) 接口与离线面包屑原生视觉结构验证
 controller.updateBottomPath(for: localCodeItem)
 assertEqual(controller.pathBar.url?.path, localCodeItem.path, "updateBottomPath(for:) 应正确更新在线文件路径")
+assertEqual(controller.pathBar.alphaValue, 1.0, "在线面包屑透明度应为 1.0")
 controller.updateBottomPath(for: offlineItem)
 assertEqual(controller.pathBar.isOfflinePathMode, true, "updateBottomPath(for:) 应直接识别离线条目进入纯内存模式")
 assertTrue(controller.pathBar.url == nil, "updateBottomPath(for:) 离线模式绝不可写入 pathBar.url")
+assertTrue(controller.pathBar.alphaValue < 1.0, "离线面包屑应采用柔和降透明态与在线路径区分")
+let offlineTitles = controller.pathBar.pathItems.map { $0.title }
+assertEqual(
+    offlineTitles,
+    ["OfflineNAS", "finance", "budget.xlsx"],
+    "/Volumes/<卷名> 离线面包屑应直接从卷名起头，隐藏生硬的 / 与 Volumes 前缀"
+)
+assertEqual(
+    controller.pathBar.offlineComponentURLs.map { $0.path },
+    ["/Volumes/OfflineNAS", "/Volumes/OfflineNAS/finance", "/Volumes/OfflineNAS/finance/budget.xlsx"],
+    "离线面包屑各节点对应的 URL 必须与完整路径一一对齐以支持右键拷贝路径"
+)
+assertTrue(
+    controller.pathBar.pathItems.allSatisfy { ($0.image?.isTemplate == false) && (($0.image?.size.width ?? 0) > 0) },
+    "离线面包屑节点必须使用全彩原生系统图标而非黑白线框模板符号"
+)
+controller.updateBottomPath(for: localCodeItem)
+assertEqual(controller.pathBar.alphaValue, 1.0, "切回在线条目后底栏面包屑透明度应恢复为 1.0")
 
 // 验证打开方式子菜单挂载独立按需代理，避免主右键菜单同步查询 LaunchServices
 assertTrue(menu.items[1].submenu?.delegate != nil, "打开方式子菜单必须挂载独立 NSMenuDelegate 实现展开时按需构建")

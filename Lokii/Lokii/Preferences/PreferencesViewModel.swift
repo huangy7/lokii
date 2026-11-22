@@ -63,6 +63,10 @@ enum SettingsPathStatusResolver {
             case .syncing:
                 return .volumeSyncing(kind: matched.kind)
             case .offline:
+                // 仅当内存与磁盘缓存确有条目时才视作“索引已保留”；PendingPath 或缓存已删除（entryCount == 0）归类为未缓存离线
+                if matched.entryCount == 0 {
+                    return .volumeUncachedOffline
+                }
                 return .volumeOffline(entryCount: matched.entryCount, kind: matched.kind)
             case .missing:
                 if let activePath = matched.activePath, !activePath.isEmpty {
