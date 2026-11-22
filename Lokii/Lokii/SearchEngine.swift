@@ -13,17 +13,25 @@ struct LokiiConfig: Codable {
         var language: String
         var showInDock: Bool
         var terminalBundleId: String
+        var hideResultsWhenEmpty: Bool
 
         enum CodingKeys: String, CodingKey {
             case language
             case showInDock = "show_in_dock"
             case terminalBundleId = "terminal_bundle_id"
+            case hideResultsWhenEmpty = "hide_results_when_empty"
         }
 
-        init(language: String = "zh-Hans", showInDock: Bool = true, terminalBundleId: String = "com.apple.Terminal") {
+        init(
+            language: String = "zh-Hans",
+            showInDock: Bool = true,
+            terminalBundleId: String = "com.apple.Terminal",
+            hideResultsWhenEmpty: Bool = false
+        ) {
             self.language = language
             self.showInDock = showInDock
             self.terminalBundleId = terminalBundleId
+            self.hideResultsWhenEmpty = hideResultsWhenEmpty
         }
 
         init(from decoder: Decoder) throws {
@@ -31,6 +39,7 @@ struct LokiiConfig: Codable {
             self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? "zh-Hans"
             self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? true
             self.terminalBundleId = try container.decodeIfPresent(String.self, forKey: .terminalBundleId) ?? "com.apple.Terminal"
+            self.hideResultsWhenEmpty = try container.decodeIfPresent(Bool.self, forKey: .hideResultsWhenEmpty) ?? false
         }
     }
 
@@ -464,7 +473,19 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
             self?.scheduleVolumeStatusesRefresh()
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self, core] in
-            _ = core.rebuildIndex(eventHandler: handler)
+            let completed = core.rebuildIndex(eventHandler: handler)
+            // 若后端因并发扫描冲突或扫描失败提前返回 false（不会触发 on_index_ready），
+            // 主动广播重建结束通知，防止主视窗与偏好设置页永久卡在 rebuilding 状态。
+            if !completed {
+                let total = core.getStats().totalCount
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: SearchEngine.indexReadyNotification,
+                        object: nil,
+                        userInfo: ["total": total, "source": "rebuild"]
+                    )
+                }
+            }
             self?.scheduleVolumeStatusesRefresh()
         }
     }

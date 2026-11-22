@@ -50,6 +50,7 @@ test: bindings
 	@swift tests/breadcrumb_and_services_test.swift
 	@swift tests/terminal_launcher_test.swift
 	@swift tests/case_sensitivity_test.swift
+	@swift tests/window_frame_manager_test.swift
 
 
 check:

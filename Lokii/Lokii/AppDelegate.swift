@@ -100,6 +100,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             trayPrefsItem.target = self
             menu.addItem(trayPrefsItem)
 
+            let trayRebuildItem = NSMenuItem(title: L("menu.rebuildIndex"), action: #selector(rebuildIndex), keyEquivalent: "")
+            trayRebuildItem.target = self
+            trayRebuildItem.isEnabled = mainWindow?.canTriggerRebuild ?? false
+            menu.addItem(trayRebuildItem)
+
             let checkUpdatesItem = NSMenuItem(title: L("menu.checkUpdates"), action: #selector(checkForUpdates), keyEquivalent: "")
             checkUpdatesItem.target = self
             menu.addItem(checkUpdatesItem)
@@ -169,6 +174,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         prefsItem.target = self
         appMenu.addItem(prefsItem)
 
+        // Rebuild Index with Cmd+Shift+R
+        let rebuildItem = NSMenuItem(localizedKey: "menu.rebuildIndex", action: #selector(rebuildIndex), keyEquivalent: "r")
+        rebuildItem.keyEquivalentModifierMask = [.command, .shift]
+        rebuildItem.target = self
+        appMenu.addItem(rebuildItem)
+
         appMenu.addItem(NSMenuItem.separator())
 
         // Services menu
@@ -205,6 +216,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let windowMenu = NSMenu(title: L("menu.window"))
         windowMenu.addLocalizedItem("menu.close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         windowMenu.addLocalizedItem("menu.minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(NSMenuItem.separator())
+        let resetSizeItem = NSMenuItem(localizedKey: "menu.resetWindowSize", action: #selector(resetWindowSize), keyEquivalent: "")
+        resetSizeItem.target = self
+        windowMenu.addItem(resetSizeItem)
         windowMenuItem.submenu = windowMenu
         mainMenu.addItem(windowMenuItem)
 
@@ -243,6 +258,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showPreferences()
     }
 
+    @objc private func rebuildIndex() {
+        mainWindow?.triggerRebuildIndex()
+    }
+
+    @objc private func resetWindowSize() {
+        mainWindow?.resetToDefaultWindowFrame()
+    }
+
     /// 从搜索结果空态直达索引页
     func openIndexPreferences() {
         showPreferences(tab: "index")
@@ -268,6 +291,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(rebuildIndex) {
+            return mainWindow?.canTriggerRebuild ?? false
+        }
+        return true
     }
 }
 

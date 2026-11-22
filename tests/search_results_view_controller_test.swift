@@ -145,6 +145,7 @@ final class MockDelegate: SearchResultsViewControllerDelegate {
 
 print("[1/12] 测试控制器初始化与内聚底栏视图层次构建...")
 UserDefaults.standard.removeObject(forKey: "NSTableView Columns SearchResultsTable")
+UserDefaults.standard.removeObject(forKey: "LokiiHiddenResultColumns")
 let controller = SearchResultsViewController()
 let _ = controller.view // 触发 loadView 与 viewDidLoad
 
@@ -186,7 +187,9 @@ let topConstraint = controller.view.constraints.first {
     $0.firstItem as? NSScrollView == controller.tableScrollView && $0.firstAttribute == .top
 }
 assertTrue(topConstraint?.secondItem is NSLayoutGuide, "tableScrollView 顶端必须锚定至 safeAreaLayoutGuide")
-assertEqual(controller.tableView.numberOfColumns, 4, "虚拟列表应具备 4 个排版列 (名称/路径/修改时间/大小)")
+assertEqual(controller.tableView.numberOfColumns, 6, "虚拟列表应注册 6 个排版列 (名称/路径/修改日期/创建日期/扩展名/大小)")
+let defaultVisibleCols = controller.tableView.tableColumns.filter { !$0.isHidden }.map { $0.identifier }
+assertEqual(defaultVisibleCols, [.columnName, .columnPath, .columnModified, .columnSize], "默认可见列应为名称/路径/修改日期/大小，创建日期与扩展名默认隐藏")
 assertTrue(controller.tableView.autosaveTableColumns, "虚拟列表应开启列配置自动持久化")
 assertEqual(controller.tableView.autosaveName, "SearchResultsTable", "虚拟列表 autosaveName 应为 SearchResultsTable")
 assertTrue(controller.tableView.usesAlternatingRowBackgroundColors, "虚拟列表应启用斑马纹交替背景色")
@@ -637,8 +640,8 @@ let testSizeCol = controller.tableView.tableColumns.first { $0.identifier == .co
 let testPathCol = controller.tableView.tableColumns.first { $0.identifier == .columnPath }!
 let testNameCol = controller.tableView.tableColumns.first { $0.identifier == .columnName }!
 
-// 1. 初始状态：大小位于末列，应为右对齐；修改时间位于中间列，应为左对齐
-assertEqual(controller.tableView.tableColumns.last?.identifier, .columnSize, "默认末列应为大小列")
+// 1. 初始状态：大小位于可见末列，应为右对齐；修改时间位于中间列，应为左对齐
+assertEqual(controller.tableView.tableColumns.last(where: { !$0.isHidden })?.identifier, .columnSize, "默认可见末列应为大小列")
 assertEqual(testSizeCol.headerCell.alignment, .right, "默认状态下大小列表头应为右对齐")
 let initialSizeCell = controller.tableView(controller.tableView, viewFor: testSizeCol, row: 0) as? NSTableCellView
 assertEqual(initialSizeCell?.textField?.alignment, .right, "默认状态下大小列单元格应为右对齐")
@@ -647,7 +650,7 @@ assertEqual(modifiedCol.headerCell.alignment, .left, "默认状态下修改时�
 let initialModifiedCell = controller.tableView(controller.tableView, viewFor: modifiedCol, row: 0) as? NSTableCellView
 assertEqual(initialModifiedCell?.textField?.alignment, .left, "默认状态下修改时间列单元格应为左对齐")
 
-// 2. 模拟将大小列从第 3 列拖动到第 1 列 (Name, Size, Path, Modified)
+// 2. 模拟将大小列从末列拖动到第 1 列
 let oldSizeIndex = controller.tableView.column(withIdentifier: .columnSize)
 controller.tableView.moveColumn(oldSizeIndex, toColumn: 1)
 controller.tableViewColumnDidMove(Notification(
@@ -656,7 +659,7 @@ controller.tableViewColumnDidMove(Notification(
     userInfo: ["NSOldColumn": oldSizeIndex, "NSNewColumn": 1]
 ))
 
-assertEqual(controller.tableView.tableColumns.last?.identifier, .columnModified, "拖拽后末列应变为修改时间列")
+assertEqual(controller.tableView.tableColumns.last(where: { !$0.isHidden })?.identifier, .columnModified, "拖拽后可见末列应变为修改时间列")
 assertEqual(testSizeCol.headerCell.alignment, .left, "移至中间列后大小列表头应自适应为左对齐")
 let movedSizeCell = controller.tableView(controller.tableView, viewFor: testSizeCol, row: 0) as? NSTableCellView
 assertEqual(movedSizeCell?.textField?.alignment, .left, "移至中间列后大小列单元格应自适应为左对齐")
@@ -665,7 +668,7 @@ assertEqual(modifiedCol.headerCell.alignment, .right, "成为末列后修改时�
 let movedModifiedCell = controller.tableView(controller.tableView, viewFor: modifiedCol, row: 0) as? NSTableCellView
 assertEqual(movedModifiedCell?.textField?.alignment, .right, "成为末列后修改时间列单元格应自适应为右对齐")
 
-// 3. 模拟将路径列拖动到末列 (Name, Size, Modified, Path)
+// 3. 模拟将路径列拖动到末列
 let oldPathIndex = controller.tableView.column(withIdentifier: .columnPath)
 let targetLastIndex = controller.tableView.tableColumns.count - 1
 controller.tableView.moveColumn(oldPathIndex, toColumn: targetLastIndex)
@@ -675,7 +678,7 @@ controller.tableViewColumnDidMove(Notification(
     userInfo: ["NSOldColumn": oldPathIndex, "NSNewColumn": targetLastIndex]
 ))
 
-assertEqual(controller.tableView.tableColumns.last?.identifier, .columnPath, "拖拽后末列应变为路径列")
+assertEqual(controller.tableView.tableColumns.last(where: { !$0.isHidden })?.identifier, .columnPath, "拖拽后可见末列应变为路径列")
 assertEqual(testPathCol.headerCell.alignment, .left, "路径列移至末列仍应保持左对齐")
 let movedPathCell = controller.tableView(controller.tableView, viewFor: testPathCol, row: 0) as? NSTableCellView
 assertEqual(movedPathCell?.textField?.alignment, .left, "路径列移至末列单元格仍应保持左对齐")
@@ -965,7 +968,213 @@ hostWin.contentView?.addSubview(textEditor)
 hostWin.makeFirstResponder(textEditor)
 assertEqual(controller.tableView.performKeyEquivalent(with: deleteEvent), false, "焦点位于文本编辑器时 ⌘⌫ 必须交还给文本编辑器，不得误删预选首行")
 
-print("测试全部通过：16/16 项断言成功。")
+print("[17/17] 测试表头右键自定义列显隐、持久化、可见末列对齐与创建日期/扩展名列渲染排序...")
+controller.resetColumnsToDefault()
+assertEqual(
+    controller.tableView.tableColumns.filter { !$0.isHidden }.map { $0.identifier },
+    [.columnName, .columnPath, .columnModified, .columnSize],
+    "恢复默认列后应仅显示名称/路径/修改日期/大小"
+)
+
+// 名称列锁定不可隐藏
+controller.setColumnHidden(true, for: .columnName)
+assertEqual(controller.tableView.tableColumns.first { $0.identifier == .columnName }?.isHidden, false, "名称列必须锁定不可隐藏")
+
+// 显示创建日期与扩展名列，隐藏大小列，验证持久化与末列对齐切换
+controller.tableView.sortDescriptors = [NSSortDescriptor(key: "size", ascending: false)]
+controller.setColumnHidden(false, for: .columnCreated)
+controller.setColumnHidden(false, for: .columnExtension)
+controller.setColumnHidden(true, for: .columnSize)
+assertTrue(controller.tableView.sortDescriptors.isEmpty, "隐藏当前排序列后必须清空失效排序描述符")
+let savedHidden = Set(UserDefaults.standard.stringArray(forKey: SearchResultsViewController.hiddenColumnsDefaultsKey) ?? [])
+assertEqual(savedHidden, Set([NSUserInterfaceItemIdentifier.columnSize.rawValue]), "隐藏列集合应持久化到 UserDefaults")
+
+// 再隐藏扩展名列，使创建日期成为最右可见列并验证右对齐
+controller.setColumnHidden(true, for: .columnExtension)
+let createdCol = controller.tableView.tableColumns.first { $0.identifier == .columnCreated }!
+let extensionCol = controller.tableView.tableColumns.first { $0.identifier == .columnExtension }!
+assertEqual(createdCol.headerCell.alignment, .right, "创建日期成为最右可见列时表头应右对齐")
+
+// 渲染与排序验证：created == 0 与目录/无扩展名显示 --，有效扩展名排序始终在空扩展名之前
+controller.setColumnHidden(false, for: .columnExtension)
+let colItems = [
+    FfiSearchResult(name: "folder_a", path: "/tmp/folder_a", extension: "", isDir: true, size: 0, created: 0, modified: 100),
+    FfiSearchResult(name: "report.pdf", path: "/tmp/report.pdf", extension: "pdf", isDir: false, size: 100, created: 1_700_000_200, modified: 200),
+    FfiSearchResult(name: "README", path: "/tmp/README", extension: "", isDir: false, size: 50, created: 1_700_000_100, modified: 150),
+    FfiSearchResult(name: "app.Swift", path: "/tmp/app.Swift", extension: "Swift", isDir: false, size: 300, created: 1_700_000_300, modified: 300),
+]
+controller.displayResults(colItems, preserveSelection: false)
+let zeroCreatedCell = controller.tableView(controller.tableView, viewFor: createdCol, row: 0) as? NSTableCellView
+assertEqual(zeroCreatedCell?.textField?.stringValue, "--", "创建时间为 0 时应显示 --")
+let validCreatedCell = controller.tableView(controller.tableView, viewFor: createdCol, row: 1) as? NSTableCellView
+assertTrue((validCreatedCell?.textField?.stringValue ?? "") != "--" && !(validCreatedCell?.textField?.stringValue ?? "").isEmpty, "有效创建时间应格式化展示")
+let dirExtCell = controller.tableView(controller.tableView, viewFor: extensionCol, row: 0) as? NSTableCellView
+assertEqual(dirExtCell?.textField?.stringValue, "--", "文件夹扩展名列应显示 --")
+let pdfExtCell = controller.tableView(controller.tableView, viewFor: extensionCol, row: 1) as? NSTableCellView
+assertEqual(pdfExtCell?.textField?.stringValue, "pdf", "普通文件扩展名列应展示扩展名")
+
+// 按创建日期升序排序
+controller.tableView.sortDescriptors = [NSSortDescriptor(key: "created", ascending: true)]
+controller.tableView(controller.tableView, sortDescriptorsDidChange: [])
+assertEqual(controller.results.map { $0.created }, [0, 1_700_000_100, 1_700_000_200, 1_700_000_300], "按创建日期升序排序应严格按数值排列")
+
+// 按扩展名升序与降序排序：有效扩展名始终位于无扩展名/目录之前
+controller.tableView.sortDescriptors = [NSSortDescriptor(key: "extension", ascending: true)]
+controller.tableView(controller.tableView, sortDescriptorsDidChange: [])
+assertEqual(controller.results.prefix(2).map { $0.name }, ["report.pdf", "app.Swift"], "扩展名升序应先排 pdf 再排 Swift，无扩展名置后")
+
+controller.tableView.sortDescriptors = [NSSortDescriptor(key: "extension", ascending: false)]
+controller.tableView(controller.tableView, sortDescriptorsDidChange: [])
+assertEqual(controller.results.prefix(2).map { $0.name }, ["app.Swift", "report.pdf"], "扩展名降序应先排 Swift 再排 pdf，无扩展名仍置后")
+
+// 表头右键菜单验证
+assertTrue(controller.savedHeaderView === controller.tableView.headerView, "savedHeaderView 应强持有表头视图")
+let headerMenu = controller.tableView.headerView?.menu
+assertTrue(headerMenu != nil, "表头视图必须挂载右键列显隐菜单")
+if let headerMenu {
+    headerMenu.delegate?.menuNeedsUpdate?(headerMenu)
+    // 6 列 + 分隔线 + 恢复默认列 = 8 项
+    assertEqual(headerMenu.items.count, 8, "表头右键菜单应包含 6 个列开关、1 条分隔线与 1 个恢复默认项")
+    let nameMenuItem = headerMenu.items[0]
+    assertEqual(nameMenuItem.state, .on, "名称列在菜单中应保持勾选态")
+    assertEqual(nameMenuItem.isEnabled, false, "名称列在菜单中必须禁用不可取消")
+}
+
+// 清理测试写入的列配置，避免污染宿主默认设置
+UserDefaults.standard.removeObject(forKey: SearchResultsViewController.hiddenColumnsDefaultsKey)
+UserDefaults.standard.removeObject(forKey: "NSTableView Columns SearchResultsTable")
+
+print("[18/18] 测试空搜索隐藏判定、.idleEmpty 语法速查卡片点击与表头无损恢复...")
+assertEqual(
+    SearchResultsViewController.shouldShowIdleEmptyState(
+        hideWhenEmpty: true,
+        query: "   ",
+        isFilterUnconstrained: true,
+        hasActiveDirectory: false,
+        isIndexingIdle: true
+    ),
+    true,
+    "开启隐藏开关且为空/纯空格、无过滤无目录筛选、索引空闲时应进入 idleEmpty"
+)
+assertEqual(
+    SearchResultsViewController.shouldShowIdleEmptyState(
+        hideWhenEmpty: false,
+        query: "",
+        isFilterUnconstrained: true,
+        hasActiveDirectory: false,
+        isIndexingIdle: true
+    ),
+    false,
+    "关闭隐藏开关时不应进入 idleEmpty"
+)
+assertEqual(
+    SearchResultsViewController.shouldShowIdleEmptyState(
+        hideWhenEmpty: true,
+        query: "",
+        isFilterUnconstrained: false,
+        hasActiveDirectory: false,
+        isIndexingIdle: true
+    ),
+    false,
+    "过滤气泡存在约束时即使搜索词为空也不应进入 idleEmpty"
+)
+assertEqual(
+    SearchResultsViewController.shouldShowIdleEmptyState(
+        hideWhenEmpty: true,
+        query: "",
+        isFilterUnconstrained: true,
+        hasActiveDirectory: true,
+        isIndexingIdle: true
+    ),
+    false,
+    "侧边栏选中目录筛选时即使搜索词为空也不应进入 idleEmpty"
+)
+
+controller.displayResults([], preserveSelection: false)
+controller.emptyState = .idleEmpty
+assertTrue(!controller.emptyStateContainer.isHidden, "idleEmpty 且无结果时应展示空态容器")
+assertEqual(controller.emptyTitleLabel.stringValue, L("search.empty.idle.title"), "idleEmpty 应展示引导主标题")
+assertTrue(!controller.emptySubtitleLabel.isHidden, "idleEmpty 应展示引导副标题")
+assertEqual(controller.emptySubtitleLabel.stringValue, L("search.empty.idle.subtitle"), "idleEmpty 副标题应匹配本地化文案")
+assertTrue(!controller.emptySyntaxSection.isHidden, "idleEmpty 应展示语法速查分区")
+assertEqual(controller.syntaxTipButtons.count, 6, "语法速查网格应固定提供 6 条常用语法卡片")
+assertTrue(controller.emptyRecentSection.isHidden, "无搜索历史时应隐藏最近搜索区块")
+assertTrue(controller.tableView.headerView == nil, "idleEmpty 下应收起表头占位高度")
+
+// 注入最近搜索历史，验证胶囊渲染上限（最多 5 条）、点击回填与一键清空
+controller.updateRecentSearches(["项目计划.pdf", "设计稿.sketch", "会议记录.docx", "q4_budget.xlsx", "架构图.png", "第六条应被截断"])
+assertTrue(!controller.emptyRecentSection.isHidden, "存在搜索历史时 idleEmpty 应显示最近搜索区块")
+assertEqual(controller.recentSearchChips.count, 5, "空态最近搜索胶囊最多展示 5 条")
+var selectedRecent: String?
+var clearRecentCount = 0
+controller.onSelectRecentSearch = { selectedRecent = $0 }
+controller.onClearRecentSearches = { clearRecentCount += 1 }
+controller.recentSearchChips[1].simulateClick()
+assertEqual(selectedRecent, "设计稿.sketch", "点击最近搜索胶囊应回调对应完整查询词")
+selectedRecent = nil
+assertEqual(controller.recentSearchChips[0].accessibilityPerformPress(), true, "VoiceOver 触发最近搜索胶囊应返回 true")
+assertEqual(selectedRecent, "项目计划.pdf", "VoiceOver 触发应回填首条历史记录")
+controller.triggerClearRecentSearchesForTesting()
+assertEqual(clearRecentCount, 1, "点击清空历史按钮应触发清空回调")
+controller.updateRecentSearches([])
+assertTrue(controller.emptyRecentSection.isHidden, "清空历史后应立即收起最近搜索区块")
+
+var selectedExample: String?
+controller.onSelectSyntaxExample = { selectedExample = $0 }
+let extTipButton = controller.syntaxTipButtons.first { $0.syntaxExample == "ext:pdf,docx" }
+assertTrue(extTipButton != nil, "语法速查卡片应包含 ext:pdf,docx")
+if let extTipButton {
+    extTipButton.simulateClick()
+}
+assertEqual(selectedExample, "ext:pdf,docx", "点击语法速查卡片应回调对应示例字符串")
+
+selectedExample = nil
+if let extTipButton {
+    assertEqual(extTipButton.accessibilityPerformPress(), true, "VoiceOver 触发 accessibilityPerformPress 必须返回 true")
+}
+assertEqual(selectedExample, "ext:pdf,docx", "VoiceOver 触发 accessibilityPerformPress 必须派发对应语法示例回调")
+
+// 退出 idleEmpty 进入 noMatches：表头与列右键菜单无损恢复，同时验证动态查询回显与 4 张可点击行动卡片
+controller.updateEmptyContext(query: "dsafas", isFuzzyActive: false)
+controller.emptyState = .noMatches
+assertTrue(controller.emptySyntaxSection.isHidden, "离开 idleEmpty 应隐藏语法速查分区")
+assertTrue(controller.emptyRecentSection.isHidden, "离开 idleEmpty 应隐藏最近搜索区块")
+assertTrue(controller.tableView.headerView === controller.savedHeaderView, "离开 idleEmpty 应恢复原始表头视图")
+assertTrue(controller.tableView.headerView?.menu != nil, "恢复后的表头视图必须保留右键列显隐菜单")
+assertEqual(
+    controller.emptySubtitleLabel.stringValue,
+    String(format: L("search.empty.subtitleWithQuery"), "dsafas"),
+    "无结果副标题应动态回显当前查询词"
+)
+assertTrue(!controller.emptyNoMatchActionsGrid.isHidden, "noMatches 态应展示 4 张行动建议卡片")
+assertEqual(controller.noMatchActionCards.count, 4, "无结果行动建议应固定包含 4 张卡片")
+
+var focusSearchCalls = 0
+var enableFuzzyCalls = 0
+var openFilterCalls = 0
+var openIndexCalls = 0
+controller.onFocusSearchField = { focusSearchCalls += 1 }
+controller.onEnableFuzzyMode = { enableFuzzyCalls += 1 }
+controller.onOpenFilterPopover = { openFilterCalls += 1 }
+controller.onManageIndexRules = { openIndexCalls += 1 }
+
+controller.noMatchActionCards[0].simulateClick()
+controller.noMatchActionCards[1].simulateClick()
+controller.noMatchActionCards[2].simulateClick()
+controller.noMatchActionCards[3].simulateClick()
+assertEqual(focusSearchCalls, 1, "点击「检查关键词」应回调聚焦搜索框")
+assertEqual(enableFuzzyCalls, 1, "点击「尝试模糊匹配」应回调开启模糊模式")
+assertEqual(openFilterCalls, 1, "点击「检查过滤条件」应回调弹出过滤浮层")
+assertEqual(openIndexCalls, 1, "点击「确认索引范围」应回调打开索引设置")
+
+// 已开启模糊匹配时，「尝试模糊匹配」卡片应置禁用并忽略点击
+controller.updateEmptyContext(query: "dsafas", isFuzzyActive: true)
+assertEqual(controller.noMatchActionCards[1].isCardEnabled, false, "模糊匹配已开启时对应卡片必须禁用")
+assertEqual(controller.noMatchActionCards[1].accessibilityPerformPress(), false, "禁用卡片通过 VoiceOver 激活应返回 false")
+controller.noMatchActionCards[1].simulateClick()
+assertEqual(enableFuzzyCalls, 1, "禁用卡片点击不得重复触发开启模糊回调")
+
+print("测试全部通过：18/18 项断言成功。")
 """
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

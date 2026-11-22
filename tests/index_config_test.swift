@@ -337,6 +337,124 @@ do {
     assertEqual(batchMatcher.match(path: expandedHomeTarget)?.displayName, "HomeMount", "预归一化批处理匹配器应兼容 ~ 展开路径")
     assertTrue(batchMatcher.match(path: "/Users/local/file.txt") == nil, "非卷本地路径应返回 nil")
 
+    // GeneralConfig.hideResultsWhenEmpty 缺省兼容与往返编解码
+    let legacyGeneralData = \"\"\"
+    {"language": "zh-Hans", "show_in_dock": true}
+    \"\"\".data(using: .utf8)!
+    let decodedLegacyGeneral = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: legacyGeneralData)
+    assertEqual(decodedLegacyGeneral.hideResultsWhenEmpty, false, "旧版配置缺失 hide_results_when_empty 时应默认回退为 false")
+
+    let enabledGeneralData = \"\"\"
+    {"language": "en", "show_in_dock": true, "hide_results_when_empty": true}
+    \"\"\".data(using: .utf8)!
+    let decodedEnabledGeneral = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: enabledGeneralData)
+    assertEqual(decodedEnabledGeneral.hideResultsWhenEmpty, true, "hide_results_when_empty = true 应准确解码")
+    let encodedGeneral = String(data: try JSONEncoder().encode(decodedEnabledGeneral), encoding: .utf8) ?? ""
+    assertTrue(encodedGeneral.contains("\\"hide_results_when_empty\\":true"), "编码后的 JSON 应保留 hide_results_when_empty 键")
+
+    // 主索引重建判定：仅修改卷开关/网络重扫间隔/追加排除路径时不触发主索引重建；修改本地目录或全局扫描选项时触发 (Review Focus #5)
+    let mountedVols = [MountedVolumeEntry(path: "/Volumes/NAS", displayName: "NAS", kind: "network")]
+    assertEqual(
+        SettingsPathStatusResolver.requiresPrimaryRebuild(
+            draftIndexPaths: ["~", "/Volumes/NAS"],
+            savedIndexPaths: ["~"],
+            draftIndexApps: false,
+            savedIndexApps: false,
+            draftIncludeHidden: false,
+            savedIncludeHidden: false,
+            draftExcludeSensitive: true,
+            savedExcludeSensitive: true,
+            draftExcludePatterns: ["node_modules"],
+            savedExcludePatterns: ["node_modules"],
+            draftExcludePaths: ["/System"],
+            savedExcludePaths: ["/System"],
+            mountedVolumes: mountedVols,
+            volumeStatuses: []
+        ),
+        false,
+        "仅勾选已挂载外置卷/网络卷时不得触发主索引重建"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.requiresPrimaryRebuild(
+            draftIndexPaths: ["~"],
+            savedIndexPaths: ["~"],
+            draftIndexApps: false,
+            savedIndexApps: false,
+            draftIncludeHidden: false,
+            savedIncludeHidden: false,
+            draftExcludeSensitive: true,
+            savedExcludeSensitive: true,
+            draftExcludePatterns: ["node_modules"],
+            savedExcludePatterns: ["node_modules"],
+            draftExcludePaths: ["/System", "~/Downloads"],
+            savedExcludePaths: ["/System"],
+            mountedVolumes: mountedVols,
+            volumeStatuses: []
+        ),
+        false,
+        "仅追加新的排除路径（或仅改 networkRescanMinutes）时不得触发主索引重建"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.requiresPrimaryRebuild(
+            draftIndexPaths: ["~", "/opt/work"],
+            savedIndexPaths: ["~"],
+            draftIndexApps: false,
+            savedIndexApps: false,
+            draftIncludeHidden: false,
+            savedIncludeHidden: false,
+            draftExcludeSensitive: true,
+            savedExcludeSensitive: true,
+            draftExcludePatterns: ["node_modules"],
+            savedExcludePatterns: ["node_modules"],
+            draftExcludePaths: ["/System"],
+            savedExcludePaths: ["/System"],
+            mountedVolumes: mountedVols,
+            volumeStatuses: []
+        ),
+        true,
+        "新增本地索引目录必须判定为需要主索引重建"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.requiresPrimaryRebuild(
+            draftIndexPaths: ["~"],
+            savedIndexPaths: ["~"],
+            draftIndexApps: false,
+            savedIndexApps: false,
+            draftIncludeHidden: true,
+            savedIncludeHidden: false,
+            draftExcludeSensitive: true,
+            savedExcludeSensitive: true,
+            draftExcludePatterns: ["node_modules"],
+            savedExcludePatterns: ["node_modules"],
+            draftExcludePaths: ["/System"],
+            savedExcludePaths: ["/System"],
+            mountedVolumes: mountedVols,
+            volumeStatuses: []
+        ),
+        true,
+        "切换包含隐藏文件必须判定为需要主索引重建"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.requiresPrimaryRebuild(
+            draftIndexPaths: ["~"],
+            savedIndexPaths: ["~"],
+            draftIndexApps: false,
+            savedIndexApps: false,
+            draftIncludeHidden: false,
+            savedIncludeHidden: false,
+            draftExcludeSensitive: true,
+            savedExcludeSensitive: true,
+            draftExcludePatterns: ["node_modules"],
+            savedExcludePatterns: ["node_modules"],
+            draftExcludePaths: [],
+            savedExcludePaths: ["/System"],
+            mountedVolumes: mountedVols,
+            volumeStatuses: []
+        ),
+        true,
+        "移除已有排除路径必须判定为需要主索引重建"
+    )
+
     print("IndexConfig 编解码、卷状态解析与通知测试全部通过！")
 } catch {
     fputs("测试执行抛出异常: \\(error)\\n", stderr)
@@ -405,10 +523,28 @@ for requiredWindowSymbol in [
     "isPathOfflineHandler",
     "volumeStatusesChangedNotification",
     "openResultWithFeedback",
-    "refreshOfflineStates"
+    "refreshOfflineStates",
+    "FilterQuerySyncCoordinator.deserialize(query: searchField.stringValue)",
+    "!window.isZoomed",
+    "styleMask.contains(.fullScreen)",
+    "isApplyingIdleEmptyState",
+    "CGEventSource.buttonState(.combinedSessionState, button: .left)",
+    "clampedFrameForScreenOverflow",
+    "resetScreenOverflowDebounce",
+    "!window.isOnActiveSpace"
 ] {
     guard searchWindowSource.contains(requiredWindowSymbol) else {
         fputs("断言失败: SearchWindow.swift 缺少 \(requiredWindowSymbol)\n", stderr)
+        exit(1)
+    }
+}
+for forbiddenWindowSymbol in [
+    "NSEvent.pressedMouseButtons",
+    "titlebarAppearsTransparent = true",
+    "collectionBehavior = [.moveToActiveSpace]"
+] {
+    guard !searchWindowSource.contains(forbiddenWindowSymbol) else {
+        fputs("断言失败: SearchWindow.swift 不得包含 \(forbiddenWindowSymbol)（会触发跨屏拖拽冲突）\n", stderr)
         exit(1)
     }
 }

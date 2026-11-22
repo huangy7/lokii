@@ -1,5 +1,6 @@
 /* AppDelegate - tray menu */
 "menu.preferences" = "Preferences…";
+"menu.rebuildIndex" = "Rebuild Index";
 "menu.quit" = "Quit Lokii";
 
 /* AppDelegate - main menu: app */
@@ -16,6 +17,7 @@
 "menu.window" = "Window";
 "menu.close" = "Close";
 "menu.minimize" = "Minimize";
+"menu.resetWindowSize" = "Reset Default Window Size";
 
 /* AppDelegate - about panel */
 "about.tagline" = "Instant file search for macOS";
@@ -35,12 +37,17 @@
 "prefs.hideOnBlur" = "Hide on focus lost";
 "prefs.hideOnBlur.description" = "Automatically hide the window when you switch to another app.";
 "prefs.rememberPosition" = "Remember window position";
-"prefs.rememberPosition.description" = "Restore the last size and position when Lokii opens again.";
+"prefs.rememberPosition.description" = "When off, the window centers slightly above middle on the active display each time it opens; when on, it restores the last dragged position.";
+"prefs.windowSize" = "Window size";
+"prefs.windowSize.description" = "Window dimensions are remembered per display resolution and automatically adapt when opened on each display.";
+"prefs.windowSize.reset" = "Reset Default Size";
 "prefs.defaultTerminal" = "Default Terminal";
 "prefs.defaultTerminal.description" = "Choose the preferred application when opening a directory in terminal.";
 "prefs.defaultTerminal.chooseOther" = "Choose Other Application...";
 
 "prefs.section.search" = "Search";
+"prefs.hideResultsWhenEmpty" = "Hide results when search is empty";
+"prefs.hideResultsWhenEmpty.description" = "Keep the results list hidden when the search field is empty and show quick syntax tips instead.";
 "prefs.maxResults" = "Maximum search results";
 "prefs.maxResults.description" = "Higher values show more matches, but the default is usually enough.";
 
@@ -74,6 +81,9 @@
 "prefs.index.saveFailed" = "Failed to save index settings. Please try again.";
 "prefs.resetToDefaults" = "Restore Defaults";
 "prefs.save" = "Save";
+"prefs.saveAndRebuild" = "Save & Rebuild";
+"prefs.index.rebuildNow" = "Rebuild Index";
+"prefs.index.rebuildNow.help" = "Rescan all saved local index directories immediately";
 "prefs.unsavedChanges.title" = "Index changes are not saved yet";
 "prefs.unsavedChanges.message" = "Your changes to index paths, exclude rules, or hidden file options have not been saved.";
 "prefs.unsavedChanges.save" = "Save";
@@ -99,6 +109,7 @@
 /* SearchWindow - toolbar & view options */
 "search.toggleSidebar" = "Toggle Sidebar";
 "search.rebuildIndex" = "Rebuild Index";
+"search.rebuildIndex.tooltip" = "Rebuild Index (⌘⇧R)";
 "window.viewOptions" = "View Options";
 "window.resetSize" = "Reset Window Size";
 "menu.zoomIn" = "Zoom In";
@@ -126,12 +137,33 @@
 "search.indexReady" = "Index ready";
 "search.empty.title" = "No Matching Files";
 "search.empty.subtitle" = "Check spelling, try fuzzy matching, or press ⌥F to adjust filters";
+"search.empty.subtitleWithQuery" = "No files matching “%@”";
+"search.empty.action.checkKeyword.title" = "Check keywords";
+"search.empty.action.checkKeyword.subtitle" = "Verify spelling or edit query";
+"search.empty.action.tryFuzzy.title" = "Try fuzzy match";
+"search.empty.action.tryFuzzy.subtitle" = "Allow flexible typo-tolerant hits";
+"search.empty.action.tryFuzzy.activeSubtitle" = "Fuzzy match is already active";
+"search.empty.action.checkFilters.title" = "Check filters";
+"search.empty.action.checkFilters.subtitle" = "Adjust file type or size limits";
+"search.empty.action.checkScope.title" = "Verify index scope";
+"search.empty.action.checkScope.subtitle" = "Ensure target folders are indexed";
 "search.empty.excluded.title" = "This Location Isn’t Indexed";
 "search.empty.excluded.subtitle" = "The search path matches an index exclusion rule. Files in this location can’t be searched yet.";
 "search.empty.excluded.tag" = "Exclusion Rule";
 "search.empty.manageRules" = "Manage Index Rules";
 "search.empty.indexing.title" = "Building the Index";
 "search.empty.indexing.subtitle" = "Indexing is still in progress. Some files can’t be searched yet. Please wait.";
+"search.empty.idle.title" = "Search Any File";
+"search.empty.idle.subtitle" = "Type a filename, extension, or search syntax";
+"search.empty.idle.section.syntax" = "Try searching with";
+"search.empty.idle.section.recent" = "Recent Searches";
+"search.empty.idle.clearHistory" = "Clear History";
+"search.empty.idle.tip.wildcard" = "Find PDF files";
+"search.empty.idle.tip.ext" = "Filter extensions";
+"search.empty.idle.tip.or" = "Match either term";
+"search.empty.idle.tip.size" = "Filter by size";
+"search.empty.idle.tip.exclude" = "Exclude a folder";
+"search.empty.idle.tip.scope" = "Limit search scope";
 "search.toolbar.pin" = "Pin Window";
 "search.caseSensitivity.auto" = "Match Case: Auto";
 "search.caseSensitivity.autoActive" = "Match Case: Auto (Uppercase Detected)";
@@ -182,7 +214,10 @@
 "search.col.name" = "Name";
 "search.col.path" = "Path";
 "search.col.dateModified" = "Date Modified";
+"search.col.dateCreated" = "Date Created";
+"search.col.extension" = "Extension";
 "search.col.size" = "Size";
+"search.col.resetDefault" = "Reset Default Columns";
 
 /* FDAGuideWindowController */
 "fda.windowTitle" = "Add Lokii to Full Disk Access";

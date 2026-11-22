@@ -27,6 +27,19 @@ struct PreferencesGeneralPane: View {
                     description: L("prefs.rememberPosition.description"),
                     isOn: $viewModel.rememberPosition
                 )
+                HStack(alignment: .center, spacing: 14) {
+                    SettingsRowLabel(
+                        L("prefs.windowSize"),
+                        description: L("prefs.windowSize.description")
+                    )
+                    Spacer(minLength: 12)
+                    Button(L("prefs.windowSize.reset")) {
+                        viewModel.resetWindowSizes()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!viewModel.hasCustomWindowSizes)
+                }
+                .padding(.vertical, 2)
                 SettingsToggleRow(
                     L("prefs.launchAtLogin"),
                     description: L("prefs.launchAtLogin.description"),
@@ -74,6 +87,12 @@ struct PreferencesGeneralPane: View {
 
             // Section 3: 搜索
             Section(L("prefs.section.search")) {
+                SettingsToggleRow(
+                    L("prefs.hideResultsWhenEmpty"),
+                    description: L("prefs.hideResultsWhenEmpty.description"),
+                    isOn: $viewModel.hideResultsWhenEmpty
+                )
+
                 HStack(alignment: .center, spacing: 14) {
                     SettingsRowLabel(
                         L("prefs.maxResults"),

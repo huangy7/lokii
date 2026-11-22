@@ -51,7 +51,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
     let contentSplitViewItem: NSSplitViewItem
 
     private(set) var rawResults: [FfiSearchResult] = []
-    private var isUpdatingSearchResults = false
+    private(set) var isUpdatingSearchResults = false
     /// 侧边栏折叠期间推迟了目录树构建的脏标记，待用户展开侧边栏或触发目录过滤时即时补建
     private var isDirectoryTreeDirty = false
     /// 当前结果集是否应自动预选首行（活跃检索为 true，默认空查询列表为 false）

@@ -968,13 +968,22 @@ struct PreferencesIndexPane: View {
                 }
                 Spacer()
 
+                Button {
+                    viewModel.triggerManualRebuild()
+                } label: {
+                    Label(L("prefs.index.rebuildNow"), systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isIndexDirty || viewModel.isRebuildingIndex)
+                .help(L("prefs.index.rebuildNow.help"))
+
                 Button(L("prefs.resetToDefaults")) {
                     viewModel.restoreIndexDefaults()
                 }
                 .buttonStyle(.bordered)
                 .disabled(!viewModel.isIndexDirty && viewModel.isDefaultIndexState)
 
-                Button(L("prefs.save")) {
+                Button(viewModel.pendingSaveRequiresRebuild ? L("prefs.saveAndRebuild") : L("prefs.save")) {
                     _ = viewModel.saveIndexChanges()
                 }
                 .buttonStyle(.borderedProminent)

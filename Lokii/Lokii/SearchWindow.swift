@@ -37,33 +37,24 @@ final class SearchWindow: NSWindowController {
         guard let screen = targetScreen ?? NSScreen.main ?? NSScreen.screens.first else {
             return NSRect(x: 0, y: 0, width: 960, height: 640)
         }
-        let visible = screen.visibleFrame
-        // 宽度取可见屏幕宽度的 60%，钳制在 [960, 1280] pt（不超过可用屏幕宽度）
-        let rawWidth = min(max(visible.width * 0.60, 960), 1280)
-        let finalWidth = min(rawWidth, visible.width)
-        // 高度取可见屏幕高度的 62%，钳制在 [600, 860] pt（不超过可用屏幕高度）
-        let rawHeight = min(max(visible.height * 0.62, 600), 860)
-        let finalHeight = min(rawHeight, visible.height)
-
-        // 水平居中，垂直方向位于视窗黄金中心（屏幕中心微偏上 5% 屏幕高度）并钳制在工作区内
-        let x = visible.origin.x + (visible.width - finalWidth) / 2
-        let targetY = visible.origin.y + (visible.height - finalHeight) / 2 + (visible.height * 0.05)
-        let y = min(max(targetY, visible.origin.y), visible.maxY - finalHeight)
-        return NSRect(x: round(x), y: round(y), width: round(finalWidth), height: round(finalHeight))
+        return WindowFrameManager.defaultFrame(on: ScreenMetrics(screen: screen))
     }
 
     /// 在目标屏幕可见工作区内保留既有窗口宽高并黄金居中，避免跨屏唤醒重置用户自定义窗口尺寸
     static func calculateCenteredFrame(preservingSize size: NSSize, on screen: NSScreen) -> NSRect {
-        let visible = screen.visibleFrame
-        let width = min(max(size.width, 780), visible.width)
-        let height = min(max(size.height, 420), visible.height)
-        let x = visible.origin.x + (visible.width - width) / 2
-        let targetY = visible.origin.y + (visible.height - height) / 2 + (visible.height * 0.05)
-        let y = min(max(targetY, visible.origin.y), visible.maxY - height)
-        return NSRect(x: round(x), y: round(y), width: round(width), height: round(height))
+        WindowFrameManager.centeredFrame(preservingSize: size, on: ScreenMetrics(screen: screen))
     }
 
-    private let savedWindowFrameKey = "LokiiMainWindowFrame"
+    private let frameManager = WindowFrameManager()
+    /// 程序主动调整窗口几何期间置 true，阻断 `windowDidResize` / `windowDidMove` 将自动适配写回用户偏好
+    private var isApplyingProgrammaticFrame = false
+    /// 跨屏拖拽彻底松手静止后的安全溢出保护状态（仅当窗口宽高真实大于目标屏可见工作区时才温和收缩）
+    private var pendingScreenOverflowCheck = false
+    private var screenOverflowDebounceWorkItem: DispatchWorkItem?
+    private var screenOverflowButtonPollTimer: Timer?
+    private static let screenOverflowSettleDelay: TimeInterval = 0.16
+    /// 进入空搜索隐藏态期间的重入守卫，防止同步派发空结果回调再次触发 `loadDefaultResults()`
+    private var isApplyingIdleEmptyState = false
     let splitViewController = SearchMainSplitViewController()
     var searchResultsViewController: SearchResultsViewController { splitViewController.searchResultsViewController }
     var sidebarTreeViewController: SidebarTreeViewController { splitViewController.sidebarTreeViewController }
@@ -136,14 +127,13 @@ final class SearchWindow: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.titlebarAppearsTransparent = true
+        // 不启用 titlebarAppearsTransparent：统一工具栏（.unified）与分栏控制器已原生承载无界顶栏，
+        // 透明标题栏会开启点击穿透并诱发客户端与 WindowServer 服务端双重拖拽冲突。
         window.titleVisibility = .hidden
         window.title = "Lokii"
         window.toolbarStyle = .unified
         window.minSize = NSSize(width: 780, height: 420)
         window.isReleasedWhenClosed = false
-        // 允许全局快捷键将窗口就地召唤至当前活跃桌面空间（Space），避免跨空间强行切屏
-        window.collectionBehavior = [.moveToActiveSpace]
 
         super.init(window: window)
 
@@ -180,6 +170,26 @@ final class SearchWindow: NSWindowController {
         searchResultsViewController.onManageIndexRules = {
             (NSApp.delegate as? AppDelegate)?.openIndexPreferences()
         }
+        searchResultsViewController.onSelectSyntaxExample = { [weak self] example in
+            self?.applySyntaxExample(example)
+        }
+        searchResultsViewController.onSelectRecentSearch = { [weak self] query in
+            self?.applySyntaxExample(query)
+        }
+        searchResultsViewController.onClearRecentSearches = { [weak self] in
+            self?.clearRecentSearches()
+        }
+        searchResultsViewController.onFocusSearchField = { [weak self] in
+            self?.focusSearchField()
+        }
+        searchResultsViewController.onEnableFuzzyMode = { [weak self] in
+            guard let self, self.currentMode != .fuzzy else { return }
+            self.toggleMode(.fuzzy)
+        }
+        searchResultsViewController.onOpenFilterPopover = { [weak self] in
+            guard let self else { return }
+            self.filterPopoverController.toggle(relativeTo: self.filterButton)
+        }
         searchResultsViewController.onOpenFDAGuide = {
             FDAGuideWindowController.show()
         }
@@ -213,11 +223,14 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    /// 一键恢复自适应默认窗口尺寸并清除持久化位置
+    /// 一键恢复自适应默认窗口尺寸并清除全部按屏尺寸与持久化位置
     @objc func resetToDefaultWindowFrame() {
         guard let window else { return }
-        clearSavedWindowFrame()
-        window.animator().setFrame(defaultWindowFrame, display: true)
+        frameManager.clearAllCustomSizesAndOrigin()
+        NotificationCenter.default.post(name: .lokiiWindowSizesDidChange, object: nil)
+        let targetScreen = window.screen ?? NSScreen.main ?? NSScreen.screens.first
+        let targetFrame = Self.calculateDefaultWindowFrame(on: targetScreen)
+        applyProgrammaticFrame(targetFrame, display: true, animate: true)
     }
 
     @available(*, unavailable)
@@ -225,23 +238,33 @@ final class SearchWindow: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        cancelPendingScreenOverflowCheck()
+        NotificationCenter.default.removeObserver(self)
+    }
+
     override func showWindow(_ sender: Any?) {
         guard let window = window else { return }
-        
+
+        // 若窗口当前可见但停留在其他桌面空间（Space），先静默移出再于当前活跃空间就地呈现；
+        // 避免常驻 .moveToActiveSpace 在「显示器具有单独的空间」模式下于跨屏交界处干扰拖拽。
+        if window.isVisible && !window.isOnActiveSpace {
+            window.orderOut(nil)
+        }
+
         let isFirstAppear = !window.isVisible
         if isFirstAppear {
             let mouseLoc = NSEvent.mouseLocation
             let mouseScreen = NSScreen.screens.first { NSMouseInRect(mouseLoc, $0.frame, false) }
-            if shouldRememberWindowPosition {
-                // 开启位置记忆时尊重用户持久化坐标；仅当保存位置已脱离全部在线屏幕时才迁移至当前屏
-                let isOnAnyScreen = NSScreen.screens.contains { $0.visibleFrame.intersects(window.frame) }
-                if !isOnAnyScreen, let targetScreen = mouseScreen {
-                    let newFrame = Self.calculateCenteredFrame(preservingSize: window.frame.size, on: targetScreen)
-                    window.setFrame(newFrame, display: false)
-                }
-            } else if let targetScreen = mouseScreen, targetScreen != window.screen {
-                let newFrame = Self.calculateCenteredFrame(preservingSize: window.frame.size, on: targetScreen)
-                window.setFrame(newFrame, display: false)
+            if let targetScreen = mouseScreen ?? window.screen ?? NSScreen.main ?? NSScreen.screens.first {
+                let allMetrics = NSScreen.screens.map { ScreenMetrics(screen: $0) }
+                let newFrame = frameManager.frameOnShow(
+                    currentFrame: window.frame,
+                    targetScreen: ScreenMetrics(screen: targetScreen),
+                    allScreens: allMetrics,
+                    rememberPosition: shouldRememberWindowPosition
+                )
+                applyProgrammaticFrame(newFrame, display: false, animate: false)
             }
 
             window.alphaValue = 0.0
@@ -287,6 +310,7 @@ final class SearchWindow: NSWindowController {
 
     /// 统一窗口收起入口：成对关闭过滤浮层与快速查看面板，避免失焦隐藏或全局快捷键收起残留浮窗
     func hideWindow(animated: Bool = true) {
+        cancelPendingScreenOverflowCheck()
         if filterPopoverController.isShown {
             filterPopoverController.close()
         }
@@ -559,6 +583,7 @@ final class SearchWindow: NSWindowController {
         }
         searchField?.toolTip = historyTitle
         searchField?.needsDisplay = true
+        searchResultsViewController.updateRecentSearches(history)
     }
 
     // MARK: - Notifications
@@ -583,6 +608,8 @@ final class SearchWindow: NSWindowController {
                        name: SearchEngine.volumeStatusesChangedNotification, object: nil)
         nc.addObserver(self, selector: #selector(onAppDidBecomeActive),
                        name: NSApplication.didBecomeActiveNotification, object: nil)
+        nc.addObserver(self, selector: #selector(resetToDefaultWindowFrame),
+                       name: .lokiiResetWindowSize, object: nil)
     }
 
     @objc private func onAppDidBecomeActive() {
@@ -649,9 +676,16 @@ final class SearchWindow: NSWindowController {
     @objc private func onIndexProgress(_ note: Notification) {
         guard indexingState != .failed else { return }
         let phase = note.userInfo?["phase"] as? String ?? ""
+        let source = note.userInfo?["source"] as? String ?? ""
+        // 偏好设置页或外部入口触发手动重建时，同步将主视窗切入 rebuilding 态以保持双端进度与完成刷表一致
+        if indexingState == .idle && source == "rebuild" {
+            indexingState = .rebuilding
+            searchResultsViewController.setRebuildEnabled(false)
+            searchResultsViewController.setRebuildSpinning(true)
+            showInlineProgress()
+        }
         guard phase != "verifying", indexingState != .idle else { return }
         if indexingState == .initializing && !isColdStart { return }
-        let source = note.userInfo?["source"] as? String ?? ""
         if indexingState == .rebuilding && source != "rebuild" { return }
         if indexingState == .initializing && source == "rebuild" { return }
 
@@ -673,9 +707,18 @@ final class SearchWindow: NSWindowController {
         statusText = .formatted("search.indexedCount", formatFileCount(total))
 
         // 完成事件必须与当前所处阶段同源：并发触发的 initialize/rebuild 事件
-        // 到达时仅刷新计数，不得据此结束当前阶段
+        // 到达时仅刷新计数，不得据此结束当前阶段；但若外部触发的快速重建在进度轮询前即已完成，仍需刷新当前视图结果
         switch indexingState {
         case .idle:
+            if source == "rebuild" {
+                searchResultsViewController.updateFDAStatus(hasFDA: engine.hasFullDiskAccess)
+                let currentText = searchField.stringValue
+                if currentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    loadDefaultResults()
+                } else {
+                    performSearch(query: currentText)
+                }
+            }
             return
         case .initializing where source == "rebuild":
             return
@@ -696,7 +739,7 @@ final class SearchWindow: NSWindowController {
         searchResultsViewController.updateFDAStatus(hasFDA: engine.hasFullDiskAccess)
         indexingState = .idle
         let currentText = searchField.stringValue
-        if currentText.isEmpty {
+        if currentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             loadDefaultResults()
         } else {
             performSearch(query: currentText)
@@ -749,7 +792,7 @@ final class SearchWindow: NSWindowController {
         reloadWindowBehavior()
         applyWindowBehaviorFromConfig()
         let currentQuery = searchField.stringValue
-        if currentQuery.isEmpty {
+        if currentQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             loadDefaultResults()
         } else {
             performSearch(query: currentQuery)
@@ -758,60 +801,159 @@ final class SearchWindow: NSWindowController {
 
     // MARK: - Window Behavior
 
-    private func applyInitialWindowFrame() {
+    private func applyProgrammaticFrame(_ frame: NSRect, display: Bool, animate: Bool = false) {
         guard let window else { return }
-        if shouldRememberWindowPosition, restoreSavedWindowFrame() {
-            ensureWindowMeetsMinimumSize(window)
+        isApplyingProgrammaticFrame = true
+        defer { isApplyingProgrammaticFrame = false }
+        let shouldAnimate = animate && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        window.setFrame(frame, display: display, animate: shouldAnimate)
+    }
+
+    private func applyInitialWindowFrame() {
+        guard window != nil else { return }
+        let primaryScreen = NSScreen.main ?? NSScreen.screens.first
+        let primaryMetrics = primaryScreen.map { ScreenMetrics(screen: $0) }
+        let allMetrics = NSScreen.screens.map { ScreenMetrics(screen: $0) }
+        frameManager.migrateLegacyFrameIfNeeded(
+            allScreens: allMetrics,
+            currentScreen: primaryMetrics,
+            rememberPosition: shouldRememberWindowPosition
+        )
+        guard let primaryMetrics else {
+            applyProgrammaticFrame(defaultWindowFrame, display: false, animate: false)
             return
         }
-        window.setFrame(defaultWindowFrame, display: false)
-        window.center()
+        let initial = frameManager.initialFrame(
+            on: primaryMetrics,
+            allScreens: allMetrics,
+            rememberPosition: shouldRememberWindowPosition
+        )
+        applyProgrammaticFrame(initial, display: false, animate: false)
     }
 
     private func applyWindowBehaviorFromConfig() {
         guard let window else { return }
         if shouldRememberWindowPosition {
-            if restoreSavedWindowFrame() {
-                ensureWindowMeetsMinimumSize(window)
-            } else {
-                saveWindowFrameIfNeeded()
+            if frameManager.savedOrigin() == nil {
+                frameManager.saveOrigin(window.frame.origin)
             }
         } else {
-            clearSavedWindowFrame()
+            frameManager.clearSavedOrigin()
         }
     }
 
-    /// 窗口位置记忆开关的本地缓存，随配置重载刷新。
+    /// 窗口位置记忆开关与空搜索隐藏列表开关的本地缓存，随配置重载刷新。
     /// 拖动与缩放回调按显示刷新率触发，若每次实时跨 FFI 解码整份配置将产生大量冗余开销。
     private var shouldRememberWindowPosition = false
+    private var hideResultsWhenEmpty = false
+
+    private var shouldShowIdleEmptyState: Bool {
+        // 以搜索框权威文本反序列化得到的过滤状态为准，避免过滤浮层收起后其内部残留状态永久阻塞空态
+        let queryFilterState = FilterQuerySyncCoordinator.deserialize(query: searchField.stringValue).state
+        let isFilterUnconstrained = queryFilterState.isUnconstrained
+            && (!filterPopoverController.isShown || filterPopoverController.currentState.isUnconstrained)
+        return SearchResultsViewController.shouldShowIdleEmptyState(
+            hideWhenEmpty: hideResultsWhenEmpty,
+            query: searchField.stringValue,
+            isFilterUnconstrained: isFilterUnconstrained,
+            hasActiveDirectory: splitViewController.sidebarTreeViewController.selectedPath != nil,
+            isIndexingIdle: indexingState == .idle
+        )
+    }
 
     private func reloadWindowBehavior() {
-        shouldRememberWindowPosition = engine.getConfig()?.window.rememberPosition ?? false
+        let cfg = engine.getConfig()
+        shouldRememberWindowPosition = cfg?.window.rememberPosition ?? false
+        hideResultsWhenEmpty = cfg?.general.hideResultsWhenEmpty ?? false
     }
 
-    private func saveWindowFrameIfNeeded() {
-        guard shouldRememberWindowPosition, let window else { return }
-        UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: savedWindowFrameKey)
+    private func saveWindowSizeIfNeeded() {
+        guard !isApplyingProgrammaticFrame, let window, window.isVisible, let screen = window.screen else { return }
+        frameManager.saveSize(window.frame.size, for: ScreenMetrics(screen: screen))
+        NotificationCenter.default.post(name: .lokiiWindowSizesDidChange, object: nil)
     }
 
-    @discardableResult
-    private func restoreSavedWindowFrame() -> Bool {
-        guard let frameString = UserDefaults.standard.string(forKey: savedWindowFrameKey),
-              !frameString.isEmpty else { return false }
-        let frame = NSRectFromString(frameString)
-        guard frame.width > 0, frame.height > 0 else { return false }
-        window?.setFrame(frame, display: false)
-        return true
+    private func saveWindowOriginIfNeeded() {
+        guard !isApplyingProgrammaticFrame, shouldRememberWindowPosition, let window, window.isVisible else { return }
+        frameManager.saveOrigin(window.frame.origin)
     }
 
-    private func clearSavedWindowFrame() {
-        UserDefaults.standard.removeObject(forKey: savedWindowFrameKey)
+    private static func isSystemLeftMouseButtonDown() -> Bool {
+        CGEventSource.buttonState(.combinedSessionState, button: .left)
     }
 
-    private func ensureWindowMeetsMinimumSize(_ window: NSWindow) {
-        guard window.frame.width < window.minSize.width || window.frame.height < window.minSize.height else { return }
-        window.setFrame(defaultWindowFrame, display: false)
-        window.center()
+    private func cancelPendingScreenOverflowCheck() {
+        pendingScreenOverflowCheck = false
+        screenOverflowDebounceWorkItem?.cancel()
+        screenOverflowDebounceWorkItem = nil
+        screenOverflowButtonPollTimer?.invalidate()
+        screenOverflowButtonPollTimer = nil
+    }
+
+    private func scheduleScreenOverflowCheck() {
+        guard !isApplyingProgrammaticFrame, let window, window.isVisible else { return }
+        pendingScreenOverflowCheck = true
+        resetScreenOverflowDebounce()
+    }
+
+    private func resetScreenOverflowDebounce() {
+        screenOverflowDebounceWorkItem?.cancel()
+        screenOverflowButtonPollTimer?.invalidate()
+        screenOverflowButtonPollTimer = nil
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.handleScreenOverflowDebounceFired()
+        }
+        screenOverflowDebounceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.screenOverflowSettleDelay, execute: workItem)
+    }
+
+    private func handleScreenOverflowDebounceFired() {
+        guard pendingScreenOverflowCheck else { return }
+        if WindowFrameManager.shouldDeferOverflowClamp(isLeftMouseButtonDown: Self.isSystemLeftMouseButtonDown()) {
+            // 用户在跨屏拖拽中途停顿但手指仍未抬起（含触控板三指拖移），轮询底层系统事件源直到真实松手
+            startPollingForLeftButtonRelease()
+            return
+        }
+        cancelPendingScreenOverflowCheck()
+        performScreenOverflowClampIfNeeded()
+    }
+
+    private func startPollingForLeftButtonRelease() {
+        guard screenOverflowButtonPollTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.pendingScreenOverflowCheck else {
+                self.cancelPendingScreenOverflowCheck()
+                return
+            }
+            if !WindowFrameManager.shouldDeferOverflowClamp(isLeftMouseButtonDown: Self.isSystemLeftMouseButtonDown()) {
+                self.cancelPendingScreenOverflowCheck()
+                self.performScreenOverflowClampIfNeeded()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        screenOverflowButtonPollTimer = timer
+    }
+
+    private func performScreenOverflowClampIfNeeded() {
+        guard !isApplyingProgrammaticFrame,
+              !WindowFrameManager.shouldDeferOverflowClamp(isLeftMouseButtonDown: Self.isSystemLeftMouseButtonDown()),
+              let window = self.window,
+              window.isVisible,
+              !window.inLiveResize,
+              !window.isZoomed,
+              !window.styleMask.contains(.fullScreen),
+              let screen = window.screen else { return }
+        guard let clamped = frameManager.clampedFrameForScreenOverflow(
+            currentFrame: window.frame,
+            newScreen: ScreenMetrics(screen: screen),
+            anchorX: NSEvent.mouseLocation.x
+        ) else { return }
+        applyProgrammaticFrame(clamped, display: true, animate: true)
+        if shouldRememberWindowPosition {
+            frameManager.saveOrigin(clamped.origin)
+        }
     }
 
     // MARK: - Loading Overlay
@@ -914,6 +1056,14 @@ final class SearchWindow: NSWindowController {
 
     // MARK: - Rebuild Action
 
+    var canTriggerRebuild: Bool {
+        indexingState == .idle && !engine.isScanning
+    }
+
+    func triggerRebuildIndex() {
+        rebuildIndexClicked()
+    }
+
     @objc private func rebuildIndexClicked() {
         guard indexingState == .idle else { return }
 
@@ -951,7 +1101,9 @@ final class SearchWindow: NSWindowController {
         lastQuery = query
         searchWorkItem?.cancel()
 
-        if query.isEmpty {
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            filterPopoverController.syncStateFromQuery("")
+            lastExclusionHint = nil
             searchResultsViewController.updateBottomPath(for: nil)
             updateCaseSensitivityButtonState()
             loadDefaultResults()
@@ -993,9 +1145,38 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    /// 搜索框为空时自动呈现全量索引文件与目录树（按修改时间倒序，时间相同时按文件名自然字母顺序排列）
+    /// 点击空搜索语法速查卡片后，将示例填入搜索框并将光标定位到末尾，立即触发一次检索
+    private func applySyntaxExample(_ example: String) {
+        searchField.stringValue = example
+        window?.makeFirstResponder(searchField)
+        if let editor = searchField.currentEditor() {
+            let end = (example as NSString).length
+            editor.selectedRange = NSRange(location: end, length: 0)
+        }
+        applyQuerySyntaxHighlighting()
+        updateCaseSensitivityButtonState()
+        updateRegexModeButtonState()
+        searchChanged()
+    }
+
+    /// 搜索框为空时自动呈现全量索引文件与目录树（按修改时间倒序，时间相同时按文件名自然字母顺序排列）；
+    /// 当用户开启「未输入时隐藏结果列表」且无过滤约束时，跳过通配查询并展示轻量语法速查空态。
     private func loadDefaultResults() {
         guard indexingState != .failed else { return }
+        if shouldShowIdleEmptyState {
+            guard !isApplyingIdleEmptyState else { return }
+            isApplyingIdleEmptyState = true
+            defer { isApplyingIdleEmptyState = false }
+            _ = nextSearchGeneration()
+            lastExclusionHint = nil
+            lastSearchError = nil
+            searchMatchText = nil
+            // 必须在派发空结果前先将空态置为 .idleEmpty，防止同步回调期间因状态未切换而重入
+            searchResultsViewController.emptyState = .idleEmpty
+            splitViewController.updateSearchResults(rawResults: [], tree: nil, deferTreeBuild: false, autoSelectFirstRow: false)
+            searchResultsViewController.updateBottomPath(for: nil)
+            return
+        }
         let generation = nextSearchGeneration()
         let shouldBuildTree = splitViewController.needsDirectoryTree
 
@@ -1366,6 +1547,10 @@ final class SearchWindow: NSWindowController {
         currentMode = (currentMode == mode) ? .auto : mode
         updateFuzzyModeButtonState()
         updateRegexModeButtonState()
+        searchResultsViewController.updateEmptyContext(
+            query: searchField?.stringValue ?? "",
+            isFuzzyActive: currentMode == .fuzzy
+        )
         if let query = searchField?.stringValue, !query.isEmpty {
             performSearch(query: query)
         }
@@ -1466,6 +1651,10 @@ final class SearchWindow: NSWindowController {
     private var lastExclusionHint: String?
 
     private func updateEmptyState() {
+        searchResultsViewController.updateEmptyContext(
+            query: searchField?.stringValue ?? "",
+            isFuzzyActive: currentMode == .fuzzy
+        )
         switch indexingState {
         case .initializing, .rebuilding:
             searchResultsViewController.emptyState = .indexing
@@ -1473,6 +1662,8 @@ final class SearchWindow: NSWindowController {
             // 失败有自己的告警与底栏状态，空态不冒充"正在建立索引"
             if let hint = lastExclusionHint {
                 searchResultsViewController.emptyState = .excluded(rule: hint)
+            } else if shouldShowIdleEmptyState {
+                searchResultsViewController.emptyState = .idleEmpty
             } else {
                 searchResultsViewController.emptyState = .noMatches
             }
@@ -1595,7 +1786,15 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
 
     func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?) {
         guard lastSearchError == nil else { return }
-        if !searchField.stringValue.isEmpty || activeDirectory != nil {
+        if !isApplyingIdleEmptyState
+            && !splitViewController.isUpdatingSearchResults
+            && activeDirectory == nil
+            && shouldShowIdleEmptyState
+            && (!splitViewController.rawResults.isEmpty || searchResultsViewController.emptyState != .idleEmpty) {
+            loadDefaultResults()
+            return
+        }
+        if !searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || activeDirectory != nil {
             updateMatchCountText(filteredCount)
         } else {
             searchMatchText = nil
@@ -1607,11 +1806,21 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
 
 extension SearchWindow: NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
-        saveWindowFrameIfNeeded()
+        saveWindowOriginIfNeeded()
+        if !isApplyingProgrammaticFrame && pendingScreenOverflowCheck {
+            resetScreenOverflowDebounce()
+        }
     }
 
     func windowDidResize(_ notification: Notification) {
-        saveWindowFrameIfNeeded()
+        if !isApplyingProgrammaticFrame {
+            cancelPendingScreenOverflowCheck()
+        }
+        saveWindowSizeIfNeeded()
+    }
+
+    func windowDidChangeScreen(_ notification: Notification) {
+        scheduleScreenOverflowCheck()
     }
     
     func windowShouldClose(_ sender: NSWindow) -> Bool {
