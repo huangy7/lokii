@@ -241,7 +241,8 @@ impl PrimaryWorkQueue {
             if guard.aborted {
                 return None;
             }
-            if let Some(dir) = guard.dirs.pop_front() {
+            // 采用 LIFO 深度优先出队：显著压缩峰值目录队列内存占用，并提升内核 VFS dcache 局部性
+            if let Some(dir) = guard.dirs.pop_back() {
                 guard.active_workers += 1;
                 return Some(dir);
             }
@@ -255,12 +256,20 @@ impl PrimaryWorkQueue {
     fn finish_dir(&self, new_subdirs: &mut Vec<PathBuf>) {
         let mut guard = self.state.lock();
         guard.active_workers = guard.active_workers.saturating_sub(1);
-        if !guard.aborted && !new_subdirs.is_empty() {
+        let added = if !guard.aborted && !new_subdirs.is_empty() {
+            let count = new_subdirs.len();
             guard.dirs.extend(new_subdirs.drain(..));
+            count
         } else {
             new_subdirs.clear();
-        }
-        if !guard.dirs.is_empty() || guard.active_workers == 0 {
+            0
+        };
+        if guard.dirs.is_empty() && guard.active_workers == 0 {
+            self.cvar.notify_all();
+        } else if added == 1 {
+            // 单子目录入队时仅唤醒一个等待线程，规避多核条件变量惊群
+            self.cvar.notify_one();
+        } else if added > 1 {
             self.cvar.notify_all();
         }
     }
@@ -376,7 +385,7 @@ fn scan_borrowed_with_sink(
     }
 
     let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 4))
+        .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4);
     let queue = PrimaryWorkQueue::new(initial_dirs);
     let cancel = std::sync::atomic::AtomicBool::new(false);
@@ -410,6 +419,7 @@ fn scan_borrowed_with_sink(
                 #[cfg(target_os = "macos")]
                 let mut bulk_buf = vec![0u64; 8192];
                 let mut path_buf = String::with_capacity(512);
+                let mut direct_protected: Vec<&PathBuf> = Vec::new();
                 let always_mounted = || true;
 
                 while let Some(dir) = queue_ref.pop_blocking() {
@@ -429,6 +439,21 @@ fn scan_borrowed_with_sink(
                     }
                     let prefix_len = path_buf.len();
 
+                    // 目录级预判：仅提取直接挂在当前目录之下的受保护子路径与子项过滤上下文，
+                    // 避免在枚举海量文件时重复扫描 70+ 条 TCC 规则与 25+ 条排除前缀。
+                    direct_protected.clear();
+                    if !skip_paths_ref.is_empty() {
+                        let child_depth = dir.components().count() + 1;
+                        for protected in skip_paths_ref {
+                            if protected.components().count() == child_depth
+                                && path_starts_with_ci(protected, &dir)
+                            {
+                                direct_protected.push(protected);
+                            }
+                        }
+                    }
+                    let dir_ctx = filter_ref.dir_child_context(&dir, include_hidden);
+
                     let mut names = String::new();
                     let mut items = Vec::new();
                     let subdirs = &mut dir_guard.subdirs;
@@ -444,14 +469,16 @@ fn scan_borrowed_with_sink(
                         path_buf.push_str(name);
                         let full_path = Path::new(&path_buf);
 
-                        // 没有 FDA 时在进入前拦截受保护路径，避免触发系统权限弹窗
-                        if !skip_paths_ref.is_empty()
-                            && is_protected_or_descendant(full_path, skip_paths_ref)
+                        // 没有 FDA 时仅在当前目录存在直接受保护子项时才比对 TCC 列表，避免触发系统权限弹窗
+                        if !direct_protected.is_empty()
+                            && direct_protected
+                                .iter()
+                                .any(|protected| paths_equal_ci(full_path, protected))
                         {
                             return Ok(());
                         }
 
-                        match filter_ref.evaluate_with_hidden(full_path, is_dir, include_hidden) {
+                        match filter_ref.evaluate_child(&dir_ctx, full_path, name, is_dir) {
                             crate::filter::ScopeDecision::HardDrop => return Ok(()),
                             crate::filter::ScopeDecision::IndexShallowContainer => {}
                             crate::filter::ScopeDecision::IndexNormally => {
@@ -1301,8 +1328,9 @@ pub fn scan_volume_compact_atomic(
     let mut dirs = std::collections::VecDeque::new();
     dirs.push_back(root.to_path_buf());
     let mut is_first_dir = true;
+    let include_hidden = filter.include_hidden();
 
-    while let Some(dir) = dirs.pop_front() {
+    while let Some(dir) = dirs.pop_back() {
         if cancel.load(Ordering::Relaxed) {
             return Err(VolumeScanError::Cancelled);
         }
@@ -1318,6 +1346,7 @@ pub fn scan_volume_compact_atomic(
         let prefix_len = path_buf.len();
         let is_root = is_first_dir;
         is_first_dir = false;
+        let dir_ctx = filter.dir_child_context(&dir, include_hidden);
 
         let mut handle_entry = |raw_name: &std::ffi::OsStr,
                                 name: &str,
@@ -1328,7 +1357,7 @@ pub fn scan_volume_compact_atomic(
          -> Result<(), VolumeScanError> {
             path_buf.truncate(prefix_len);
             path_buf.push_str(name);
-            let decision = filter.evaluate(Path::new(&path_buf), is_dir);
+            let decision = filter.evaluate_child(&dir_ctx, Path::new(&path_buf), name, is_dir);
             match decision {
                 crate::filter::ScopeDecision::HardDrop => return Ok(()),
                 crate::filter::ScopeDecision::IndexShallowContainer => {}
@@ -1385,6 +1414,298 @@ pub fn scan_volume_compact_atomic(
     if cancel.load(Ordering::Relaxed) {
         return Err(VolumeScanError::Cancelled);
     }
+
+    Ok(index)
+}
+
+/// 并行原子扫描本地外置高速卷（如 Thunderbolt / USB-C 外置 SSD）并流式写入 `CompactIndex`。
+///
+/// 采用 DFS 工作队列（上限 8 线程）+ 目录级 O(1) 过滤 + `getattrlistbulk(2)` 批量属性读取；
+/// 任何工作线程检测到取消或卷卸载断开错误时立即中止全队列并释放句柄，避免卸载残留。
+pub fn scan_volume_compact_atomic_parallel(
+    root: &Path,
+    filter: &crate::filter::CompiledFilter,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    is_mounted: &(dyn Fn() -> bool + Sync),
+    on_progress: &mut dyn FnMut(u64),
+) -> Result<crate::compact_index::CompactIndex, VolumeScanError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(VolumeScanError::Cancelled);
+    }
+
+    if !is_mounted() {
+        return Err(VolumeScanError::Disconnected(format!(
+            "volume at {:?} is not mounted",
+            root
+        )));
+    }
+
+    let root_meta = match std::fs::metadata(root) {
+        Ok(m) => m,
+        Err(err) => {
+            if is_disconnect_error(&err, is_mounted) {
+                return Err(VolumeScanError::Disconnected(err.to_string()));
+            } else {
+                return Err(VolumeScanError::RootUnavailable(err.to_string()));
+            }
+        }
+    };
+
+    if !root_meta.is_dir() {
+        return Err(VolumeScanError::RootUnavailable(format!(
+            "{:?} is not a directory",
+            root
+        )));
+    }
+
+    let mut index = crate::compact_index::CompactIndex::new();
+    let mut hints = crate::compact_index::InternHints::default();
+    let mut ext_buf = String::with_capacity(32);
+
+    let root_str = root.to_string_lossy();
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| root_str.clone());
+    let root_modified = system_time_to_unix_secs(root_meta.modified());
+    let root_created = system_time_to_unix_secs(root_meta.created());
+    index
+        .push_borrowed_with_hints(
+            &root_name,
+            &root_str,
+            true,
+            0,
+            root_modified,
+            root_created,
+            "",
+            &mut hints,
+        )
+        .map_err(|e| VolumeScanError::IndexLimit(e.to_string()))?;
+
+    let mut progress_count = 1u64;
+    on_progress(progress_count);
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
+    let queue = PrimaryWorkQueue::new(vec![root.to_path_buf()]);
+    let local_abort = std::sync::atomic::AtomicBool::new(false);
+    let first_error: parking_lot::Mutex<Option<VolumeScanError>> = parking_lot::Mutex::new(None);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PrimaryDirBatch>(64);
+    let include_hidden = filter.include_hidden();
+
+    let queue_ref = &queue;
+    let cancel_ref = cancel.as_ref();
+    let local_abort_ref = &local_abort;
+    let first_error_ref = &first_error;
+
+    struct VolumeAbortGuard<'a> {
+        local_abort: &'a std::sync::atomic::AtomicBool,
+        queue: &'a PrimaryWorkQueue,
+    }
+    impl Drop for VolumeAbortGuard<'_> {
+        fn drop(&mut self) {
+            self.local_abort.store(true, Ordering::Relaxed);
+            self.queue.abort();
+        }
+    }
+
+    let sink_result: Result<(), VolumeScanError> = std::thread::scope(|scope| {
+        let _abort_on_exit = VolumeAbortGuard {
+            local_abort: local_abort_ref,
+            queue: queue_ref,
+        };
+
+        for _ in 0..worker_count {
+            let worker_tx = tx.clone();
+            scope.spawn(move || {
+                #[cfg(target_os = "macos")]
+                let mut bulk_buf = vec![0u64; 8192];
+                let mut path_buf = String::with_capacity(512);
+
+                while let Some(dir) = queue_ref.pop_blocking() {
+                    let mut dir_guard = ActiveDirGuard::new(queue_ref);
+                    if cancel_ref.load(Ordering::Relaxed) || local_abort_ref.load(Ordering::Relaxed)
+                    {
+                        dir_guard.finish();
+                        break;
+                    }
+
+                    let dir_str = dir.to_string_lossy();
+                    path_buf.clear();
+                    if dir_str == "/" {
+                        path_buf.push('/');
+                    } else {
+                        path_buf.push_str(dir_str.trim_end_matches('/'));
+                        path_buf.push('/');
+                    }
+                    let prefix_len = path_buf.len();
+                    let is_root = dir.as_path() == root;
+                    let dir_ctx = filter.dir_child_context(&dir, include_hidden);
+
+                    let mut names = String::new();
+                    let mut items = Vec::new();
+                    let subdirs = &mut dir_guard.subdirs;
+
+                    let mut handle_entry = |raw_name: &std::ffi::OsStr,
+                                            name: &str,
+                                            is_dir: bool,
+                                            size: u64,
+                                            modified: u64,
+                                            created_at: u64|
+                     -> Result<(), VolumeScanError> {
+                        if local_abort_ref.load(Ordering::Relaxed) {
+                            return Err(VolumeScanError::Cancelled);
+                        }
+                        path_buf.truncate(prefix_len);
+                        path_buf.push_str(name);
+                        let decision =
+                            filter.evaluate_child(&dir_ctx, Path::new(&path_buf), name, is_dir);
+                        match decision {
+                            crate::filter::ScopeDecision::HardDrop => return Ok(()),
+                            crate::filter::ScopeDecision::IndexShallowContainer => {}
+                            crate::filter::ScopeDecision::IndexNormally => {
+                                if is_dir {
+                                    subdirs.push(dir.join(raw_name));
+                                }
+                            }
+                        }
+
+                        let name_start = names.len() as u32;
+                        names.push_str(name);
+                        items.push(PrimaryScannedItem {
+                            name_start,
+                            name_len: name.len() as u32,
+                            is_dir,
+                            size,
+                            modified,
+                            created_at,
+                        });
+                        Ok(())
+                    };
+
+                    let enum_res: Result<(), VolumeScanError> = {
+                        #[cfg(target_os = "macos")]
+                        {
+                            match macos_bulk::enumerate_dir_bulk(
+                                &dir,
+                                is_root,
+                                true,
+                                &mut bulk_buf,
+                                cancel_ref,
+                                is_mounted,
+                                &mut handle_entry,
+                            ) {
+                                Ok(macos_bulk::BulkOutcome::Done) => Ok(()),
+                                Ok(macos_bulk::BulkOutcome::Unsupported) => enumerate_dir_fallback(
+                                    &dir,
+                                    is_root,
+                                    true,
+                                    cancel_ref,
+                                    is_mounted,
+                                    &mut handle_entry,
+                                ),
+                                Err(err) => Err(err),
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            enumerate_dir_fallback(
+                                &dir,
+                                is_root,
+                                true,
+                                cancel_ref,
+                                is_mounted,
+                                &mut handle_entry,
+                            )
+                        }
+                    };
+
+                    if let Err(err) = enum_res {
+                        let mut slot = first_error_ref.lock();
+                        if slot.is_none() {
+                            *slot = Some(err);
+                        }
+                        drop(slot);
+                        local_abort_ref.store(true, Ordering::Relaxed);
+                        queue_ref.abort();
+                        dir_guard.subdirs.clear();
+                        dir_guard.finish();
+                        break;
+                    }
+
+                    dir_guard.finish();
+
+                    if !items.is_empty() {
+                        let parent = path_buf[..prefix_len].to_owned();
+                        if worker_tx
+                            .send(PrimaryDirBatch {
+                                parent,
+                                names,
+                                items,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut sink_path_buf = String::with_capacity(512);
+        let mut res: Result<(), VolumeScanError> = Ok(());
+        for batch in rx {
+            if cancel_ref.load(Ordering::Relaxed) {
+                res = Err(VolumeScanError::Cancelled);
+                local_abort_ref.store(true, Ordering::Relaxed);
+                queue_ref.abort();
+                break;
+            }
+            sink_path_buf.clear();
+            sink_path_buf.push_str(&batch.parent);
+            let prefix_len = sink_path_buf.len();
+
+            for item in &batch.items {
+                let start = item.name_start as usize;
+                let end = start + item.name_len as usize;
+                let name = &batch.names[start..end];
+                sink_path_buf.truncate(prefix_len);
+                sink_path_buf.push_str(name);
+                write_extension_lowercase(name, item.is_dir, &mut ext_buf);
+                if let Err(err) = index.push_borrowed_with_hints(
+                    name,
+                    &sink_path_buf,
+                    item.is_dir,
+                    item.size,
+                    item.modified,
+                    item.created_at,
+                    &ext_buf,
+                    &mut hints,
+                ) {
+                    res = Err(VolumeScanError::IndexLimit(err.to_string()));
+                    local_abort_ref.store(true, Ordering::Relaxed);
+                    queue_ref.abort();
+                    break;
+                }
+                progress_count += 1;
+                on_progress(progress_count);
+            }
+            if res.is_err() {
+                break;
+            }
+        }
+        res
+    });
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(VolumeScanError::Cancelled);
+    }
+    if let Some(err) = first_error.into_inner() {
+        return Err(err);
+    }
+    sink_result?;
 
     Ok(index)
 }
@@ -2047,6 +2368,98 @@ mod tests {
             },
         );
         assert!(matches!(cancelled, Err(VolumeScanError::Cancelled)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_scan_volume_compact_atomic_parallel_matches_serial_and_handles_cancel() {
+        let root = std::env::temp_dir().join(format!(
+            "lokii_vol_parallel_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::create_dir_all(root.join("d/e")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("App.app/Contents/MacOS")).unwrap();
+        fs::create_dir_all(root.join(".ssh")).unwrap();
+        fs::write(root.join("root.txt"), "root").unwrap();
+        fs::write(root.join("a/b/c/deep.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("d/e/中文报告.md"), "内容").unwrap();
+        fs::write(root.join("node_modules/pkg/drop.js"), "ignored").unwrap();
+        fs::write(root.join("App.app/Contents/MacOS/App"), "bin").unwrap();
+        fs::write(root.join(".ssh/id_rsa"), "secret").unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.index.include_hidden = true;
+        config.index.exclude_sensitive = true;
+        config.index.index_apps = true;
+        let filter = crate::filter::CompiledFilter::for_volume(&config, &root);
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut serial_progress = 0u64;
+        let serial = scan_volume_compact_atomic(
+            &root,
+            &filter,
+            &cancel,
+            &|| true,
+            &mut |c| serial_progress = c,
+        )
+        .unwrap();
+
+        let mut parallel_progress = 0u64;
+        let parallel = scan_volume_compact_atomic_parallel(
+            &root,
+            &filter,
+            &cancel,
+            &|| true,
+            &mut |c| parallel_progress = c,
+        )
+        .unwrap();
+
+        assert_eq!(parallel.len(), serial.len());
+        assert_eq!(parallel_progress, parallel.len() as u64);
+        assert_eq!(serial_progress, serial.len() as u64);
+
+        let collect_map = |idx: &crate::compact_index::CompactIndex| {
+            let mut map = std::collections::HashMap::new();
+            let mut path_buf = String::new();
+            for (_, view) in idx.iter() {
+                view.path_into(&mut path_buf);
+                map.insert(
+                    path_buf.clone(),
+                    (
+                        view.is_dir,
+                        view.extension.to_string(),
+                        if view.is_dir { 0 } else { view.size },
+                    ),
+                );
+            }
+            map
+        };
+        assert_eq!(collect_map(&parallel), collect_map(&serial));
+
+        // 预取消与未挂载均应快速返回对应错误
+        let cancelled = scan_volume_compact_atomic_parallel(
+            &root,
+            &filter,
+            &Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            &|| true,
+            &mut |_| {},
+        );
+        assert!(matches!(cancelled, Err(VolumeScanError::Cancelled)));
+
+        let disconnected = scan_volume_compact_atomic_parallel(
+            &root,
+            &filter,
+            &cancel,
+            &|| false,
+            &mut |_| {},
+        );
+        assert!(matches!(disconnected, Err(VolumeScanError::Disconnected(_))));
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

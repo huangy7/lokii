@@ -303,6 +303,61 @@ fn bigram_bucket(c0: u8, c1: u8) -> u32 {
     (h >> 24) % 46
 }
 
+/// 64 位无二次哈希直通 Hasher：用于 `StringPool::lookup`（键本身已是经充分雪崩混洗的 `u64` 哈希值），
+/// 避免 `HashMap` 对 `u64` 键重复运行 SipHash。
+#[derive(Default)]
+struct IdentityU64Hasher(u64);
+
+impl std::hash::Hasher for IdentityU64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut acc = self.0;
+        for &b in bytes {
+            acc = acc.wrapping_mul(0x100_0000_01b3) ^ (b as u64);
+        }
+        self.0 = acc;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type IdentityBuildHasher = std::hash::BuildHasherDefault<IdentityU64Hasher>;
+
+/// 针对文件名与路径字符串的 64 位高速哈希（8 字节分块 + SplitMix64 终结混洗）：
+/// 确保低位桶索引与高 7 位 SIMD 控制标签均充分雪崩，供 `IdentityU64Hasher` 直通查表。
+#[inline]
+fn hash_str_64(text: &str) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ (text.len() as u64).wrapping_mul(K);
+    let bytes = text.as_bytes();
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut tail = 0u64;
+        for (i, &b) in rem.iter().enumerate() {
+            tail |= (b as u64) << (i * 8);
+        }
+        h = (h.rotate_left(5) ^ tail).wrapping_mul(K);
+    }
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
 struct PoolEntry {
     text: Box<str>,
     references: u32,
@@ -312,16 +367,19 @@ struct PoolEntry {
 #[derive(Default)]
 pub(crate) struct StringPool {
     slots: Vec<Option<PoolEntry>>,
-    lookup: std::collections::HashMap<u64, u32>,
+    lookup: std::collections::HashMap<u64, u32, IdentityBuildHasher>,
     free: Vec<u32>,
     live: usize,
 }
 
 impl StringPool {
-    pub(crate) fn from_cache(
-        strings: Vec<String>,
+    pub(crate) fn from_cache<S>(
+        strings: Vec<S>,
         references: Vec<u32>,
-    ) -> Result<Self, IndexError> {
+    ) -> Result<Self, IndexError>
+    where
+        S: AsRef<str> + Into<Box<str>>,
+    {
         if strings.len() != references.len() {
             return Err(IndexError::InvalidReference);
         }
@@ -336,20 +394,21 @@ impl StringPool {
             if id == u32::MAX {
                 return Err(IndexError::IdOverflow);
             }
-            let hash = pool.hash(&text);
+            let text_ref = text.as_ref();
+            let hash = pool.hash(text_ref);
             let next = pool.lookup.get(&hash).copied().unwrap_or(u32::MAX);
             let mut current = next;
             while current != u32::MAX {
                 let slot = pool.slots[current as usize]
                     .as_ref()
                     .ok_or(IndexError::InvalidReference)?;
-                if slot.text.as_ref() == text {
+                if slot.text.as_ref() == text_ref {
                     return Err(IndexError::InvalidReference);
                 }
                 current = slot.next;
             }
             pool.slots.push(Some(PoolEntry {
-                text: text.into_boxed_str(),
+                text: text.into(),
                 references,
                 next,
             }));
@@ -359,9 +418,9 @@ impl StringPool {
         Ok(pool)
     }
 
+    #[inline]
     fn hash(&self, text: &str) -> u64 {
-        use std::hash::BuildHasher;
-        self.lookup.hasher().hash_one(text)
+        hash_str_64(text)
     }
 
     pub(crate) fn intern(&mut self, text: &str) -> Result<u32, IndexError> {
@@ -610,6 +669,23 @@ impl StringPool {
         vec![0; self.slots.len()]
     }
 
+    /// 池内槽位是否完全紧凑无空洞（每个槽位 ID 即其序列化序号，存盘时可免重映射直接借用 records）。
+    #[inline]
+    pub(crate) fn is_dense(&self) -> bool {
+        self.free.is_empty() && self.live == self.slots.len()
+    }
+
+    pub(crate) fn cache_strings_dense(&self) -> Vec<&str> {
+        debug_assert!(self.is_dense());
+        let mut strings = Vec::with_capacity(self.live);
+        for slot in &self.slots {
+            if let Some(slot) = slot {
+                strings.push(&*slot.text);
+            }
+        }
+        strings
+    }
+
     pub(crate) fn cache_strings(&self) -> (Vec<&str>, Vec<u32>) {
         let mut strings = Vec::with_capacity(self.live);
         let mut mapping = vec![u32::MAX; self.slots.len()];
@@ -660,7 +736,7 @@ impl StringPool {
 
         let mut new_lookup = std::collections::HashMap::with_capacity_and_hasher(
             self.live,
-            self.lookup.hasher().clone(),
+            IdentityBuildHasher::default(),
         );
         let mut new_next = vec![u32::MAX; self.slots.len()];
 

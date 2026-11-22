@@ -396,7 +396,12 @@ fn save_dirty_caches_and_mark(
 ) -> HashSet<String> {
     let mut saved_ids = HashSet::new();
     for save in saves {
-        if cache::save_compact(&save.store.read(), save.checkpoint, &save.cache_path).is_ok() {
+        // 仅在短读锁内完成内存字节编码，立即释放读锁后再落盘与 sync_data()，避免阻塞增量写入与并发搜索
+        let encoded = {
+            let guard = save.store.read();
+            cache::encode_compact(&guard)
+        };
+        if cache::save_encoded_compact(&encoded, save.checkpoint, &save.cache_path).is_ok() {
             saved_ids.insert(save.volume_id.clone());
             let mut guard = inner.write();
             if let Some(slot) = guard.slots.iter_mut().find(|s| {
@@ -672,10 +677,16 @@ impl VolumeCoordinator {
 
                     let (cfg_changed, rescan_minutes, cfg_opt) = {
                         let guard = config_store.read();
-                        let changed = last_index_cfg.as_ref() != Some(&guard.index);
                         let rescan_mins = guard.index.network_rescan_minutes;
-                        let cfg = if changed { Some(guard.clone()) } else { None };
-                        (changed, rescan_mins, cfg)
+                        if last_index_cfg.as_ref() == Some(&guard.index) {
+                            (false, rescan_mins, None)
+                        } else if inner.read().config.index == guard.index {
+                            // 已由前序 on_config_updated 完成对账，仅同步本地游标避免重复全量对账
+                            last_index_cfg = Some(guard.index.clone());
+                            (false, rescan_mins, None)
+                        } else {
+                            (true, rescan_mins, Some(guard.clone()))
+                        }
                     };
 
                     let mounts = (mount_lister)();
@@ -948,6 +959,10 @@ impl VolumeCoordinator {
     }
 
     pub fn on_config_updated(&self, new_config: &AppConfig) {
+        // 若卷协调器内部已与目标索引配置一致，跳过重复挂载表探测与对账（防止前端写盘触发多路重复回调）
+        if self.inner.read().config.index == new_config.index {
+            return;
+        }
         let volumes_dir = self.volumes_dir();
         let mounts = (self.mount_lister)();
         let effects = apply_config_update(&self.inner, &mounts, &volumes_dir, new_config);
@@ -1088,6 +1103,25 @@ impl VolumeCoordinator {
             .map(|s| s.store.len() as u64)
             .sum();
         primary.len() as u64 + vol_sum
+    }
+
+    /// 导出当前已加载缓存的非空卷分片存储句柄快照，供后台预热线程在无锁状态下独立预热，
+    /// 不持有 `Arc<VolumeCoordinator>` 强引用以免干扰协调器析构生命周期。
+    pub(crate) fn loaded_stores(&self) -> Vec<IndexStore> {
+        self.inner
+            .read()
+            .slots
+            .iter()
+            .filter(|slot| slot.has_cache && !slot.store.is_empty())
+            .map(|slot| slot.store.clone())
+            .collect()
+    }
+
+    /// 为当前已加载缓存的所有卷分片预热查询侧索引（CSR/签名/排序表），消除外置与离线卷首次搜索冷启动毛刺。
+    pub fn warm_query_indexes(&self) {
+        for store in self.loaded_stores() {
+            store.warm_query_index();
+        }
     }
 
     pub fn persist_all(&self) {
@@ -2144,13 +2178,24 @@ fn execute_scan_job(
 
     let scan_started = Instant::now();
     let mut progress = |_count: u64| {};
-    let scan_result = scanner::scan_volume_compact_atomic(
-        &job.root,
-        &filter,
-        &job.cancel,
-        &is_mounted,
-        &mut progress,
-    );
+    // 本地外置高速卷启用多线程 DFS 并行扫描；网络共享卷保持单线程批量读取，规避 SMB 并发锁竞争
+    let scan_result = if job.kind == VolumeKind::LocalExternal {
+        scanner::scan_volume_compact_atomic_parallel(
+            &job.root,
+            &filter,
+            &job.cancel,
+            &is_mounted,
+            &mut progress,
+        )
+    } else {
+        scanner::scan_volume_compact_atomic(
+            &job.root,
+            &filter,
+            &job.cancel,
+            &is_mounted,
+            &mut progress,
+        )
+    };
 
     match scan_result {
         Ok(compact) => {
@@ -4383,5 +4428,82 @@ mod tests {
         // 超过 300 秒冷却期后应触发周期重扫
         slot.last_sync_at = Some(now_unix.saturating_sub(305));
         assert!(network_slot_rescan_due(&slot, Duration::from_secs(60), now_unix));
+    }
+
+    #[test]
+    fn on_config_updated_skips_redundant_reconcile_and_warms_loaded_shards() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let volumes_dir = cache_dir.path().join("volumes");
+        let rec = make_network_record(
+            "/Volumes/Archive",
+            "/Volumes/Archive",
+            Some("/Volumes/Archive"),
+            "",
+            "Archive",
+            "//nas.local/archive",
+            1,
+            false,
+        );
+        let mut manifest = VolumeManifest::default();
+        manifest.upsert(rec.clone());
+        manifest.save_atomic(&volumes_dir).unwrap();
+        seed_volume_cache(
+            &volumes_dir,
+            &rec,
+            vec![make_entry(
+                "quarterly_report.pdf",
+                "/Volumes/Archive/quarterly_report.pdf",
+                false,
+            )],
+        );
+
+        let mut config = AppConfig::default();
+        config.index.index_paths = vec!["/Volumes/Archive".to_string()];
+        config.index.exclude_paths = vec![];
+
+        let mount_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mount_calls_ref = Arc::clone(&mount_calls);
+        let coord = VolumeCoordinator::with_mount_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(move || {
+                mount_calls_ref.fetch_add(1, Ordering::SeqCst);
+                base_mounts()
+            }),
+        );
+        coord.initialize(&config, Arc::new(|| {}));
+        assert_eq!(mount_calls.load(Ordering::SeqCst), 1);
+
+        // 传入与当前 index 完全一致的配置应直接短路，不触发重复挂载表探测
+        coord.on_config_updated(&config);
+        assert_eq!(
+            mount_calls.load(Ordering::SeqCst),
+            1,
+            "unchanged IndexConfig must short-circuit without calling mount_lister"
+        );
+
+        // 真正修改 index 配置时应触发一次对账，再次重复传入则继续短路
+        let mut next = config.clone();
+        next.index.exclude.push("cache_tmp".to_string());
+        coord.on_config_updated(&next);
+        assert_eq!(mount_calls.load(Ordering::SeqCst), 2);
+        coord.on_config_updated(&next);
+        assert_eq!(mount_calls.load(Ordering::SeqCst), 2);
+
+        // 后台预热应覆盖已加载的离线卷分片并保证立即可搜
+        let stores = coord.loaded_stores();
+        assert_eq!(stores.len(), 1);
+        coord.warm_query_indexes();
+        let primary = IndexStore::new();
+        let (hits, _, err, _) = coord.search(
+            &primary,
+            "quarterly_report",
+            SearchMode::Substring,
+            CaseSensitivity::Auto,
+            10,
+            true,
+        );
+        assert!(err.is_none());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].result.entry.name, "quarterly_report.pdf");
     }
 }

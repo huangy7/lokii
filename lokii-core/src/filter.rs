@@ -130,6 +130,18 @@ pub(crate) fn is_system_noise_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 目录级子项过滤上下文：在枚举目录前计算一次，使该目录下所有直接子条目
+/// 只需 O(1) 检查末端文件名，免除每文件重复遍历全部祖先组件与扫描多条前缀规则。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirChildContext {
+    /// 父目录自身是否已按 `evaluate_with_hidden(dir, true, include_hidden)` 常规放行。
+    parent_admitted: bool,
+    /// 当前目录下是否存在深度恰好为 `dir_depth + 1` 的直接子级 `include_roots` 或 `excluded_prefixes` 规则。
+    has_child_prefix_override: bool,
+    /// 本次遍历是否包含用户隐藏文件。
+    include_hidden: bool,
+}
+
 /// 统一索引范围策略：按严格优先级裁决显式排除、系统噪声、用户隐藏开关与浅层容器目录。
 ///
 /// 构造期完成路径展开与前缀预编译，确保扫描和事件热路径保持零额外字符串规范化开销。
@@ -185,6 +197,10 @@ impl IndexScopePolicy {
             sensitive_names: config.index.sensitive_names.clone(),
             index_apps: config.index.index_apps,
         }
+    }
+
+    pub(crate) fn include_hidden(&self) -> bool {
+        self.include_hidden
     }
 
     pub(crate) fn has_empty_include_roots(&self) -> bool {
@@ -371,6 +387,75 @@ impl IndexScopePolicy {
             }
         }
 
+        ScopeDecision::IndexNormally
+    }
+
+    /// 预计算目录 `dir` 的子项过滤上下文，供扫描器在枚举目录时为所有直接子条目执行 O(1) 判定。
+    ///
+    /// 任意直接子路径 `dir/child` 的组件深度严格为 `dir_depth + 1`，
+    /// 因此前缀集合中只有深度恰好等于 `dir_depth + 1` 且位于 `dir` 之下的规则可能改变 `in_depth` 或 `ex_depth`。
+    pub(crate) fn dir_child_context(&self, dir: &Path, include_hidden: bool) -> DirChildContext {
+        let dir_depth = dir.components().count();
+        let child_depth = dir_depth + 1;
+        let has_child_include = self
+            .include_roots
+            .iter()
+            .any(|p| p.depth == child_depth && path_starts_with_ci(&p.raw, dir));
+        let has_child_exclude = self
+            .excluded_prefixes
+            .iter()
+            .any(|p| p.depth == child_depth && path_starts_with_ci(&p.raw, dir));
+        let parent_admitted =
+            self.evaluate_with_hidden(dir, true, include_hidden) == ScopeDecision::IndexNormally;
+        DirChildContext {
+            parent_admitted,
+            has_child_prefix_override: has_child_include || has_child_exclude,
+            include_hidden,
+        }
+    }
+
+    /// 针对已预计算 `DirChildContext` 的目录直接子条目执行 O(1) 过滤，语义与 `evaluate_with_hidden` 100% 等价。
+    #[inline]
+    pub(crate) fn evaluate_child(
+        &self,
+        ctx: &DirChildContext,
+        child_full_path: &Path,
+        child_name: &str,
+        is_dir: bool,
+    ) -> ScopeDecision {
+        // 若存在直接子级前缀覆写或非标准单段文件名，回退完整评估以保证与全路径口径严格一致
+        if ctx.has_child_prefix_override
+            || child_name.is_empty()
+            || child_name == "."
+            || child_name == ".."
+            || child_name.contains('/')
+        {
+            return self.evaluate_with_hidden(child_full_path, is_dir, ctx.include_hidden);
+        }
+        if !ctx.parent_admitted {
+            return ScopeDecision::HardDrop;
+        }
+        if !ctx.include_hidden && child_name.starts_with('.') {
+            return ScopeDecision::HardDrop;
+        }
+        if self.excluded_names.contains(child_name) {
+            return ScopeDecision::HardDrop;
+        }
+        if self.exclude_sensitive
+            && self
+                .sensitive_names
+                .iter()
+                .any(|sensitive| sensitive.eq_ignore_ascii_case(child_name))
+        {
+            return ScopeDecision::HardDrop;
+        }
+        if self.index_apps && is_app_bundle_name(child_name) {
+            return if is_dir {
+                ScopeDecision::IndexShallowContainer
+            } else {
+                ScopeDecision::IndexNormally
+            };
+        }
         ScopeDecision::IndexNormally
     }
 
@@ -957,6 +1042,79 @@ mod tests {
                 &config
             ),
             Some("node_modules".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_child_matches_evaluate_with_hidden_across_edge_cases() {
+        let mut config = AppConfig::default();
+        config.index.index_paths = vec![
+            "/root".to_string(),
+            "/root/blocked/pierced".to_string(),
+            "/root/.ssh".to_string(),
+        ];
+        config.index.exclude_paths = vec![
+            "/root/blocked".to_string(),
+            "/root/sub/deep_blocked".to_string(),
+        ];
+        config.index.exclude = vec!["node_modules".to_string(), "target".to_string()];
+        config.index.exclude_sensitive = true;
+
+        let dirs = [
+            "/root",
+            "/root/sub",
+            "/root/blocked",
+            "/root/blocked/pierced",
+            "/root/.ssh",
+            "/root/Demo.app",
+            "/outside",
+        ];
+        let children = [
+            ("readme.md", false),
+            ("docs", true),
+            (".hidden", false),
+            (".hidden_dir", true),
+            ("node_modules", true),
+            ("target", false),
+            (".ssh", true),
+            (".AWS", true),
+            ("blocked", true),
+            ("pierced", true),
+            ("deep_blocked", true),
+            ("Demo.app", true),
+            ("Demo.app", false),
+            ("Contents", true),
+            ("ok", true),
+        ];
+
+        for index_apps in [false, true] {
+            config.index.index_apps = index_apps;
+            let policy = IndexScopePolicy::from_config_lexical(&config);
+            for include_hidden in [false, true] {
+                for dir in dirs {
+                    let dir_path = Path::new(dir);
+                    let ctx = policy.dir_child_context(dir_path, include_hidden);
+                    for &(child_name, is_dir) in &children {
+                        let full = dir_path.join(child_name);
+                        let expected = policy.evaluate_with_hidden(&full, is_dir, include_hidden);
+                        let actual = policy.evaluate_child(&ctx, &full, child_name, is_dir);
+                        assert_eq!(
+                            actual, expected,
+                            "mismatch for dir={dir} child={child_name} is_dir={is_dir} include_hidden={include_hidden} index_apps={index_apps}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 空 include_roots 场景下父目录自身含排除组件时，子项同样保持与 evaluate_with_hidden 一致
+        let empty_roots_policy = make_test_filter(vec![], vec!["node_modules"], vec!["/blocked"]);
+        let excluded_dir = Path::new("/tmp/node_modules/sub");
+        let ctx = empty_roots_policy.dir_child_context(excluded_dir, true);
+        let child = excluded_dir.join("file.js");
+        assert_eq!(
+            empty_roots_policy.evaluate_child(&ctx, &child, "file.js", false),
+            empty_roots_policy.evaluate_with_hidden(&child, false, true)
         );
     }
 }

@@ -14,7 +14,7 @@ const APP_INDEX_ROOTS: [&str; 3] = [
 ];
 
 /// General application settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// UI language: "zh-Hans" (default) or "en".
@@ -152,7 +152,7 @@ impl Default for IndexConfig {
 }
 
 /// Window behavior configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
     /// Whether to auto-hide the window when it loses focus.
@@ -173,7 +173,7 @@ impl Default for WindowConfig {
 /// Global shortcut configuration.
 /// NOTE: Deprecated — shortcut is now managed by KeyboardShortcuts (UserDefaults).
 /// Retained for TOML backward compatibility only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShortcutConfig {
     /// Global keyboard shortcut to toggle the search window.
@@ -193,7 +193,7 @@ impl Default for ShortcutConfig {
 ///
 /// Organized into TOML sections: [general], [index], [window], [shortcut].
 /// Supports partial TOML deserialization -- missing sections use defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     #[serde(default)]
@@ -400,14 +400,18 @@ impl ConfigStore {
 /// Load config from disk or create default config.toml on first run.
 ///
 /// Returns the parsed config and an optional error message (for invalid/unreadable files).
-/// On error, returns AppConfig::default() so the app always starts.
+/// On parse error, backs up the corrupted file to `config.toml.bak` before returning
+/// `AppConfig::default()` so subsequent UI preference saves never wipe user edits silently.
 pub fn load_or_create_config() -> (AppConfig, Option<String>) {
-    let config_dir = AppConfig::config_dir();
+    load_or_create_config_in(&AppConfig::config_dir())
+}
+
+pub(crate) fn load_or_create_config_in(config_dir: &std::path::Path) -> (AppConfig, Option<String>) {
     let config_path = config_dir.join("config.toml");
 
     if !config_path.exists() {
         // First run: create default config (per D-03, CFG-06)
-        let _ = std::fs::create_dir_all(&config_dir);
+        let _ = std::fs::create_dir_all(config_dir);
         let _ = std::fs::write(&config_path, DEFAULT_CONFIG_TOML);
         return (AppConfig::default(), None);
     }
@@ -416,8 +420,18 @@ pub fn load_or_create_config() -> (AppConfig, Option<String>) {
         Ok(content) => match AppConfig::from_toml(&content) {
             Ok(config) => (config, None),
             Err(e) => {
-                // Invalid config -> return defaults + error message
-                let msg = format!("Config parse error in {}: {}", config_path.display(), e);
+                // 解析失败时自动备份原始损坏文件为 config.toml.bak，防止后续设置保存覆盖导致用户配置永久丢失
+                let backup_path = config_dir.join("config.toml.bak");
+                let backup_note = match std::fs::copy(&config_path, &backup_path) {
+                    Ok(_) => format!(" (backed up to {})", backup_path.display()),
+                    Err(_) => String::new(),
+                };
+                let msg = format!(
+                    "Config parse error in {}: {}{}",
+                    config_path.display(),
+                    e,
+                    backup_note
+                );
                 (AppConfig::default(), Some(msg))
             }
         },
@@ -473,6 +487,11 @@ where
                     match std::fs::read_to_string(&config_path) {
                         Ok(content) => match AppConfig::from_toml(&content) {
                             Ok(new_config) => {
+                                // 若磁盘内容与内存 config_store 完全一致（典型于前端自身写盘触发的文件事件），
+                                // 直接跳过重复回调，消除无意义的卷协调器对账与 UI 重载。
+                                if *config_store.read() == new_config {
+                                    continue;
+                                }
                                 config_store.update(new_config.clone());
                                 on_reload(&new_config);
                             }
@@ -843,5 +862,24 @@ max_results = 200
         // If there's no config file issue, error should be None
         // (but we can't guarantee this in CI, so just check it doesn't panic)
         let _ = error;
+    }
+
+    #[test]
+    fn test_load_or_create_config_in_backs_up_corrupted_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let corrupted = "invalid {{{{ toml content\n[index]\nmax_results = \"bad\"\n";
+        fs::write(&config_path, corrupted).unwrap();
+
+        let (config, error) = load_or_create_config_in(tmp.path());
+        assert_eq!(config, AppConfig::default());
+        let msg = error.expect("corrupted config must surface an error message");
+        assert!(
+            msg.contains("config.toml.bak"),
+            "error message should mention backup path, got: {msg}"
+        );
+        let backup_path = tmp.path().join("config.toml.bak");
+        assert!(backup_path.exists(), "corrupted config.toml must be backed up");
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), corrupted);
     }
 }

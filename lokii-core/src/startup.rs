@@ -64,6 +64,11 @@ pub fn checkpoint(config: &AppConfig) -> cache::Checkpoint {
 /// Hash of everything that decides which paths get indexed: roots, exclusion
 /// rules, hidden files and Full Disk Access.
 pub fn scope_fingerprint(config: &AppConfig) -> u64 {
+    scope_fingerprint_with_fda(config, crate::permissions::has_full_disk_access())
+}
+
+/// 复用已探测的 `has_fda` 状态计算全量索引范围指纹，避免后台轮询重复打开系统 `TCC.db`。
+pub(crate) fn scope_fingerprint_with_fda(config: &AppConfig, has_fda: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     // A different binary may hash differently; that only costs one full scan.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -74,7 +79,7 @@ pub fn scope_fingerprint(config: &AppConfig) -> u64 {
     config.index.exclude_sensitive.hash(&mut hasher);
     config.index.sensitive_names.hash(&mut hasher);
     config.index.index_apps.hash(&mut hasher);
-    crate::permissions::has_full_disk_access().hash(&mut hasher);
+    has_fda.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -83,6 +88,21 @@ pub fn primary_scope_fingerprint(
     config: &AppConfig,
     primary_roots: &[std::path::PathBuf],
     excluded_mount_roots: &[std::path::PathBuf],
+) -> u64 {
+    primary_scope_fingerprint_with_fda(
+        config,
+        primary_roots,
+        excluded_mount_roots,
+        crate::permissions::has_full_disk_access(),
+    )
+}
+
+/// 复用已探测的 `has_fda` 状态计算主本地索引域指纹，避免每 15 秒刷新范围时重复触发权限探测。
+pub(crate) fn primary_scope_fingerprint_with_fda(
+    config: &AppConfig,
+    primary_roots: &[std::path::PathBuf],
+    excluded_mount_roots: &[std::path::PathBuf],
+    has_fda: bool,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -96,7 +116,7 @@ pub fn primary_scope_fingerprint(
     config.index.exclude_sensitive.hash(&mut hasher);
     config.index.sensitive_names.hash(&mut hasher);
     config.index.index_apps.hash(&mut hasher);
-    crate::permissions::has_full_disk_access().hash(&mut hasher);
+    has_fda.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -107,6 +127,13 @@ pub fn save_index(
     cache_file: &Path,
 ) {
     if let Err(error) = cache::save_compact(index, Some(checkpoint), cache_file) {
+        eprintln!("[Lokii] index cache save failed: {error}");
+    }
+}
+
+/// 将已在短读锁内完成内存编码的索引字节流连同检查点落盘（完全无锁执行磁盘写入与 `sync_data()`）。
+pub fn save_encoded_index(encoded: &[u8], checkpoint: cache::Checkpoint, cache_file: &Path) {
+    if let Err(error) = cache::save_encoded_compact(encoded, Some(checkpoint), cache_file) {
         eprintln!("[Lokii] index cache save failed: {error}");
     }
 }
@@ -154,11 +181,13 @@ pub fn initialize_index(
                 Err(error) => return StartupMode::Failed(error),
             };
             let count = fresh.len();
-
-            // Save cache for next startup
-            let _ = cache::save_compact(&fresh, Some(checkpoint), cache_file);
-
+            // 先将新索引发布进 store 立即可搜，再在读锁外执行落盘与 sync_data()
             store.replace_compact(fresh);
+            let encoded = {
+                let guard = store.read();
+                cache::encode_compact(&guard)
+            };
+            let _ = cache::save_encoded_compact(&encoded, Some(checkpoint), cache_file);
             StartupMode::ColdStart {
                 scanned_count: count,
                 event_id: checkpoint.event_id,
@@ -198,6 +227,36 @@ pub fn initialize_primary_index_with_progress(
     on_progress: &mut dyn FnMut(&str, u64),
     cache_path: &Path,
 ) -> Result<StartupMode, InitError> {
+    let (mode, cold_checkpoint) = initialize_primary_index_deferred_persist(
+        store,
+        config,
+        primary_roots,
+        excluded_mount_roots,
+        progress,
+        on_progress,
+        cache_path,
+    )?;
+    if let Some(checkpoint) = cold_checkpoint {
+        let encoded = {
+            let guard = store.read();
+            cache::encode_compact(&guard)
+        };
+        let _ = cache::save_encoded_compact(&encoded, Some(checkpoint), cache_path);
+    }
+    Ok(mode)
+}
+
+/// 初始化主索引：冷启动扫盘完成后立即调用 `store.replace_compact(fresh)` 发布索引并返回待落盘的
+/// `Checkpoint`，使调用方得以先向 UI 派发 `on_index_ready` 解锁交互，随后在无锁状态下落盘缓存。
+pub(crate) fn initialize_primary_index_deferred_persist(
+    store: &IndexStore,
+    config: &AppConfig,
+    primary_roots: &[std::path::PathBuf],
+    excluded_mount_roots: &[std::path::PathBuf],
+    progress: Arc<AtomicUsize>,
+    on_progress: &mut dyn FnMut(&str, u64),
+    cache_path: &Path,
+) -> Result<(StartupMode, Option<cache::Checkpoint>), InitError> {
     if primary_roots.is_empty() {
         store.replace_compact(crate::compact_index::CompactIndex::new());
         if cache_path.exists() {
@@ -209,10 +268,13 @@ pub fn initialize_primary_index_with_progress(
             }
         }
         on_progress("ready", 0);
-        return Ok(StartupMode::HotStart {
-            cached_count: 0,
-            checkpoint: None,
-        });
+        return Ok((
+            StartupMode::HotStart {
+                cached_count: 0,
+                checkpoint: None,
+            },
+            None,
+        ));
     }
 
     let fingerprint = primary_scope_fingerprint(config, primary_roots, excluded_mount_roots);
@@ -223,10 +285,13 @@ pub fn initialize_primary_index_with_progress(
             progress.store(count, std::sync::atomic::Ordering::Relaxed);
             store.replace_compact(entries);
             on_progress("cached", count as u64);
-            Ok(StartupMode::HotStart {
-                cached_count: count,
-                checkpoint: saved.filter(|saved| saved.fingerprint == fingerprint),
-            })
+            Ok((
+                StartupMode::HotStart {
+                    cached_count: count,
+                    checkpoint: saved.filter(|saved| saved.fingerprint == fingerprint),
+                },
+                None,
+            ))
         }
         Err(_) => {
             let current_event_id = crate::fsevents::current_event_id();
@@ -250,12 +315,14 @@ pub fn initialize_primary_index_with_progress(
             };
             let count = fresh.len();
             on_progress("scanned", count as u64);
-            let _ = cache::save_compact(&fresh, Some(checkpoint), cache_path);
             store.replace_compact(fresh);
-            Ok(StartupMode::ColdStart {
-                scanned_count: count,
-                event_id: checkpoint.event_id,
-            })
+            Ok((
+                StartupMode::ColdStart {
+                    scanned_count: count,
+                    event_id: checkpoint.event_id,
+                },
+                Some(checkpoint),
+            ))
         }
     }
 }

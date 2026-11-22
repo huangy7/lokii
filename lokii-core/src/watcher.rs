@@ -224,11 +224,11 @@ fn safe_watch_paths(
     out
 }
 
-fn watch_scope_for_paths(
+fn watch_scope_for_paths_with_fda(
     paths: Vec<PathBuf>,
     filter: &CompiledFilter,
+    has_fda: bool,
 ) -> (bool, Vec<PathBuf>, Vec<PathBuf>) {
-    let has_fda = has_full_disk_access();
     let protected = if has_fda {
         vec![]
     } else {
@@ -243,8 +243,12 @@ fn watch_scope_for_paths(
 }
 
 /// FDA 状态、需丢弃事件的受保护路径，以及可安全挂监听的根目录。
-fn watch_scope(config: &AppConfig, filter: &CompiledFilter) -> (bool, Vec<PathBuf>, Vec<PathBuf>) {
-    watch_scope_for_paths(config.resolve_paths(), filter)
+fn watch_scope_with_fda(
+    config: &AppConfig,
+    filter: &CompiledFilter,
+    has_fda: bool,
+) -> (bool, Vec<PathBuf>, Vec<PathBuf>) {
+    watch_scope_for_paths_with_fda(config.resolve_paths(), filter, has_fda)
 }
 
 // ── Resolving Changes ──────────────────────────────────────────────────────
@@ -452,10 +456,14 @@ struct Scope {
 
 impl Scope {
     fn new(config: &AppConfig) -> Self {
+        Self::new_with_fda(config, has_full_disk_access())
+    }
+
+    fn new_with_fda(config: &AppConfig, has_fda: bool) -> Self {
         let filter = CompiledFilter::from_config(config);
-        let (has_fda, protected, watch_paths) = watch_scope(config, &filter);
+        let (has_fda, protected, watch_paths) = watch_scope_with_fda(config, &filter, has_fda);
         Self {
-            fingerprint: crate::startup::scope_fingerprint(config),
+            fingerprint: crate::startup::scope_fingerprint_with_fda(config, has_fda),
             exclude: config.index.exclude.clone(),
             exclude_paths: config.resolve_exclude_paths(),
             filter,
@@ -471,15 +479,30 @@ impl Scope {
 
     fn new_primary(config: &AppConfig, volumes_dir: &Path) -> Self {
         let (primary_paths, excluded_mount_roots) = primary_scope_inputs(config, volumes_dir);
+        Self::new_primary_with_inputs(
+            config,
+            primary_paths,
+            excluded_mount_roots,
+            has_full_disk_access(),
+        )
+    }
+
+    fn new_primary_with_inputs(
+        config: &AppConfig,
+        primary_paths: Vec<PathBuf>,
+        excluded_mount_roots: Vec<PathBuf>,
+        has_fda: bool,
+    ) -> Self {
         let filter =
             CompiledFilter::from_primary_config(config, &primary_paths, &excluded_mount_roots);
         let (has_fda, protected, watch_paths) =
-            watch_scope_for_paths(primary_paths.clone(), &filter);
+            watch_scope_for_paths_with_fda(primary_paths.clone(), &filter, has_fda);
         Self {
-            fingerprint: crate::startup::primary_scope_fingerprint(
+            fingerprint: crate::startup::primary_scope_fingerprint_with_fda(
                 config,
                 &primary_paths,
                 &excluded_mount_roots,
+                has_fda,
             ),
             exclude: config.index.exclude.clone(),
             exclude_paths: config.resolve_exclude_paths(),
@@ -666,7 +689,7 @@ struct Service<F, P> {
 impl<F, P> Service<F, P>
 where
     F: Fn(usize),
-    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint),
+    P: Fn(&[u8], crate::cache::Checkpoint),
 {
     fn run(mut self, resume: Resume) {
         match resume {
@@ -728,9 +751,16 @@ where
             applied: Arc::clone(&self.applied),
             fingerprint: Arc::clone(&self.fingerprint),
         };
-        let index = self.store.read();
-        if let Some(checkpoint) = handle_view.checkpoint() {
-            (self.persist)(&index, checkpoint);
+        // 仅在短读锁内提取检查点并完成内存编码，立即释放读锁后再把字节流交给回调落盘与 sync_data()，
+        // 防止在 parking_lot::RwLock 写优先策略下因慢磁盘 fsync 引发写锁与 UI 搜索读锁的级联阻塞。
+        let snapshot = {
+            let index = self.store.read();
+            handle_view
+                .checkpoint()
+                .map(|checkpoint| (crate::cache::encode_compact(&index), checkpoint))
+        };
+        if let Some((encoded, checkpoint)) = snapshot {
+            (self.persist)(&encoded, checkpoint);
         }
     }
 
@@ -1018,12 +1048,13 @@ where
         } else {
             Duration::from_secs(2)
         };
-        let fda_changed = if self.fda_checked.elapsed() >= fda_poll_interval {
+        let current_has_fda = if self.fda_checked.elapsed() >= fda_poll_interval {
             self.fda_checked = Instant::now();
-            has_full_disk_access() != self.scope.has_fda
+            has_full_disk_access()
         } else {
-            false
+            self.scope.has_fda
         };
+        let fda_changed = current_has_fda != self.scope.has_fda;
 
         // 每 15 秒低频复核一次本地目录存在性与嵌套挂载排除集合，兼顾新建索引根/后挂载嵌套卷的自动感知与低空转开销
         let periodic_scope_refresh = self.scope_refreshed.elapsed() >= Duration::from_secs(15);
@@ -1031,23 +1062,48 @@ where
             self.scope_refreshed = Instant::now();
         }
 
-        let scope_changed = if self.primary_volumes_dir.is_some() {
-            index_changed || fda_changed || periodic_scope_refresh
-        } else if index_changed || fda_changed || periodic_scope_refresh {
+        let next_scope = if !(index_changed || fda_changed || periodic_scope_refresh) {
+            None
+        } else {
             let config = changed_config
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| self.config_store.read().clone());
-            crate::startup::scope_fingerprint(&config) != self.scope.fingerprint
-        } else {
-            false
+            match &self.primary_volumes_dir {
+                Some(volumes_dir) => {
+                    // 先复用缓存的 has_fda 与范围输入比对指纹，未变化时直接跳过 Scope 重建与无 FDA 时的目录递归
+                    let (primary_paths, excluded_mount_roots) =
+                        primary_scope_inputs(&config, volumes_dir);
+                    let next_fp = crate::startup::primary_scope_fingerprint_with_fda(
+                        &config,
+                        &primary_paths,
+                        &excluded_mount_roots,
+                        current_has_fda,
+                    );
+                    if next_fp != self.scope.fingerprint {
+                        Some(Scope::new_primary_with_inputs(
+                            &config,
+                            primary_paths,
+                            excluded_mount_roots,
+                            current_has_fda,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    let next_fp =
+                        crate::startup::scope_fingerprint_with_fda(&config, current_has_fda);
+                    if next_fp != self.scope.fingerprint {
+                        Some(Scope::new_with_fda(&config, current_has_fda))
+                    } else {
+                        None
+                    }
+                }
+            }
         };
-        if scope_changed {
-            let config = changed_config.unwrap_or_else(|| self.config_store.read().clone());
-            let next_scope = match &self.primary_volumes_dir {
-                Some(volumes_dir) => Scope::new_primary(&config, volumes_dir),
-                None => Scope::new(&config),
-            };
+
+        if let Some(next_scope) = next_scope {
             if next_scope.fingerprint != self.scope.fingerprint {
                 let previous = std::mem::replace(&mut self.scope, next_scope);
                 let index_matched_previous =
@@ -1105,8 +1161,7 @@ where
 
 /// 启动索引服务线程：按 `resume` 接上（追赶或全量对账），之后持续把 FSEvents 变更写入索引。
 ///
-/// `on_batch(总数)` 在每批变更后调用；`persist(索引, 检查点)` 在追赶完成、全量对账后与
-/// 有变更时定期调用，由调用方落盘。
+/// `on_batch(总数)` 在每批变更后调用；`persist(已编码缓存字节, 检查点)` 在释放索引读锁后调用，由调用方落盘。
 pub fn start_watcher<F, P>(
     store: IndexStore,
     config_store: ConfigStore,
@@ -1118,7 +1173,7 @@ pub fn start_watcher<F, P>(
 ) -> WatcherHandle
 where
     F: Fn(usize) + Send + 'static,
-    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
+    P: Fn(&[u8], crate::cache::Checkpoint) + Send + 'static,
 {
     start_watcher_with_options(
         store,
@@ -1151,7 +1206,7 @@ pub fn start_primary_watcher<F, P>(
 ) -> WatcherHandle
 where
     F: Fn(usize) + Send + 'static,
-    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
+    P: Fn(&[u8], crate::cache::Checkpoint) + Send + 'static,
 {
     start_watcher_with_options(
         store,
@@ -1177,7 +1232,7 @@ fn start_watcher_with_options<F, P>(
 ) -> WatcherHandle
 where
     F: Fn(usize) + Send + 'static,
-    P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint) + Send + 'static,
+    P: Fn(&[u8], crate::cache::Checkpoint) + Send + 'static,
 {
     let (control_tx, control) = mpsc::channel();
     let service_tx = control_tx.clone();
@@ -1467,14 +1522,11 @@ mod tests {
     fn idle_service(
         store: &IndexStore,
         root: &Path,
-    ) -> Service<impl Fn(usize), impl Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint)>
-    {
-        idle_service_persisting(store, root, |_: &crate::compact_index::CompactIndex, _| {})
+    ) -> Service<impl Fn(usize), impl Fn(&[u8], crate::cache::Checkpoint)> {
+        idle_service_persisting(store, root, |_: &[u8], _| {})
     }
 
-    fn idle_service_persisting<
-        P: Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint),
-    >(
+    fn idle_service_persisting<P: Fn(&[u8], crate::cache::Checkpoint)>(
         store: &IndexStore,
         root: &Path,
         persist: P,
@@ -1597,7 +1649,7 @@ mod tests {
         let mut service = idle_service_persisting(
             &store,
             &root,
-            |_: &crate::compact_index::CompactIndex, checkpoint: crate::cache::Checkpoint| {
+            |_: &[u8], checkpoint: crate::cache::Checkpoint| {
                 saved.borrow_mut().push(checkpoint.event_id)
             },
         );
@@ -1632,7 +1684,7 @@ mod tests {
         let mut service = idle_service_persisting(
             &store,
             &root,
-            |_: &crate::compact_index::CompactIndex, checkpoint: crate::cache::Checkpoint| {
+            |_: &[u8], checkpoint: crate::cache::Checkpoint| {
                 saved.borrow_mut().push(checkpoint.event_id)
             },
         );
@@ -1857,7 +1909,10 @@ mod tests {
         assert_eq!(store.len(), 0);
     }
 
-    fn rescope(service: &mut Service<impl Fn(usize), impl Fn(&crate::compact_index::CompactIndex, crate::cache::Checkpoint)>, edit: impl FnOnce(&mut AppConfig)) {
+    fn rescope(
+        service: &mut Service<impl Fn(usize), impl Fn(&[u8], crate::cache::Checkpoint)>,
+        edit: impl FnOnce(&mut AppConfig),
+    ) {
         let mut config = service.config_store.read().clone();
         edit(&mut config);
         service.config_store.update(config);
@@ -2625,6 +2680,41 @@ mod tests {
             callback_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "primary watcher should forward config updates via callback"
         );
+    }
+
+    #[test]
+    fn persist_now_releases_store_read_lock_before_invoking_persist_callback() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("hello.txt");
+        fs::write(&file, "data").unwrap();
+        let store = IndexStore::new();
+        let store_for_cb = store.clone();
+        let write_lock_acquired = std::cell::Cell::new(false);
+        let saved_bytes_len = std::cell::Cell::new(0usize);
+
+        let mut service = idle_service_persisting(
+            &store,
+            &root,
+            |encoded: &[u8], checkpoint: crate::cache::Checkpoint| {
+                // 若 persist_now 仍持有 store.read()，此处 try_write 必返回 None
+                assert!(
+                    store_for_cb.try_write().is_some(),
+                    "store read lock must be released before disk persistence callback runs"
+                );
+                assert_eq!(checkpoint.event_id, 88);
+                assert!(!encoded.is_empty());
+                write_lock_acquired.set(true);
+                saved_bytes_len.set(encoded.len());
+            },
+        );
+
+        service.intake(vec![event(file, crate::fsevents::ITEM_CREATED, 88)]);
+        service.flush();
+        service.persist_now();
+
+        assert!(write_lock_acquired.get());
+        assert!(saved_bytes_len.get() > 0);
     }
 
 }
