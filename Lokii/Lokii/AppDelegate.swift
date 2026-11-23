@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let engine = SearchEngine()
     private var preferencesController: PreferencesWindowController?
+    private var dockVisibilityController: DockVisibilityController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let config = engine.getConfig()
@@ -27,6 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
         setupMainMenu()
+        dockVisibilityController = DockVisibilityController(engine: engine)
+        dockVisibilityController?.start()
         NotificationCenter.default.addObserver(self, selector: #selector(onLanguageChanged),
                                                name: L10n.languageChangedNotification, object: nil)
         registerGlobalShortcut()

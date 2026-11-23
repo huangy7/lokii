@@ -3,6 +3,10 @@ import UniformTypeIdentifiers
 import Quartz
 import SwiftUI
 
+extension Notification.Name {
+    static let lokiiSearchWindowDidHide = Notification.Name("LokiiSearchWindowDidHide")
+}
+
 /// Container view that intercepts clicks outside interactiveCardView while routing clicks inside to the card.
 private final class OverlayContainerView: NSView {
     weak var interactiveCardView: NSView?
@@ -323,6 +327,7 @@ final class SearchWindow: NSWindowController {
             window.orderOut(nil)
             window.alphaValue = 1.0
             window.contentView?.layer?.transform = CATransform3DIdentity
+            NotificationCenter.default.post(name: .lokiiSearchWindowDidHide, object: window)
             return
         }
 
@@ -335,6 +340,9 @@ final class SearchWindow: NSWindowController {
             self?.window?.orderOut(nil)
             self?.window?.alphaValue = 1.0
             self?.window?.contentView?.layer?.transform = CATransform3DIdentity
+            if let window = self?.window {
+                NotificationCenter.default.post(name: .lokiiSearchWindowDidHide, object: window)
+            }
         })
     }
 
