@@ -134,6 +134,57 @@ fn fnv1a_dual(bytes: &[u8]) -> String {
     format!("{:016x}{:016x}", h1, h2)
 }
 
+/// Computes a deterministic 64-bit FNV-1a fingerprint of the volume scan filter
+/// settings and Full Disk Access state so offline config edits invalidate
+/// persisted volume caches on next launch.
+pub fn volume_filter_fingerprint(config: &AppConfig, has_fda: bool) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    #[inline]
+    fn feed_u64(hash: &mut u64, value: u64) {
+        for &b in &value.to_le_bytes() {
+            *hash ^= b as u64;
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    #[inline]
+    fn feed_bytes(hash: &mut u64, bytes: &[u8]) {
+        feed_u64(hash, bytes.len() as u64);
+        for &b in bytes {
+            *hash ^= b as u64;
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut hash = FNV_OFFSET;
+    let exclude_paths = config.resolve_exclude_paths();
+    feed_u64(&mut hash, exclude_paths.len() as u64);
+    for path in exclude_paths {
+        feed_bytes(&mut hash, path.to_string_lossy().as_bytes());
+    }
+
+    feed_u64(&mut hash, config.index.exclude.len() as u64);
+    for pat in &config.index.exclude {
+        feed_bytes(&mut hash, pat.as_bytes());
+    }
+
+    feed_u64(&mut hash, config.index.sensitive_names.len() as u64);
+    for name in &config.index.sensitive_names {
+        feed_bytes(&mut hash, name.as_bytes());
+    }
+
+    let flags = (u8::from(config.index.include_hidden))
+        | (u8::from(config.index.exclude_sensitive) << 1)
+        | (u8::from(config.index.index_apps) << 2)
+        | (u8::from(has_fda) << 3);
+    hash ^= flags as u64;
+    hash = hash.wrapping_mul(FNV_PRIME);
+    // 0 is reserved by legacy cache checkpoints written before filter fingerprinting existed.
+    if hash == 0 { 1 } else { hash }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeRecord {
     pub volume_id: String,
@@ -150,6 +201,10 @@ pub struct VolumeRecord {
     pub journal_uuid: Option<String>,
     pub entry_count: u64,
     pub dirty_filter: bool,
+    #[serde(default)]
+    pub filter_fingerprint: Option<u64>,
+    #[serde(default)]
+    pub pruned_for_fp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +242,10 @@ impl VolumeManifest {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         let write_result = (|| -> Result<(), std::io::Error> {
-            let mut file = std::fs::File::create(&tmp_path)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
             file.write_all(&data)?;
             file.sync_all()?;
             std::fs::rename(&tmp_path, &final_path)?;
@@ -821,6 +879,8 @@ mod tests {
             journal_uuid: None,
             entry_count: 42,
             dirty_filter: false,
+            filter_fingerprint: None,
+            pruned_for_fp: None,
         };
 
         manifest.upsert(record.clone());
@@ -1035,5 +1095,21 @@ mod tests {
             exact_name_key: false,
         };
         assert_eq!(original.volume_id(), replugged_drifted.volume_id());
+    }
+
+    #[test]
+    fn volume_filter_fingerprint_is_nonzero_and_reflects_filter_inputs() {
+        let base = AppConfig::default();
+        let fp_no_fda = volume_filter_fingerprint(&base, false);
+        let fp_fda = volume_filter_fingerprint(&base, true);
+        assert_ne!(fp_no_fda, 0);
+        assert_ne!(fp_fda, 0);
+        assert_ne!(fp_no_fda, fp_fda);
+
+        let mut edited = base.clone();
+        edited.index.exclude.push("custom_excluded_dir".to_string());
+        let fp_edited = volume_filter_fingerprint(&edited, true);
+        assert_ne!(fp_edited, 0);
+        assert_ne!(fp_edited, fp_fda);
     }
 }
