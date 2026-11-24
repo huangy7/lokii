@@ -38,6 +38,12 @@ enum SettingsPathStatusResolver {
         return trimmed
     }
 
+    /// 规范化后大小写无关地判断 `paths` 中是否有与 `path` 相同的路径（祖先/子孙不算）。
+    static func containsSamePath(_ paths: [String], _ path: String) -> Bool {
+        let key = normalizePath(path).lowercased()
+        return paths.contains { normalizePath($0).lowercased() == key }
+    }
+
     static func isUnderVolumesNamespace(_ path: String) -> Bool {
         let normalized = normalizePath(path)
         let prefix = "/volumes/"

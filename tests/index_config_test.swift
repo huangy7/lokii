@@ -318,6 +318,27 @@ do {
         false,
         "裸 /Volumes 容器目录不应被视为具体挂载卷"
     )
+    let conflictHome = NSHomeDirectory()
+    assertEqual(
+        SettingsPathStatusResolver.containsSamePath(["~/Library/"], conflictHome + "/library"),
+        true,
+        "波浪号展开、尾部斜杠与大小写差异后的同一路径应判定为相同"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.containsSamePath(["~/Library"], "~/Library/xxx"),
+        false,
+        "子路径属于合法穿透，不应判定为同路径冲突"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.containsSamePath(["~/Library/xxx"], "~/Library"),
+        false,
+        "祖先路径不应判定为同路径冲突"
+    )
+    assertEqual(
+        SettingsPathStatusResolver.containsSamePath(["~/Library", "/opt"], "~/LibraryX"),
+        false,
+        "仅前缀相同的兄弟路径不应误判"
+    )
     var updatedStatus = disk2Slot
     updatedStatus.entryCount += 1
     assertEqual(updatedStatus == disk2Slot, false, "计数变化仍应更新卷状态快照")

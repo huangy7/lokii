@@ -606,22 +606,12 @@ pub fn partition_index_paths(
 
     primary_candidates.extend(config.resolve_app_roots());
 
-    // Deduplicate primary_paths (eliminate redundant child paths and exact duplicates)
-    let mut primary_paths: Vec<PathBuf> = Vec::new();
-    for p in primary_candidates {
-        if !primary_paths.iter().any(|existing| paths_equal_ci(existing, &p)) {
-            primary_paths.push(p);
-        }
-    }
-    let final_primary: Vec<PathBuf> = primary_paths
-        .iter()
-        .filter(|candidate| {
-            !primary_paths.iter().any(|other| {
-                !paths_equal_ci(candidate, other) && path_starts_with_ci(candidate, other)
-            })
-        })
-        .cloned()
-        .collect();
+    // 子根仅在与上层根之间无排除/隐藏剪枝时才算冗余，否则显式子根会被排除墙吞掉（issue #61）。
+    // 词法策略：分区路径不做磁盘 stat。
+    let scope = crate::filter::CompiledFilter::from_config_lexical(config);
+    let include_hidden = config.index.include_hidden;
+    let final_primary =
+        crate::scanner::deduplicate_scan_roots(&primary_candidates, &scope, include_hidden);
 
     // Deduplicate mounted_targets (handle strictly nested paths on same volume, but keep sibling subpaths!)
     let mut unique_mounted: Vec<MountedPathTarget> = Vec::new();
@@ -633,15 +623,13 @@ pub fn partition_index_paths(
             unique_mounted.push(t);
         }
     }
+    let mounted_paths: Vec<PathBuf> =
+        unique_mounted.iter().map(|t| t.configured_path.clone()).collect();
+    let kept_mounted =
+        crate::scanner::deduplicate_scan_roots(&mounted_paths, &scope, include_hidden);
     let mut final_mounted: Vec<MountedPathTarget> = unique_mounted
-        .iter()
-        .filter(|candidate| {
-            !unique_mounted.iter().any(|other| {
-                !paths_equal_ci(&candidate.configured_path, &other.configured_path)
-                    && path_starts_with_ci(&candidate.configured_path, &other.configured_path)
-            })
-        })
-        .cloned()
+        .into_iter()
+        .filter(|t| kept_mounted.contains(&t.configured_path))
         .collect();
 
     // 当同一配置中包含多个剥离后缀后同名的本地无 UUID 目标（如 Backup-1 与 Backup-2）时，
@@ -883,6 +871,72 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("/Volumes/NAS/Work")));
         assert!(paths.contains(&PathBuf::from("/Volumes/NAS/Media")));
         assert!(!paths.contains(&PathBuf::from("/Volumes/NAS/Work/Deep")));
+    }
+
+    /// Issue #61：默认排除 `~/Library` 时，显式索引的 `~/Library/xxx` 必须穿透排除墙。
+    #[test]
+    fn partition_keeps_primary_child_root_behind_excluded_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        let library = home.join("Library");
+        let sub = library.join("xxx");
+        let plain = home.join("Docs").join("Deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(sub.join("note.txt"), b"x").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![
+            home.to_string_lossy().into_owned(),
+            sub.to_string_lossy().into_owned(),
+            plain.to_string_lossy().into_owned(),
+        ];
+        cfg.index.exclude_paths = vec![library.to_string_lossy().into_owned()];
+        let mounts = vec![MountedFsInfo {
+            mount_point: "/".into(),
+            fstype: "apfs".into(),
+            from_name: "/dev/disk3s1s1".into(),
+            is_local: true,
+            uuid: Some("ROOT-UUID".into()),
+            total_bytes: 1_000_000,
+            volume_name: "Macintosh HD".into(),
+        }];
+
+        let part = partition_index_paths(&cfg, &VolumeManifest::default(), &mounts);
+        assert!(part.primary_paths.contains(&home));
+        assert!(part.primary_paths.contains(&sub), "{:?}", part.primary_paths);
+        // 沿途无排除墙的嵌套子根仍按冗余去重
+        assert!(!part.primary_paths.contains(&plain));
+
+        let filter = crate::filter::CompiledFilter::from_primary_config(&cfg, &part.primary_paths, &[]);
+        let entries = crate::scanner::scan_directories(
+            &part.primary_paths,
+            std::sync::Arc::new(filter),
+            false,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        assert!(entries.iter().any(|e| e.name == "note.txt"));
+    }
+
+    #[test]
+    fn partition_keeps_mounted_child_root_behind_excluded_ancestor() {
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec!["/Volumes/NAS".into(), "/Volumes/NAS/Private/Keep".into()];
+        cfg.index.exclude_paths = vec!["/Volumes/NAS/Private".into()];
+        let mounts = vec![MountedFsInfo {
+            mount_point: "/Volumes/NAS".into(),
+            fstype: "smbfs".into(),
+            from_name: "//nas/NAS".into(),
+            is_local: false,
+            uuid: None,
+            total_bytes: 1_000_000,
+            volume_name: "NAS".into(),
+        }];
+
+        let part = partition_index_paths(&cfg, &VolumeManifest::default(), &mounts);
+        let paths: Vec<PathBuf> = part.mounted_targets.into_iter().map(|t| t.configured_path).collect();
+        assert!(paths.contains(&PathBuf::from("/Volumes/NAS")));
+        assert!(paths.contains(&PathBuf::from("/Volumes/NAS/Private/Keep")));
     }
 
     #[test]
