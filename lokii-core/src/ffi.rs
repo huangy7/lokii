@@ -625,6 +625,8 @@ impl LokiiCore {
             eprintln!("[Lokii] {error}");
         }
         let cache_dir = AppConfig::config_dir();
+        cache::cleanup_stale_temp_files(&cache_dir);
+        cache::cleanup_stale_temp_files(&cache_dir.join("volumes"));
         let config_store = ConfigStore::new(config);
         let store = IndexStore::new();
         let volumes = Arc::new(VolumeCoordinator::new(cache_dir.clone()));

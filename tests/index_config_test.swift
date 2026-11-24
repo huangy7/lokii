@@ -42,6 +42,25 @@ guard let preferencesSource = try? String(contentsOfFile: preferencesPath, encod
 }
 let pathResolverCode = String(preferencesSource[resolverStart.lowerBound..<resolverEnd.lowerBound])
 
+guard let appDelegateSource = try? String(contentsOfFile: "Lokii/Lokii/AppDelegate.swift", encoding: .utf8),
+      let guardStart = appDelegateSource.range(of: "@_silgen_name(\"flock\")"),
+      let delegateStart = appDelegateSource.range(of: "final class AppDelegate:") else {
+    fputs("tests/index_config_test.swift: error: 未能在 AppDelegate.swift 中定位 SingleInstanceGuard\n", stderr)
+    exit(1)
+}
+let singleInstanceGuardCode = String(appDelegateSource[guardStart.lowerBound..<delegateStart.lowerBound])
+
+guard let mainSwiftSource = try? String(contentsOfFile: "Lokii/Lokii/main.swift", encoding: .utf8),
+      mainSwiftSource.contains("SingleInstanceGuard.acquireOrActivateExistingAndExit()") else {
+    fputs("tests/index_config_test.swift: error: main.swift 必须在创建 AppDelegate 前调用 SingleInstanceGuard.acquireOrActivateExistingAndExit()\n", stderr)
+    exit(1)
+}
+
+guard appDelegateSource.contains("private lazy var engine = SearchEngine()") else {
+    fputs("tests/index_config_test.swift: error: AppDelegate.engine 必须为 lazy，避免重复实例初始化 core\n", stderr)
+    exit(1)
+}
+
 let mockVolumeTypesCode = """
 public enum FfiVolumeState: Equatable, Hashable {
     case online
@@ -87,7 +106,9 @@ public struct FfiVolumeStatus: Equatable, Hashable {
 
 let runnerSource = """
 import Cocoa
+import Darwin
 
+\(singleInstanceGuardCode)
 \(lokiiConfigCode)
 \(mockVolumeTypesCode)
 \(lifecycleCode)
@@ -590,6 +611,78 @@ do {
     assertEqual(dmgEntry.isDiskImage, true, "MountedVolumeEntry 应支持记录 isDiskImage 标志")
     let usbEntry = MountedVolumeEntry(path: "/Volumes/MyUSB", displayName: "MyUSB", kind: "local_external")
     assertEqual(usbEntry.isDiskImage, false, "MountedVolumeEntry 默认 isDiskImage 应为 false")
+
+    let lockTmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("lokii-lock-test-\\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: lockTmpDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: lockTmpDir) }
+    let testLockPath = lockTmpDir.appendingPathComponent("lokii.lock").path
+
+    var heldGuard: SingleInstanceGuard?
+    switch SingleInstanceGuard.tryAcquire(at: testLockPath) {
+    case .acquired(let g):
+        let fdFlags = Darwin.fcntl(g.fileDescriptor, F_GETFD)
+        assertTrue((fdFlags & FD_CLOEXEC) != 0, "单实例锁文件描述符必须设置 FD_CLOEXEC")
+        heldGuard = g
+    case .alreadyHeld, .ioError:
+        fputs("断言失败: 首次获取测试单实例锁应成功\\n", stderr)
+        exit(1)
+    }
+
+    withExtendedLifetime(heldGuard) {
+        switch SingleInstanceGuard.tryAcquire(at: testLockPath) {
+        case .alreadyHeld(let holderPid):
+            assertEqual(holderPid, Darwin.getpid(), "重复获取单实例锁应返回当前持锁进程 PID")
+        case .acquired, .ioError:
+            fputs("断言失败: 持有单实例锁期间二次 tryAcquire 必须返回 alreadyHeld\\n", stderr)
+            exit(1)
+        }
+    }
+
+    heldGuard = nil
+    switch SingleInstanceGuard.tryAcquire(at: testLockPath) {
+    case .acquired(let reacquired):
+        _ = reacquired
+    case .alreadyHeld, .ioError:
+        fputs("断言失败: 释放锁句柄后应可重新获取单实例锁\\n", stderr)
+        exit(1)
+    }
+
+    assertEqual(
+        SingleInstanceGuard.matchesExistingInstance(
+            candidateBundleId: "com.lokii.app",
+            candidateName: "Lokii",
+            currentBundleId: "com.lokii.app"
+        ),
+        true,
+        "相同 bundleId 的持锁进程应允许唤醒"
+    )
+    assertEqual(
+        SingleInstanceGuard.matchesExistingInstance(
+            candidateBundleId: "com.apple.Safari",
+            candidateName: "Safari",
+            currentBundleId: "com.lokii.app"
+        ),
+        false,
+        "被系统复用给无关应用的 PID 不得被误唤醒"
+    )
+    assertEqual(
+        SingleInstanceGuard.matchesExistingInstance(
+            candidateBundleId: nil,
+            candidateName: "Lokii",
+            currentBundleId: nil
+        ),
+        true,
+        "开发态无 bundleId 时仅允许同名 Lokii 进程"
+    )
+    assertEqual(
+        SingleInstanceGuard.matchesExistingInstance(
+            candidateBundleId: nil,
+            candidateName: "OtherTool",
+            currentBundleId: nil
+        ),
+        false,
+        "开发态无 bundleId 时不得唤醒其他同名缺失进程"
+    )
 
     print("IndexConfig 编解码、卷状态解析与通知测试全部通过！")
 } catch {

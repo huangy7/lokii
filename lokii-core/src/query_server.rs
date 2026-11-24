@@ -2,9 +2,9 @@
 //! `lokii` CLI 及 Alfred / Raycast / 快捷指令等第三方脚本都经由此处查询 App 内存中的实时索引。
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +45,67 @@ pub fn start(store: IndexStore, config_store: ConfigStore) -> std::io::Result<()
     start_with_coordinator(store, None, config_store)
 }
 
+/// Binds `path` as a 0600 Unix domain socket without hijacking an active instance.
+pub(crate) fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    // On macOS/BSD, `bind(2)` follows a dangling symlink and creates the socket at the
+    // link target; reject symlinks upfront so we never bind or chmod through a symlink.
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("refusing to bind query socket through symlink {}", path.display()),
+        ));
+    }
+    let listener = match UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            match UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "another Lokii instance is already listening on {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(connect_err)
+                    if matches!(
+                        connect_err.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) => {}
+                Err(connect_err) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "socket {} is already in use and could not be verified stale: {}",
+                            path.display(),
+                            connect_err
+                        ),
+                    ));
+                }
+            }
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_socket() => {
+                    // Previous process exited without unlinking the socket; remove stale socket only.
+                    let _ = std::fs::remove_file(path);
+                    UnixListener::bind(path)?
+                }
+                Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
+                    // The stale socket vanished between `bind` and `connect`; retry binding directly.
+                    UnixListener::bind(path)?
+                }
+                _ => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
 /// 绑定 `~/.config/lokii/query.sock` 并在后台线程同时服务主本地索引与挂载卷协调器。
 pub fn start_with_coordinator(
     store: IndexStore,
@@ -52,10 +113,7 @@ pub fn start_with_coordinator(
     config_store: ConfigStore,
 ) -> std::io::Result<()> {
     let path = socket_path();
-    // 上次进程异常退出会留下陈旧的 socket 文件，不删除则 bind 失败
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = bind_socket(&path)?;
     std::thread::spawn(move || {
         serve_with_coordinator(listener, store, coordinator, config_store, MAX_CONNECTIONS)
     });
@@ -399,5 +457,82 @@ mod tests {
         assert_eq!(online_only.results.len(), 1);
         assert_eq!(online_only.results[0].path, "/Users/me/src/report_local.rs");
         assert!(online_only.offline_indices.is_empty());
+    }
+
+    #[test]
+    fn bind_socket_rejects_live_listener_and_cleans_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("query.sock");
+
+        let listener = bind_socket(&sock_path).unwrap();
+        let store = IndexStore::new();
+        store.replace(vec![entry("live.rs", "/src/live.rs")]);
+        let config_store = ConfigStore::new(AppConfig::default());
+        std::thread::spawn(move || serve(listener, store, config_store, MAX_CONNECTIONS));
+
+        // Second bind attempt while server is live must fail without unlinking query.sock.
+        let second = bind_socket(&sock_path);
+        assert!(second.is_err());
+        assert_eq!(second.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+
+        let reply = query(&sock_path, r#"{"q":"live","mode":"substring"}"#);
+        assert_eq!(reply.results.len(), 1);
+
+        // Unreachable socket left behind by an exited process must be cleaned and rebound.
+        let stale_path = dir.path().join("stale.sock");
+        let stale_listener = UnixListener::bind(&stale_path).unwrap();
+        drop(stale_listener);
+        assert!(stale_path.exists());
+        let rebound = bind_socket(&stale_path);
+        assert!(rebound.is_ok());
+
+        // Socket returning non-ConnectionRefused (e.g. PermissionDenied) must NOT be unlinked.
+        let restricted_path = dir.path().join("restricted.sock");
+        let _restricted_listener = UnixListener::bind(&restricted_path).unwrap();
+        std::fs::set_permissions(&restricted_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restricted_err = bind_socket(&restricted_path);
+        assert!(restricted_err.is_err());
+        assert_eq!(
+            restricted_err.unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(
+            restricted_path.exists(),
+            "socket whose liveness could not be proven stale must not be unlinked"
+        );
+        let _ = std::fs::set_permissions(&restricted_path, std::fs::Permissions::from_mode(0o600));
+
+        // Dangling symlink must NOT be followed, unlinked, or overwritten.
+        let dangling_target = dir.path().join("nonexistent.sock");
+        let dangling_path = dir.path().join("dangling.sock");
+        std::os::unix::fs::symlink(&dangling_target, &dangling_path).unwrap();
+        let dangling_err = bind_socket(&dangling_path);
+        assert!(dangling_err.is_err());
+        assert_eq!(
+            dangling_err.unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(
+            std::fs::symlink_metadata(&dangling_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dangling symlink must never be unlinked by bind_socket"
+        );
+        assert!(
+            !dangling_target.exists(),
+            "bind_socket must not follow a dangling symlink to create target"
+        );
+
+        // Regular file at socket path must NOT be unlinked.
+        let regular_path = dir.path().join("regular.sock");
+        std::fs::write(&regular_path, b"keep").unwrap();
+        let regular_err = bind_socket(&regular_path);
+        assert!(regular_err.is_err());
+        assert_eq!(
+            regular_err.unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert_eq!(std::fs::read(&regular_path).unwrap(), b"keep");
     }
 }

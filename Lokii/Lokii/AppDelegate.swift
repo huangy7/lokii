@@ -1,13 +1,168 @@
 import AppKit
+import Darwin
 
 extension KeyboardShortcuts.Name {
     static let toggleWindow = Self("toggleWindow", default: .init(.space, modifiers: [.command, .shift]))
 }
 
+@_silgen_name("flock")
+private func darwinFlock(_ fd: Int32, _ operation: Int32) -> Int32
+
+/// Enforces a single live Lokii instance via a non-blocking exclusive `flock` lockfile
+/// before `LokiiCore`, watchers, or the query server initialize.
+final class SingleInstanceGuard {
+    enum AcquireResult {
+        case acquired(SingleInstanceGuard)
+        case alreadyHeld(holderPid: pid_t)
+        case ioError(Int32)
+    }
+
+    private static var activeGuard: SingleInstanceGuard?
+
+    private let fd: Int32
+
+    private init(fd: Int32) {
+        self.fd = fd
+    }
+
+    deinit {
+        if fd >= 0 {
+            Darwin.close(fd)
+        }
+    }
+
+    var fileDescriptor: Int32 { fd }
+
+    static var defaultLockPath: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(".config/lokii/lokii.lock")
+    }
+
+    static func tryAcquire(at lockPath: String) -> AcquireResult {
+        let parentDir = (lockPath as NSString).deletingLastPathComponent
+        if !parentDir.isEmpty {
+            try? FileManager.default.createDirectory(
+                atPath: parentDir,
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+        }
+
+        // Open with O_CLOEXEC so child processes never inherit the lock fd and keep
+        // subsequent Lokii launches blocked after the parent exits.
+        let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard fd >= 0 else {
+            return .ioError(Darwin.errno)
+        }
+
+        var lockRc: Int32 = -1
+        repeat {
+            lockRc = darwinFlock(fd, LOCK_EX | LOCK_NB)
+        } while lockRc != 0 && Darwin.errno == EINTR
+
+        if lockRc == 0 {
+            Darwin.ftruncate(fd, 0)
+            Darwin.lseek(fd, 0, SEEK_SET)
+            let pidLine = "\(Darwin.getpid())\n"
+            _ = pidLine.withCString { ptr in
+                Darwin.write(fd, ptr, strlen(ptr))
+            }
+            return .acquired(SingleInstanceGuard(fd: fd))
+        }
+
+        let lockErr = Darwin.errno
+        if lockErr == EWOULDBLOCK || lockErr == EAGAIN {
+            var buffer = [CChar](repeating: 0, count: 32)
+            let bytesRead = Darwin.pread(fd, &buffer, buffer.count - 1, 0)
+            var holderPid: pid_t = 0
+            if bytesRead > 0 {
+                let text = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+                if let parsed = pid_t(text), parsed > 0 {
+                    holderPid = parsed
+                }
+            }
+            Darwin.close(fd)
+            return .alreadyHeld(holderPid: holderPid)
+        }
+
+        Darwin.close(fd)
+        return .ioError(lockErr)
+    }
+
+    static func acquireOrActivateExistingAndExit() {
+        switch tryAcquire(at: defaultLockPath) {
+        case .acquired(let guardHandle):
+            activeGuard = guardHandle
+        case .alreadyHeld(let holderPid):
+            activateExistingInstance(holderPid: holderPid)
+            Darwin.exit(0)
+        case .ioError(let code):
+            NSLog("[Lokii] Single-instance lock open failed (errno=%d); continuing startup", code)
+        }
+    }
+
+    /// Verifies that a PID read from the lockfile actually belongs to a Lokii instance
+    /// so a recycled PID read in a narrow race window never activates an unrelated app.
+    static func matchesExistingInstance(
+        candidateBundleId: String?,
+        candidateName: String?,
+        currentBundleId: String?,
+        fallbackBundleId: String = "com.lokii.app"
+    ) -> Bool {
+        let expectedBundleId = currentBundleId ?? fallbackBundleId
+        if let candidateBundleId {
+            return candidateBundleId == expectedBundleId
+        }
+        return currentBundleId == nil && candidateName == "Lokii"
+    }
+
+    private static func activateExistingInstance(holderPid: pid_t) {
+        let selfPid = Darwin.getpid()
+        let currentBundleId = Bundle.main.bundleIdentifier
+        let bundleId = currentBundleId ?? "com.lokii.app"
+        let candidateByPid: NSRunningApplication? = {
+            guard holderPid > 0, holderPid != selfPid else { return nil }
+            guard let app = NSRunningApplication(processIdentifier: holderPid),
+                  !app.isTerminated,
+                  matchesExistingInstance(
+                      candidateBundleId: app.bundleIdentifier,
+                      candidateName: app.localizedName,
+                      currentBundleId: currentBundleId
+                  ) else {
+                return nil
+            }
+            return app
+        }()
+        let existingApp = candidateByPid
+            ?? NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+                .first(where: { $0.processIdentifier != selfPid && !$0.isTerminated })
+
+        guard let existingApp else { return }
+        existingApp.unhide()
+        if #available(macOS 14.0, *) {
+            existingApp.activate(options: [.activateAllWindows])
+        } else {
+            existingApp.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        }
+
+        // Reopen through LaunchServices so an accessory-mode instance whose window is
+        // hidden by hideOnBlur receives applicationShouldHandleReopen and shows itself.
+        if let bundleURL = existingApp.bundleURL {
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = true
+            config.createsNewApplicationInstance = false
+            let delivered = DispatchSemaphore(value: 0)
+            NSWorkspace.shared.openApplication(at: bundleURL, configuration: config) { _, _ in
+                delivered.signal()
+            }
+            _ = delivered.wait(timeout: .now() + 0.5)
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindow: SearchWindow?
     private var statusItem: NSStatusItem?
-    private let engine = SearchEngine()
+    private lazy var engine = SearchEngine()
     private var preferencesController: PreferencesWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
