@@ -73,3 +73,4 @@ targets:
       path: Lokii/Lokii.entitlements
       properties:
         com.apple.security.app-sandbox: false
+        com.apple.security.automation.apple-events: true

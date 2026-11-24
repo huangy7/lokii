@@ -1157,6 +1157,75 @@ final class SearchResultsViewController: NSViewController {
         NSWorkspace.shared.icon(forFile: path)
     }
 
+    struct AppleScriptOutcome {
+        let succeeded: Bool
+        let errorNumber: Int?
+        let errorMessage: String?
+    }
+
+    static let automationPrivacySettingsURLs = [
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+    ]
+
+    private static var isPresentingAutomationAlert = false
+
+    static func openAutomationPrivacySettings() {
+        for rawValue in automationPrivacySettingsURLs {
+            guard let url = URL(string: rawValue) else { continue }
+            if NSWorkspace.shared.open(url) {
+                return
+            }
+        }
+    }
+
+    static func presentAutomationPermissionAlert() {
+        guard !isPresentingAutomationAlert else { return }
+        isPresentingAutomationAlert = true
+        defer { isPresentingAutomationAlert = false }
+
+        // System TCC prompts or Finder activation steal focus and hide SearchWindow when
+        // hideOnBlur is enabled, so force-activate the app (consistent with SearchWindow /
+        // AppDelegate) before running a modal alert even in accessory mode on macOS 14+.
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L("search.getInfo.automationDenied.title")
+        alert.informativeText = L("search.getInfo.automationDenied.message")
+        alert.addButton(withTitle: L("search.getInfo.automationDenied.openSettings"))
+        alert.addButton(withTitle: L("fda.later"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            openAutomationPrivacySettings()
+        }
+    }
+
+    /// Injectable AppleScript runner for Finder Get Info actions.
+    var appleScriptExecutor: (String) -> AppleScriptOutcome = { source in
+        guard let script = NSAppleScript(source: source) else {
+            return AppleScriptOutcome(
+                succeeded: false,
+                errorNumber: nil,
+                errorMessage: nil
+            )
+        }
+        var error: NSDictionary?
+        script.executeAndReturnError(&error)
+        if let error = error {
+            return AppleScriptOutcome(
+                succeeded: false,
+                errorNumber: error[NSAppleScript.errorNumber] as? Int,
+                errorMessage: error[NSAppleScript.errorMessage] as? String
+            )
+        }
+        return AppleScriptOutcome(succeeded: true, errorNumber: nil, errorMessage: nil)
+    }
+
+    /// Invoked on main thread when Finder Automation permission (-1743) is denied.
+    var automationPermissionDeniedHandler: () -> Void = {
+        SearchResultsViewController.presentAutomationPermissionAlert()
+    }
+
     /// 上下文作用域租约：当面包屑弹出右键菜单时临时接管有效载荷，规避与主列表选区发生交叉错位
     var activeContextMenuPayload: [URL]?
 
@@ -2682,12 +2751,18 @@ final class SearchResultsViewController: NSViewController {
         }
         let candidatePaths = Array(paths.prefix(10))
         guard !candidatePaths.isEmpty else { return }
+        let executor = appleScriptExecutor
         delegate?.searchResultsDidConsumeResult()
 
         // 将 fileExists 过滤也放入后台队列，避免失联网络挂载点在点击“显示简介”时阻塞主线程
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let targets = candidatePaths.filter { FileManager.default.fileExists(atPath: $0) }
-            guard !targets.isEmpty else { return }
+            guard !targets.isEmpty else {
+                DispatchQueue.main.async {
+                    self?.showBlockedActionFeedback(L("search.getInfo.notFound"))
+                }
+                return
+            }
             let statements = targets.map { path -> String in
                 let escaped = path
                     .replacingOccurrences(of: "\\", with: "\\\\")
@@ -2702,9 +2777,31 @@ final class SearchResultsViewController: NSViewController {
             end tell
             """
 
-            var error: NSDictionary?
-            if let script = NSAppleScript(source: scriptSource) {
-                script.executeAndReturnError(&error)
+            let outcome = executor(scriptSource)
+            guard !outcome.succeeded else { return }
+
+            if outcome.errorNumber == -128 {
+                // User dismissed or cancelled the system authorization / AppleScript prompt.
+                return
+            }
+
+            if outcome.errorNumber == -1743 {
+                NSLog("[Lokii] Finder Automation permission denied (-1743)")
+                DispatchQueue.main.async {
+                    self?.showBlockedActionFeedback(L("search.getInfo.automationDenied.title"))
+                    self?.automationPermissionDeniedHandler()
+                }
+                return
+            }
+
+            let rawErrorMessage = outcome.errorMessage
+            NSLog("[Lokii] Finder Get Info AppleScript failed (%@): %@",
+                  outcome.errorNumber.map(String.init) ?? "unknown",
+                  rawErrorMessage ?? "unknown error")
+            DispatchQueue.main.async {
+                let trimmed = rawErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayMessage = (trimmed?.isEmpty == false) ? trimmed! : L("search.getInfo.failed")
+                self?.showBlockedActionFeedback(displayMessage)
             }
         }
     }

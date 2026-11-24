@@ -361,6 +361,11 @@
 "search.result.offline" = "Offline";
 "search.offline.actionBlocked" = "Volume is disconnected; file operation unavailable";
 "search.offline.openFailedTitle" = "Unable to Open Item";
+"search.getInfo.notFound" = "Selected item was not found on disk";
+"search.getInfo.failed" = "Unable to open Finder Get Info window";
+"search.getInfo.automationDenied.title" = "Finder Automation Permission Required";
+"search.getInfo.automationDenied.message" = "Lokii needs Automation permission to ask Finder to open Get Info windows. Enable Finder under Lokii in System Settings → Privacy & Security → Automation.";
+"search.getInfo.automationDenied.openSettings" = "Open System Settings";
 "prefs.volume.status.online" = "Online (%@ entries)";
 "prefs.volume.status.syncing" = "Syncing...";
 "prefs.volume.status.offline" = "Offline · Index cached (%@ entries)";

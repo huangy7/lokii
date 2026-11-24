@@ -1174,8 +1174,126 @@ assertEqual(controller.noMatchActionCards[1].accessibilityPerformPress(), false,
 controller.noMatchActionCards[1].simulateClick()
 assertEqual(enableFuzzyCalls, 1, "禁用卡片点击不得重复触发开启模糊回调")
 
-print("测试全部通过：18/18 项断言成功。")
+// 验证「显示简介」：目标缺失反馈、-128 用户取消静默跳过、-1743 自动化权限弹窗回调与系统设置链接
+func waitMainUntil(timeout: TimeInterval = 2.0, _ predicate: () -> Bool) {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !predicate() && Date() < deadline {
+        CFRunLoopRunInMode(.defaultMode, 0.02, true)
+    }
+}
+
+let infoTmpFile = "/tmp/lokii-getinfo-test-\\(UUID().uuidString).txt"
+FileManager.default.createFile(atPath: infoTmpFile, contents: Data("ok".utf8))
+defer { try? FileManager.default.removeItem(atPath: infoTmpFile) }
+
+let missingResult = FfiSearchResult(
+    name: "missing.txt",
+    path: "/tmp/lokii-getinfo-missing-\\(UUID().uuidString).txt",
+    extension: "txt",
+    isDir: false,
+    size: 1,
+    created: 0,
+    modified: 0
+)
+controller.displayResults([missingResult], preserveSelection: false)
+controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+assertEqual(controller.selectedResults.count, 1, "缺失条目行必须处于选中态")
+controller.showInfoSelected(nil)
+waitMainUntil { controller.statusLabel.stringValue == L("search.getInfo.notFound") }
+assertEqual(
+    controller.statusLabel.stringValue,
+    L("search.getInfo.notFound"),
+    "目标文件不在磁盘上时必须提示未找到简介反馈"
+)
+
+let existingResult = FfiSearchResult(
+    name: "present.txt",
+    path: infoTmpFile,
+    extension: "txt",
+    isDir: false,
+    size: 2,
+    created: 0,
+    modified: 0
+)
+controller.displayResults([existingResult], preserveSelection: false)
+controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+
+var automationPromptCount = 0
+var scriptExecutorCalls = 0
+controller.automationPermissionDeniedHandler = {
+    automationPromptCount += 1
+}
+
+controller.cancelTemporaryStatus()
+controller.statusLabel.stringValue = ""
+controller.appleScriptExecutor = { _ in
+    DispatchQueue.main.async { scriptExecutorCalls += 1 }
+    return .init(succeeded: false, errorNumber: -128, errorMessage: "User canceled.")
+}
+controller.showInfoSelected(nil)
+waitMainUntil { scriptExecutorCalls == 1 }
+CFRunLoopRunInMode(.defaultMode, 0.05, true)
+assertEqual(scriptExecutorCalls, 1, "-128 用例应实际执行 AppleScript 调用器")
+assertEqual(automationPromptCount, 0, "-128 用户取消不得弹出自动化权限警告")
+assertEqual(controller.statusLabel.stringValue, "", "-128 用户取消不得显示错误提示")
+
+controller.appleScriptExecutor = { _ in
+    .init(succeeded: false, errorNumber: -1743, errorMessage: "Not authorized to send Apple events to Finder.")
+}
+controller.showInfoSelected(nil)
+waitMainUntil { automationPromptCount == 1 && controller.statusLabel.stringValue == L("search.getInfo.automationDenied.title") }
+assertEqual(automationPromptCount, 1, "-1743 拒绝自动化权限时必须弹出可见指引弹窗")
+assertEqual(
+    controller.statusLabel.stringValue,
+    L("search.getInfo.automationDenied.title"),
+    "-1743 拒绝权限时状态栏应更新为本地化权限提示"
+)
+assertTrue(
+    SearchResultsViewController.automationPrivacySettingsURLs.allSatisfy { $0.contains("Privacy_Automation") },
+    "系统设置跳转链接必须指向隐私与安全性 → 自动化"
+)
+
+// 通用 AppleScript 失败（errorMessage == nil 或纯空白）必须展示简介专属失败提示，不得误报离线卷文案或留白
+controller.cancelTemporaryStatus()
+controller.statusLabel.stringValue = ""
+controller.appleScriptExecutor = { _ in
+    .init(succeeded: false, errorNumber: -1000, errorMessage: nil)
+}
+controller.showInfoSelected(nil)
+waitMainUntil { controller.statusLabel.stringValue == L("search.getInfo.failed") }
+assertEqual(
+    controller.statusLabel.stringValue,
+    L("search.getInfo.failed"),
+    "通用简介失败兜底不得误用离线卷断开提示文案"
+)
+
+controller.cancelTemporaryStatus()
+controller.statusLabel.stringValue = ""
+controller.appleScriptExecutor = { _ in
+    .init(succeeded: false, errorNumber: -1000, errorMessage: "  \\n\\t ")
+}
+controller.showInfoSelected(nil)
+waitMainUntil { controller.statusLabel.stringValue == L("search.getInfo.failed") }
+assertEqual(
+    controller.statusLabel.stringValue,
+    L("search.getInfo.failed"),
+    "纯空白 errorMessage 必须回退至简介专属本地化失败提示"
+)
+
+print("测试全部通过：21/21 项断言成功。")
 """
+
+guard searchResultsSource.contains("NSApp.activate(ignoringOtherApps: true)")
+        && !searchResultsSource.contains("NSApp.activate()") else {
+    fputs("断言失败: presentAutomationPermissionAlert 必须使用 NSApp.activate(ignoringOtherApps: true) 以兼容 macOS 14+ 后台置前\n", stderr)
+    exit(1)
+}
+
+guard let projectYmlSource = try? String(contentsOfFile: "Lokii/project.yml", encoding: .utf8),
+      projectYmlSource.contains("com.apple.security.automation.apple-events: true") else {
+    fputs("断言失败: Lokii/project.yml 必须声明 com.apple.security.automation.apple-events: true，避免 XcodeGen 生成时覆盖权限配置\n", stderr)
+    exit(1)
+}
 
 let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
 try! FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
