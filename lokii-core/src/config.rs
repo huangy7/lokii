@@ -417,8 +417,7 @@ pub(crate) fn load_or_create_config_in(config_dir: &std::path::Path) -> (AppConf
 
     if !config_path.exists() {
         // First run: create default config (per D-03, CFG-06)
-        let _ = std::fs::create_dir_all(config_dir);
-        let _ = std::fs::write(&config_path, DEFAULT_CONFIG_TOML);
+        let _ = write_config_atomic(&config_path, DEFAULT_CONFIG_TOML);
         return (AppConfig::default(), None);
     }
 
@@ -446,6 +445,115 @@ pub(crate) fn load_or_create_config_in(config_dir: &std::path::Path) -> (AppConf
             (AppConfig::default(), Some(msg))
         }
     }
+}
+
+/// Resolves symlink targets before atomic replacement so writing through a
+/// symlinked `config.toml` updates the real backing file in place instead of
+/// replacing the symlink itself with a regular file.
+fn resolve_atomic_write_target(config_path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let is_symlink = std::fs::symlink_metadata(config_path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return Ok(config_path.to_path_buf());
+    }
+    if let Ok(canonical) = std::fs::canonicalize(config_path) {
+        return Ok(canonical);
+    }
+    let mut current = config_path.to_path_buf();
+    for hop in 0..=32 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if hop == 32 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "too many levels of symbolic links",
+                    ));
+                }
+                let link_target = std::fs::read_link(&current)?;
+                current = if link_target.is_absolute() {
+                    link_target
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("/"))
+                        .join(link_target)
+                };
+            }
+            _ => return Ok(current),
+        }
+    }
+    Ok(current)
+}
+
+/// Serializes atomic config writes with `start_config_watcher` reloads so self-writes
+/// publish to `ConfigStore` before the watcher observes the renamed file, while never
+/// exposing uncommitted config changes to concurrent readers before `rename` succeeds.
+static CONFIG_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Atomically persists serialized TOML configuration in the resolved target
+/// directory (`temp file -> preserve permissions -> sync_data -> rename`) so
+/// readers never observe a truncated file and symlinks/permissions stay intact.
+pub fn write_config_atomic(config_path: &std::path::Path, toml_str: &str) -> std::io::Result<()> {
+    write_config_atomic_then(config_path, toml_str, || {})
+}
+
+/// Atomically persists `toml_str` and runs `on_committed` under `CONFIG_WRITE_LOCK`
+/// only after `rename` succeeds.
+pub(crate) fn write_config_atomic_then<F>(
+    config_path: &std::path::Path,
+    toml_str: &str,
+    on_committed: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(),
+{
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let _write_guard = CONFIG_WRITE_LOCK.lock();
+    let target_path = resolve_atomic_write_target(config_path)?;
+
+    let existing_perms = std::fs::metadata(&target_path).ok().map(|m| m.permissions());
+    if let Some(parent) = target_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    let seq = CONFIG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!("{file_name}.tmp.{}.{seq}", std::process::id());
+    let tmp_path = target_path.with_file_name(tmp_name);
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(ref perms) = existing_perms {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // Create the staging file directly with the existing mode so restricted
+            // configs (e.g. 0600) are never briefly world-readable under default umask.
+            opts.mode(perms.mode() & 0o777);
+        }
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(toml_str.as_bytes())?;
+        file.flush()?;
+        if let Some(perms) = existing_perms {
+            file.set_permissions(perms)?;
+        }
+        file.sync_data()?;
+        std::fs::rename(&tmp_path, &target_path)?;
+        Ok(())
+    })();
+    if write_res.is_ok() {
+        on_committed();
+    } else {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_res
 }
 
 /// Start watching the config.toml file for changes.
@@ -490,27 +598,35 @@ where
                     // Debounce: drain extra events within 200ms
                     while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
 
-                    match std::fs::read_to_string(&config_path) {
-                        Ok(content) => match AppConfig::from_toml(&content) {
-                            Ok(new_config) => {
-                                // 若磁盘内容与内存 config_store 完全一致（典型于前端自身写盘触发的文件事件），
-                                // 直接跳过重复回调，消除无意义的卷协调器对账与 UI 重载。
-                                if *config_store.read() == new_config {
-                                    continue;
+                    // Hold CONFIG_WRITE_LOCK only while reading and comparing against config_store
+                    // so in-process atomic writes finish publishing before the watcher checks equality,
+                    // then release the lock prior to invoking external callbacks.
+                    let reload_outcome = {
+                        let _write_guard = CONFIG_WRITE_LOCK.lock();
+                        match std::fs::read_to_string(&config_path) {
+                            Ok(content) => match AppConfig::from_toml(&content) {
+                                Ok(new_config) => {
+                                    // 若磁盘内容与内存 config_store 完全一致（典型于前端自身写盘触发的文件事件），
+                                    // 直接跳过重复回调，消除无意义的卷协调器对账与 UI 重载。
+                                    if *config_store.read() == new_config {
+                                        Ok(None)
+                                    } else {
+                                        config_store.update(new_config.clone());
+                                        Ok(Some(new_config))
+                                    }
                                 }
-                                config_store.update(new_config.clone());
-                                on_reload(&new_config);
-                            }
-                            Err(e) => {
-                                on_error(format!(
+                                Err(e) => Err(format!(
                                     "Config parse error: {} (keeping previous config)",
                                     e
-                                ));
-                            }
-                        },
-                        Err(e) => {
-                            on_error(format!("Failed to read config: {}", e));
+                                )),
+                            },
+                            Err(e) => Err(format!("Failed to read config: {}", e)),
                         }
+                    };
+                    match reload_outcome {
+                        Ok(Some(new_config)) => on_reload(&new_config),
+                        Ok(None) => {}
+                        Err(msg) => on_error(msg),
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -914,5 +1030,117 @@ hide_results_when_empty = false
         let json = serde_json::to_string(&disabled).expect("serialize");
         let roundtrip: AppConfig = serde_json::from_str(&json).expect("deserialize");
         assert!(!roundtrip.general.hide_results_when_empty);
+    }
+
+    #[test]
+    fn test_write_config_atomic_replaces_without_leftover_tmp() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        write_config_atomic(&path, "[index]\nmax_results = 250\n").unwrap();
+        write_config_atomic(&path, "[index]\nmax_results = 350\n").unwrap();
+        let parsed = AppConfig::from_toml(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.index.max_results, 350);
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_preserves_symlink_target_and_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        let dotfiles_dir = tmp.path().join("dotfiles");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&dotfiles_dir).unwrap();
+
+        let real_target = dotfiles_dir.join("lokii.toml");
+        fs::write(&real_target, "[index]\nmax_results = 100\n").unwrap();
+        fs::set_permissions(&real_target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let symlink_path = config_dir.join("config.toml");
+        symlink(&real_target, &symlink_path).unwrap();
+
+        write_config_atomic(&symlink_path, "[index]\nmax_results = 750\n").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&symlink_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink at config.toml must remain a symlink"
+        );
+        let updated = AppConfig::from_toml(&fs::read_to_string(&real_target).unwrap()).unwrap();
+        assert_eq!(updated.index.max_results, 750);
+        let mode = fs::metadata(&real_target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "target permissions must be preserved");
+        let dir_leftovers: Vec<_> = fs::read_dir(&config_dir)
+            .unwrap()
+            .chain(fs::read_dir(&dotfiles_dir).unwrap())
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(dir_leftovers.is_empty(), "leftover temp files: {dir_leftovers:?}");
+
+        // Regular file custom permissions are also preserved across atomic replace.
+        let regular_path = tmp.path().join("regular.toml");
+        fs::write(&regular_path, "[index]\nmax_results = 100\n").unwrap();
+        fs::set_permissions(&regular_path, fs::Permissions::from_mode(0o600)).unwrap();
+        write_config_atomic(&regular_path, "[index]\nmax_results = 420\n").unwrap();
+        assert_eq!(
+            fs::metadata(&regular_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Dangling symlink resolves to the intended target path while keeping the symlink intact.
+        let dangling_target = dotfiles_dir.join("created_later.toml");
+        let dangling_link = config_dir.join("dangling.toml");
+        symlink(&dangling_target, &dangling_link).unwrap();
+        write_config_atomic(&dangling_link, "[index]\nmax_results = 888\n").unwrap();
+        assert!(
+            fs::symlink_metadata(&dangling_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            AppConfig::from_toml(&fs::read_to_string(&dangling_target).unwrap())
+                .unwrap()
+                .index
+                .max_results,
+            888
+        );
+    }
+
+    #[test]
+    fn write_config_atomic_then_invokes_commit_only_after_success() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let mut committed = false;
+        write_config_atomic_then(&path, "[index]\nmax_results = 300\n", || {
+            assert!(path.exists(), "file must already be renamed when on_committed runs");
+            committed = true;
+        })
+        .unwrap();
+        assert!(committed);
+
+        // Replace target with a directory so rename fails: on_committed must never execute.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let mut called_on_failure = false;
+        let res = write_config_atomic_then(&path, "[index]\nmax_results = 999\n", || {
+            called_on_failure = true;
+        });
+        assert!(res.is_err());
+        assert!(
+            !called_on_failure,
+            "on_committed must not run when atomic rename fails"
+        );
     }
 }

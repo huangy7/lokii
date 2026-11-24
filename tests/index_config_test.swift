@@ -132,7 +132,7 @@ do {
     assertEqual(config1.maxResults, 200, "maxResults 解析匹配")
     assertEqual(config1.networkRescanMinutes, 15, "networkRescanMinutes 解析匹配")
 
-    print("[2/3] 测试 IndexConfig 缺少 exclude_paths 时的优雅回退（默认空数组）...")
+    print("[2/3] 测试 IndexConfig 缺少 exclude_paths 时的默认回退...")
     let jsonWithoutExcludePaths = \"\"\"
     {
         "index_paths": ["~"],
@@ -146,10 +146,10 @@ do {
     assertEqual(config2.indexPaths, ["~"], "indexPaths 正常")
     assertTrue(!config2.indexApps, "缺少 index_apps 时默认关闭")
     assertEqual(config2.exclude, ["target"], "exclude 正常")
-    assertEqual(config2.excludePaths, [], "缺少 exclude_paths 时回退为空数组")
+    assertEqual(config2.excludePaths, LokiiConfig.IndexConfig.defaultExcludePaths, "缺少 exclude_paths 时应回退至默认排除路径列表")
     assertTrue(config2.includeHidden, "includeHidden 为 true")
     assertTrue(config2.excludeSensitive, "缺少 exclude_sensitive 时默认保护凭据目录")
-    assertEqual(config2.sensitiveNames, [], "缺少 sensitive_names 时回退为空数组")
+    assertEqual(config2.sensitiveNames, LokiiConfig.IndexConfig.defaultSensitiveNames, "缺少 sensitive_names 时应回退至默认敏感路径列表")
     assertEqual(config2.networkRescanMinutes, 30, "缺少 network_rescan_minutes 时回退为 30 分钟")
 
     print("[3/3] 测试 IndexConfig 序列化能正确输出 exclude_paths 字段...")
@@ -339,6 +339,32 @@ do {
         false,
         "仅前缀相同的兄弟路径不应误判"
     )
+
+    print("[8/8] 测试空 JSON 与默认初始化回退值与 Rust AppConfig::default() 一致...")
+    let emptyData = "{}".data(using: .utf8)!
+    let decodedIndex = try decoder.decode(LokiiConfig.IndexConfig.self, from: emptyData)
+    let defaultIndex = LokiiConfig.IndexConfig()
+    assertEqual(decodedIndex.indexPaths, ["~"], "IndexConfig decode indexPaths 应默认 [~]")
+    assertEqual(defaultIndex.indexPaths, ["~"], "IndexConfig init indexPaths 应默认 [~]")
+    assertEqual(decodedIndex.exclude, LokiiConfig.IndexConfig.defaultExclude, "IndexConfig decode exclude 应匹配默认列表")
+    assertEqual(decodedIndex.exclude.count, 35, "IndexConfig defaultExclude 应包含 35 项")
+    assertEqual(decodedIndex.excludePaths, LokiiConfig.IndexConfig.defaultExcludePaths, "IndexConfig decode excludePaths 应匹配默认列表")
+    assertEqual(decodedIndex.excludePaths.count, 25, "IndexConfig defaultExcludePaths 应包含 25 项")
+    assertEqual(decodedIndex.sensitiveNames, LokiiConfig.IndexConfig.defaultSensitiveNames, "IndexConfig decode sensitiveNames 应匹配默认列表")
+    assertEqual(decodedIndex.sensitiveNames.count, 12, "IndexConfig defaultSensitiveNames 应包含 12 项")
+    assertEqual(decodedIndex.includeHidden, false, "IndexConfig decode includeHidden 应默认 false")
+    assertEqual(defaultIndex.includeHidden, false, "IndexConfig init includeHidden 应默认 false")
+    assertEqual(decodedIndex.maxResults, 500, "IndexConfig decode maxResults 应默认 500")
+    assertEqual(defaultIndex.maxResults, 500, "IndexConfig init maxResults 应默认 500")
+    assertEqual(decodedIndex.excludeSensitive, true, "IndexConfig decode excludeSensitive 应默认 true")
+    assertEqual(decodedIndex.networkRescanMinutes, 30, "IndexConfig decode networkRescanMinutes 应默认 30")
+
+    let decodedWindow = try decoder.decode(LokiiConfig.WindowConfig.self, from: emptyData)
+    let defaultWindow = LokiiConfig.WindowConfig()
+    assertEqual(decodedWindow.hideOnBlur, true, "WindowConfig decode hideOnBlur 应默认 true")
+    assertEqual(defaultWindow.hideOnBlur, true, "WindowConfig init hideOnBlur 应默认 true")
+    assertEqual(decodedWindow.rememberPosition, false, "WindowConfig decode rememberPosition 应默认 false")
+    assertEqual(defaultWindow.rememberPosition, false, "WindowConfig init rememberPosition 应默认 false")
     var updatedStatus = disk2Slot
     updatedStatus.entryCount += 1
     assertEqual(updatedStatus == disk2Slot, false, "计数变化仍应更新卷状态快照")
