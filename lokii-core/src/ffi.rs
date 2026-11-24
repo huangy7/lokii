@@ -605,6 +605,8 @@ pub struct LokiiCore {
     watcher: Mutex<Option<watcher::WatcherHandle>>,
     /// Prevents concurrent full scans (rebuild vs the service's reconciliation).
     scan_lock: Arc<Mutex<()>>,
+    /// Serializes `update_config_from_json` read-merge-persist-rollback transactions.
+    config_update_lock: Mutex<()>,
     /// Watcher diagnostics metrics.
     metrics: Arc<WatcherMetrics>,
     /// True once initial startup has completed and `on_index_ready` has been emitted.
@@ -634,6 +636,7 @@ impl LokiiCore {
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
+            config_update_lock: Mutex::new(()),
             metrics: Arc::new(WatcherMetrics::new()),
             initialized: Arc::new(AtomicBool::new(false)),
             startup_config_error: Mutex::new(config_error),
@@ -721,6 +724,7 @@ impl LokiiCore {
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
+            config_update_lock: Mutex::new(()),
             metrics: Arc::new(WatcherMetrics::new()),
             initialized: Arc::new(AtomicBool::new(false)),
             startup_config_error: Mutex::new(None),
@@ -1137,8 +1141,13 @@ impl LokiiCore {
     }
 
     /// Update configuration from a JSON patch string. Returns true on success.
-    /// Writes to TOML file first, then syncs ConfigStore, primary store exclusions, and VolumeCoordinator.
+    /// Atomically writes `config.toml` and publishes to ConfigStore only after rename succeeds,
+    /// then syncs primary store exclusions and VolumeCoordinator.
     pub fn update_config_from_json(&self, json: String) -> bool {
+        let _config_guard = self
+            .config_update_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let current = self.config_store.read().clone();
         let new_config = match merge_config_patch(&current, &json) {
             Some(config) => config,
@@ -1148,7 +1157,6 @@ impl LokiiCore {
             }
         };
 
-        let _ = std::fs::create_dir_all(&self.cache_dir);
         let config_path = self.cache_dir.join("config.toml");
         let toml_str = match toml::to_string_pretty(&new_config) {
             Ok(s) => s,
@@ -1158,7 +1166,12 @@ impl LokiiCore {
             }
         };
 
-        if let Err(e) = std::fs::write(&config_path, &toml_str) {
+        // Publish to config_store under CONFIG_WRITE_LOCK only after rename succeeds so
+        // background pollers never observe uncommitted changes on write failure, while
+        // start_config_watcher still sees the updated config before re-reading the file.
+        if let Err(e) = config::write_config_atomic_then(&config_path, &toml_str, || {
+            self.config_store.update(new_config.clone());
+        }) {
             eprintln!("[Lokii] Failed to write config file: {e}");
             return false;
         }
@@ -1180,10 +1193,8 @@ impl LokiiCore {
             self.store.exclude_paths(&new_resolved);
         }
 
-        let index_changed = current.index != new_config.index;
-        self.config_store.update(new_config.clone());
         // 仅当索引相关配置变更时同步卷协调器，避免修改通用/窗口设置时触发挂载表探测与卷缓存对账
-        if index_changed {
+        if current.index != new_config.index {
             self.volumes.on_config_updated(&new_config);
         }
         true
@@ -2444,5 +2455,92 @@ mod tests {
                 .any(|e| e.contains("config.toml.bak")),
             "startup config error must only be delivered once"
         );
+    }
+
+    #[test]
+    fn update_config_from_json_writes_atomically_and_rolls_back_on_failure() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::default();
+        let core = LokiiCore::for_test(cache_dir.path().to_path_buf(), cfg.clone(), Arc::new(Vec::new));
+
+        assert!(core.update_config_from_json(r#"{"index":{"max_results":250}}"#.to_string()));
+        assert_eq!(core.config_store.read().index.max_results, 250);
+        let parsed =
+            AppConfig::from_toml(&std::fs::read_to_string(cache_dir.path().join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(parsed.index.max_results, 250);
+
+        // Replace config.toml with a directory so atomic rename fails, verifying no
+        // concurrent reader ever observes the uncommitted patch value.
+        let config_path = cache_dir.path().join("config.toml");
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+
+        let core = Arc::new(core);
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let saw_dirty = Arc::new(AtomicBool::new(false));
+        let core_reader = Arc::clone(&core);
+        let stop_flag = Arc::clone(&stop_reader);
+        let dirty_flag = Arc::clone(&saw_dirty);
+        let reader_handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                if core_reader.config_store.read().index.max_results == 777 {
+                    dirty_flag.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        for _ in 0..20 {
+            assert!(!core.update_config_from_json(r#"{"index":{"max_results":777}}"#.to_string()));
+        }
+        stop_reader.store(true, Ordering::Relaxed);
+        reader_handle.join().unwrap();
+        assert!(
+            !saw_dirty.load(Ordering::SeqCst),
+            "concurrent ConfigStore reader must never observe uncommitted config on write failure"
+        );
+        assert_eq!(core.config_store.read().index.max_results, 250);
+        let leftovers: Vec<_> = std::fs::read_dir(cache_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files after failure: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_update_config_from_json_serializes_without_lost_updates() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(LokiiCore::for_test(
+            cache_dir.path().to_path_buf(),
+            AppConfig::default(),
+            Arc::new(Vec::new),
+        ));
+
+        let patches = [
+            r#"{"general":{"language":"en"}}"#,
+            r#"{"general":{"show_in_dock":false}}"#,
+            r#"{"window":{"remember_position":true}}"#,
+            r#"{"index":{"max_results":321}}"#,
+        ];
+
+        std::thread::scope(|scope| {
+            for patch in patches {
+                let c = Arc::clone(&core);
+                scope.spawn(move || {
+                    assert!(c.update_config_from_json(patch.to_string()));
+                });
+            }
+        });
+
+        let in_mem = core.config_store.read().clone();
+        let on_disk = AppConfig::from_toml(
+            &std::fs::read_to_string(cache_dir.path().join("config.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(in_mem, on_disk);
+        assert_eq!(in_mem.general.language, "en");
+        assert!(!in_mem.general.show_in_dock);
+        assert!(in_mem.window.remember_position);
+        assert_eq!(in_mem.index.max_results, 321);
     }
 }

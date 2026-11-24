@@ -340,7 +340,7 @@ class PreferencesViewModel: ObservableObject {
         }
     }
 
-    @Published var hideOnBlur: Bool = false {
+    @Published var hideOnBlur: Bool = true {
         didSet {
             saveGeneralConfig()
         }
@@ -364,7 +364,7 @@ class PreferencesViewModel: ObservableObject {
         refreshWindowSizeState()
     }
 
-    @Published var maxResults: Int = 100 {
+    @Published var maxResults: Int = 500 {
         didSet {
             saveGeneralConfig()
         }
@@ -431,15 +431,15 @@ class PreferencesViewModel: ObservableObject {
     }
 
     // 索引配置草稿态
-    @Published var indexPaths: [String] = [] {
+    @Published var indexPaths: [String] = LokiiConfig.IndexConfig.defaultIndexPaths {
         didSet {
             guard !isLoading else { return }
             refreshLocalPathChecks()
         }
     }
     @Published var indexApps: Bool = false
-    @Published var excludePatterns: [String] = []
-    @Published var excludePaths: [String] = [] {
+    @Published var excludePatterns: [String] = LokiiConfig.IndexConfig.defaultExclude
+    @Published var excludePaths: [String] = LokiiConfig.IndexConfig.defaultExcludePaths {
         didSet {
             guard !isLoading else { return }
             refreshLocalPathChecks()
@@ -481,13 +481,13 @@ class PreferencesViewModel: ObservableObject {
     private var cliProbeGeneration: UInt64 = 0
 
     // 已持久化的索引配置，用于脏状态比对与放弃更改恢复
-    @Published var savedIndexPaths: [String] = []
+    @Published var savedIndexPaths: [String] = LokiiConfig.IndexConfig.defaultIndexPaths
     @Published var savedIndexApps: Bool = false
-    @Published var savedExcludePatterns: [String] = []
-    @Published var savedExcludePaths: [String] = []
+    @Published var savedExcludePatterns: [String] = LokiiConfig.IndexConfig.defaultExclude
+    @Published var savedExcludePaths: [String] = LokiiConfig.IndexConfig.defaultExcludePaths
     @Published var savedIncludeHidden: Bool = false
     @Published var savedExcludeSensitive: Bool = true
-    private var sensitiveNames: [String] = []
+    private var sensitiveNames: [String] = LokiiConfig.IndexConfig.defaultSensitiveNames
     @Published var savedNetworkRescanMinutes: Int = 30
 
     @Published var hasFullDiskAccess: Bool = false

@@ -66,15 +66,35 @@ struct LokiiConfig: Codable {
             case networkRescanMinutes = "network_rescan_minutes"
         }
 
+        static let defaultIndexPaths: [String] = ["~"]
+        static let defaultExclude: [String] = [
+            "node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn",
+            "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__",
+            "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp",
+            "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj",
+            ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata",
+        ]
+        static let defaultExcludePaths: [String] = [
+            "/System", "/Library", "/private", "/bin", "/sbin", "/usr", "/dev",
+            "/Volumes", "/opt", "~/Library", "~/.Trash", "~/.cache", "~/.npm",
+            "~/.pnpm-store", "~/.yarn", "~/.cargo/registry", "~/.cargo/git", "~/.rustup",
+            "~/.gradle/caches", "~/.m2/repository", "~/.bun", "~/.deno", "~/.nvm",
+            "~/.orbstack", "~/.docker",
+        ]
+        static let defaultSensitiveNames: [String] = [
+            ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store",
+            ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".authinfo", ".msmtprc",
+        ]
+
         init(
-            indexPaths: [String] = [],
+            indexPaths: [String] = IndexConfig.defaultIndexPaths,
             indexApps: Bool = false,
-            exclude: [String] = [],
-            excludePaths: [String] = [],
-            includeHidden: Bool = true,
+            exclude: [String] = IndexConfig.defaultExclude,
+            excludePaths: [String] = IndexConfig.defaultExcludePaths,
+            includeHidden: Bool = false,
             excludeSensitive: Bool = true,
-            sensitiveNames: [String] = [],
-            maxResults: Int = 1000,
+            sensitiveNames: [String] = IndexConfig.defaultSensitiveNames,
+            maxResults: Int = 500,
             networkRescanMinutes: Int = 30
         ) {
             self.indexPaths = indexPaths
@@ -90,14 +110,14 @@ struct LokiiConfig: Codable {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.indexPaths = try container.decodeIfPresent([String].self, forKey: .indexPaths) ?? []
+            self.indexPaths = try container.decodeIfPresent([String].self, forKey: .indexPaths) ?? IndexConfig.defaultIndexPaths
             self.indexApps = try container.decodeIfPresent(Bool.self, forKey: .indexApps) ?? false
-            self.exclude = try container.decodeIfPresent([String].self, forKey: .exclude) ?? []
-            self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? []
-            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? true
+            self.exclude = try container.decodeIfPresent([String].self, forKey: .exclude) ?? IndexConfig.defaultExclude
+            self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? IndexConfig.defaultExcludePaths
+            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? false
             self.excludeSensitive = try container.decodeIfPresent(Bool.self, forKey: .excludeSensitive) ?? true
-            self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? []
-            self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? 1000
+            self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? IndexConfig.defaultSensitiveNames
+            self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? 500
             self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? 30
         }
     }
@@ -109,6 +129,20 @@ struct LokiiConfig: Codable {
         enum CodingKeys: String, CodingKey {
             case hideOnBlur = "hide_on_blur"
             case rememberPosition = "remember_position"
+        }
+
+        init(
+            hideOnBlur: Bool = true,
+            rememberPosition: Bool = false
+        ) {
+            self.hideOnBlur = hideOnBlur
+            self.rememberPosition = rememberPosition
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.hideOnBlur = try container.decodeIfPresent(Bool.self, forKey: .hideOnBlur) ?? true
+            self.rememberPosition = try container.decodeIfPresent(Bool.self, forKey: .rememberPosition) ?? false
         }
     }
 }

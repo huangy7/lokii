@@ -985,7 +985,8 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     
     /**
      * Update configuration from a JSON patch string. Returns true on success.
-     * Writes to TOML file first, then syncs ConfigStore, primary store exclusions, and VolumeCoordinator.
+     * Atomically writes `config.toml` and publishes to ConfigStore only after rename succeeds,
+     * then syncs primary store exclusions and VolumeCoordinator.
      */
     func updateConfigFromJson(json: String)  -> Bool
     
@@ -1296,7 +1297,8 @@ open func startWatcher(eventHandler: EventHandler)  {try! rustCall() {
     
     /**
      * Update configuration from a JSON patch string. Returns true on success.
-     * Writes to TOML file first, then syncs ConfigStore, primary store exclusions, and VolumeCoordinator.
+     * Atomically writes `config.toml` and publishes to ConfigStore only after rename succeeds,
+     * then syncs primary store exclusions and VolumeCoordinator.
      */
 open func updateConfigFromJson(json: String) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -2644,7 +2646,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_start_watcher() != 39967) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 11500) {
+    if (uniffi_lokii_core_checksum_method_lokiicore_update_config_from_json() != 41564) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_constructor_lokiicore_new() != 44128) {
