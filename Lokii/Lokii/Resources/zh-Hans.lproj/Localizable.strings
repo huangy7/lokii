@@ -361,6 +361,11 @@
 "search.result.offline" = "未连接";
 "search.offline.actionBlocked" = "磁盘或网络卷已断开，无法执行此文件操作";
 "search.offline.openFailedTitle" = "无法打开项目";
+"search.getInfo.notFound" = "未在磁盘上找到所选项目，无法显示简介";
+"search.getInfo.failed" = "无法打开访达“显示简介”窗口";
+"search.getInfo.automationDenied.title" = "需要访达自动化权限";
+"search.getInfo.automationDenied.message" = "Lokii 需要“自动化”权限才能控制访达打开“显示简介”窗口。请在“系统设置 → 隐私与安全性 → 自动化”中允许 Lokii 控制访达。";
+"search.getInfo.automationDenied.openSettings" = "打开系统设置";
 "prefs.volume.status.online" = "在线（%@ 项）";
 "prefs.volume.status.syncing" = "同步中...";
 "prefs.volume.status.offline" = "已离线 · 索引已保留（%@ 项）";

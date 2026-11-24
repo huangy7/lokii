@@ -272,6 +272,8 @@ build_app() {
     <false/>
     <key>SUVerifyUpdateBeforeExtraction</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>$(/usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$repo_root/Lokii/Lokii/Info.plist")</string>
 </dict>
 </plist>
 EOF

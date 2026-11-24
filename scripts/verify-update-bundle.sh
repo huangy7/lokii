@@ -15,6 +15,13 @@ public_key="$(read_plist SUPublicEDKey)"
 [[ $(read_plist SUVerifyUpdateBeforeExtraction) == true ]]
 [[ $(read_plist SUUpdateCheckInterval) == 86400 ]]
 [[ $(read_plist LSMinimumSystemVersion) == 13.0 ]]
+[[ -n "$(read_plist NSAppleEventsUsageDescription)" ]]
+entitlements_xml="$(codesign -d --entitlements - --xml "$bundle" 2>/dev/null || true)"
+apple_events_entitlement="$(plutil -extract 'com\.apple\.security\.automation\.apple-events' raw -o - - <<<"$entitlements_xml" 2>/dev/null || true)"
+if [[ "$apple_events_entitlement" != true ]]; then
+    printf '[FAIL] 缺少 com.apple.security.automation.apple-events entitlement\n' >&2
+    exit 1
+fi
 framework="$bundle/Contents/Frameworks/Sparkle.framework"
 [[ -L "$framework/Versions/Current" ]]
 [[ -x "$framework/Sparkle" ]]
