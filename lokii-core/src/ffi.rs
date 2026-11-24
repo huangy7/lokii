@@ -1404,6 +1404,8 @@ mod tests {
             journal_uuid: None,
             entry_count,
             dirty_filter: false,
+            filter_fingerprint: None,
+            pruned_for_fp: None,
         };
         let mut manifest = VolumeManifest::load_from_dir(volumes_dir);
         manifest.upsert(record.clone());

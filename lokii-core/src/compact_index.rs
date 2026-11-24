@@ -1974,6 +1974,51 @@ impl CompactIndex {
         Ok((added, removed))
     }
 
+    /// Retains only records whose full path satisfies `keep(path, is_dir)` and
+    /// immediately compacts query indexes.
+    pub fn retain_paths(&mut self, mut keep: impl FnMut(&str, bool) -> bool) -> usize {
+        if self.records.is_empty() {
+            return 0;
+        }
+        let mut path_buf = String::with_capacity(256);
+        let mut first_removed = None;
+        let mut removed = 0usize;
+        let mut retained = 0usize;
+        let count = self.records.len();
+
+        for ordinal in 0..count {
+            let record = self.records[ordinal];
+            let keep_record = if record.raw_path {
+                let raw = self.raw_paths.get(record.path).unwrap_or("");
+                keep(raw, record.is_dir)
+            } else {
+                let parent = self.parents.get(record.path).unwrap_or("");
+                let name = self.names.get(record.name).unwrap_or("");
+                path_buf.clear();
+                path_buf.reserve(parent.len() + name.len());
+                path_buf.push_str(parent);
+                path_buf.push_str(name);
+                keep(&path_buf, record.is_dir)
+            };
+
+            if keep_record {
+                self.records[retained] = record;
+                retained += 1;
+            } else {
+                if first_removed.is_none() {
+                    first_removed = Some(ordinal);
+                }
+                removed += 1;
+                self.release(record);
+            }
+        }
+        self.records.truncate(retained);
+        if let Some(first_removed) = first_removed {
+            self.on_records_removed(first_removed);
+        }
+        removed
+    }
+
     /// 索引里是否有以 `dir` 为父目录的条目。
     pub fn has_children(&self, dir: &str) -> bool {
         self.parents.find(&format!("{dir}/")).is_some()
@@ -2730,5 +2775,73 @@ mod tests {
         let rebuilt = index.sorted_names();
         let new_id = index.names.find("brand_new.rs").unwrap();
         assert!(rebuilt.ids.contains(&new_id));
+    }
+
+    #[test]
+    fn retain_paths_evicts_pooled_and_raw_records_and_keeps_query_index_valid() {
+        let entries = vec![
+            FileEntry {
+                name: "keep.txt".into(),
+                path: "/vol/docs/keep.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 100,
+                created_at: 10,
+                extension: "txt".into(),
+            },
+            FileEntry {
+                name: "drop.txt".into(),
+                path: "/vol/secret/drop.txt".into(),
+                is_dir: false,
+                size: 20,
+                modified: 100,
+                created_at: 10,
+                extension: "txt".into(),
+            },
+            // Include non-canonical raw_path records (name differs from path basename) on both sides.
+            FileEntry {
+                name: "raw_keep_alias".into(),
+                path: "/vol/docs/raw_keep_target".into(),
+                is_dir: true,
+                size: 0,
+                modified: 100,
+                created_at: 10,
+                extension: "".into(),
+            },
+            FileEntry {
+                name: "raw_drop_alias".into(),
+                path: "/vol/secret/raw_drop_target".into(),
+                is_dir: false,
+                size: 30,
+                modified: 100,
+                created_at: 10,
+                extension: "".into(),
+            },
+        ];
+
+        let mut index = CompactIndex::from_entries(entries).unwrap();
+        assert_eq!(index.pool_counts(), (4, 2, 2, 2));
+        assert_eq!(index.records().iter().filter(|r| r.raw_path).count(), 2);
+        index.warm_query_index();
+
+        let removed = index.retain_paths(|path, _| !path.contains("/secret"));
+        assert_eq!(removed, 2);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.pool_counts(), (2, 1, 2, 1));
+        assert_eq!(index.records().iter().filter(|r| r.raw_path).count(), 1);
+        index.validate().unwrap();
+
+        assert_eq!(index.names.find("drop.txt"), None);
+        assert_eq!(index.names.find("raw_drop_alias"), None);
+        let kept_paths: Vec<String> = index.iter().map(|(_, v)| v.materialize().path).collect();
+        assert!(kept_paths.contains(&"/vol/docs/keep.txt".to_string()));
+        assert!(kept_paths.contains(&"/vol/docs/raw_keep_target".to_string()));
+
+        // Verify warmed query index returns the remaining entries and never hits dropped ones.
+        let qi = index.query_index();
+        assert_eq!(qi.entries(index.names.find("keep.txt").unwrap()).len(), 1);
+        let raw_keep_id = index.names.find("raw_keep_alias").unwrap();
+        assert_eq!(qi.entries(raw_keep_id).len(), 1);
+        assert!(index.sorted_names().ids.contains(&raw_keep_id));
     }
 }

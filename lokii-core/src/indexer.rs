@@ -263,6 +263,11 @@ impl IndexStore {
         let _ = write.apply_event_batch(&[], paths, &[], Vec::new());
     }
 
+    /// Retains only entries matching `keep(path, is_dir)` and compacts query indexes.
+    pub fn retain_paths(&self, keep: impl FnMut(&str, bool) -> bool) -> usize {
+        self.entries.write().retain_paths(keep)
+    }
+
     pub fn search(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
         let query = query.trim();
         if query.is_empty() || max_results == 0 {
