@@ -234,14 +234,22 @@ fn prefix_rename_preserves_neighbor_and_merges_target_parent() {
 
 #[test]
 fn failed_cache_save_preserves_previous_file() {
+    use std::os::unix::fs::PermissionsExt;
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("index.cache");
     let index = CompactIndex::from_entries([entry("main.rs", "/a/main.rs")]).unwrap();
     lokii_core::cache::save_compact(&index, None, &path).unwrap();
     let previous = std::fs::read(&path).unwrap();
-    std::fs::create_dir(path.with_extension("tmp")).unwrap();
-    assert!(lokii_core::cache::save_compact(&index, None, &path).is_err());
-    assert_eq!(std::fs::read(path).unwrap(), previous);
+
+    // Prevent creating any unique staging temp file in the parent directory.
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let save_result = lokii_core::cache::save_compact(&index, None, &path);
+    let current = std::fs::read(&path).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(save_result.is_err());
+    assert_eq!(current, previous);
 }
 
 #[test]

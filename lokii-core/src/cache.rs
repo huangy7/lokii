@@ -1,8 +1,11 @@
 use crate::indexer::FileEntry;
 
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 const CACHE_MAGIC: &[u8; 4] = b"LOKI";
 /// Version of the legacy `Vec<FileEntry>` payload.
@@ -111,8 +114,57 @@ pub fn encode_compact(index: &crate::compact_index::CompactIndex) -> Vec<u8> {
     index.encode_cache()
 }
 
-/// 将已编码的紧凑索引字节流与可选回放检查点原子写入磁盘。
-pub fn save_encoded_compact(
+/// Resolves a stable lock key even when leaf parent directories do not exist yet,
+/// by canonicalizing the nearest existing ancestor and re-appending missing components.
+fn canonical_lock_key(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    let mut pending_components = Vec::new();
+    let mut cursor = abs.as_path();
+    loop {
+        if let Ok(canon) = fs::canonicalize(cursor) {
+            let mut key = canon;
+            for comp in pending_components.into_iter().rev() {
+                key.push(comp);
+            }
+            return key;
+        }
+        match (cursor.parent(), cursor.file_name()) {
+            (Some(parent), Some(name)) if parent != cursor => {
+                pending_components.push(name.to_os_string());
+                cursor = parent;
+            }
+            _ => return abs,
+        }
+    }
+}
+
+/// Serialize concurrent saves targeting the exact same cache path while allowing
+/// distinct shard files to flush and `sync_data()` in parallel.
+pub(crate) fn path_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    static PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+    let key = canonical_lock_key(path);
+
+    let map = PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock();
+    if guard.len() > 256 {
+        guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    Arc::clone(
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+pub(crate) fn save_encoded_compact_unlocked(
     encoded: &[u8],
     checkpoint: Option<Checkpoint>,
     path: &Path,
@@ -122,7 +174,7 @@ pub fn save_encoded_compact(
         fingerprint: 0,
     });
     // 检查点与编码结果分段写入文件，不再拼成一份连续负载，省掉一次整份复制。
-    write_cache(
+    write_cache_unlocked(
         CACHE_VERSION_CHECKPOINT,
         &[
             &checkpoint.event_id.to_le_bytes(),
@@ -133,13 +185,28 @@ pub fn save_encoded_compact(
     )
 }
 
+/// 将已编码的紧凑索引字节流与可选回放检查点原子写入磁盘。
+pub fn save_encoded_compact(
+    encoded: &[u8],
+    checkpoint: Option<Checkpoint>,
+    path: &Path,
+) -> Result<(), CacheError> {
+    let lock = path_write_lock(path);
+    let _guard = lock.lock();
+    save_encoded_compact_unlocked(encoded, checkpoint, path)
+}
+
 pub fn save_compact(
     index: &crate::compact_index::CompactIndex,
     checkpoint: Option<Checkpoint>,
     path: &Path,
 ) -> Result<(), CacheError> {
+    // Hold the per-path lock across encoding and atomic rename so concurrent callers
+    // saving the same cache file cannot commit snapshots out of order.
+    let lock = path_write_lock(path);
+    let _guard = lock.lock();
     let encoded = encode_compact(index);
-    save_encoded_compact(&encoded, checkpoint, path)
+    save_encoded_compact_unlocked(&encoded, checkpoint, path)
 }
 
 pub fn load_compact(
@@ -186,26 +253,116 @@ pub fn load_compact(
     result
 }
 
+fn parse_temp_pid(file_name: &str) -> Option<u32> {
+    let (prefix, rest) = file_name.rsplit_once(".tmp.")?;
+    if prefix.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let pid_part = match rest.split_once('.') {
+        Some((pid_str, seq_str)) => {
+            if seq_str.is_empty() || !seq_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            pid_str
+        }
+        None => rest,
+    };
+    if pid_part.is_empty() || !pid_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid_part.parse::<u32>().ok().filter(|&pid| pid > 0)
+}
+
+#[cfg(unix)]
+fn is_process_missing(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return false;
+    }
+    let Ok(native_pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { libc::kill(native_pid, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn is_process_missing(_pid: u32) -> bool {
+    false
+}
+
+/// Remove orphaned `<name>.tmp.<pid>` / `<name>.tmp.<pid>.<seq>` staging files in `dir`
+/// left behind by crashed processes whose PID is no longer alive.
+pub fn cleanup_stale_temp_files(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(pid) = parse_temp_pid(name_str) else {
+            continue;
+        };
+        if is_process_missing(pid) && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn temporary_cache_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let seq = CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cache");
+    path.with_file_name(format!("{file_name}.tmp.{}.{seq}", std::process::id()))
+}
+
 /// Write `[4 bytes "LOKI"] [4 bytes version u32 LE] [payload parts...]` atomically.
 fn write_cache(version: u32, payload: &[&[u8]], path: &Path) -> Result<(), CacheError> {
-    // 索引服务、重建、对账与退出时都会存盘，共用同一个 .tmp：串行化，免得改名到别人写了一半的文件。
-    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = SAVE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(parent) = path.parent() {
+    let lock = path_write_lock(path);
+    let _guard = lock.lock();
+    write_cache_unlocked(version, payload, path)
+}
+
+fn write_cache_unlocked(version: u32, payload: &[&[u8]], path: &Path) -> Result<(), CacheError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("tmp");
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(CACHE_MAGIC)?;
-    file.write_all(&version.to_le_bytes())?;
-    for part in payload {
-        file.write_all(part)?;
+    let temporary = temporary_cache_path(path);
+    let write_res = (|| -> Result<(), CacheError> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(CACHE_MAGIC)?;
+        file.write_all(&version.to_le_bytes())?;
+        for part in payload {
+            file.write_all(part)?;
+        }
+        file.flush()?;
+        // 先落盘再改名：断电后要么是旧缓存，要么是完整的新缓存。
+        file.sync_data()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    file.flush()?;
-    // 先落盘再改名：断电后要么是旧缓存，要么是完整的新缓存。
-    file.sync_data()?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    write_res
 }
 
 /// Read a cache file, returning its version and raw contents (header included).
@@ -259,7 +416,8 @@ mod tests {
         let path = temp_cache_path(&directory);
         let previous = make_entries(3);
         save_cache(&previous, &path).unwrap();
-        fs::write(path.with_extension("tmp"), b"LOKI\x04\x00").unwrap();
+        let crashed_tmp = directory.path().join("index.cache.tmp.999999.0");
+        fs::write(&crashed_tmp, b"LOKI\x04\x00").unwrap();
 
         let recovered = load_cache(&path).unwrap();
         assert_eq!(recovered.len(), previous.len());
@@ -267,7 +425,17 @@ mod tests {
 
         save_cache(&make_entries(5), &path).unwrap();
         assert_eq!(load_cache(&path).unwrap().len(), 5);
-        assert!(!path.with_extension("tmp").exists());
+
+        let extra_tmps: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.contains(".tmp.") && name != "index.cache.tmp.999999.0"
+            })
+            .collect();
+        assert!(extra_tmps.is_empty(), "new save must not leave temp files: {extra_tmps:?}");
     }
 
     #[test]
@@ -297,8 +465,12 @@ mod tests {
 
         save_cache(&make_entries(1), &path).unwrap();
 
-        let tmp_path = path.with_extension("tmp");
-        assert!(!tmp_path.exists(), ".tmp file should not remain after save");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), ".tmp file should not remain after save: {leftovers:?}");
     }
 
     #[test]
@@ -400,6 +572,86 @@ mod tests {
         assert!(
             path_str.ends_with(".config/lokii/index.cache"),
             "cache_path should end with .config/lokii/index.cache, got: {path_str}"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_save_compact_uses_unique_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let shared_path = tmp.path().join("shared.cache");
+        let compact = crate::compact_index::CompactIndex::from_entries(make_entries(25)).unwrap();
+        let checkpoint = Some(Checkpoint {
+            event_id: 99,
+            fingerprint: 1234,
+        });
+
+        std::thread::scope(|scope| {
+            for t in 0..6 {
+                let compact_ref = &compact;
+                let shared_ref = &shared_path;
+                let distinct_path = tmp.path().join(format!("shard_{t}.cache"));
+                scope.spawn(move || {
+                    for _ in 0..4 {
+                        save_compact(compact_ref, checkpoint, shared_ref).unwrap();
+                        save_compact(compact_ref, checkpoint, &distinct_path).unwrap();
+                    }
+                });
+            }
+        });
+
+        let (decoded_shared, cp) = load_compact(&shared_path).unwrap();
+        assert_eq!(decoded_shared.len(), 25);
+        assert_eq!(cp, checkpoint);
+        for t in 0..6 {
+            let (decoded, _) = load_compact(&tmp.path().join(format!("shard_{t}.cache"))).unwrap();
+            assert_eq!(decoded.len(), 25);
+        }
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover cache temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn cleanup_stale_temp_files_removes_dead_pid_but_keeps_live_and_real_files() {
+        let tmp = TempDir::new().unwrap();
+        let dead_tmp_seq = tmp.path().join("index.cache.tmp.999999999.0");
+        let dead_tmp_plain = tmp.path().join("manifest.json.tmp.999999998");
+        let live_tmp = tmp
+            .path()
+            .join(format!("index.cache.tmp.{}.1", std::process::id()));
+        let real_cache = tmp.path().join("index.cache");
+        let real_cfg = tmp.path().join("config.toml");
+
+        fs::write(&dead_tmp_seq, b"dead1").unwrap();
+        fs::write(&dead_tmp_plain, b"dead2").unwrap();
+        fs::write(&live_tmp, b"live").unwrap();
+        fs::write(&real_cache, b"LOKI").unwrap();
+        fs::write(&real_cfg, b"[general]").unwrap();
+
+        let removed = cleanup_stale_temp_files(tmp.path());
+        assert_eq!(removed, 2);
+        assert!(!dead_tmp_seq.exists());
+        assert!(!dead_tmp_plain.exists());
+        assert!(live_tmp.exists(), "must preserve temp file owned by live process");
+        assert!(real_cache.exists());
+        assert!(real_cfg.exists());
+    }
+
+    #[test]
+    fn path_write_lock_returns_same_mutex_before_and_after_parent_creation() {
+        let tmp = TempDir::new().unwrap();
+        let uncreated_subdir = tmp.path().join("nested").join("volumes");
+        let cache_path = uncreated_subdir.join("vol_a.cache");
+
+        let lock_before = path_write_lock(&cache_path);
+        fs::create_dir_all(&uncreated_subdir).unwrap();
+        let lock_after = path_write_lock(&cache_path);
+        assert!(
+            Arc::ptr_eq(&lock_before, &lock_after),
+            "per-path lock must remain identical before and after parent directory creation"
         );
     }
 }
