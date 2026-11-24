@@ -254,11 +254,16 @@
 "prefs.index.pathConfirm.title" = "路径可能不存在";
 "prefs.index.pathConfirm.message" = "路径“%@”在当前磁盘上未找到（可能是拼写错误或未挂载的外置磁盘）。是否仍要添加？";
 "prefs.index.pathConfirm.addAnyway" = "仍要添加";
+"prefs.index.pathConfirm.conflictExcluded" = "该路径已在排除路径中，添加后不会收录。";
+"prefs.index.pathConfirm.conflictIndexed" = "该路径同时是索引路径，排除优先，添加后该路径将不收录。";
 "prefs.index.pathConfirm.cancel" = "取消";
 "prefs.index.pathNotFound" = "未找到";
 "prefs.index.pathNotFound.help" = "该路径在当前磁盘上未找到或处于离线状态。";
 "prefs.index.addExcludePath" = "添加排除";
 "prefs.index.excludePaths.empty" = "暂无自定义排除路径";
+"prefs.index.indexPaths.alsoExcluded" = "该路径同时在排除路径中；同路径排除优先，不会收录";
+"prefs.index.excludePaths.alsoIndexed" = "该路径同时是索引路径；同路径排除优先，不会收录";
+"prefs.index.pathConflict.badge" = "不会收录";
 "prefs.index.excludePaths.inputTitle" = "添加排除路径前缀";
 "prefs.index.excludePaths.inputMessage" = "请输入绝对路径或以 ~ 开头的用户目录路径（例如：~/Library 或 /opt）：";
 "prefs.index.excludePaths.inputPlaceholder" = "例如：~/Library 或 /opt";

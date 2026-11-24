@@ -34,6 +34,7 @@ private struct SettingsPathRow: View {
     var showVolumeMetrics: Bool = true
     var onRescan: (() -> Void)? = nil
     var onClearCache: (() -> Void)? = nil
+    var conflict: (label: String, help: String)? = nil
     let onRemove: () -> Void
 
     @State private var isHovered = false
@@ -96,6 +97,19 @@ private struct SettingsPathRow: View {
                         .truncationMode(.middle)
 
                     statusBadge
+
+                    if let conflict {
+                        HStack(spacing: 3) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.orange)
+                            Text(conflict.label)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
+                        }
+                        .help(conflict.help)
+                    }
                 }
 
                 if case let .volumeOnline(_, activePath, isRemounted, _) = availabilityState,
@@ -268,11 +282,13 @@ private enum IndexInputSheetMode: String, Identifiable {
 private struct PreferencesTextInputSheet: View {
     let mode: IndexInputSheetMode
     let isPathOffline: (String) -> Bool
+    let isConflicting: (String) -> Bool
     let onCommit: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
     @State private var unconfirmedMissingPath: String?
+    @State private var unconfirmedConflictPath: String?
     @State private var isProbingPath = false
     @State private var probeTask: Task<Void, Never>?
     @FocusState private var isFieldFocused: Bool
@@ -282,6 +298,18 @@ private struct PreferencesTextInputSheet: View {
             return PreferencesPathNormalizer.normalize(text)
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var warningMessage: String? {
+        if let missingPath = unconfirmedMissingPath {
+            return String(format: L("prefs.index.pathConfirm.message"), missingPath)
+        }
+        guard unconfirmedConflictPath != nil else { return nil }
+        switch mode {
+        case .indexPath: return L("prefs.index.pathConfirm.conflictExcluded")
+        case .excludePath: return L("prefs.index.pathConfirm.conflictIndexed")
+        case .excludePattern: return nil
+        }
     }
 
     var body: some View {
@@ -306,18 +334,17 @@ private struct PreferencesTextInputSheet: View {
                     probeTask?.cancel()
                     probeTask = nil
                     isProbingPath = false
-                    if unconfirmedMissingPath != nil {
-                        unconfirmedMissingPath = nil
-                    }
+                    unconfirmedMissingPath = nil
+                    unconfirmedConflictPath = nil
                 }
 
-            if let missingPath = unconfirmedMissingPath {
+            if let warningMessage {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                         .font(.system(size: 12))
                         .padding(.top, 1)
-                    Text(String(format: L("prefs.index.pathConfirm.message"), missingPath))
+                    Text(warningMessage)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -337,7 +364,7 @@ private struct PreferencesTextInputSheet: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
-                Button(unconfirmedMissingPath != nil
+                Button(warningMessage != nil
                        ? L("prefs.index.pathConfirm.addAnyway")
                        : L("prefs.excludePatterns.editor.confirm")) {
                     handleSubmit()
@@ -380,8 +407,7 @@ private struct PreferencesTextInputSheet: View {
                 isProbingPath = false
                 probeTask = nil
                 if exists {
-                    onCommit(value)
-                    dismiss()
+                    commit(value)
                 } else {
                     unconfirmedMissingPath = value
                 }
@@ -389,6 +415,15 @@ private struct PreferencesTextInputSheet: View {
             return
         }
 
+        commit(value)
+    }
+
+    /// 与另一列表存在完全相同的路径时先拦截确认，避免写入后静默不生效。
+    private func commit(_ value: String) {
+        if unconfirmedConflictPath != value && isConflicting(value) {
+            unconfirmedConflictPath = value
+            return
+        }
         onCommit(value)
         dismiss()
     }
@@ -623,6 +658,8 @@ struct PreferencesIndexPane: View {
                                 onClearCache: exactStatus.map { status in
                                     { pendingClearCachePath = status.volumeId }
                                 },
+                                conflict: SettingsPathStatusResolver.containsSamePath(viewModel.excludePaths, path)
+                                    ? (L("prefs.index.pathConflict.badge"), L("prefs.index.indexPaths.alsoExcluded")) : nil,
                                 onRemove: {
                                     viewModel.indexPaths.removeAll(where: { $0 == path })
                                 }
@@ -731,6 +768,8 @@ struct PreferencesIndexPane: View {
                                 path: path,
                                 availabilityState: viewModel.availabilityState(for: path),
                                 showVolumeMetrics: false,
+                                conflict: SettingsPathStatusResolver.containsSamePath(viewModel.indexPaths, path)
+                                    ? (L("prefs.index.pathConflict.badge"), L("prefs.index.excludePaths.alsoIndexed")) : nil,
                                 onRemove: {
                                     viewModel.excludePaths.removeAll(where: { $0 == path })
                                 }
@@ -890,6 +929,16 @@ struct PreferencesIndexPane: View {
                 mode: mode,
                 isPathOffline: { expanded in
                     viewModel.engine.isPathOffline(expanded)
+                },
+                isConflicting: { value in
+                    switch mode {
+                    case .indexPath:
+                        return SettingsPathStatusResolver.containsSamePath(viewModel.excludePaths, value)
+                    case .excludePath:
+                        return SettingsPathStatusResolver.containsSamePath(viewModel.indexPaths, value)
+                    case .excludePattern:
+                        return false
+                    }
                 }
             ) { value in
                 switch mode {
@@ -935,6 +984,22 @@ struct PreferencesIndexPane: View {
         VStack(spacing: 0) {
             Divider()
             HStack(spacing: 10) {
+                // 维护性次要动作放左侧弱化；重建中由紧随其后的进度指示占位，避免与进度文字挤在一起
+                if !viewModel.isRebuildingIndex {
+                    Button {
+                        viewModel.triggerManualRebuild()
+                    } label: {
+                        Label(L("prefs.index.rebuildNow"), systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 11, weight: .medium))
+                    // 显式着色的无边框按钮禁用时不会自动变灰
+                    .foregroundStyle(viewModel.isIndexDirty ? Color.secondary : Color.accentColor)
+                    .fixedSize()
+                    .disabled(viewModel.isIndexDirty || viewModel.isRebuildingIndex)
+                    .help(L("prefs.index.rebuildNow.help"))
+                }
+
                 if viewModel.isIndexDirty {
                     HStack(spacing: 4) {
                         Image(systemName: "exclamationmark.circle.fill")
@@ -967,15 +1032,6 @@ struct PreferencesIndexPane: View {
                     }
                 }
                 Spacer()
-
-                Button {
-                    viewModel.triggerManualRebuild()
-                } label: {
-                    Label(L("prefs.index.rebuildNow"), systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .disabled(viewModel.isIndexDirty || viewModel.isRebuildingIndex)
-                .help(L("prefs.index.rebuildNow.help"))
 
                 Button(L("prefs.resetToDefaults")) {
                     viewModel.restoreIndexDefaults()

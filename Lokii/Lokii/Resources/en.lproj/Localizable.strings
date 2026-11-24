@@ -254,11 +254,16 @@
 "prefs.index.pathConfirm.title" = "Path May Not Exist";
 "prefs.index.pathConfirm.message" = "Path \"%@\" was not found on disk (it may be misspelled or an unmounted external volume). Do you still want to add it?";
 "prefs.index.pathConfirm.addAnyway" = "Add Anyway";
+"prefs.index.pathConfirm.conflictExcluded" = "This path is already in Excluded Paths; it will not be indexed.";
+"prefs.index.pathConfirm.conflictIndexed" = "This path is also an Index Path; exclusion wins, so it will not be indexed.";
 "prefs.index.pathConfirm.cancel" = "Cancel";
 "prefs.index.pathNotFound" = "Not Found";
 "prefs.index.pathNotFound.help" = "This path was not found on disk or is currently offline.";
 "prefs.index.addExcludePath" = "Add Exclusion";
 "prefs.index.excludePaths.empty" = "No custom excluded paths";
+"prefs.index.indexPaths.alsoExcluded" = "Also in Excluded Paths; exclusion wins, so it is not indexed";
+"prefs.index.excludePaths.alsoIndexed" = "Also an Index Path; exclusion wins, so it is not indexed";
+"prefs.index.pathConflict.badge" = "Not Indexed";
 "prefs.index.excludePaths.inputTitle" = "Add Excluded Path Prefix";
 "prefs.index.excludePaths.inputMessage" = "Enter an absolute path or a path starting with ~ (e.g. ~/Library or /opt):";
 "prefs.index.excludePaths.inputPlaceholder" = "e.g. ~/Library or /opt";
