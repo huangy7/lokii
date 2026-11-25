@@ -9,6 +9,34 @@ struct LokiiConfig: Codable {
     var index: IndexConfig
     var window: WindowConfig
 
+    /// 出厂默认配置，通过强类型 UniFFI Record 从 Rust `AppConfig::default()` 获取，确保编译期字段校验与单一来源。
+    static let defaultConfig: LokiiConfig = {
+        let raw = defaultAppConfig()
+        return LokiiConfig(
+            general: GeneralConfig(
+                language: raw.general.language,
+                showInDock: raw.general.showInDock,
+                terminalBundleId: raw.general.terminalBundleId,
+                hideResultsWhenEmpty: raw.general.hideResultsWhenEmpty
+            ),
+            index: IndexConfig(
+                indexPaths: raw.index.indexPaths,
+                indexApps: raw.index.indexApps,
+                exclude: raw.index.exclude,
+                excludePaths: raw.index.excludePaths,
+                includeHidden: raw.index.includeHidden,
+                excludeSensitive: raw.index.excludeSensitive,
+                sensitiveNames: raw.index.sensitiveNames,
+                maxResults: Int(raw.index.maxResults),
+                networkRescanMinutes: Int(raw.index.networkRescanMinutes)
+            ),
+            window: WindowConfig(
+                hideOnBlur: raw.window.hideOnBlur,
+                rememberPosition: raw.window.rememberPosition
+            )
+        )
+    }()
+
     struct GeneralConfig: Codable {
         var language: String
         var showInDock: Bool
@@ -23,23 +51,32 @@ struct LokiiConfig: Codable {
         }
 
         init(
-            language: String = "zh-Hans",
-            showInDock: Bool = true,
-            terminalBundleId: String = "com.apple.Terminal",
-            hideResultsWhenEmpty: Bool = true
+            language: String? = nil,
+            showInDock: Bool? = nil,
+            terminalBundleId: String? = nil,
+            hideResultsWhenEmpty: Bool? = nil
         ) {
-            self.language = language
-            self.showInDock = showInDock
-            self.terminalBundleId = terminalBundleId
-            self.hideResultsWhenEmpty = hideResultsWhenEmpty
+            if let language, let showInDock, let terminalBundleId, let hideResultsWhenEmpty {
+                self.language = language
+                self.showInDock = showInDock
+                self.terminalBundleId = terminalBundleId
+                self.hideResultsWhenEmpty = hideResultsWhenEmpty
+            } else {
+                let defaults = LokiiConfig.defaultConfig.general
+                self.language = language ?? defaults.language
+                self.showInDock = showInDock ?? defaults.showInDock
+                self.terminalBundleId = terminalBundleId ?? defaults.terminalBundleId
+                self.hideResultsWhenEmpty = hideResultsWhenEmpty ?? defaults.hideResultsWhenEmpty
+            }
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? "zh-Hans"
-            self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? true
-            self.terminalBundleId = try container.decodeIfPresent(String.self, forKey: .terminalBundleId) ?? "com.apple.Terminal"
-            self.hideResultsWhenEmpty = try container.decodeIfPresent(Bool.self, forKey: .hideResultsWhenEmpty) ?? true
+            let defaults = LokiiConfig.defaultConfig.general
+            self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? defaults.language
+            self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? defaults.showInDock
+            self.terminalBundleId = try container.decodeIfPresent(String.self, forKey: .terminalBundleId) ?? defaults.terminalBundleId
+            self.hideResultsWhenEmpty = try container.decodeIfPresent(Bool.self, forKey: .hideResultsWhenEmpty) ?? defaults.hideResultsWhenEmpty
         }
     }
 
@@ -66,59 +103,62 @@ struct LokiiConfig: Codable {
             case networkRescanMinutes = "network_rescan_minutes"
         }
 
-        static let defaultIndexPaths: [String] = ["~"]
-        static let defaultExclude: [String] = [
-            "node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn",
-            "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__",
-            "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp",
-            "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj",
-            ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata",
-        ]
-        static let defaultExcludePaths: [String] = [
-            "/System", "/Library", "/private", "/bin", "/sbin", "/usr", "/dev",
-            "/Volumes", "/opt", "~/Library", "~/.Trash", "~/.cache", "~/.npm",
-            "~/.pnpm-store", "~/.yarn", "~/.cargo/registry", "~/.cargo/git", "~/.rustup",
-            "~/.gradle/caches", "~/.m2/repository", "~/.bun", "~/.deno", "~/.nvm",
-            "~/.orbstack", "~/.docker",
-        ]
-        static let defaultSensitiveNames: [String] = [
-            ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store",
-            ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".authinfo", ".msmtprc",
-        ]
+        static var defaultIndexPaths: [String] { LokiiConfig.defaultConfig.index.indexPaths }
+        static var defaultExclude: [String] { LokiiConfig.defaultConfig.index.exclude }
+        static var defaultExcludePaths: [String] { LokiiConfig.defaultConfig.index.excludePaths }
+        static var defaultSensitiveNames: [String] { LokiiConfig.defaultConfig.index.sensitiveNames }
+        static var defaultMaxResults: Int { LokiiConfig.defaultConfig.index.maxResults }
+        static var defaultNetworkRescanMinutes: Int { LokiiConfig.defaultConfig.index.networkRescanMinutes }
 
         init(
-            indexPaths: [String] = IndexConfig.defaultIndexPaths,
-            indexApps: Bool = false,
-            exclude: [String] = IndexConfig.defaultExclude,
-            excludePaths: [String] = IndexConfig.defaultExcludePaths,
-            includeHidden: Bool = false,
-            excludeSensitive: Bool = true,
-            sensitiveNames: [String] = IndexConfig.defaultSensitiveNames,
-            maxResults: Int = 500,
-            networkRescanMinutes: Int = 30
+            indexPaths: [String]? = nil,
+            indexApps: Bool? = nil,
+            exclude: [String]? = nil,
+            excludePaths: [String]? = nil,
+            includeHidden: Bool? = nil,
+            excludeSensitive: Bool? = nil,
+            sensitiveNames: [String]? = nil,
+            maxResults: Int? = nil,
+            networkRescanMinutes: Int? = nil
         ) {
-            self.indexPaths = indexPaths
-            self.indexApps = indexApps
-            self.exclude = exclude
-            self.excludePaths = excludePaths
-            self.includeHidden = includeHidden
-            self.excludeSensitive = excludeSensitive
-            self.sensitiveNames = sensitiveNames
-            self.maxResults = maxResults
-            self.networkRescanMinutes = networkRescanMinutes
+            if let indexPaths, let indexApps, let exclude, let excludePaths,
+               let includeHidden, let excludeSensitive, let sensitiveNames,
+               let maxResults, let networkRescanMinutes {
+                self.indexPaths = indexPaths
+                self.indexApps = indexApps
+                self.exclude = exclude
+                self.excludePaths = excludePaths
+                self.includeHidden = includeHidden
+                self.excludeSensitive = excludeSensitive
+                self.sensitiveNames = sensitiveNames
+                self.maxResults = maxResults
+                self.networkRescanMinutes = networkRescanMinutes
+            } else {
+                let defaults = LokiiConfig.defaultConfig.index
+                self.indexPaths = indexPaths ?? defaults.indexPaths
+                self.indexApps = indexApps ?? defaults.indexApps
+                self.exclude = exclude ?? defaults.exclude
+                self.excludePaths = excludePaths ?? defaults.excludePaths
+                self.includeHidden = includeHidden ?? defaults.includeHidden
+                self.excludeSensitive = excludeSensitive ?? defaults.excludeSensitive
+                self.sensitiveNames = sensitiveNames ?? defaults.sensitiveNames
+                self.maxResults = maxResults ?? defaults.maxResults
+                self.networkRescanMinutes = networkRescanMinutes ?? defaults.networkRescanMinutes
+            }
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.indexPaths = try container.decodeIfPresent([String].self, forKey: .indexPaths) ?? IndexConfig.defaultIndexPaths
-            self.indexApps = try container.decodeIfPresent(Bool.self, forKey: .indexApps) ?? false
-            self.exclude = try container.decodeIfPresent([String].self, forKey: .exclude) ?? IndexConfig.defaultExclude
-            self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? IndexConfig.defaultExcludePaths
-            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? false
-            self.excludeSensitive = try container.decodeIfPresent(Bool.self, forKey: .excludeSensitive) ?? true
-            self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? IndexConfig.defaultSensitiveNames
-            self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? 500
-            self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? 30
+            let defaults = LokiiConfig.defaultConfig.index
+            self.indexPaths = try container.decodeIfPresent([String].self, forKey: .indexPaths) ?? defaults.indexPaths
+            self.indexApps = try container.decodeIfPresent(Bool.self, forKey: .indexApps) ?? defaults.indexApps
+            self.exclude = try container.decodeIfPresent([String].self, forKey: .exclude) ?? defaults.exclude
+            self.excludePaths = try container.decodeIfPresent([String].self, forKey: .excludePaths) ?? defaults.excludePaths
+            self.includeHidden = try container.decodeIfPresent(Bool.self, forKey: .includeHidden) ?? defaults.includeHidden
+            self.excludeSensitive = try container.decodeIfPresent(Bool.self, forKey: .excludeSensitive) ?? defaults.excludeSensitive
+            self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? defaults.sensitiveNames
+            self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? defaults.maxResults
+            self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? defaults.networkRescanMinutes
         }
     }
 
@@ -132,17 +172,24 @@ struct LokiiConfig: Codable {
         }
 
         init(
-            hideOnBlur: Bool = true,
-            rememberPosition: Bool = false
+            hideOnBlur: Bool? = nil,
+            rememberPosition: Bool? = nil
         ) {
-            self.hideOnBlur = hideOnBlur
-            self.rememberPosition = rememberPosition
+            if let hideOnBlur, let rememberPosition {
+                self.hideOnBlur = hideOnBlur
+                self.rememberPosition = rememberPosition
+            } else {
+                let defaults = LokiiConfig.defaultConfig.window
+                self.hideOnBlur = hideOnBlur ?? defaults.hideOnBlur
+                self.rememberPosition = rememberPosition ?? defaults.rememberPosition
+            }
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.hideOnBlur = try container.decodeIfPresent(Bool.self, forKey: .hideOnBlur) ?? true
-            self.rememberPosition = try container.decodeIfPresent(Bool.self, forKey: .rememberPosition) ?? false
+            let defaults = LokiiConfig.defaultConfig.window
+            self.hideOnBlur = try container.decodeIfPresent(Bool.self, forKey: .hideOnBlur) ?? defaults.hideOnBlur
+            self.rememberPosition = try container.decodeIfPresent(Bool.self, forKey: .rememberPosition) ?? defaults.rememberPosition
         }
     }
 }
@@ -599,7 +646,7 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
     }
 }
 
-private extension FfiVolumeStatus {
+extension FfiVolumeStatus {
     func hasSameLifecycle(as other: Self) -> Bool {
         var status = self
         status.entryCount = other.entryCount

@@ -437,6 +437,69 @@ pub fn resolve_case_sensitive(
     }
 }
 
+/// 供前端工具栏实时预览的查询语义标志，与检索分发路径共用词法与模式裁决逻辑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryPreview {
+    pub has_effective_uppercase: bool,
+    pub has_regex_sugar: bool,
+}
+
+/// 基于核心词法与正则语法糖解析器预判查询的 Smart Case 与行内正则激活状态。
+pub fn preview_query_flags(query: &str, mode: SearchMode) -> QueryPreview {
+    let parsed = parse_query_structured(query);
+    let regex_sugar = extract_regex_sugar_from_tokens(&parsed.positive_tokens);
+    let has_regex_prefix = parsed.positive_tokens.iter().any(|t| {
+        !t.negated
+            && !t.quoted
+            && !t.was_sanitized_pasted_path
+            && t.text.starts_with("regex:")
+    });
+    let has_regex_sugar = regex_sugar.is_some() || has_regex_prefix;
+    let is_regex = mode == SearchMode::Regex || has_regex_sugar;
+
+    let has_effective_uppercase = if mode == SearchMode::Auto {
+        if let Some(sugar) = regex_sugar {
+            if sugar.case_insensitive {
+                false
+            } else {
+                has_effective_uppercase(&sugar.pattern, true)
+            }
+        } else if has_regex_prefix {
+            resolve_case_sensitive_tokens(
+                &parsed.positive_tokens,
+                CaseSensitivity::Auto,
+                SearchMode::Regex,
+            )
+        } else if has_unescaped_pipe(query) {
+            split_query_pipes(query).into_iter().any(|raw| {
+                let clause = parse_query_structured(&raw);
+                resolve_case_sensitive_tokens(
+                    &clause.positive_tokens,
+                    CaseSensitivity::Auto,
+                    SearchMode::Auto,
+                )
+            })
+        } else {
+            resolve_case_sensitive_tokens(
+                &parsed.positive_tokens,
+                CaseSensitivity::Auto,
+                SearchMode::Auto,
+            )
+        }
+    } else {
+        resolve_case_sensitive_tokens(
+            &parsed.positive_tokens,
+            CaseSensitivity::Auto,
+            if is_regex { SearchMode::Regex } else { mode },
+        )
+    };
+
+    QueryPreview {
+        has_effective_uppercase,
+        has_regex_sugar,
+    }
+}
+
 /// Result from advanced search. Per D-06.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

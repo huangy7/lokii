@@ -76,6 +76,51 @@ pub struct FfiVolumeStatus {
     pub is_remounted: bool,
 }
 
+/// Real-time query semantic preview flags for frontend toolbar badges.
+#[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FfiQueryPreview {
+    pub has_effective_uppercase: bool,
+    pub has_regex_sugar: bool,
+}
+
+/// Typed general settings exposed via UniFFI for compile-time safe defaults.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiGeneralConfig {
+    pub language: String,
+    pub show_in_dock: bool,
+    pub terminal_bundle_id: String,
+    pub hide_results_when_empty: bool,
+}
+
+/// Typed index settings exposed via UniFFI for compile-time safe defaults.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiIndexConfig {
+    pub index_paths: Vec<String>,
+    pub index_apps: bool,
+    pub exclude: Vec<String>,
+    pub exclude_paths: Vec<String>,
+    pub include_hidden: bool,
+    pub exclude_sensitive: bool,
+    pub sensitive_names: Vec<String>,
+    pub max_results: u64,
+    pub network_rescan_minutes: u64,
+}
+
+/// Typed window settings exposed via UniFFI for compile-time safe defaults.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiWindowConfig {
+    pub hide_on_blur: bool,
+    pub remember_position: bool,
+}
+
+/// Typed application configuration snapshot exposed via UniFFI.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiAppConfig {
+    pub general: FfiGeneralConfig,
+    pub index: FfiIndexConfig,
+    pub window: FfiWindowConfig,
+}
+
 // ── UniFFI Enums & Errors ───────────────────────────────────────────────
 
 /// Errors surfaced across the UniFFI boundary.
@@ -603,6 +648,8 @@ pub struct LokiiCore {
     resume: Mutex<Option<watcher::Resume>>,
     /// The running index service, once `start_watcher` has been called.
     watcher: Mutex<Option<watcher::WatcherHandle>>,
+    /// The running config file watcher, once `start_config_watcher` has been called.
+    config_watcher: Mutex<Option<config::ConfigWatcherHandle>>,
     /// Prevents concurrent full scans (rebuild vs the service's reconciliation).
     scan_lock: Arc<Mutex<()>>,
     /// Serializes `update_config_from_json` read-merge-persist-rollback transactions.
@@ -637,6 +684,7 @@ impl LokiiCore {
             cache_dir,
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
+            config_watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
             config_update_lock: Mutex::new(()),
             metrics: Arc::new(WatcherMetrics::new()),
@@ -725,6 +773,7 @@ impl LokiiCore {
             cache_dir,
             resume: Mutex::new(None),
             watcher: Mutex::new(None),
+            config_watcher: Mutex::new(None),
             scan_lock: Arc::new(Mutex::new(())),
             config_update_lock: Mutex::new(()),
             metrics: Arc::new(WatcherMetrics::new()),
@@ -918,7 +967,7 @@ impl LokiiCore {
         let error_handler = Arc::clone(&event_handler);
         let weak_volumes = Arc::downgrade(&self.volumes);
 
-        if let Err(e) = config::start_config_watcher(
+        match config::start_config_watcher(
             self.config_store.clone(),
             move |new_config| {
                 if let Some(volumes) = weak_volumes.upgrade() {
@@ -931,7 +980,15 @@ impl LokiiCore {
                 error_handler.on_watcher_error(msg);
             },
         ) {
-            eprintln!("Failed to start config watcher: {e}");
+            Ok(handle) => {
+                *self
+                    .config_watcher
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            }
+            Err(e) => {
+                eprintln!("Failed to start config watcher: {e}");
+            }
         }
     }
 
@@ -1245,6 +1302,46 @@ impl LokiiCore {
     }
 }
 
+/// Preview Smart Case and inline regex-sugar state using the core query parser.
+#[uniffi::export]
+pub fn preview_query_flags(query: String, mode: FfiSearchMode) -> FfiQueryPreview {
+    let preview = search::preview_query_flags(&query, SearchMode::from(&mode));
+    FfiQueryPreview {
+        has_effective_uppercase: preview.has_effective_uppercase,
+        has_regex_sugar: preview.has_regex_sugar,
+    }
+}
+
+/// Return `AppConfig::default()` as a strongly-typed UniFFI record so the frontend
+/// shares Rust's single source of truth with compile-time schema verification.
+#[uniffi::export]
+pub fn default_app_config() -> FfiAppConfig {
+    let cfg = AppConfig::default();
+    FfiAppConfig {
+        general: FfiGeneralConfig {
+            language: cfg.general.language,
+            show_in_dock: cfg.general.show_in_dock,
+            terminal_bundle_id: cfg.general.terminal_bundle_id,
+            hide_results_when_empty: cfg.general.hide_results_when_empty,
+        },
+        index: FfiIndexConfig {
+            index_paths: cfg.index.index_paths,
+            index_apps: cfg.index.index_apps,
+            exclude: cfg.index.exclude,
+            exclude_paths: cfg.index.exclude_paths,
+            include_hidden: cfg.index.include_hidden,
+            exclude_sensitive: cfg.index.exclude_sensitive,
+            sensitive_names: cfg.index.sensitive_names,
+            max_results: cfg.index.max_results as u64,
+            network_rescan_minutes: cfg.index.network_rescan_minutes,
+        },
+        window: FfiWindowConfig {
+            hide_on_blur: cfg.window.hide_on_blur,
+            remember_position: cfg.window.remember_position,
+        },
+    }
+}
+
 /// Overlay a frontend-supplied config patch onto the currently effective config.
 ///
 /// The frontend mirrors only part of the schema (it has no notion of
@@ -1281,6 +1378,79 @@ mod tests {
     use super::*;
     use crate::compact_index::IndexError;
     use crate::volumes::VolumeManifest;
+
+    #[test]
+    fn preview_query_flags_matches_smart_case_and_regex_sugar_rules() {
+        let auto = |q: &str| preview_query_flags(q.to_string(), FfiSearchMode::Auto);
+
+        assert!(!auto("report").has_effective_uppercase);
+        assert!(auto("Report").has_effective_uppercase);
+        assert!(!auto("in:/Users/Downloads report").has_effective_uppercase);
+        assert!(!auto("ext:PNG report").has_effective_uppercase);
+        assert!(auto("ext:png Report").has_effective_uppercase);
+        assert!(auto("type:pdf /path/to/File").has_effective_uppercase);
+        assert!(!auto("type:pdf /path/to/file").has_effective_uppercase);
+        assert!(!auto(".git report").has_effective_uppercase);
+        assert!(auto(".GIT Report").has_effective_uppercase);
+        assert!(!auto("!Test").has_effective_uppercase);
+        assert!(!auto("!\"Test\"").has_effective_uppercase);
+        assert!(auto("\"Test\"").has_effective_uppercase);
+        assert!(!auto("main !Test").has_effective_uppercase);
+        assert!(auto("Main !Test").has_effective_uppercase);
+        assert!(auto("\"type:PDF\"").has_effective_uppercase);
+        assert!(auto("\"in:Dir\"").has_effective_uppercase);
+        assert!(auto("\"foo/Bar\"").has_effective_uppercase);
+        assert!(!auto(r"regex:\D+ !Skip").has_effective_uppercase);
+        assert!(auto("regex:^Main !skip").has_effective_uppercase);
+        assert!(auto("foo | Bar").has_effective_uppercase);
+        assert!(!auto("foo | bar").has_effective_uppercase);
+
+        assert!(!auto("").has_regex_sugar);
+        assert!(!auto("/").has_regex_sugar);
+        assert!(!auto("//").has_regex_sugar);
+        assert!(!auto("/pattern/").has_regex_sugar);
+        assert!(auto("/pattern/i").has_regex_sugar);
+        assert!(auto("/[a-z]+/").has_regex_sugar);
+        assert!(auto("/[a-z]+/i").has_regex_sugar);
+        assert!(auto("/[a-z]+/I").has_regex_sugar);
+        assert!(!auto("/[A-Z]+/i").has_effective_uppercase);
+        assert!(auto("/[A-Z]+/").has_effective_uppercase);
+        assert!(auto("regex:foo").has_regex_sugar);
+        assert!(!auto("\"regex:foo\"").has_regex_sugar);
+        assert!(auto("  /[a-z]+/  ").has_regex_sugar);
+        assert!(auto(r"/foo\/bar/").has_regex_sugar);
+        assert!(auto(r"in:src /^test_.*\.rs/").has_regex_sugar);
+        assert!(!auto(r"in:SRC /^test_.*\.rs/").has_effective_uppercase);
+        assert!(!auto("/unclosed").has_regex_sugar);
+        assert!(!auto(r"/escaped\/").has_regex_sugar);
+        assert!(!auto("/usr/local/bin/").has_regex_sugar);
+        assert!(!auto("plain text").has_regex_sugar);
+
+        // 显式正则锁定下，反斜杠转义元字符不触发 Smart Case
+        assert!(!preview_query_flags(r"\D+\S+".to_string(), FfiSearchMode::Regex).has_effective_uppercase);
+        assert!(preview_query_flags(r"Main\d+".to_string(), FfiSearchMode::Regex).has_effective_uppercase);
+    }
+
+    #[test]
+    fn default_app_config_matches_app_config_default() {
+        let ffi_cfg = default_app_config();
+        let expected = AppConfig::default();
+        assert_eq!(ffi_cfg.general.language, expected.general.language);
+        assert_eq!(ffi_cfg.general.show_in_dock, expected.general.show_in_dock);
+        assert_eq!(ffi_cfg.general.terminal_bundle_id, expected.general.terminal_bundle_id);
+        assert_eq!(ffi_cfg.general.hide_results_when_empty, expected.general.hide_results_when_empty);
+        assert_eq!(ffi_cfg.index.index_paths, expected.index.index_paths);
+        assert_eq!(ffi_cfg.index.index_apps, expected.index.index_apps);
+        assert_eq!(ffi_cfg.index.exclude, expected.index.exclude);
+        assert_eq!(ffi_cfg.index.exclude_paths, expected.index.exclude_paths);
+        assert_eq!(ffi_cfg.index.include_hidden, expected.index.include_hidden);
+        assert_eq!(ffi_cfg.index.exclude_sensitive, expected.index.exclude_sensitive);
+        assert_eq!(ffi_cfg.index.sensitive_names, expected.index.sensitive_names);
+        assert_eq!(ffi_cfg.index.max_results, expected.index.max_results as u64);
+        assert_eq!(ffi_cfg.index.network_rescan_minutes, expected.index.network_rescan_minutes);
+        assert_eq!(ffi_cfg.window.hide_on_blur, expected.window.hide_on_blur);
+        assert_eq!(ffi_cfg.window.remember_position, expected.window.remember_position);
+    }
 
     #[derive(Default)]
     struct RecordingHandler {

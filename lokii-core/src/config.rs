@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -556,47 +556,118 @@ where
     write_res
 }
 
-/// Start watching the config.toml file for changes.
+/// 配置文件 FSEvents 监听句柄；释放时通知后台线程退出并关闭事件流。
+pub struct ConfigWatcherHandle {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for ConfigWatcherHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn event_matches_config(
+    event: &crate::fsevents::Event,
+    config_path: &Path,
+    canonical_config_path: &Path,
+    resolved_target: Option<&Path>,
+) -> bool {
+    const RESCAN_FLAGS: u32 = crate::fsevents::MUST_SCAN_SUBDIRS
+        | crate::fsevents::USER_DROPPED
+        | crate::fsevents::KERNEL_DROPPED;
+    if event.flags & RESCAN_FLAGS != 0 {
+        return true;
+    }
+    event.path == config_path
+        || event.path == canonical_config_path
+        || resolved_target.is_some_and(|target| event.path == target)
+}
+
+/// Start watching the config.toml file for changes via macOS FSEvents.
 ///
-/// Uses the same notify + mpsc + recv_timeout pattern from watcher.rs.
 /// On file change, re-parses config and updates the ConfigStore.
 /// Calls `on_reload` with the new config on success, `on_error` with message on failure.
-///
-/// Hot-reloadable settings (per D-01): index_paths, exclude, include_hidden,
-/// max_results, hide_on_blur. Shortcut changes require app restart.
+/// Dropping the returned handle stops the FSEvents stream and background thread.
 pub fn start_config_watcher<F>(
     config_store: ConfigStore,
     on_reload: F,
     on_error: impl Fn(String) + Send + 'static,
-) -> Result<(), notify::Error>
+) -> std::io::Result<ConfigWatcherHandle>
 where
     F: Fn(&AppConfig) + Send + 'static,
 {
     let config_path = AppConfig::config_dir().join("config.toml");
-    let watch_dir = config_path.parent().unwrap().to_path_buf();
+    start_config_watcher_at(config_path, config_store, on_reload, on_error)
+}
 
-    let (tx, rx) = std::sync::mpsc::channel::<Event>();
+pub(crate) fn start_config_watcher_at<F>(
+    config_path: PathBuf,
+    config_store: ConfigStore,
+    on_reload: F,
+    on_error: impl Fn(String) + Send + 'static,
+) -> std::io::Result<ConfigWatcherHandle>
+where
+    F: Fn(&AppConfig) + Send + 'static,
+{
+    let watch_dir = config_path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "config path has no parent directory"))?
+        .to_path_buf();
+    std::fs::create_dir_all(&watch_dir)?;
 
-    let mut watcher = RecommendedWatcher::new(
-        move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = tx.send(event);
+    let canonical_watch_dir =
+        std::fs::canonicalize(&watch_dir).unwrap_or_else(|_| watch_dir.clone());
+    let canonical_config_path = config_path
+        .file_name()
+        .map(|name| canonical_watch_dir.join(name))
+        .unwrap_or_else(|| config_path.clone());
+
+    let mut watch_roots = vec![canonical_watch_dir.clone()];
+    let resolved_target = resolve_atomic_write_target(&config_path).ok().and_then(|target| {
+        let canonical_target = target
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .and_then(|dir| target.file_name().map(|name| dir.join(name)))
+            .unwrap_or(target);
+        if let Some(target_dir) = canonical_target.parent() {
+            let target_dir_buf = target_dir.to_path_buf();
+            if target_dir_buf != canonical_watch_dir && target_dir_buf.is_dir() {
+                watch_roots.push(target_dir_buf);
             }
-        },
-        NotifyConfig::default(),
-    )?;
-    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+        }
+        (canonical_target != canonical_config_path).then_some(canonical_target)
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::fsevents::Event>>();
+    let stream = crate::fsevents::watch(&watch_roots, crate::fsevents::SINCE_NOW, tx)
+        .ok_or_else(|| std::io::Error::other("failed to start FSEvents config watcher"))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
 
     std::thread::spawn(move || {
-        let _watcher = watcher; // keep alive
-        loop {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(event) => {
-                    if !event.paths.iter().any(|p| p == &config_path) {
+        let _stream = stream; // keep FSEvents stream alive until stop
+        while !stop_flag.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(batch) => {
+                    if !batch.iter().any(|e| {
+                        event_matches_config(
+                            e,
+                            &config_path,
+                            &canonical_config_path,
+                            resolved_target.as_deref(),
+                        )
+                    }) {
                         continue;
                     }
                     // Debounce: drain extra events within 200ms
-                    while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+                    while !stop_flag.load(Ordering::Relaxed)
+                        && rx.recv_timeout(Duration::from_millis(200)).is_ok()
+                    {}
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
 
                     // Hold CONFIG_WRITE_LOCK only while reading and comparing against config_store
                     // so in-process atomic writes finish publishing before the watcher checks equality,
@@ -635,7 +706,7 @@ where
         }
     });
 
-    Ok(())
+    Ok(ConfigWatcherHandle { stop })
 }
 
 #[cfg(test)]
@@ -1142,5 +1213,65 @@ hide_results_when_empty = false
             !called_on_failure,
             "on_committed must not run when atomic rename fails"
         );
+    }
+
+    #[test]
+    fn fsevents_config_watcher_reloads_external_edits_and_reports_parse_errors() {
+        use std::sync::mpsc;
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let initial = AppConfig::default();
+        fs::write(&config_path, toml::to_string_pretty(&initial).unwrap()).unwrap();
+
+        let store = ConfigStore::new(initial);
+        let (reload_tx, reload_rx) = mpsc::channel::<usize>();
+        let (err_tx, err_rx) = mpsc::channel::<String>();
+
+        let _handle = start_config_watcher_at(
+            config_path.clone(),
+            store.clone(),
+            move |cfg| {
+                let _ = reload_tx.send(cfg.index.max_results);
+            },
+            move |msg| {
+                let _ = err_tx.send(msg);
+            },
+        )
+        .expect("FSEvents config watcher should start");
+
+        // 给 fseventsd 一点时间完成流注册
+        std::thread::sleep(Duration::from_millis(250));
+
+        // 1. 进程内原子写入同时同步 ConfigStore：不应触发冗余 on_reload
+        let mut self_updated = store.read().clone();
+        self_updated.index.max_results = 650;
+        let toml_str = toml::to_string_pretty(&self_updated).unwrap();
+        let store_for_commit = store.clone();
+        let cfg_for_commit = self_updated.clone();
+        write_config_atomic_then(&config_path, &toml_str, || {
+            store_for_commit.update(cfg_for_commit);
+        })
+        .unwrap();
+        assert!(
+            reload_rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "self-write matching ConfigStore should not emit duplicate reload"
+        );
+
+        // 2. 外部修改 config.toml：应触发 on_reload 并更新 ConfigStore
+        fs::write(&config_path, "[index]\nmax_results = 777\n").unwrap();
+        let reloaded = reload_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("external config edit should trigger FSEvents reload");
+        assert_eq!(reloaded, 777);
+        assert_eq!(store.read().index.max_results, 777);
+
+        // 3. 写入非法 TOML：应触发 on_error 并保留旧配置
+        fs::write(&config_path, "[index\nnot_valid_toml = ").unwrap();
+        let err_msg = err_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("invalid TOML should trigger on_error");
+        assert!(err_msg.contains("Config parse error"), "unexpected error: {err_msg}");
+        assert_eq!(store.read().index.max_results, 777);
     }
 }

@@ -1365,6 +1365,305 @@ public func FfiConverterTypeLokiiCore_lower(_ value: LokiiCore) -> UnsafeMutable
 
 
 /**
+ * Typed application configuration snapshot exposed via UniFFI.
+ */
+public struct FfiAppConfig {
+    public var general: FfiGeneralConfig
+    public var index: FfiIndexConfig
+    public var window: FfiWindowConfig
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(general: FfiGeneralConfig, index: FfiIndexConfig, window: FfiWindowConfig) {
+        self.general = general
+        self.index = index
+        self.window = window
+    }
+}
+
+#if compiler(>=6)
+extension FfiAppConfig: Sendable {}
+#endif
+
+
+extension FfiAppConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiAppConfig, rhs: FfiAppConfig) -> Bool {
+        if lhs.general != rhs.general {
+            return false
+        }
+        if lhs.index != rhs.index {
+            return false
+        }
+        if lhs.window != rhs.window {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(general)
+        hasher.combine(index)
+        hasher.combine(window)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAppConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAppConfig {
+        return
+            try FfiAppConfig(
+                general: FfiConverterTypeFfiGeneralConfig.read(from: &buf), 
+                index: FfiConverterTypeFfiIndexConfig.read(from: &buf), 
+                window: FfiConverterTypeFfiWindowConfig.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiAppConfig, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiGeneralConfig.write(value.general, into: &buf)
+        FfiConverterTypeFfiIndexConfig.write(value.index, into: &buf)
+        FfiConverterTypeFfiWindowConfig.write(value.window, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAppConfig_lift(_ buf: RustBuffer) throws -> FfiAppConfig {
+    return try FfiConverterTypeFfiAppConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAppConfig_lower(_ value: FfiAppConfig) -> RustBuffer {
+    return FfiConverterTypeFfiAppConfig.lower(value)
+}
+
+
+/**
+ * Typed general settings exposed via UniFFI for compile-time safe defaults.
+ */
+public struct FfiGeneralConfig {
+    public var language: String
+    public var showInDock: Bool
+    public var terminalBundleId: String
+    public var hideResultsWhenEmpty: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(language: String, showInDock: Bool, terminalBundleId: String, hideResultsWhenEmpty: Bool) {
+        self.language = language
+        self.showInDock = showInDock
+        self.terminalBundleId = terminalBundleId
+        self.hideResultsWhenEmpty = hideResultsWhenEmpty
+    }
+}
+
+#if compiler(>=6)
+extension FfiGeneralConfig: Sendable {}
+#endif
+
+
+extension FfiGeneralConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiGeneralConfig, rhs: FfiGeneralConfig) -> Bool {
+        if lhs.language != rhs.language {
+            return false
+        }
+        if lhs.showInDock != rhs.showInDock {
+            return false
+        }
+        if lhs.terminalBundleId != rhs.terminalBundleId {
+            return false
+        }
+        if lhs.hideResultsWhenEmpty != rhs.hideResultsWhenEmpty {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(language)
+        hasher.combine(showInDock)
+        hasher.combine(terminalBundleId)
+        hasher.combine(hideResultsWhenEmpty)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiGeneralConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiGeneralConfig {
+        return
+            try FfiGeneralConfig(
+                language: FfiConverterString.read(from: &buf), 
+                showInDock: FfiConverterBool.read(from: &buf), 
+                terminalBundleId: FfiConverterString.read(from: &buf), 
+                hideResultsWhenEmpty: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiGeneralConfig, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.language, into: &buf)
+        FfiConverterBool.write(value.showInDock, into: &buf)
+        FfiConverterString.write(value.terminalBundleId, into: &buf)
+        FfiConverterBool.write(value.hideResultsWhenEmpty, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGeneralConfig_lift(_ buf: RustBuffer) throws -> FfiGeneralConfig {
+    return try FfiConverterTypeFfiGeneralConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGeneralConfig_lower(_ value: FfiGeneralConfig) -> RustBuffer {
+    return FfiConverterTypeFfiGeneralConfig.lower(value)
+}
+
+
+/**
+ * Typed index settings exposed via UniFFI for compile-time safe defaults.
+ */
+public struct FfiIndexConfig {
+    public var indexPaths: [String]
+    public var indexApps: Bool
+    public var exclude: [String]
+    public var excludePaths: [String]
+    public var includeHidden: Bool
+    public var excludeSensitive: Bool
+    public var sensitiveNames: [String]
+    public var maxResults: UInt64
+    public var networkRescanMinutes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(indexPaths: [String], indexApps: Bool, exclude: [String], excludePaths: [String], includeHidden: Bool, excludeSensitive: Bool, sensitiveNames: [String], maxResults: UInt64, networkRescanMinutes: UInt64) {
+        self.indexPaths = indexPaths
+        self.indexApps = indexApps
+        self.exclude = exclude
+        self.excludePaths = excludePaths
+        self.includeHidden = includeHidden
+        self.excludeSensitive = excludeSensitive
+        self.sensitiveNames = sensitiveNames
+        self.maxResults = maxResults
+        self.networkRescanMinutes = networkRescanMinutes
+    }
+}
+
+#if compiler(>=6)
+extension FfiIndexConfig: Sendable {}
+#endif
+
+
+extension FfiIndexConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiIndexConfig, rhs: FfiIndexConfig) -> Bool {
+        if lhs.indexPaths != rhs.indexPaths {
+            return false
+        }
+        if lhs.indexApps != rhs.indexApps {
+            return false
+        }
+        if lhs.exclude != rhs.exclude {
+            return false
+        }
+        if lhs.excludePaths != rhs.excludePaths {
+            return false
+        }
+        if lhs.includeHidden != rhs.includeHidden {
+            return false
+        }
+        if lhs.excludeSensitive != rhs.excludeSensitive {
+            return false
+        }
+        if lhs.sensitiveNames != rhs.sensitiveNames {
+            return false
+        }
+        if lhs.maxResults != rhs.maxResults {
+            return false
+        }
+        if lhs.networkRescanMinutes != rhs.networkRescanMinutes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(indexPaths)
+        hasher.combine(indexApps)
+        hasher.combine(exclude)
+        hasher.combine(excludePaths)
+        hasher.combine(includeHidden)
+        hasher.combine(excludeSensitive)
+        hasher.combine(sensitiveNames)
+        hasher.combine(maxResults)
+        hasher.combine(networkRescanMinutes)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiIndexConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiIndexConfig {
+        return
+            try FfiIndexConfig(
+                indexPaths: FfiConverterSequenceString.read(from: &buf), 
+                indexApps: FfiConverterBool.read(from: &buf), 
+                exclude: FfiConverterSequenceString.read(from: &buf), 
+                excludePaths: FfiConverterSequenceString.read(from: &buf), 
+                includeHidden: FfiConverterBool.read(from: &buf), 
+                excludeSensitive: FfiConverterBool.read(from: &buf), 
+                sensitiveNames: FfiConverterSequenceString.read(from: &buf), 
+                maxResults: FfiConverterUInt64.read(from: &buf), 
+                networkRescanMinutes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiIndexConfig, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.indexPaths, into: &buf)
+        FfiConverterBool.write(value.indexApps, into: &buf)
+        FfiConverterSequenceString.write(value.exclude, into: &buf)
+        FfiConverterSequenceString.write(value.excludePaths, into: &buf)
+        FfiConverterBool.write(value.includeHidden, into: &buf)
+        FfiConverterBool.write(value.excludeSensitive, into: &buf)
+        FfiConverterSequenceString.write(value.sensitiveNames, into: &buf)
+        FfiConverterUInt64.write(value.maxResults, into: &buf)
+        FfiConverterUInt64.write(value.networkRescanMinutes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiIndexConfig_lift(_ buf: RustBuffer) throws -> FfiIndexConfig {
+    return try FfiConverterTypeFfiIndexConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiIndexConfig_lower(_ value: FfiIndexConfig) -> RustBuffer {
+    return FfiConverterTypeFfiIndexConfig.lower(value)
+}
+
+
+/**
  * Index statistics exposed to Swift.
  */
 public struct FfiIndexStats {
@@ -1507,6 +1806,79 @@ public func FfiConverterTypeFfiMatchRange_lift(_ buf: RustBuffer) throws -> FfiM
 #endif
 public func FfiConverterTypeFfiMatchRange_lower(_ value: FfiMatchRange) -> RustBuffer {
     return FfiConverterTypeFfiMatchRange.lower(value)
+}
+
+
+/**
+ * Real-time query semantic preview flags for frontend toolbar badges.
+ */
+public struct FfiQueryPreview {
+    public var hasEffectiveUppercase: Bool
+    public var hasRegexSugar: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hasEffectiveUppercase: Bool, hasRegexSugar: Bool) {
+        self.hasEffectiveUppercase = hasEffectiveUppercase
+        self.hasRegexSugar = hasRegexSugar
+    }
+}
+
+#if compiler(>=6)
+extension FfiQueryPreview: Sendable {}
+#endif
+
+
+extension FfiQueryPreview: Equatable, Hashable {
+    public static func ==(lhs: FfiQueryPreview, rhs: FfiQueryPreview) -> Bool {
+        if lhs.hasEffectiveUppercase != rhs.hasEffectiveUppercase {
+            return false
+        }
+        if lhs.hasRegexSugar != rhs.hasRegexSugar {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hasEffectiveUppercase)
+        hasher.combine(hasRegexSugar)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiQueryPreview: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiQueryPreview {
+        return
+            try FfiQueryPreview(
+                hasEffectiveUppercase: FfiConverterBool.read(from: &buf), 
+                hasRegexSugar: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiQueryPreview, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.hasEffectiveUppercase, into: &buf)
+        FfiConverterBool.write(value.hasRegexSugar, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQueryPreview_lift(_ buf: RustBuffer) throws -> FfiQueryPreview {
+    return try FfiConverterTypeFfiQueryPreview.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQueryPreview_lower(_ value: FfiQueryPreview) -> RustBuffer {
+    return FfiConverterTypeFfiQueryPreview.lower(value)
 }
 
 
@@ -1900,6 +2272,79 @@ public func FfiConverterTypeFfiVolumeStatus_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiVolumeStatus_lower(_ value: FfiVolumeStatus) -> RustBuffer {
     return FfiConverterTypeFfiVolumeStatus.lower(value)
+}
+
+
+/**
+ * Typed window settings exposed via UniFFI for compile-time safe defaults.
+ */
+public struct FfiWindowConfig {
+    public var hideOnBlur: Bool
+    public var rememberPosition: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hideOnBlur: Bool, rememberPosition: Bool) {
+        self.hideOnBlur = hideOnBlur
+        self.rememberPosition = rememberPosition
+    }
+}
+
+#if compiler(>=6)
+extension FfiWindowConfig: Sendable {}
+#endif
+
+
+extension FfiWindowConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiWindowConfig, rhs: FfiWindowConfig) -> Bool {
+        if lhs.hideOnBlur != rhs.hideOnBlur {
+            return false
+        }
+        if lhs.rememberPosition != rhs.rememberPosition {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hideOnBlur)
+        hasher.combine(rememberPosition)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWindowConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWindowConfig {
+        return
+            try FfiWindowConfig(
+                hideOnBlur: FfiConverterBool.read(from: &buf), 
+                rememberPosition: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWindowConfig, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.hideOnBlur, into: &buf)
+        FfiConverterBool.write(value.rememberPosition, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWindowConfig_lift(_ buf: RustBuffer) throws -> FfiWindowConfig {
+    return try FfiConverterTypeFfiWindowConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWindowConfig_lower(_ value: FfiWindowConfig) -> RustBuffer {
+    return FfiConverterTypeFfiWindowConfig.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -2475,6 +2920,31 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiMatchRange: FfiConverterRustBuffer {
     typealias SwiftType = [FfiMatchRange]
 
@@ -2546,6 +3016,27 @@ fileprivate struct FfiConverterSequenceTypeFfiVolumeStatus: FfiConverterRustBuff
         return seq
     }
 }
+/**
+ * Return `AppConfig::default()` as a strongly-typed UniFFI record so the frontend
+ * shares Rust's single source of truth with compile-time schema verification.
+ */
+public func defaultAppConfig() -> FfiAppConfig  {
+    return try!  FfiConverterTypeFfiAppConfig_lift(try! rustCall() {
+    uniffi_lokii_core_fn_func_default_app_config($0
+    )
+})
+}
+/**
+ * Preview Smart Case and inline regex-sugar state using the core query parser.
+ */
+public func previewQueryFlags(query: String, mode: FfiSearchMode) -> FfiQueryPreview  {
+    return try!  FfiConverterTypeFfiQueryPreview_lift(try! rustCall() {
+    uniffi_lokii_core_fn_func_preview_query_flags(
+        FfiConverterString.lower(query),
+        FfiConverterTypeFfiSearchMode_lower(mode),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -2561,6 +3052,12 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_lokii_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_lokii_core_checksum_func_default_app_config() != 14390) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_func_preview_query_flags() != 27255) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_eventhandler_on_index_progress() != 43913) {
         return InitializationResult.apiChecksumMismatch

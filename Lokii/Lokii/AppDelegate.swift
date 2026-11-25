@@ -475,3 +475,15 @@ extension AppDelegate: NSMenuDelegate {
         statusItem?.button?.highlight(false)  // Fix highlight stuck bug (Pitfall #2)
     }
 }
+
+/// 应用启动入口，供可执行包装层调用以保证单实例锁在初始化任何核心服务前生效。
+public enum LokiiApplication {
+    public static func main() {
+        SingleInstanceGuard.acquireOrActivateExistingAndExit()
+
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}
