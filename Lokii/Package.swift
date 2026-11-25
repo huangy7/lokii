@@ -4,7 +4,11 @@ import Foundation
 
 // 支持通过环境变量指定 Rust target，默认 aarch64-apple-darwin
 let rustTarget = ProcessInfo.processInfo.environment["LOKII_RUST_TARGET"] ?? "aarch64-apple-darwin"
-let rustLibPath = "../target/\(rustTarget)/release"
+let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+let rustLibPath = packageDir
+    .deletingLastPathComponent()
+    .appendingPathComponent("target/\(rustTarget)/release")
+    .path
 
 let package = Package(
     name: "Lokii",
@@ -18,8 +22,8 @@ let package = Package(
             name: "lokii_coreFFI",
             path: "LokiiCore/Headers"
         ),
-        .executableTarget(
-            name: "Lokii",
+        .target(
+            name: "LokiiAppLib",
             dependencies: [
                 "lokii_coreFFI",
                 .product(name: "Sparkle", package: "Sparkle"),
@@ -29,8 +33,24 @@ let package = Package(
             linkerSettings: [
                 // 强制静态链接，避免运行时依赖 dylib 路径
                 .unsafeFlags(["\(rustLibPath)/liblokii_core.a"]),
+            ]
+        ),
+        .executableTarget(
+            name: "Lokii",
+            dependencies: [
+                "LokiiAppLib",
+            ],
+            path: "LokiiEntry",
+            linkerSettings: [
                 .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
             ]
+        ),
+        .testTarget(
+            name: "LokiiTests",
+            dependencies: [
+                "LokiiAppLib",
+            ],
+            path: "Tests/LokiiTests"
         ),
     ]
 )

@@ -672,212 +672,6 @@ pub fn is_disconnect_error(err: &std::io::Error, is_mounted: &dyn Fn() -> bool) 
     }
 }
 
-/// 原子扫描独立挂载卷。
-///
-/// 核心防护机制：
-/// 1. 取消与断开快速响应：在 `process_read_dir` 入口检查 `cancel`、`abort_flag` 与 `disconnected` 标记，
-///    一旦置位立即清空 `children`，阻止 Rayon 线程池继续展开任何子目录并立即释放描述符；
-/// 2. 局部容错与原子回滚：局部权限错误跳过继续，硬件/连接断开立刻终止并丢弃半途收集的数据，
-///    确保调用方不会得到残缺索引切片；
-/// 3. 安全退出排空：遇到提前中止时设置 `abort_flag` 并排空 `walker` 迭代器，确保所有后台工作线程
-///    完全终止并释放所有打开的目录句柄后函数方才返回。
-pub fn scan_volume_atomic(
-    root: &Path,
-    filter: &crate::filter::CompiledFilter,
-    cancel: &Arc<std::sync::atomic::AtomicBool>,
-    is_mounted: &dyn Fn() -> bool,
-    on_progress: &mut dyn FnMut(u64),
-) -> Result<Vec<FileEntry>, VolumeScanError> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err(VolumeScanError::Cancelled);
-    }
-
-    if !is_mounted() {
-        return Err(VolumeScanError::Disconnected(format!(
-            "volume at {:?} is not mounted",
-            root
-        )));
-    }
-
-    let root_meta = match std::fs::metadata(root) {
-        Ok(m) => m,
-        Err(err) => {
-            if is_disconnect_error(&err, is_mounted) {
-                return Err(VolumeScanError::Disconnected(err.to_string()));
-            } else {
-                return Err(VolumeScanError::RootUnavailable(err.to_string()));
-            }
-        }
-    };
-
-    if !root_meta.is_dir() {
-        return Err(VolumeScanError::RootUnavailable(format!(
-            "{:?} is not a directory",
-            root
-        )));
-    }
-
-    if let Err(err) = std::fs::read_dir(root) {
-        if is_disconnect_error(&err, is_mounted) {
-            return Err(VolumeScanError::Disconnected(err.to_string()));
-        } else {
-            return Err(VolumeScanError::RootUnavailable(err.to_string()));
-        }
-    }
-
-    let abort_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cancel_clone = Arc::clone(cancel);
-    let abort_clone = Arc::clone(&abort_flag);
-    let disconnected_atomic = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let disconnect_message = Arc::new(parking_lot::Mutex::new(None::<String>));
-
-    let disconnected_clone = Arc::clone(&disconnected_atomic);
-    let disconnect_msg_clone = Arc::clone(&disconnect_message);
-    let filter_clone = filter.clone();
-
-    let walker = jwalk::WalkDir::new(root)
-        .skip_hidden(false)
-        .process_read_dir(move |_depth, _path, _state, children| {
-            if cancel_clone.load(Ordering::Relaxed)
-                || abort_clone.load(Ordering::Relaxed)
-                || disconnected_clone.load(Ordering::Relaxed)
-            {
-                children.clear();
-                return;
-            }
-
-            for entry_res in children.iter() {
-                if let Err(ref err) = entry_res {
-                    if let Some(io_err) = err.io_error() {
-                        if is_deterministic_disconnect_error(io_err) {
-                            disconnected_clone.store(true, Ordering::Relaxed);
-                            let mut msg = disconnect_msg_clone.lock();
-                            if msg.is_none() {
-                                *msg = Some(io_err.to_string());
-                            }
-                            children.clear();
-                            return;
-                        }
-                    }
-                }
-            }
-
-            children.retain_mut(|entry_res| {
-                let Ok(entry) = entry_res else {
-                    return false;
-                };
-                match filter_clone.evaluate(&entry.path(), entry.file_type().is_dir()) {
-                    crate::filter::ScopeDecision::HardDrop => false,
-                    crate::filter::ScopeDecision::IndexShallowContainer => {
-                        entry.read_children_path = None;
-                        true
-                    }
-                    crate::filter::ScopeDecision::IndexNormally => true,
-                }
-            });
-        });
-
-    let mut entries = Vec::new();
-    let mut progress_count = 0u64;
-    let mut iter = walker.into_iter();
-
-    while let Some(entry_res) = iter.next() {
-        if cancel.load(Ordering::Relaxed) {
-            abort_flag.store(true, Ordering::Relaxed);
-            while iter.next().is_some() {}
-            return Err(VolumeScanError::Cancelled);
-        }
-        if disconnected_atomic.load(Ordering::Relaxed) {
-            let msg = disconnect_message
-                .lock()
-                .take()
-                .unwrap_or_else(|| "volume disconnected".into());
-            abort_flag.store(true, Ordering::Relaxed);
-            while iter.next().is_some() {}
-            return Err(VolumeScanError::Disconnected(msg));
-        }
-
-        match entry_res {
-            Ok(entry) => match entry.metadata() {
-                Ok(metadata) => {
-                    let name_str = entry.file_name.to_string_lossy();
-                    let extension = if metadata.is_dir() {
-                        String::new()
-                    } else {
-                        std::path::Path::new(name_str.as_ref())
-                            .extension()
-                            .map(|ext| ext.to_string_lossy().to_lowercase())
-                            .unwrap_or_default()
-                    };
-                    entries.push(FileEntry {
-                        name: name_str.into_owned(),
-                        path: entry.path().to_string_lossy().into_owned(),
-                        is_dir: metadata.is_dir(),
-                        size: metadata.len(),
-                        modified: metadata
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                        created_at: metadata
-                            .created()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                        extension,
-                    });
-                    progress_count += 1;
-                    on_progress(progress_count);
-                }
-                Err(err) => {
-                    if let Some(io_err) = err.io_error() {
-                        if is_disconnect_error(io_err, is_mounted) {
-                            abort_flag.store(true, Ordering::Relaxed);
-                            while iter.next().is_some() {}
-                            return Err(VolumeScanError::Disconnected(io_err.to_string()));
-                        }
-                    }
-                }
-            },
-            Err(err) => {
-                if let Some(io_err) = err.io_error() {
-                    if is_disconnect_error(io_err, is_mounted) {
-                        abort_flag.store(true, Ordering::Relaxed);
-                        while iter.next().is_some() {}
-                        return Err(VolumeScanError::Disconnected(io_err.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    if cancel.load(Ordering::Relaxed) {
-        abort_flag.store(true, Ordering::Relaxed);
-        while iter.next().is_some() {}
-        return Err(VolumeScanError::Cancelled);
-    }
-    if disconnected_atomic.load(Ordering::Relaxed) {
-        let msg = disconnect_message
-            .lock()
-            .take()
-            .unwrap_or_else(|| "volume disconnected".into());
-        abort_flag.store(true, Ordering::Relaxed);
-        while iter.next().is_some() {}
-        return Err(VolumeScanError::Disconnected(msg));
-    }
-
-    if entries.is_empty() {
-        return Err(VolumeScanError::RootUnavailable(format!(
-            "scan yielded no readable entries for {:?}",
-            root
-        )));
-    }
-
-    Ok(entries)
-}
-
 #[inline]
 fn write_extension_lowercase(name: &str, is_dir: bool, out: &mut String) {
     out.clear();
@@ -1740,7 +1534,7 @@ mod tests {
         );
 
         // Should have the root dir + 3 files = 4, or just 3 files
-        // jwalk includes the root directory entry
+        // Scanner includes the root directory entry
         assert!(
             entries.len() >= 3,
             "Expected at least 3 entries, got {}",
@@ -2110,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_volume_atomic_cancelled() {
+    fn test_scan_volume_compact_atomic_cancelled() {
         use std::sync::atomic::AtomicBool;
 
         let tmp = make_temp_dir();
@@ -2121,7 +1915,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
         let mut progress_count = 0u64;
 
-        let res = scan_volume_atomic(
+        let res = scan_volume_compact_atomic(
             tmp.path(),
             &filter,
             &cancel,
@@ -2133,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_volume_atomic_root_unavailable() {
+    fn test_scan_volume_compact_atomic_root_unavailable() {
         use std::sync::atomic::AtomicBool;
 
         let non_existent = PathBuf::from("/non_existent_volume_path_404");
@@ -2142,7 +1936,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut progress_count = 0u64;
 
-        let res_mounted = scan_volume_atomic(
+        let res_mounted = scan_volume_compact_atomic(
             &non_existent,
             &filter,
             &cancel,
@@ -2151,7 +1945,7 @@ mod tests {
         );
         assert!(matches!(res_mounted, Err(VolumeScanError::RootUnavailable(_))));
 
-        let res_unmounted = scan_volume_atomic(
+        let res_unmounted = scan_volume_compact_atomic(
             &non_existent,
             &filter,
             &cancel,
@@ -2162,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_volume_atomic_success() {
+    fn test_scan_volume_compact_atomic_success() {
         use std::sync::atomic::AtomicBool;
 
         let tmp = make_temp_dir();
@@ -2177,7 +1971,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut progress_count = 0u64;
 
-        let res = scan_volume_atomic(
+        let res = scan_volume_compact_atomic(
             tmp.path(),
             &filter,
             &cancel,
@@ -2186,15 +1980,15 @@ mod tests {
         )
         .unwrap();
 
-        let names: Vec<&str> = res.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"file1.txt"));
-        assert!(names.contains(&"file2.rs"));
-        assert!(!names.contains(&"bad.js"));
+        let names: Vec<String> = res.iter().map(|(_, v)| v.name.to_string()).collect();
+        assert!(names.iter().any(|n| n == "file1.txt"));
+        assert!(names.iter().any(|n| n == "file2.rs"));
+        assert!(!names.iter().any(|n| n == "bad.js"));
         assert!(progress_count >= 2);
     }
 
     #[test]
-    fn test_scan_volume_atomic_honors_scope_policy() {
+    fn test_scan_volume_compact_atomic_honors_scope_policy() {
         let tmp = make_temp_dir();
         let root = tmp.path().canonicalize().unwrap();
         for path in ["Demo.app", ".keys", ".visible", "excluded"] {
@@ -2221,7 +2015,7 @@ mod tests {
         config.index.sensitive_names = vec![".keys".into()];
         let scan_names = |config: &crate::config::AppConfig| {
             let filter = crate::filter::CompiledFilter::for_volume(config, &root);
-            scan_volume_atomic(
+            scan_volume_compact_atomic(
                 &root,
                 &filter,
                 &Arc::new(false.into()),
@@ -2229,8 +2023,8 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
+            .iter()
+            .map(|(_, view)| view.name.to_string())
             .collect::<std::collections::HashSet<_>>()
         };
 
@@ -2251,7 +2045,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_volume_atomic_aborted_drains_cleanly_without_leaks() {
+    fn test_scan_volume_compact_atomic_aborted_drains_cleanly_without_leaks() {
         use std::sync::atomic::AtomicBool;
 
         let tmp = make_temp_dir();
@@ -2268,7 +2062,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_trigger = Arc::clone(&cancel);
 
-        let res = scan_volume_atomic(
+        let res = scan_volume_compact_atomic(
             tmp.path(),
             &filter,
             &cancel,
@@ -2282,13 +2076,13 @@ mod tests {
 
         assert!(matches!(res, Err(VolumeScanError::Cancelled)));
 
-        // After scan_volume_atomic returns, all descriptors must be dropped immediately,
+        // After scan_volume_compact_atomic returns, all descriptors must be dropped immediately,
         // allowing clean removal of the directory tree without any EBUSY.
         fs::remove_dir_all(tmp.path()).unwrap();
     }
 
     #[test]
-    fn test_scan_volume_compact_atomic_matches_jwalk_and_handles_cancel() {
+    fn test_scan_volume_compact_atomic_collects_expected_entries_and_handles_cancel() {
         use std::sync::atomic::AtomicBool;
 
         let tmp = make_temp_dir();
@@ -2313,16 +2107,6 @@ mod tests {
         let filter = crate::filter::CompiledFilter::for_volume(&config, &root);
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut legacy_progress = 0u64;
-        let legacy = scan_volume_atomic(
-            &root,
-            &filter,
-            &cancel,
-            &|| true,
-            &mut |c| legacy_progress = c,
-        )
-        .unwrap();
-
         let mut compact_progress = 0u64;
         let compact = scan_volume_compact_atomic(
             &root,
@@ -2333,14 +2117,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(compact.len(), legacy.len());
         assert_eq!(compact_progress, compact.len() as u64);
 
-        let mut legacy_map: std::collections::HashMap<String, (bool, String, u64)> =
-            std::collections::HashMap::new();
-        for e in &legacy {
-            legacy_map.insert(e.path.clone(), (e.is_dir, e.extension.clone(), if e.is_dir { 0 } else { e.size }));
-        }
         let mut compact_map: std::collections::HashMap<String, (bool, String, u64)> =
             std::collections::HashMap::new();
         let mut path_buf = String::new();
@@ -2351,7 +2129,38 @@ mod tests {
                 (view.is_dir, view.extension.to_string(), if view.is_dir { 0 } else { view.size }),
             );
         }
-        assert_eq!(compact_map, legacy_map);
+
+        let mut expected: std::collections::HashMap<String, (bool, String, u64)> =
+            std::collections::HashMap::from([
+                (root.to_string_lossy().into_owned(), (true, String::new(), 0)),
+                (root.join("sub").to_string_lossy().into_owned(), (true, String::new(), 0)),
+                (root.join("sub/nested").to_string_lossy().into_owned(), (true, String::new(), 0)),
+                (
+                    root.join("sub/nested/文档.md").to_string_lossy().into_owned(),
+                    (false, "md".into(), "测试内容".len() as u64),
+                ),
+                (
+                    root.join("alpha.TXT").to_string_lossy().into_owned(),
+                    (false, "txt".into(), "hello world".len() as u64),
+                ),
+                (
+                    root.join("Demo.app").to_string_lossy().into_owned(),
+                    (true, String::new(), 0),
+                ),
+                (
+                    root.join(".visible").to_string_lossy().into_owned(),
+                    (false, String::new(), "dotfile".len() as u64),
+                ),
+            ]);
+        #[cfg(unix)]
+        {
+            let link_meta = fs::symlink_metadata(root.join("sub_link")).unwrap();
+            expected.insert(
+                root.join("sub_link").to_string_lossy().into_owned(),
+                (false, String::new(), link_meta.len()),
+            );
+        }
+        assert_eq!(compact_map, expected);
 
         // 取消时应立刻中止并释放全部目录描述符
         let cancel_mid = Arc::new(AtomicBool::new(false));

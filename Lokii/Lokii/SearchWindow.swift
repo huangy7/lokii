@@ -1371,166 +1371,14 @@ final class SearchWindow: NSWindowController {
                 caseSensitivityButton.visualState = effective ? .autoActive : .inactive
             } else {
                 let query = searchField?.stringValue ?? ""
-                let hasUpper = Self.hasEffectiveUppercase(query: query)
+                let hasUpper = Self.hasEffectiveUppercase(query: query, mode: currentMode)
                 caseSensitivityButton.visualState = hasUpper ? .autoActive : .inactive
             }
         }
     }
 
-    static func hasEffectiveUppercase(query: String) -> Bool {
-        func findClosingQuote(in s: String, from start: String.Index) -> String.Index? {
-            var j = start
-            while j < s.endIndex {
-                if s[j] == "\\" {
-                    let next = s.index(after: j)
-                    j = next < s.endIndex ? s.index(after: next) : next
-                    continue
-                }
-                if s[j] == "\"" {
-                    return j
-                }
-                j = s.index(after: j)
-            }
-            return nil
-        }
-
-        func hasRegexEffectiveUppercase(_ pattern: String) -> Bool {
-            var idx = pattern.startIndex
-            while idx < pattern.endIndex {
-                let c = pattern[idx]
-                idx = pattern.index(after: idx)
-                if c == "\\" {
-                    if idx < pattern.endIndex {
-                        idx = pattern.index(after: idx)
-                    }
-                    continue
-                }
-                if c.isUppercase {
-                    return true
-                }
-            }
-            return false
-        }
-
-        var i = query.startIndex
-        while i < query.endIndex {
-            while i < query.endIndex && query[i].isWhitespace {
-                i = query.index(after: i)
-            }
-            if i >= query.endIndex { break }
-
-            // regex: 前缀整词原样保留，跳过内部反斜杠元字符后检查大写
-            if query[i...].hasPrefix("regex:") {
-                var end = i
-                while end < query.endIndex && !query[end].isWhitespace {
-                    end = query.index(after: end)
-                }
-                let payload = String(query[query.index(i, offsetBy: 6)..<end])
-                if hasRegexEffectiveUppercase(payload) {
-                    return true
-                }
-                i = end
-                continue
-            }
-
-            var negated = false
-            if query[i] == "!" {
-                negated = true
-                i = query.index(after: i)
-                if i >= query.endIndex || query[i].isWhitespace {
-                    continue
-                }
-            }
-
-            let bodyStart = i
-            var text = ""
-            var startedWithQuote = false
-            var hasUnquotedContent = false
-
-            while i < query.endIndex && !query[i].isWhitespace {
-                let ch = query[i]
-                if ch == "\"" {
-                    let afterOpen = query.index(after: i)
-                    if let closeIdx = findClosingQuote(in: query, from: afterOpen) {
-                        if i == bodyStart {
-                            startedWithQuote = true
-                        }
-                        var innerIdx = afterOpen
-                        while innerIdx < closeIdx {
-                            let ic = query[innerIdx]
-                            let nextInner = query.index(after: innerIdx)
-                            if ic == "\\" && nextInner < closeIdx && query[nextInner] == "\"" {
-                                text.append("\"")
-                                innerIdx = query.index(after: nextInner)
-                            } else {
-                                text.append(ic)
-                                innerIdx = nextInner
-                            }
-                        }
-                        i = query.index(after: closeIdx)
-                        continue
-                    }
-                    text.append("\"")
-                    hasUnquotedContent = true
-                    i = afterOpen
-                    continue
-                }
-
-                if ch == "\\" {
-                    let next = query.index(after: i)
-                    if next < query.endIndex {
-                        let nextCh = query[next]
-                        if nextCh == "\"" || nextCh == "!" || nextCh == "|" {
-                            text.append(nextCh)
-                            hasUnquotedContent = true
-                            i = query.index(after: next)
-                            continue
-                        }
-                    }
-                    text.append("\\")
-                    hasUnquotedContent = true
-                    i = next
-                    continue
-                }
-
-                text.append(ch)
-                hasUnquotedContent = true
-                i = query.index(after: i)
-            }
-
-            if text.isEmpty || negated {
-                continue
-            }
-
-            let quoted = startedWithQuote && !hasUnquotedContent
-            if quoted {
-                if text.contains(where: { $0.isUppercase }) {
-                    return true
-                }
-                continue
-            }
-
-            let lower = text.lowercased()
-            if lower.hasPrefix("in:") || lower.hasPrefix("type:") || lower.hasPrefix("ext:") || lower.hasPrefix("size:") {
-                continue
-            }
-            if text.contains("/") {
-                if text.hasSuffix("/") { continue }
-                if let last = text.split(separator: "/").last,
-                   !last.isEmpty,
-                   last.contains(where: { $0.isUppercase }) {
-                    return true
-                }
-                continue
-            }
-            if text.hasPrefix(".") && !text.hasPrefix("..") {
-                continue
-            }
-            if text.contains(where: { $0.isUppercase }) {
-                return true
-            }
-        }
-        return false
+    static func hasEffectiveUppercase(query: String, mode: FfiSearchMode = .auto) -> Bool {
+        previewQueryFlags(query: query, mode: mode).hasEffectiveUppercase
     }
 
     // MARK: - Fuzzy & Regex Mode Actions & State
@@ -1572,40 +1420,7 @@ final class SearchWindow: NSWindowController {
     }
 
     static func hasRegexSugar(query: String) -> Bool {
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("regex:") { return true }
-        guard trimmed.hasPrefix("/"), trimmed.count >= 2 else { return false }
-        // Check if closed by unescaped slash
-        let chars = Array(trimmed)
-        var i = chars.count - 1
-        // Check for trailing 'i' or 'I'
-        if i >= 1 && (chars[i] == "i" || chars[i] == "I") {
-            i -= 1
-        }
-        guard i >= 1 && chars[i] == "/" else { return false }
-        var backslashCount = 0
-        var j = i - 1
-        while j >= 0 && chars[j] == "\\" {
-            backslashCount += 1
-            j -= 1
-        }
-        guard backslashCount % 2 == 0 else { return false }
-
-        // Intermediate unescaped slashes indicate a directory path rather than a regex pattern
-        var k = 1
-        var intermediateBackslashes = 0
-        while k < i {
-            if chars[k] == "/" && intermediateBackslashes % 2 == 0 {
-                return false
-            }
-            if chars[k] == "\\" {
-                intermediateBackslashes += 1
-            } else {
-                intermediateBackslashes = 0
-            }
-            k += 1
-        }
-        return true
+        previewQueryFlags(query: query, mode: .auto).hasRegexSugar
     }
 
     // MARK: - Filter Popover Actions & State

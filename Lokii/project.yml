@@ -29,6 +29,7 @@ targets:
           # Assets.car 是 actool 的编译产物，仅作 CI 兜底由 scripts/build.sh 直接读取；
           # 若作为资源参与拷贝会与 LinkAssetCatalog 争抢同一输出路径
           - "Resources/Assets.car"
+      - path: LokiiEntry
     dependencies:
       - package: KeyboardShortcuts
       - package: Sparkle

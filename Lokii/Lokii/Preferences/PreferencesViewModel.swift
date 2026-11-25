@@ -1244,13 +1244,14 @@ class PreferencesViewModel: ObservableObject {
     }
 
     func restoreIndexDefaults() {
-        indexPaths = Self.defaultIndexPaths
-        indexApps = false
-        excludePatterns = Self.defaultExcludePatterns
-        excludePaths = Self.defaultExcludePaths
-        includeHidden = false
-        excludeSensitive = true
-        networkRescanMinutes = Self.defaultNetworkRescanMinutes
+        let defaults = LokiiConfig.defaultConfig.index
+        indexPaths = defaults.indexPaths
+        indexApps = defaults.indexApps
+        excludePatterns = defaults.exclude
+        excludePaths = defaults.excludePaths
+        includeHidden = defaults.includeHidden
+        excludeSensitive = defaults.excludeSensitive
+        networkRescanMinutes = defaults.networkRescanMinutes
     }
 
     /// 开关打开时内核追加的系统应用索引根；此处仅用于提示与排除规则的冲突。
@@ -1268,18 +1269,11 @@ class PreferencesViewModel: ObservableObject {
         }
     }
 
-    /// 索引配置的出厂默认值，与 Rust 侧 IndexConfig::default 保持一致。
-    /// 重置入口与“当前是否处于默认态”判定共用此定义，避免两处字面量各自漂移。
-    static let defaultIndexPaths = ["~"]
-    static let defaultNetworkRescanMinutes = 30
-    static let defaultExcludePatterns = ["node_modules", ".git", ".DS_Store", "target", ".Trash", ".hg", ".svn", "build", "dist", ".next", ".nuxt", ".cache", ".venv", "venv", "__pycache__", "DerivedData", "Pods", "Carthage", "Contents", "logs", "tmp", "temp", "coverage", ".idea", ".vscode", "vendor", "out", "bin", "obj", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "xcshareddata", "xcuserdata"]
-    static let defaultExcludePaths = [
-        "/System", "/Library", "/private", "/bin", "/sbin", "/usr", "/dev",
-        "/Volumes", "/opt", "~/Library", "~/.Trash", "~/.cache", "~/.npm",
-        "~/.pnpm-store", "~/.yarn", "~/.cargo/registry", "~/.cargo/git",
-        "~/.rustup", "~/.gradle/caches", "~/.m2/repository", "~/.bun",
-        "~/.deno", "~/.nvm", "~/.orbstack", "~/.docker"
-    ]
+    /// 索引配置的出厂默认值，直接透传自 Rust `AppConfig::default()` 单一来源。
+    static var defaultIndexPaths: [String] { LokiiConfig.IndexConfig.defaultIndexPaths }
+    static var defaultNetworkRescanMinutes: Int { LokiiConfig.IndexConfig.defaultNetworkRescanMinutes }
+    static var defaultExcludePatterns: [String] { LokiiConfig.IndexConfig.defaultExclude }
+    static var defaultExcludePaths: [String] { LokiiConfig.IndexConfig.defaultExcludePaths }
 
     var customExcludePaths: [String] {
         excludePaths.filter { !Self.defaultExcludePaths.contains($0) }
@@ -1298,12 +1292,13 @@ class PreferencesViewModel: ObservableObject {
     }
 
     var isDefaultIndexState: Bool {
-        indexPaths == Self.defaultIndexPaths &&
-        !indexApps &&
-        excludePatterns == Self.defaultExcludePatterns &&
-        excludePaths == Self.defaultExcludePaths &&
-        !includeHidden &&
-        excludeSensitive &&
-        networkRescanMinutes == Self.defaultNetworkRescanMinutes
+        let defaults = LokiiConfig.defaultConfig.index
+        return indexPaths == defaults.indexPaths &&
+            indexApps == defaults.indexApps &&
+            excludePatterns == defaults.exclude &&
+            excludePaths == defaults.excludePaths &&
+            includeHidden == defaults.includeHidden &&
+            excludeSensitive == defaults.excludeSensitive &&
+            networkRescanMinutes == defaults.networkRescanMinutes
     }
 }

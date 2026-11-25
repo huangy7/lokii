@@ -18,7 +18,7 @@ help:
 	@echo "  make build [ARCH=...]    - 编译 Debug 版本 (默认: $(ARCH))"
 	@echo "  make release [ARCH=...]  - 编译 Release 版本 (默认: $(ARCH))"
 	@echo "  make bindings [ARCH=...] - 编译 Rust 核心并生成 UniFFI Swift 绑定"
-	@echo "  make test [ARCH=...]     - 运行 Rust 核心单测与 Swift 编译校验"
+	@echo "  make test [ARCH=...]     - 运行 Rust 核心与 Swift 单元测试"
 	@echo "  make check [ARCH=...]    - 运行 Rust 核心静态类型与目标检查"
 	@echo "  make package [ARCH=...]  - 打包构建 macOS DMG 安装镜像 (支持 arm64 / x86_64)"
 	@echo "  make bump-version V=...  - 更新项目全量版本号 (如: make bump-version V=0.1.0)"
@@ -35,22 +35,7 @@ release:
 
 test: bindings
 	@cargo test --workspace --target $(RUST_TARGET)
-	@cd Lokii && LOKII_RUST_TARGET=$(RUST_TARGET) swift build --arch $(ARCH)
-	@swift tests/result_directory_tree_test.swift
-	@swift tests/search_results_view_controller_test.swift
-	@swift tests/sidebar_tree_view_controller_test.swift
-	@swift tests/toolbar_test.swift
-	@swift tests/split_view_controller_test.swift
-	@swift tests/keyboard_navigation_test.swift
-	@swift tests/shortcut_recorder_test.swift
-	@swift tests/index_config_test.swift
-	@swift tests/filter_query_sync_coordinator_test.swift
-	@swift tests/filter_popover_view_test.swift
-	@swift tests/filter_popover_controller_test.swift
-	@swift tests/breadcrumb_and_services_test.swift
-	@swift tests/terminal_launcher_test.swift
-	@swift tests/case_sensitivity_test.swift
-	@swift tests/window_frame_manager_test.swift
+	@cd Lokii && LOKII_RUST_TARGET=$(RUST_TARGET) swift test --arch $(ARCH)
 
 
 check:

@@ -482,6 +482,17 @@ void uniffi_lokii_core_fn_method_lokiicore_start_watcher(void*_Nonnull ptr, void
 int8_t uniffi_lokii_core_fn_method_lokiicore_update_config_from_json(void*_Nonnull ptr, RustBuffer json, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_FUNC_DEFAULT_APP_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_FUNC_DEFAULT_APP_CONFIG
+RustBuffer uniffi_lokii_core_fn_func_default_app_config(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_FUNC_PREVIEW_QUERY_FLAGS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_FUNC_PREVIEW_QUERY_FLAGS
+RustBuffer uniffi_lokii_core_fn_func_preview_query_flags(RustBuffer query, RustBuffer mode, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_FFI_LOKII_CORE_RUSTBUFFER_ALLOC
 #define UNIFFI_FFIDEF_FFI_LOKII_CORE_RUSTBUFFER_ALLOC
 RustBuffer ffi_lokii_core_rustbuffer_alloc(uint64_t size, RustCallStatus *_Nonnull out_status
@@ -760,6 +771,18 @@ void ffi_lokii_core_rust_future_free_void(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_LOKII_CORE_RUST_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FFI_LOKII_CORE_RUST_FUTURE_COMPLETE_VOID
 void ffi_lokii_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_FUNC_DEFAULT_APP_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_FUNC_DEFAULT_APP_CONFIG
+uint16_t uniffi_lokii_core_checksum_func_default_app_config(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_FUNC_PREVIEW_QUERY_FLAGS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_FUNC_PREVIEW_QUERY_FLAGS
+uint16_t uniffi_lokii_core_checksum_func_preview_query_flags(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_EVENTHANDLER_ON_INDEX_PROGRESS

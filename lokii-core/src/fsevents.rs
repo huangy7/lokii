@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 pub(crate) const ITEM_CREATED: u32 = fs::kFSEventStreamEventFlagItemCreated;
 pub(crate) const ITEM_RENAMED: u32 = fs::kFSEventStreamEventFlagItemRenamed;
+pub(crate) const SINCE_NOW: u64 = fs::kFSEventStreamEventIdSinceNow;
 
 /// 系统当前最新的事件 ID。
 pub(crate) fn current_event_id() -> u64 {
