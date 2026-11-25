@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::indexer::FileEntry;
 
 use parking_lot::Mutex;
@@ -86,19 +87,15 @@ pub fn cache_path() -> PathBuf {
         .join("index.cache")
 }
 
-/// Save file entries to a cache file with a version header.
-///
-/// Uses atomic write: writes to a .tmp file first, then renames to final path
-/// to prevent corruption if the process crashes mid-write.
-pub fn save_cache(entries: &[FileEntry], path: &Path) -> Result<(), CacheError> {
+/// Save file entries to a legacy v3 cache file (test-only; production uses compact v5 caches).
+#[cfg(test)]
+pub(crate) fn save_cache(entries: &[FileEntry], path: &Path) -> Result<(), CacheError> {
     write_cache(CACHE_VERSION, &[&bitcode::encode(entries)], path)
 }
 
-/// Load file entries from a cache file, validating the version header.
-///
-/// Returns errors for: missing file, too small, bad magic, version mismatch, corrupt payload.
-/// Never panics on invalid input.
-pub fn load_cache(path: &Path) -> Result<Vec<FileEntry>, CacheError> {
+/// Load file entries from a legacy v3 cache file (test-only; production uses `load_compact`).
+#[cfg(test)]
+fn load_cache(path: &Path) -> Result<Vec<FileEntry>, CacheError> {
     let (version, data) = read_cache(path)?;
     if version != CACHE_VERSION {
         return Err(CacheError::VersionMismatch {
@@ -332,6 +329,7 @@ fn temporary_cache_path(path: &Path) -> PathBuf {
 }
 
 /// Write `[4 bytes "LOKI"] [4 bytes version u32 LE] [payload parts...]` atomically.
+#[cfg(test)]
 fn write_cache(version: u32, payload: &[&[u8]], path: &Path) -> Result<(), CacheError> {
     let lock = path_write_lock(path);
     let _guard = lock.lock();

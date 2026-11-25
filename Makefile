@@ -1,7 +1,8 @@
 .PHONY: all build release test check bindings package bump-version clean help
 
 # 默认架构检测（支持 arm64 或 x86_64）
-ARCH ?= $(shell uname -m)
+HOST_ARCH := $(shell uname -m)
+ARCH ?= $(HOST_ARCH)
 
 ifeq ($(ARCH),arm64)
 RUST_TARGET := aarch64-apple-darwin
@@ -35,7 +36,16 @@ release:
 
 test: bindings
 	@cargo test --workspace --target $(RUST_TARGET)
+ifeq ($(ARCH),$(HOST_ARCH))
 	@cd Lokii && LOKII_RUST_TARGET=$(RUST_TARGET) swift test --arch $(ARCH)
+else
+	@cd Lokii && LOKII_RUST_TARGET=$(RUST_TARGET) swift build --build-tests --arch $(ARCH) && \
+		BIN_PATH="$$(LOKII_RUST_TARGET=$(RUST_TARGET) swift build --build-tests --arch $(ARCH) --show-bin-path)" && \
+		TEST_BUNDLE="$$(find "$$BIN_PATH" -maxdepth 1 -name '*.xctest' -print -quit)" && \
+		test -n "$$TEST_BUNDLE" && \
+		XCTEST_BIN="$$(xcrun --find xctest)" && \
+		DYLD_FRAMEWORK_PATH="$$BIN_PATH:$$BIN_PATH/PackageFrameworks" arch -$(ARCH) "$$XCTEST_BIN" "$$TEST_BUNDLE"
+endif
 
 
 check:
