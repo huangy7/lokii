@@ -388,8 +388,6 @@ enum Control {
         checkpoint: crate::cache::Checkpoint,
         done: mpsc::Sender<()>,
     },
-    /// 后台重扫得到的整棵子树，由服务线程换入。
-    Subtree { root: PathBuf, entries: Vec<FileEntry> },
 }
 
 /// 运行中的索引服务。
@@ -431,7 +429,6 @@ impl WatcherHandle {
                 Ok(())
             }
             Err(mpsc::SendError(Control::Replace { index, .. })) => Err(index),
-            Err(mpsc::SendError(Control::Subtree { .. })) => unreachable!("sent a Replace"),
         }
     }
 }
@@ -450,8 +447,6 @@ struct Scope {
     scan_paths: Vec<PathBuf>,
     excluded_mount_roots: Vec<PathBuf>,
     include_hidden: bool,
-    /// 非本地卷上的根多久整棵重扫一次（`None` 表示不重扫）。
-    network_rescan: Option<Duration>,
 }
 
 impl Scope {
@@ -473,7 +468,6 @@ impl Scope {
             scan_paths: config.resolve_paths(),
             excluded_mount_roots: Vec::new(),
             include_hidden: config.index.include_hidden,
-            network_rescan: network_rescan(config),
         }
     }
 
@@ -513,7 +507,6 @@ impl Scope {
             scan_paths: primary_paths,
             excluded_mount_roots,
             include_hidden: config.index.include_hidden,
-            network_rescan: None,
         }
     }
 
@@ -582,48 +575,6 @@ pub(crate) fn primary_scope_inputs(
     (partition.primary_paths, excluded_mount_roots)
 }
 
-fn network_rescan(config: &AppConfig) -> Option<Duration> {
-    let minutes = config.index.network_rescan_minutes;
-    (minutes > 0).then(|| Duration::from_secs(minutes * 60))
-}
-
-/// 路径所在卷是否本地卷；查不到（不存在、未挂载）按本地处理，不触发重扫。
-fn is_local_volume(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return true;
-    };
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
-        return true;
-    }
-    stat.f_flags & libc::MNT_LOCAL as u32 != 0
-}
-
-/// 在后台线程逐个重扫远端卷上的根，结果交回服务线程换入（网络卷可能很慢，不能挡住本地事件）。
-fn rescan_network_roots(
-    roots: Vec<PathBuf>,
-    filter: Arc<CompiledFilter>,
-    include_hidden: bool,
-    is_remote: impl Fn(&Path) -> bool + Send + 'static,
-    control: mpsc::Sender<Control>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        // 卸载中的共享 exists/statfs 也可能卡住，只卡这个线程。
-        for root in roots.into_iter().filter(|root| root.exists() && is_remote(root)) {
-            let entries = scanner::scan_directories(
-                &[root.clone()],
-                Arc::clone(&filter),
-                include_hidden,
-                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            );
-            if control.send(Control::Subtree { root, entries }).is_err() {
-                return;
-            }
-        }
-    })
-}
-
 /// 刚获得完全磁盘访问时，原先受保护、现在可读且在索引范围内的目录。
 fn newly_readable(protected: &[PathBuf], scope: &Scope) -> Vec<PathBuf> {
     protected
@@ -650,8 +601,6 @@ struct Service<F, P> {
     stream: Option<crate::fsevents::Stream>,
     events: mpsc::Receiver<Vec<crate::fsevents::Event>>,
     control: mpsc::Receiver<Control>,
-    /// 交给后台重扫线程，用来把结果送回本线程。
-    control_tx: mpsc::Sender<Control>,
     applied: Arc<AtomicU64>,
     /// 索引内容对应的范围指纹；与 `scope.fingerprint` 不同即索引落后于配置，需全量对账。
     fingerprint: Arc<AtomicU64>,
@@ -679,8 +628,6 @@ struct Service<F, P> {
     last_persist: Instant,
     /// 上次落盘后收下的索引事件数，对应下次启动要回放的量。
     unpersisted_events: usize,
-    network_scanned: Option<Instant>,
-    network_scanning: Arc<std::sync::atomic::AtomicBool>,
     primary_volumes_dir: Option<PathBuf>,
     last_index_config: IndexConfig,
     on_config_updated: Option<Arc<dyn Fn(&AppConfig) + Send + Sync>>,
@@ -707,7 +654,6 @@ where
             self.poll_control();
             self.poll_scope();
             self.poll_gap();
-            self.poll_network();
             let timeout = match self.first_pending {
                 Some(first) => Duration::from_millis(DEFAULT_DEBOUNCE_MS)
                     .min(MAX_DEBOUNCE.saturating_sub(first.elapsed())),
@@ -746,18 +692,18 @@ where
         self.dirty = false;
         self.unpersisted_events = 0;
         self.last_persist = Instant::now();
-        let handle_view = WatcherHandle {
-            control: self.control_tx.clone(),
-            applied: Arc::clone(&self.applied),
-            fingerprint: Arc::clone(&self.fingerprint),
-        };
         // 仅在短读锁内提取检查点并完成内存编码，立即释放读锁后再把字节流交给回调落盘与 sync_data()，
         // 防止在 parking_lot::RwLock 写优先策略下因慢磁盘 fsync 引发写锁与 UI 搜索读锁的级联阻塞。
         let snapshot = {
             let index = self.store.read();
-            handle_view
-                .checkpoint()
-                .map(|checkpoint| (crate::cache::encode_compact(&index), checkpoint))
+            let event_id = self.applied.load(Ordering::Acquire);
+            (event_id != 0).then(|| {
+                let checkpoint = crate::cache::Checkpoint {
+                    event_id,
+                    fingerprint: self.fingerprint.load(Ordering::Acquire),
+                };
+                (crate::cache::encode_compact(&index), checkpoint)
+            })
         };
         if let Some((encoded, checkpoint)) = snapshot {
             (self.persist)(&encoded, checkpoint);
@@ -969,54 +915,8 @@ where
                     let _ = done.send(());
                     self.store.warm_query_index();
                 }
-                Control::Subtree { root, entries } => {
-                    // 扫描期间该根可能已移出索引范围。
-                    if !self.scope.scan_paths.contains(&root) || !self.scope.admits(&root) {
-                        continue;
-                    }
-                    let root = root.to_string_lossy().into_owned();
-                    let applied = self
-                        .store
-                        .write()
-                        .apply_event_batch(&[], &[], &[root], entries);
-                    match applied {
-                        Ok(_) => {
-                            self.dirty = true;
-                            (self.on_batch)(self.store.len());
-                        }
-                        Err(error) => eprintln!("[Lokii] network rescan failed: {error}"),
-                    }
-                }
             }
         }
-    }
-
-    /// 非本地卷上的根按配置间隔整棵重扫；启动后先扫一次，补上关闭期间的远端改动。
-    fn poll_network(&mut self) {
-        if self.primary_volumes_dir.is_some() {
-            return;
-        }
-        let Some(every) = self.scope.network_rescan else {
-            return;
-        };
-        if self.network_scanned.is_some_and(|at| at.elapsed() < every)
-            || self.network_scanning.swap(true, Ordering::Relaxed)
-        {
-            return;
-        }
-        self.network_scanned = Some(Instant::now());
-        let scanning = Arc::clone(&self.network_scanning);
-        let worker = rescan_network_roots(
-            self.scope.scan_paths.clone(),
-            Arc::new(self.scope.filter.clone()),
-            self.scope.include_hidden,
-            |root| !is_local_volume(root),
-            self.control_tx.clone(),
-        );
-        std::thread::spawn(move || {
-            let _ = worker.join();
-            scanning.store(false, Ordering::Relaxed);
-        });
     }
 
     /// 索引根、排除规则、隐藏文件或 FDA 变化后，按新范围从已应用位置重开流。
@@ -1134,10 +1034,6 @@ where
                     self.first_pending.get_or_insert_with(Instant::now);
                 }
             }
-        } else if self.primary_volumes_dir.is_none() {
-            if let Some(ref config) = changed_config {
-                self.scope.network_rescan = network_rescan(config);
-            }
         }
     }
 
@@ -1159,10 +1055,9 @@ where
     }
 }
 
-/// 启动索引服务线程：按 `resume` 接上（追赶或全量对账），之后持续把 FSEvents 变更写入索引。
-///
-/// `on_batch(总数)` 在每批变更后调用；`persist(已编码缓存字节, 检查点)` 在释放索引读锁后调用，由调用方落盘。
-pub fn start_watcher<F, P>(
+/// 启动索引服务线程（无卷隔离的旧全量入口，仅保留给单元测试）。
+#[cfg(test)]
+fn start_watcher<F, P>(
     store: IndexStore,
     config_store: ConfigStore,
     metrics: Arc<WatcherMetrics>,
@@ -1235,7 +1130,6 @@ where
     P: Fn(&[u8], crate::cache::Checkpoint) + Send + 'static,
 {
     let (control_tx, control) = mpsc::channel();
-    let service_tx = control_tx.clone();
     let applied = Arc::new(AtomicU64::new(match resume {
         Resume::From(id) => id,
         Resume::Verify => 0,
@@ -1271,7 +1165,6 @@ where
             stream: None,
             events: mpsc::channel().1,
             control,
-            control_tx: service_tx,
             applied,
             fingerprint,
             pending_fingerprint: None,
@@ -1290,8 +1183,6 @@ where
             dirty: false,
             last_persist: Instant::now(),
             unpersisted_events: 0,
-            network_scanned: None,
-            network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             primary_volumes_dir,
             last_index_config: initial_config.index,
             on_config_updated,
@@ -1532,7 +1423,7 @@ mod tests {
         persist: P,
     ) -> Service<impl Fn(usize), P> {
         let config = scoped_config(root);
-        let (control_tx, control) = mpsc::channel();
+        let (_, control) = mpsc::channel();
         Service {
             store: store.clone(),
             config_store: ConfigStore::new(config.clone()),
@@ -1548,7 +1439,6 @@ mod tests {
             events: mpsc::channel().1,
             control,
             applied: Arc::new(AtomicU64::new(5)),
-            control_tx,
             fingerprint: Arc::new(AtomicU64::new(Scope::new(&config).fingerprint)),
             pending_fingerprint: None,
             pending: HashMap::new(),
@@ -1566,62 +1456,10 @@ mod tests {
             dirty: false,
             last_persist: Instant::now(),
             unpersisted_events: 0,
-            network_scanned: None,
-            network_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             primary_volumes_dir: None,
             last_index_config: config.index,
             on_config_updated: None,
         }
-    }
-
-    #[test]
-    fn local_volumes_are_detected() {
-        let dir = TempDir::new().unwrap();
-        assert!(is_local_volume(dir.path()));
-        assert!(is_local_volume(Path::new("/definitely/not/mounted")), "unknown counts as local");
-    }
-
-    #[test]
-    fn network_roots_are_rescanned_off_thread_and_applied_by_the_service() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        fs::write(root.join("real.txt"), "x").unwrap();
-        let ghost = root.join("ghost.txt");
-        let store = IndexStore::new();
-        store.replace(vec![make_entry("ghost.txt", &ghost.to_string_lossy(), false)]);
-        let mut service = idle_service(&store, &root);
-
-        rescan_network_roots(
-            vec![root.clone()],
-            Arc::new(service.scope.filter.clone()),
-            true,
-            |_| true,
-            service.control_tx.clone(),
-        );
-        wait_until("network rescan applied", || {
-            service.poll_control();
-            indexed(&store, &root.join("real.txt"))
-        });
-        assert!(!indexed(&store, &ghost));
-        assert!(service.dirty);
-    }
-
-    #[test]
-    fn network_rescans_follow_the_configured_interval() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let store = IndexStore::new();
-        let mut service = idle_service(&store, &root);
-        service.scope.network_rescan = None;
-        service.poll_network();
-        assert!(service.network_scanned.is_none(), "0 minutes disables rescans");
-
-        service.scope.network_rescan = Some(Duration::from_secs(300));
-        service.poll_network();
-        let first = service.network_scanned.expect("due right away");
-        service.network_scanning.store(false, Ordering::Relaxed);
-        service.poll_network();
-        assert_eq!(service.network_scanned, Some(first), "not due again yet");
     }
 
     #[test]
@@ -2013,24 +1851,6 @@ mod tests {
         assert!(scope_hidden_on.admits(&root.join(".zshrc")));
         assert!(!scope_hidden_on.admits(&root.join("node_modules")));
         assert!(!scope_hidden_on.admits(&root.join("node_modules/pkg/a.js")));
-    }
-
-    #[test]
-    fn network_results_for_roots_no_longer_indexed_are_dropped() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let store = IndexStore::new();
-        let mut service = idle_service(&store, &root);
-        let gone = PathBuf::from("/Volumes/lokii-removed-share");
-        service
-            .control_tx
-            .send(Control::Subtree {
-                root: gone.clone(),
-                entries: vec![make_entry("a.txt", "/Volumes/lokii-removed-share/a.txt", false)],
-            })
-            .unwrap();
-        service.poll_control();
-        assert!(store.is_empty());
     }
 
     #[test]

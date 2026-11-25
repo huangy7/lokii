@@ -83,6 +83,15 @@ fn compact_cache_migrates_legacy_and_rejects_corruption() {
     assert!(lokii_core::cache::load_compact(&path).is_err());
 }
 
+fn write_legacy_v3_cache(entries: &[FileEntry], path: &std::path::Path) {
+    let encoded = bitcode::encode(entries);
+    let mut bytes = Vec::with_capacity(8 + encoded.len());
+    bytes.extend_from_slice(b"LOKI");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&encoded);
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[test]
 fn legacy_migration_preserves_empty_duplicate_and_unusual_records() {
     let directory = tempfile::tempdir().unwrap();
@@ -99,7 +108,7 @@ fn legacy_migration_preserves_empty_duplicate_and_unusual_records() {
     ];
     originals[0].is_dir = true;
     for records in [&[][..], originals.as_slice()] {
-        lokii_core::cache::save_cache(records, &path).unwrap();
+        write_legacy_v3_cache(records, &path);
         let (compact, _) = lokii_core::cache::load_compact(&path).unwrap();
         assert_eq!(compact.len(), records.len());
         for (ordinal, original) in records.iter().enumerate() {

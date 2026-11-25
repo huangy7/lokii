@@ -53,7 +53,8 @@ impl From<crate::compact_index::IndexError> for InitError {
 /// Capture a checkpoint for a snapshot about to be scanned or replayed: the
 /// event id is read first, so anything that changes during the work is
 /// replayed again next time rather than lost.
-pub fn checkpoint(config: &AppConfig) -> cache::Checkpoint {
+#[cfg(test)]
+fn checkpoint(config: &AppConfig) -> cache::Checkpoint {
     let event_id = crate::fsevents::current_event_id();
     cache::Checkpoint {
         event_id,
@@ -63,7 +64,8 @@ pub fn checkpoint(config: &AppConfig) -> cache::Checkpoint {
 
 /// Hash of everything that decides which paths get indexed: roots, exclusion
 /// rules, hidden files and Full Disk Access.
-pub fn scope_fingerprint(config: &AppConfig) -> u64 {
+#[cfg(test)]
+fn scope_fingerprint(config: &AppConfig) -> u64 {
     scope_fingerprint_with_fda(config, crate::permissions::has_full_disk_access())
 }
 
@@ -121,7 +123,8 @@ pub(crate) fn primary_scope_fingerprint_with_fda(
 }
 
 /// Save `index` with the replay checkpoint it reflects.
-pub fn save_index(
+#[cfg(test)]
+fn save_index(
     index: &crate::compact_index::CompactIndex,
     checkpoint: cache::Checkpoint,
     cache_file: &Path,
@@ -138,13 +141,9 @@ pub fn save_encoded_index(encoded: &[u8], checkpoint: cache::Checkpoint, cache_f
     }
 }
 
-/// Initialize the index: try cache first, fall back to full scan.
-///
-/// For hot start: loads cache into store and returns immediately so the UI
-/// can become interactive. The index service then catches up in the background.
-///
-/// For cold start: performs a full blocking scan.
-pub fn initialize_index(
+/// Initialize the index: try cache first, fall back to full scan (legacy single-domain path, test-only).
+#[cfg(test)]
+fn initialize_index(
     store: &IndexStore,
     config: &AppConfig,
     progress: Arc<AtomicUsize>,
