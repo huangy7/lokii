@@ -134,10 +134,162 @@ fn fnv1a_dual(bytes: &[u8]) -> String {
     format!("{:016x}{:016x}", h1, h2)
 }
 
-/// Computes a deterministic 64-bit FNV-1a fingerprint of the volume scan filter
-/// settings and Full Disk Access state so offline config edits invalidate
-/// persisted volume caches on next launch.
-pub fn volume_filter_fingerprint(config: &AppConfig, has_fda: bool) -> u64 {
+/// 判断文件系统是否支持跨关机重启/拔插持久化的 macOS FSEvents 历史日志。
+///
+/// 仅 macOS 原生日志型本地文件系统（APFS / HFS+）持久化 `.fseventsd` 历史日志；
+/// ExFAT / FAT32 / NTFS 与网络卷不具备跨重启持久化日志（ExFAT 在同挂载会话内仍保留非空 UUID，
+/// 不可仅靠 `journal_uuid.is_some()` 判断）。
+pub fn fstype_supports_persistent_fsevents_journal(fstype: &str) -> bool {
+    fstype.eq_ignore_ascii_case("apfs") || fstype.eq_ignore_ascii_case("hfs")
+}
+
+/// 通过 macOS IOKit 内核注册表零磁盘 I/O 检测块设备是否为旋转机械介质（HDD）。
+///
+/// 仅当 `"Device Characteristics"` -> `"Medium Type"` 明确为 `"Rotational"` 时返回 `true`；
+/// 缺失、未知、网络源或非 macOS 平台一律保守返回 `false`。
+#[cfg(target_os = "macos")]
+pub fn is_rotational_device(from_name: &str) -> bool {
+    use std::ffi::{CStr, CString};
+
+    type IoObjectT = u32;
+    type IoRegistryEntryT = IoObjectT;
+    type IoServiceT = IoObjectT;
+    type MachPortT = u32;
+    type CfRef = fsevent_sys::core_foundation::CFRef;
+    type CfTypeId = usize;
+
+    const K_IO_MAIN_PORT_DEFAULT: MachPortT = 0;
+    const K_IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 0x0000_0001;
+    const K_IO_REGISTRY_ITERATE_PARENTS: u32 = 0x0000_0002;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOBSDNameMatching(
+            main_port: MachPortT,
+            options: u32,
+            bsd_name: *const std::os::raw::c_char,
+        ) -> CfRef;
+        fn IOServiceGetMatchingService(main_port: MachPortT, matching: CfRef) -> IoServiceT;
+        fn IORegistryEntrySearchCFProperty(
+            entry: IoRegistryEntryT,
+            plane: *const std::os::raw::c_char,
+            key: CfRef,
+            allocator: CfRef,
+            options: u32,
+        ) -> CfRef;
+        fn IOObjectRelease(object: IoObjectT) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: CfRef,
+            c_str: *const std::os::raw::c_char,
+            encoding: u32,
+        ) -> CfRef;
+        fn CFStringGetCString(
+            the_string: CfRef,
+            buffer: *mut std::os::raw::c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> bool;
+        fn CFDictionaryGetValue(dict: CfRef, key: CfRef) -> CfRef;
+        fn CFGetTypeID(cf: CfRef) -> CfTypeId;
+        fn CFDictionaryGetTypeID() -> CfTypeId;
+        fn CFStringGetTypeID() -> CfTypeId;
+        fn CFRelease(cf: CfRef);
+    }
+
+    let trimmed = from_name.trim();
+    let Some(bsd_name) = trimmed.strip_prefix("/dev/") else {
+        return false;
+    };
+    if bsd_name.is_empty() || bsd_name.contains('/') {
+        return false;
+    }
+    let Ok(c_bsd) = CString::new(bsd_name) else {
+        return false;
+    };
+
+    unsafe {
+        let matching = IOBSDNameMatching(K_IO_MAIN_PORT_DEFAULT, 0, c_bsd.as_ptr());
+        if matching.is_null() {
+            return false;
+        }
+        // IOServiceGetMatchingService consumes one reference to `matching`.
+        let service = IOServiceGetMatchingService(K_IO_MAIN_PORT_DEFAULT, matching);
+        if service == 0 {
+            return false;
+        }
+
+        let key_chars = CFStringCreateWithCString(
+            std::ptr::null_mut(),
+            c"Device Characteristics".as_ptr(),
+            K_CF_STRING_ENCODING_UTF8,
+        );
+        if key_chars.is_null() {
+            IOObjectRelease(service);
+            return false;
+        }
+        let prop = IORegistryEntrySearchCFProperty(
+            service,
+            c"IOService".as_ptr(),
+            key_chars,
+            std::ptr::null_mut(),
+            K_IO_REGISTRY_ITERATE_RECURSIVELY | K_IO_REGISTRY_ITERATE_PARENTS,
+        );
+        CFRelease(key_chars);
+        IOObjectRelease(service);
+
+        if prop.is_null() {
+            return false;
+        }
+        let rotational = if CFGetTypeID(prop) == CFDictionaryGetTypeID() {
+            let key_medium = CFStringCreateWithCString(
+                std::ptr::null_mut(),
+                c"Medium Type".as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            if key_medium.is_null() {
+                false
+            } else {
+                let val = CFDictionaryGetValue(prop, key_medium);
+                CFRelease(key_medium);
+                if !val.is_null() && CFGetTypeID(val) == CFStringGetTypeID() {
+                    let mut buf = [0u8; 64];
+                    if CFStringGetCString(
+                        val,
+                        buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                        buf.len() as isize,
+                        K_CF_STRING_ENCODING_UTF8,
+                    ) {
+                        CStr::from_bytes_until_nul(&buf)
+                            .ok()
+                            .and_then(|c| c.to_str().ok())
+                            .is_some_and(|s| s.eq_ignore_ascii_case("Rotational"))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        CFRelease(prop);
+        rotational
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_rotational_device(_from_name: &str) -> bool {
+    false
+}
+
+/// 兼容旧版 `manifest.json` 升级认领的 64 位 FNV-1a 指纹（仅供升级迁移校验，不用于新运行期状态）。
+pub fn legacy_volume_filter_fingerprint(config: &AppConfig, has_fda: bool) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -200,11 +352,17 @@ pub struct VolumeRecord {
     pub last_event_id: Option<u64>,
     pub journal_uuid: Option<String>,
     pub entry_count: u64,
+    #[serde(default)]
+    pub scope_snapshot: Option<crate::scope_diff::VolumeScopeSnapshot>,
+    #[serde(default)]
+    pub dirty_upper_bound: bool,
+    #[serde(default)]
+    pub pending_confirm_reason: Option<crate::scope_diff::VolumeConfirmReason>,
+    // 仅兼容反序列化旧 manifest.json 升级认领，不再写回：
+    #[serde(default, skip_serializing)]
     pub dirty_filter: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub filter_fingerprint: Option<u64>,
-    #[serde(default)]
-    pub pruned_for_fp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,6 +671,7 @@ pub struct ResolvedMountMatch {
     pub display_name: String,
     pub kind: VolumeKind,
     pub fstype: String,
+    pub from_name: String,
     pub identity: VolumeIdentity,
 }
 
@@ -643,6 +802,7 @@ pub fn partition_index_paths(
                     display_name,
                     kind,
                     fstype: m.fstype.clone(),
+                    from_name: m.from_name.clone(),
                     identity,
                 }),
             });
@@ -664,12 +824,18 @@ pub fn partition_index_paths(
 
     primary_candidates.extend(config.resolve_app_roots());
 
-    // 子根仅在与上层根之间无排除/隐藏剪枝时才算冗余，否则显式子根会被排除墙吞掉（issue #61）。
-    // 词法策略：分区路径不做磁盘 stat。
+    // 策略根去重：除沿途排除/隐藏剪枝保护外，禁止浅层应用祖先根（shallow_apps = true）
+    // 吞掉非浅层用户子根（如 /Applications/Utilities），确保 filter.include_roots 与快照保留子根策略；
+    // 扫描遍历起点去重仍由 scanner::deduplicate_scan_roots 独立负责，只扫一遍、零重复。
     let scope = crate::filter::CompiledFilter::from_config_lexical(config);
+    let shallow_app_roots = config.resolve_shallow_app_roots();
     let include_hidden = config.index.include_hidden;
-    let final_primary =
-        crate::scanner::deduplicate_scan_roots(&primary_candidates, &scope, include_hidden);
+    let final_primary = deduplicate_primary_policy_roots(
+        &primary_candidates,
+        &shallow_app_roots,
+        &scope,
+        include_hidden,
+    );
 
     // Deduplicate mounted_targets (handle strictly nested paths on same volume, but keep sibling subpaths!)
     let mut unique_mounted: Vec<MountedPathTarget> = Vec::new();
@@ -745,6 +911,53 @@ pub fn partition_index_paths(
         primary_paths: final_primary,
         mounted_targets: final_mounted,
     }
+}
+
+/// 主索引策略根去重：决定哪些根进入 `primary_paths`、`filter.include_roots` 与 `PrimaryScopeSnapshot`。
+/// 与扫描遍历起点去重（`scanner::deduplicate_scan_roots`）职责分离：当上层根属于 `shallow_app_roots`
+/// （`shallow_apps = true`）而子根为非浅层用户根（`shallow_apps = false`）时，子根绝不算冗余。
+pub(crate) fn deduplicate_primary_policy_roots(
+    paths: &[PathBuf],
+    shallow_app_roots: &[PathBuf],
+    filter: &crate::filter::CompiledFilter,
+    include_hidden: bool,
+) -> Vec<PathBuf> {
+    let mut unique_paths: Vec<&Path> = Vec::new();
+    for p in paths {
+        if !unique_paths.iter().any(|existing| paths_equal_ci(existing, p)) {
+            unique_paths.push(p.as_path());
+        }
+    }
+    let is_shallow = |path: &Path| {
+        shallow_app_roots
+            .iter()
+            .any(|shallow| paths_equal_ci(shallow, path))
+    };
+
+    let mut clean_roots: Vec<PathBuf> = Vec::new();
+    for (i, candidate) in unique_paths.iter().enumerate() {
+        let candidate_shallow = is_shallow(candidate);
+        let is_redundant = unique_paths.iter().enumerate().any(|(j, other)| {
+            if j == i || !path_starts_with_ci(candidate, other) {
+                return false;
+            }
+            // 浅层应用祖先根不可吞掉非浅层用户子根
+            if is_shallow(other) && !candidate_shallow {
+                return false;
+            }
+            candidate
+                .ancestors()
+                .take_while(|ancestor| !paths_equal_ci(ancestor, other))
+                .all(|ancestor| {
+                    filter.evaluate_with_hidden(ancestor, true, include_hidden)
+                        == crate::filter::ScopeDecision::IndexNormally
+                })
+        });
+        if !is_redundant {
+            clean_roots.push(candidate.to_path_buf());
+        }
+    }
+    clean_roots
 }
 
 #[cfg(test)]
@@ -878,9 +1091,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count: 42,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
 
         manifest.upsert(record.clone());
@@ -1098,18 +1313,59 @@ mod tests {
     }
 
     #[test]
-    fn volume_filter_fingerprint_is_nonzero_and_reflects_filter_inputs() {
+    fn legacy_volume_filter_fingerprint_is_nonzero_and_reflects_filter_inputs() {
         let base = AppConfig::default();
-        let fp_no_fda = volume_filter_fingerprint(&base, false);
-        let fp_fda = volume_filter_fingerprint(&base, true);
+        let fp_no_fda = legacy_volume_filter_fingerprint(&base, false);
+        let fp_fda = legacy_volume_filter_fingerprint(&base, true);
         assert_ne!(fp_no_fda, 0);
         assert_ne!(fp_fda, 0);
         assert_ne!(fp_no_fda, fp_fda);
 
         let mut edited = base.clone();
         edited.index.exclude.push("custom_excluded_dir".to_string());
-        let fp_edited = volume_filter_fingerprint(&edited, true);
+        let fp_edited = legacy_volume_filter_fingerprint(&edited, true);
         assert_ne!(fp_edited, 0);
         assert_ne!(fp_edited, fp_fda);
+    }
+
+    #[test]
+    fn fstype_persistent_journal_and_rotational_device_guards() {
+        assert!(fstype_supports_persistent_fsevents_journal("apfs"));
+        assert!(fstype_supports_persistent_fsevents_journal("APFS"));
+        assert!(fstype_supports_persistent_fsevents_journal("hfs"));
+        assert!(!fstype_supports_persistent_fsevents_journal("exfat"));
+        assert!(!fstype_supports_persistent_fsevents_journal("msdos"));
+        assert!(!fstype_supports_persistent_fsevents_journal("ntfs"));
+        assert!(!fstype_supports_persistent_fsevents_journal("smbfs"));
+        assert!(!fstype_supports_persistent_fsevents_journal("nfs"));
+
+        // 网络路径、空字符串或不存在的设备名安全保守返回 false
+        assert!(!is_rotational_device(""));
+        assert!(!is_rotational_device("//nas.local/share"));
+        assert!(!is_rotational_device("/dev/disk9999s99"));
+    }
+
+    #[test]
+    fn policy_root_dedup_preserves_non_shallow_child_under_shallow_app_root() {
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec!["/Applications/Utilities".into()];
+        cfg.index.index_apps = true;
+        let shallow_roots = cfg.resolve_shallow_app_roots();
+        assert!(shallow_roots.contains(&PathBuf::from("/Applications")));
+
+        let filter = crate::filter::CompiledFilter::from_config_lexical(&cfg);
+        let candidates = vec![
+            PathBuf::from("/Applications/Utilities"),
+            PathBuf::from("/Applications"),
+        ];
+        // 策略根去重保留两根，使 filter.include_roots 同时持有浅层 /Applications 与非浅层 Utilities
+        let policy_roots =
+            deduplicate_primary_policy_roots(&candidates, &shallow_roots, &filter, false);
+        assert!(policy_roots.contains(&PathBuf::from("/Applications")));
+        assert!(policy_roots.contains(&PathBuf::from("/Applications/Utilities")));
+
+        // 扫描器遍历起点去重继续沿用原 deduplicate_scan_roots：仅从 /Applications 出发遍历一次
+        let scan_roots = crate::scanner::deduplicate_scan_roots(&policy_roots, &filter, false);
+        assert_eq!(scan_roots, vec![PathBuf::from("/Applications")]);
     }
 }

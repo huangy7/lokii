@@ -238,7 +238,7 @@
 "prefs.tab.about" = "关于";
 "prefs.index.group.paths" = "索引路径";
 "prefs.index.applications" = "索引应用程序";
-"prefs.index.applications.description" = "加入 /Applications 与系统应用目录；应用包内部不会被索引。";
+"prefs.index.applications.description" = "自动加入 /Applications 与系统应用目录并仅收录应用本身；若这些目录已在索引路径中，则按常规规则索引。";
 "prefs.index.applications.conflict" = "开关已打开，但相关目录被排除路径或排除名单挡住，当前不会生效。";
 "prefs.index.group.excludes" = "排除规则";
 "prefs.index.group.excludePaths" = "排除路径";
@@ -389,3 +389,35 @@
 "prefs.volume.status.pendingSave" = "待保存生效";
 "prefs.volume.includeOffline" = "包含离线卷结果";
 "prefs.volume.includeOffline.description" = "外置磁盘或网络卷断开后，仍在搜索结果中保留已缓存的文件。";
+"prefs.volume.status.scanning" = "正在扫描";
+"prefs.volume.status.syncingWithCount" = "正在扫描 · %@ 项";
+"prefs.volume.status.needsConfirmation" = "需要更新索引";
+"prefs.volume.updateIndex" = "更新索引";
+"prefs.volume.cancelScan" = "取消";
+"prefs.volume.confirmReason.initialScan" = "尚未建立索引缓存，点击“更新索引”开始首次扫描。";
+"prefs.volume.confirmReason.filterWidened" = "筛选规则已放宽，需要重新扫描以补齐新增范围；当前仍可搜索旧索引。";
+"prefs.volume.confirmReason.journalInvalidated" = "文件变更日志已重置，建议重新扫描以补齐差异；当前仍可搜索旧索引。";
+"prefs.volume.confirmReason.schemaUpgrade" = "索引格式已升级，需要重新扫描；当前仍可搜索旧索引。";
+"prefs.volume.nonPersistentJournalHint" = "仅支持挂载期间实时追踪，离线或跨设备修改后可手动重新扫描";
+
+/* Top Volume Confirmation & Syncing Banner */
+"volume.banner.syncing.single" = "正在扫描「%1$@」· 已扫描 %2$@ 项";
+"volume.banner.syncing.singleNoCount" = "正在扫描「%@」...";
+"volume.banner.syncing.multi" = "正在扫描「%1$@」等 %2$d 个外置卷 · 已扫描 %3$@ 项";
+"volume.banner.syncing.multiNoCount" = "正在扫描「%1$@」等 %2$d 个外置卷...";
+"volume.banner.confirm.initialScan" = "外置卷「%@」尚未建立索引缓存，是否立即扫描？";
+"volume.banner.confirm.filterWidened" = "外置卷「%@」因筛选规则放宽需要重新扫描，当前仍可搜索旧索引";
+"volume.banner.confirm.journalInvalidated" = "外置卷「%@」的文件变更日志已重置，建议重新扫描以补齐差异，当前仍可搜索旧索引";
+"volume.banner.confirm.schemaUpgrade" = "外置卷「%@」因版本索引结构升级需要重新扫描，当前仍可搜索旧索引";
+"volume.banner.confirm.multi" = "「%1$@」等 %2$d 个外置卷需要更新索引，当前仍可搜索旧索引";
+"volume.banner.action.updateNow" = "立即更新";
+"volume.banner.action.cancel" = "取消";
+"volume.banner.action.manage" = "管理...";
+"volume.banner.action.later" = "稍后再说";
+
+/* Manual Rebuild Scope Confirmation */
+"rebuild.scopeConfirm.title" = "选择重建索引范围";
+"rebuild.scopeConfirm.message" = "检测到已连接的外置卷（%@）。大型外置盘全量重扫可能耗时较长，建议仅重建本地索引。";
+"rebuild.scopeConfirm.primaryOnly" = "仅重建本地索引（推荐）";
+"rebuild.scopeConfirm.all" = "全部重建（含外置卷）";
+"rebuild.scopeConfirm.cancel" = "取消";

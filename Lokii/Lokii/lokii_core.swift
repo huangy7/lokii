@@ -866,6 +866,11 @@ public func FfiConverterTypeEventHandler_lower(_ value: EventHandler) -> UnsafeM
 public protocol LokiiCoreProtocol: AnyObject, Sendable {
     
     /**
+     * Cancel an in-flight external/network volume scan without losing any prior cache.
+     */
+    func cancelVolumeScan(pathOrId: String) throws  -> Bool
+    
+    /**
      * Check if macOS Full Disk Access is granted.
      */
     func checkFda()  -> Bool
@@ -874,6 +879,16 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
      * Remove a volume slot and delete its cached index shard and manifest record.
      */
     func clearVolumeCache(pathOrId: String) throws  -> Bool
+    
+    /**
+     * Confirm and start scanning all volumes currently waiting in `NeedsConfirmation`.
+     */
+    func confirmAllPendingVolumeScans()  -> UInt32
+    
+    /**
+     * Confirm and start scanning a single volume currently waiting in `NeedsConfirmation`.
+     */
+    func confirmVolumeScan(pathOrId: String) throws  -> Bool
     
     /**
      * Get the current configuration as a JSON string.
@@ -941,10 +956,21 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func persistIndex() 
     
     /**
+     * Preview what action saving `draft_config_json` would trigger for the local primary index.
+     */
+    func previewPrimaryScopeAction(draftConfigJson: String) throws  -> FfiPrimaryScopeAction
+    
+    /**
      * Rebuild the primary index from scratch and schedule rescans for online mounted volumes.
      * Blocking — call from a background thread.
      */
     func rebuildIndex(eventHandler: EventHandler)  -> Bool
+    
+    /**
+     * Rebuild only the local primary index without triggering any external/network volume rescan.
+     * Blocking — call from a background thread.
+     */
+    func rebuildPrimaryIndex(eventHandler: EventHandler)  -> Bool
     
     /**
      * Trigger an atomic background rescan for a mounted volume slot.
@@ -1057,6 +1083,17 @@ public convenience init() {
 
     
     /**
+     * Cancel an in-flight external/network volume scan without losing any prior cache.
+     */
+open func cancelVolumeScan(pathOrId: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_lokii_core_fn_method_lokiicore_cancel_volume_scan(self.uniffiClonePointer(),
+        FfiConverterString.lower(pathOrId),$0
+    )
+})
+}
+    
+    /**
      * Check if macOS Full Disk Access is granted.
      */
 open func checkFda() -> Bool  {
@@ -1072,6 +1109,27 @@ open func checkFda() -> Bool  {
 open func clearVolumeCache(pathOrId: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_lokii_core_fn_method_lokiicore_clear_volume_cache(self.uniffiClonePointer(),
+        FfiConverterString.lower(pathOrId),$0
+    )
+})
+}
+    
+    /**
+     * Confirm and start scanning all volumes currently waiting in `NeedsConfirmation`.
+     */
+open func confirmAllPendingVolumeScans() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_confirm_all_pending_volume_scans(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Confirm and start scanning a single volume currently waiting in `NeedsConfirmation`.
+     */
+open func confirmVolumeScan(pathOrId: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_lokii_core_fn_method_lokiicore_confirm_volume_scan(self.uniffiClonePointer(),
         FfiConverterString.lower(pathOrId),$0
     )
 })
@@ -1204,12 +1262,35 @@ open func persistIndex()  {try! rustCall() {
 }
     
     /**
+     * Preview what action saving `draft_config_json` would trigger for the local primary index.
+     */
+open func previewPrimaryScopeAction(draftConfigJson: String)throws  -> FfiPrimaryScopeAction  {
+    return try  FfiConverterTypeFfiPrimaryScopeAction_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_lokii_core_fn_method_lokiicore_preview_primary_scope_action(self.uniffiClonePointer(),
+        FfiConverterString.lower(draftConfigJson),$0
+    )
+})
+}
+    
+    /**
      * Rebuild the primary index from scratch and schedule rescans for online mounted volumes.
      * Blocking — call from a background thread.
      */
 open func rebuildIndex(eventHandler: EventHandler) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_lokii_core_fn_method_lokiicore_rebuild_index(self.uniffiClonePointer(),
+        FfiConverterTypeEventHandler_lower(eventHandler),$0
+    )
+})
+}
+    
+    /**
+     * Rebuild only the local primary index without triggering any external/network volume rescan.
+     * Blocking — call from a background thread.
+     */
+open func rebuildPrimaryIndex(eventHandler: EventHandler) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_rebuild_primary_index(self.uniffiClonePointer(),
         FfiConverterTypeEventHandler_lower(eventHandler),$0
     )
 })
@@ -1547,10 +1628,11 @@ public struct FfiIndexConfig {
     public var sensitiveNames: [String]
     public var maxResults: UInt64
     public var networkRescanMinutes: UInt64
+    public var serialScanPaths: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(indexPaths: [String], indexApps: Bool, exclude: [String], excludePaths: [String], includeHidden: Bool, excludeSensitive: Bool, sensitiveNames: [String], maxResults: UInt64, networkRescanMinutes: UInt64) {
+    public init(indexPaths: [String], indexApps: Bool, exclude: [String], excludePaths: [String], includeHidden: Bool, excludeSensitive: Bool, sensitiveNames: [String], maxResults: UInt64, networkRescanMinutes: UInt64, serialScanPaths: [String]) {
         self.indexPaths = indexPaths
         self.indexApps = indexApps
         self.exclude = exclude
@@ -1560,6 +1642,7 @@ public struct FfiIndexConfig {
         self.sensitiveNames = sensitiveNames
         self.maxResults = maxResults
         self.networkRescanMinutes = networkRescanMinutes
+        self.serialScanPaths = serialScanPaths
     }
 }
 
@@ -1597,6 +1680,9 @@ extension FfiIndexConfig: Equatable, Hashable {
         if lhs.networkRescanMinutes != rhs.networkRescanMinutes {
             return false
         }
+        if lhs.serialScanPaths != rhs.serialScanPaths {
+            return false
+        }
         return true
     }
 
@@ -1610,6 +1696,7 @@ extension FfiIndexConfig: Equatable, Hashable {
         hasher.combine(sensitiveNames)
         hasher.combine(maxResults)
         hasher.combine(networkRescanMinutes)
+        hasher.combine(serialScanPaths)
     }
 }
 
@@ -1630,7 +1717,8 @@ public struct FfiConverterTypeFfiIndexConfig: FfiConverterRustBuffer {
                 excludeSensitive: FfiConverterBool.read(from: &buf), 
                 sensitiveNames: FfiConverterSequenceString.read(from: &buf), 
                 maxResults: FfiConverterUInt64.read(from: &buf), 
-                networkRescanMinutes: FfiConverterUInt64.read(from: &buf)
+                networkRescanMinutes: FfiConverterUInt64.read(from: &buf), 
+                serialScanPaths: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -1644,6 +1732,7 @@ public struct FfiConverterTypeFfiIndexConfig: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.sensitiveNames, into: &buf)
         FfiConverterUInt64.write(value.maxResults, into: &buf)
         FfiConverterUInt64.write(value.networkRescanMinutes, into: &buf)
+        FfiConverterSequenceString.write(value.serialScanPaths, into: &buf)
     }
 }
 
@@ -2159,10 +2248,14 @@ public struct FfiVolumeStatus {
     public var entryCount: UInt64
     public var lastSyncAt: UInt64?
     public var isRemounted: Bool
+    public var hasCache: Bool
+    public var confirmReason: FfiVolumeConfirmReason?
+    public var scannedCount: UInt64
+    public var supportsPersistentJournal: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(volumeId: String, configuredPath: String, activePath: String?, displayName: String, kind: String, state: FfiVolumeState, entryCount: UInt64, lastSyncAt: UInt64?, isRemounted: Bool) {
+    public init(volumeId: String, configuredPath: String, activePath: String?, displayName: String, kind: String, state: FfiVolumeState, entryCount: UInt64, lastSyncAt: UInt64?, isRemounted: Bool, hasCache: Bool, confirmReason: FfiVolumeConfirmReason?, scannedCount: UInt64, supportsPersistentJournal: Bool) {
         self.volumeId = volumeId
         self.configuredPath = configuredPath
         self.activePath = activePath
@@ -2172,6 +2265,10 @@ public struct FfiVolumeStatus {
         self.entryCount = entryCount
         self.lastSyncAt = lastSyncAt
         self.isRemounted = isRemounted
+        self.hasCache = hasCache
+        self.confirmReason = confirmReason
+        self.scannedCount = scannedCount
+        self.supportsPersistentJournal = supportsPersistentJournal
     }
 }
 
@@ -2209,6 +2306,18 @@ extension FfiVolumeStatus: Equatable, Hashable {
         if lhs.isRemounted != rhs.isRemounted {
             return false
         }
+        if lhs.hasCache != rhs.hasCache {
+            return false
+        }
+        if lhs.confirmReason != rhs.confirmReason {
+            return false
+        }
+        if lhs.scannedCount != rhs.scannedCount {
+            return false
+        }
+        if lhs.supportsPersistentJournal != rhs.supportsPersistentJournal {
+            return false
+        }
         return true
     }
 
@@ -2222,6 +2331,10 @@ extension FfiVolumeStatus: Equatable, Hashable {
         hasher.combine(entryCount)
         hasher.combine(lastSyncAt)
         hasher.combine(isRemounted)
+        hasher.combine(hasCache)
+        hasher.combine(confirmReason)
+        hasher.combine(scannedCount)
+        hasher.combine(supportsPersistentJournal)
     }
 }
 
@@ -2242,7 +2355,11 @@ public struct FfiConverterTypeFfiVolumeStatus: FfiConverterRustBuffer {
                 state: FfiConverterTypeFfiVolumeState.read(from: &buf), 
                 entryCount: FfiConverterUInt64.read(from: &buf), 
                 lastSyncAt: FfiConverterOptionUInt64.read(from: &buf), 
-                isRemounted: FfiConverterBool.read(from: &buf)
+                isRemounted: FfiConverterBool.read(from: &buf), 
+                hasCache: FfiConverterBool.read(from: &buf), 
+                confirmReason: FfiConverterOptionTypeFfiVolumeConfirmReason.read(from: &buf), 
+                scannedCount: FfiConverterUInt64.read(from: &buf), 
+                supportsPersistentJournal: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2256,6 +2373,10 @@ public struct FfiConverterTypeFfiVolumeStatus: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.entryCount, into: &buf)
         FfiConverterOptionUInt64.write(value.lastSyncAt, into: &buf)
         FfiConverterBool.write(value.isRemounted, into: &buf)
+        FfiConverterBool.write(value.hasCache, into: &buf)
+        FfiConverterOptionTypeFfiVolumeConfirmReason.write(value.confirmReason, into: &buf)
+        FfiConverterUInt64.write(value.scannedCount, into: &buf)
+        FfiConverterBool.write(value.supportsPersistentJournal, into: &buf)
     }
 }
 
@@ -2611,6 +2732,90 @@ extension FfiFileType: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiPrimaryScopeAction {
+    
+    case noOp
+    case pruneOnly
+    case incrementalUpdate
+    case fullRebuild
+}
+
+
+#if compiler(>=6)
+extension FfiPrimaryScopeAction: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPrimaryScopeAction: FfiConverterRustBuffer {
+    typealias SwiftType = FfiPrimaryScopeAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPrimaryScopeAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .noOp
+        
+        case 2: return .pruneOnly
+        
+        case 3: return .incrementalUpdate
+        
+        case 4: return .fullRebuild
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiPrimaryScopeAction, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .noOp:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .pruneOnly:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .incrementalUpdate:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .fullRebuild:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPrimaryScopeAction_lift(_ buf: RustBuffer) throws -> FfiPrimaryScopeAction {
+    return try FfiConverterTypeFfiPrimaryScopeAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPrimaryScopeAction_lower(_ value: FfiPrimaryScopeAction) -> RustBuffer {
+    return FfiConverterTypeFfiPrimaryScopeAction.lower(value)
+}
+
+
+extension FfiPrimaryScopeAction: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiSearchMode {
     
     case auto
@@ -2788,10 +2993,95 @@ extension FfiStartupMode: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiVolumeConfirmReason {
+    
+    case initialScan
+    case filterWidened
+    case journalInvalidated
+    case schemaUpgrade
+}
+
+
+#if compiler(>=6)
+extension FfiVolumeConfirmReason: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVolumeConfirmReason: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVolumeConfirmReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVolumeConfirmReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .initialScan
+        
+        case 2: return .filterWidened
+        
+        case 3: return .journalInvalidated
+        
+        case 4: return .schemaUpgrade
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiVolumeConfirmReason, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .initialScan:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .filterWidened:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .journalInvalidated:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .schemaUpgrade:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVolumeConfirmReason_lift(_ buf: RustBuffer) throws -> FfiVolumeConfirmReason {
+    return try FfiConverterTypeFfiVolumeConfirmReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVolumeConfirmReason_lower(_ value: FfiVolumeConfirmReason) -> RustBuffer {
+    return FfiConverterTypeFfiVolumeConfirmReason.lower(value)
+}
+
+
+extension FfiVolumeConfirmReason: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiVolumeState {
     
     case online
     case syncing
+    case needsConfirmation
     case offline
     case missing
 }
@@ -2815,9 +3105,11 @@ public struct FfiConverterTypeFfiVolumeState: FfiConverterRustBuffer {
         
         case 2: return .syncing
         
-        case 3: return .offline
+        case 3: return .needsConfirmation
         
-        case 4: return .missing
+        case 4: return .offline
+        
+        case 5: return .missing
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2835,12 +3127,16 @@ public struct FfiConverterTypeFfiVolumeState: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         
         
-        case .offline:
+        case .needsConfirmation:
             writeInt(&buf, Int32(3))
         
         
-        case .missing:
+        case .offline:
             writeInt(&buf, Int32(4))
+        
+        
+        case .missing:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -2912,6 +3208,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiVolumeConfirmReason: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVolumeConfirmReason?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiVolumeConfirmReason.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiVolumeConfirmReason.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3077,10 +3397,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_eventhandler_on_volume_statuses_changed() != 1749) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lokii_core_checksum_method_lokiicore_cancel_volume_scan() != 64884) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lokii_core_checksum_method_lokiicore_check_fda() != 35374) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_clear_volume_cache() != 60623) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_confirm_all_pending_volume_scans() != 64301) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_confirm_volume_scan() != 32680) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_get_config_json() != 54941) {
@@ -3119,7 +3448,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lokii_core_checksum_method_lokiicore_persist_index() != 18870) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lokii_core_checksum_method_lokiicore_preview_primary_scope_action() != 15733) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lokii_core_checksum_method_lokiicore_rebuild_index() != 7923) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_rebuild_primary_index() != 41589) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_rescan_volume() != 38967) {

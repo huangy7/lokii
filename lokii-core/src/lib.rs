@@ -12,6 +12,7 @@ pub mod pinyin;
 pub mod pinyin_data;
 pub mod query_server;
 pub mod scanner;
+pub mod scope_diff;
 pub mod search;
 pub mod startup;
 pub mod volume_manager;

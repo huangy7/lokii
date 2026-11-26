@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 /// 「索引应用程序」开关追加的索引根（存在才加入）。
-const APP_INDEX_ROOTS: [&str; 3] = [
+pub(crate) const APP_INDEX_ROOTS: [&str; 3] = [
     "/Applications",
     "/System/Applications",
     "/System/Cryptexes/App/System/Applications",
@@ -45,7 +45,7 @@ impl Default for GeneralConfig {
 pub struct IndexConfig {
     /// Directories to index (supports "~" for home directory).
     pub index_paths: Vec<String>,
-    /// 是否索引应用程序目录（/Applications 与系统应用目录），应用包内部不递归。
+    /// 是否自动索引应用程序目录（/Applications 与系统应用目录）；仅收录应用本身，若目录已在 `index_paths` 中则按常规规则索引。
     pub index_apps: bool,
     /// Directory names to exclude from traversal (component-level match).
     pub exclude: Vec<String>,
@@ -61,6 +61,9 @@ pub struct IndexConfig {
     pub max_results: usize,
     /// 非本地卷（网络共享等）上的索引根每隔多少分钟整棵重扫一次；FSEvents 看不到远端改动。0 表示不重扫。
     pub network_rescan_minutes: u64,
+    /// 强制使用单线程顺序友好批量扫描的卷路径列表（当外置机械盘桥接芯片不上报 IOKit 旋转介质属性时手动覆盖）。
+    #[serde(default)]
+    pub serial_scan_paths: Vec<String>,
 }
 
 impl Default for IndexConfig {
@@ -150,6 +153,7 @@ impl Default for IndexConfig {
             ],
             max_results: 500,
             network_rescan_minutes: 30,
+            serial_scan_paths: Vec::new(),
         }
     }
 }
@@ -251,13 +255,52 @@ impl AppConfig {
                 }
             })
             .collect();
-        // 应用开关追加的根不写回用户配置，关闭后自然消失
+        // 应用开关追加的未覆盖浅层根不写回用户配置，关闭后自然消失
         for path in self.resolve_app_roots() {
-            if !paths.contains(&path) {
+            if !paths
+                .iter()
+                .any(|existing| crate::path_utils::paths_equal_ci(existing, &path))
+            {
                 paths.push(path);
             }
         }
         paths
+    }
+
+    /// 纯词法计算由 `index_apps` 自动追加且未被用户显式 `index_paths` 覆盖的浅层应用根集合（零磁盘 `stat`）。
+    ///
+    /// 使用内部 `IndexScopePolicy::from_user_roots_lexical` 避免与 `from_config_lexical` 形成递归，
+    /// 并复用与 `scope_diff` 相同的沿途 `IndexNormally` 覆盖判定：已被用户根完整覆盖的应用根直接不追加。
+    pub fn resolve_shallow_app_roots(&self) -> Vec<PathBuf> {
+        if !self.index.index_apps {
+            return Vec::new();
+        }
+        let user_roots: Vec<PathBuf> = self
+            .index
+            .index_paths
+            .iter()
+            .map(|p| expand_tilde(p))
+            .collect();
+        let user_filter = crate::filter::IndexScopePolicy::from_user_roots_lexical(self);
+        let mut out = Vec::new();
+        for root in APP_INDEX_ROOTS {
+            let app_root = PathBuf::from(root);
+            let covered_by_user = user_roots.iter().any(|u| {
+                crate::path_utils::paths_equal_ci(&app_root, u)
+                    || crate::scope_diff::path_chain_admitted_normally(
+                        u,
+                        &app_root,
+                        &user_filter,
+                        self.index.include_hidden,
+                        true,
+                        &[],
+                    )
+            });
+            if !covered_by_user {
+                out.push(app_root);
+            }
+        }
+        out
     }
 
     /// 纯词法展开索引根目录，仅执行 `~` 替换与去重，绝不触发任何磁盘 `stat` / `exists()` 系统调用。
@@ -266,28 +309,37 @@ impl AppConfig {
         let mut paths: Vec<PathBuf> = Vec::with_capacity(self.index.index_paths.len());
         for p in &self.index.index_paths {
             let resolved = expand_tilde(p);
-            if !paths.contains(&resolved) {
+            if !paths
+                .iter()
+                .any(|existing| crate::path_utils::paths_equal_ci(existing, &resolved))
+            {
                 paths.push(resolved);
             }
         }
-        if self.index.index_apps {
-            for root in APP_INDEX_ROOTS {
-                let path = PathBuf::from(root);
-                if !paths.contains(&path) {
-                    paths.push(path);
-                }
+        for path in self.resolve_shallow_app_roots() {
+            if !paths
+                .iter()
+                .any(|existing| crate::path_utils::paths_equal_ci(existing, &path))
+            {
+                paths.push(path);
             }
         }
         paths
     }
 
     pub(crate) fn resolve_app_roots(&self) -> impl Iterator<Item = PathBuf> {
-        let enabled = self.index.index_apps;
-        APP_INDEX_ROOTS
+        self.resolve_shallow_app_roots()
             .into_iter()
-            .filter(move |_| enabled)
-            .map(PathBuf::from)
             .filter(|path| path.exists())
+    }
+
+    /// Resolve serial scan override paths, expanding "~" to the user's home directory.
+    pub fn resolve_serial_scan_paths(&self) -> Vec<PathBuf> {
+        self.index
+            .serial_scan_paths
+            .iter()
+            .map(|p| expand_tilde(p))
+            .collect()
     }
 
     /// Resolve exclude paths, expanding "~" to the user's home directory.
@@ -337,7 +389,7 @@ hide_results_when_empty = true
 # 索引目录列表（支持 ~ 表示用户主目录）
 index_paths = ["~"]
 
-# 是否索引应用程序目录（/Applications 与系统应用目录），应用包内部不递归
+# 是否自动索引应用程序目录（/Applications 与系统应用目录，仅收录应用本身；若目录已在 index_paths 中则按常规规则索引）
 index_apps = false
 
 # 排除的目录名（不会索引这些目录及其子目录）

@@ -28,7 +28,8 @@ struct LokiiConfig: Codable {
                 excludeSensitive: raw.index.excludeSensitive,
                 sensitiveNames: raw.index.sensitiveNames,
                 maxResults: Int(raw.index.maxResults),
-                networkRescanMinutes: Int(raw.index.networkRescanMinutes)
+                networkRescanMinutes: Int(raw.index.networkRescanMinutes),
+                serialScanPaths: raw.index.serialScanPaths
             ),
             window: WindowConfig(
                 hideOnBlur: raw.window.hideOnBlur,
@@ -90,6 +91,7 @@ struct LokiiConfig: Codable {
         var sensitiveNames: [String]
         var maxResults: Int
         var networkRescanMinutes: Int
+        var serialScanPaths: [String]
 
         enum CodingKeys: String, CodingKey {
             case indexPaths = "index_paths"
@@ -101,6 +103,7 @@ struct LokiiConfig: Codable {
             case sensitiveNames = "sensitive_names"
             case maxResults = "max_results"
             case networkRescanMinutes = "network_rescan_minutes"
+            case serialScanPaths = "serial_scan_paths"
         }
 
         static var defaultIndexPaths: [String] { LokiiConfig.defaultConfig.index.indexPaths }
@@ -109,6 +112,7 @@ struct LokiiConfig: Codable {
         static var defaultSensitiveNames: [String] { LokiiConfig.defaultConfig.index.sensitiveNames }
         static var defaultMaxResults: Int { LokiiConfig.defaultConfig.index.maxResults }
         static var defaultNetworkRescanMinutes: Int { LokiiConfig.defaultConfig.index.networkRescanMinutes }
+        static var defaultSerialScanPaths: [String] { LokiiConfig.defaultConfig.index.serialScanPaths }
 
         init(
             indexPaths: [String]? = nil,
@@ -119,11 +123,12 @@ struct LokiiConfig: Codable {
             excludeSensitive: Bool? = nil,
             sensitiveNames: [String]? = nil,
             maxResults: Int? = nil,
-            networkRescanMinutes: Int? = nil
+            networkRescanMinutes: Int? = nil,
+            serialScanPaths: [String]? = nil
         ) {
             if let indexPaths, let indexApps, let exclude, let excludePaths,
                let includeHidden, let excludeSensitive, let sensitiveNames,
-               let maxResults, let networkRescanMinutes {
+               let maxResults, let networkRescanMinutes, let serialScanPaths {
                 self.indexPaths = indexPaths
                 self.indexApps = indexApps
                 self.exclude = exclude
@@ -133,6 +138,7 @@ struct LokiiConfig: Codable {
                 self.sensitiveNames = sensitiveNames
                 self.maxResults = maxResults
                 self.networkRescanMinutes = networkRescanMinutes
+                self.serialScanPaths = serialScanPaths
             } else {
                 let defaults = LokiiConfig.defaultConfig.index
                 self.indexPaths = indexPaths ?? defaults.indexPaths
@@ -144,6 +150,7 @@ struct LokiiConfig: Codable {
                 self.sensitiveNames = sensitiveNames ?? defaults.sensitiveNames
                 self.maxResults = maxResults ?? defaults.maxResults
                 self.networkRescanMinutes = networkRescanMinutes ?? defaults.networkRescanMinutes
+                self.serialScanPaths = serialScanPaths ?? defaults.serialScanPaths
             }
         }
 
@@ -159,6 +166,7 @@ struct LokiiConfig: Codable {
             self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? defaults.sensitiveNames
             self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? defaults.maxResults
             self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? defaults.networkRescanMinutes
+            self.serialScanPaths = try container.decodeIfPresent([String].self, forKey: .serialScanPaths) ?? defaults.serialScanPaths
         }
     }
 
@@ -225,6 +233,8 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
     static let indexReadyNotification = Notification.Name("LokiiIndexReady")
     /// Posted on main thread when index is updated. userInfo: ["total": UInt64]
     static let indexUpdatedNotification = Notification.Name("LokiiIndexUpdated")
+    /// Posted on main thread when watcher or primary reconciliation fails. userInfo: ["message": String, "source": String]
+    static let watcherErrorNotification = Notification.Name("LokiiWatcherError")
     /// Posted on main thread after initialize() determines startup mode. userInfo: ["isColdStart": Bool]
     static let startupModeNotification = Notification.Name("LokiiStartupMode")
     static let initializationFailedNotification = Notification.Name("LokiiInitializationFailed")
@@ -286,7 +296,12 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
     ///   2. indexReadyNotification   ->  UI dismisses the correct indicator
     func initialize() {
         startWorkspaceMonitoring()
-        let handler = NotificationEventHandler { [weak self] in
+        let initHandler = NotificationEventHandler(source: "initialize") { [weak self] in
+            self?.scheduleVolumeStatusesRefresh()
+        }
+        // watcher 负责配置宽化后的唯一全量重建与后台卷监控，需使用 source = "rebuild" 驱动进度与刷表，
+        // 同时保留 onVolumeChanged 闭包以刷新顶部横幅与设置页卷行。
+        let watcherHandler = Self.makeWatcherEventHandler { [weak self] in
             self?.scheduleVolumeStatusesRefresh()
         }
         queue.async { [weak self, core] in
@@ -306,7 +321,7 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
                 )
             }
 
-            let mode = core.initialize(eventHandler: handler)
+            let mode = core.initialize(eventHandler: initHandler)
             switch mode {
             case let .hotStart(cachedCount):
                 print("[Lokii] Hot start: \(cachedCount) cached entries")
@@ -322,10 +337,16 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
                 }
                 return
             }
-            core.startWatcher(eventHandler: handler)
-            core.startConfigWatcher(eventHandler: handler)
+            core.startWatcher(eventHandler: watcherHandler)
+            core.startConfigWatcher(eventHandler: initHandler)
             self?.refreshVolumeStatusesSync()
         }
+    }
+
+    static func makeWatcherEventHandler(
+        onVolumeChanged: (@Sendable () -> Void)? = nil
+    ) -> NotificationEventHandler {
+        NotificationEventHandler(source: "rebuild", onVolumeChanged: onVolumeChanged)
     }
 
     /// Register NSWorkspace mount/unmount notifications and forward them to the Rust engine.
@@ -492,6 +513,64 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Confirm and start scanning a single volume waiting in `NeedsConfirmation`.
+    func confirmVolumeScan(pathOrId: String, completion: ((FileActionOutcome) -> Void)? = nil) {
+        volumeEventQueue.async { [weak self] in
+            guard let self else { return }
+            let outcome: FileActionOutcome
+            do {
+                let started = try self.core.confirmVolumeScan(pathOrId: pathOrId)
+                outcome = FileActionOutcome(
+                    succeeded: started,
+                    errorMessage: started ? nil : L("prefs.volume.actionFailed")
+                )
+            } catch let FfiError.IoError(message) {
+                outcome = FileActionOutcome(succeeded: false, errorMessage: message)
+            } catch {
+                outcome = FileActionOutcome(succeeded: false, errorMessage: error.localizedDescription)
+            }
+            self.refreshVolumeStatusesSync()
+            if let completion {
+                DispatchQueue.main.async { completion(outcome) }
+            }
+        }
+    }
+
+    /// Confirm and start scanning all currently mounted volumes waiting in `NeedsConfirmation`.
+    func confirmAllPendingVolumeScans(completion: ((UInt32) -> Void)? = nil) {
+        volumeEventQueue.async { [weak self] in
+            guard let self else { return }
+            let started = self.core.confirmAllPendingVolumeScans()
+            self.refreshVolumeStatusesSync()
+            if let completion {
+                DispatchQueue.main.async { completion(started) }
+            }
+        }
+    }
+
+    /// Cancel an active scan for a volume while preserving its prior cached entries.
+    func cancelVolumeScan(pathOrId: String, completion: ((FileActionOutcome) -> Void)? = nil) {
+        volumeEventQueue.async { [weak self] in
+            guard let self else { return }
+            let outcome: FileActionOutcome
+            do {
+                let cancelled = try self.core.cancelVolumeScan(pathOrId: pathOrId)
+                outcome = FileActionOutcome(
+                    succeeded: cancelled,
+                    errorMessage: cancelled ? nil : L("prefs.volume.actionFailed")
+                )
+            } catch let FfiError.IoError(message) {
+                outcome = FileActionOutcome(succeeded: false, errorMessage: message)
+            } catch {
+                outcome = FileActionOutcome(succeeded: false, errorMessage: error.localizedDescription)
+            }
+            self.refreshVolumeStatusesSync()
+            if let completion {
+                DispatchQueue.main.async { completion(outcome) }
+            }
+        }
+    }
+
     /// Clear cached index entries for an offline or unmounted volume slot.
     func clearVolumeCache(pathOrId: String, completion: ((FileActionOutcome) -> Void)? = nil) {
         volumeEventQueue.async { [weak self] in
@@ -548,7 +627,7 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
         core.isScanning()
     }
 
-    /// Rebuild index from scratch on background thread.
+    /// Rebuild both the local primary index and all online mounted external/network volumes.
     func rebuildIndex() {
         let handler = NotificationEventHandler(source: "rebuild") { [weak self] in
             self?.scheduleVolumeStatusesRefresh()
@@ -569,6 +648,34 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
             }
             self?.scheduleVolumeStatusesRefresh()
         }
+    }
+
+    /// Rebuild only the local primary index without triggering any external/network volume rescan.
+    func rebuildPrimaryIndex() {
+        let handler = NotificationEventHandler(source: "rebuild") { [weak self] in
+            self?.scheduleVolumeStatusesRefresh()
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, core] in
+            let completed = core.rebuildPrimaryIndex(eventHandler: handler)
+            if !completed {
+                let total = core.getStats().totalCount
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: SearchEngine.indexReadyNotification,
+                        object: nil,
+                        userInfo: ["total": total, "source": "rebuild"]
+                    )
+                }
+            }
+            self?.scheduleVolumeStatusesRefresh()
+        }
+    }
+
+    /// Preview what primary index scope action a draft configuration would trigger via Rust scope_diff.
+    func previewPrimaryScopeAction(_ draftConfig: LokiiConfig) -> FfiPrimaryScopeAction? {
+        guard let data = try? JSONEncoder().encode(draftConfig),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return try? core.previewPrimaryScopeAction(draftConfigJson: json)
     }
 
     /// Save the index with its replay checkpoint (blocking; call on quit).
@@ -647,16 +754,159 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
 }
 
 extension FfiVolumeStatus {
+    /// 忽略高频跳动的条目计数与实时扫描进度，避免 150ms 节流进度触发重搜或 IOKit 挂载表轮询。
     func hasSameLifecycle(as other: Self) -> Bool {
         var status = self
         status.entryCount = other.entryCount
+        status.scannedCount = other.scannedCount
         return status == other
+    }
+}
+
+/// 协调主窗口底栏、全局菜单/快捷键与设置页三处手动「重建索引」入口的作用域决策与确认弹窗。
+enum ManualRebuildCoordinator {
+    /// 返回当前在线或待确认的外置卷/网络卷（全量重建时会连带重扫的对象）。
+    static func activeExternalVolumes(in statuses: [FfiVolumeStatus]) -> [FfiVolumeStatus] {
+        statuses.filter { $0.state == .online || $0.state == .needsConfirmation }
+    }
+
+    /// 仅当存在在线或待确认的外部卷时弹出双模式作用域确认框；否则静默仅重建本地索引。
+    static func requiresScopeConfirmation(for statuses: [FfiVolumeStatus]) -> Bool {
+        !activeExternalVolumes(in: statuses).isEmpty
+    }
+
+    static func requestRebuild(
+        window: NSWindow?,
+        statuses: [FfiVolumeStatus],
+        onPrimaryOnly: @escaping () -> Void,
+        onRebuildAll: @escaping () -> Void
+    ) {
+        let active = activeExternalVolumes(in: statuses)
+        guard !active.isEmpty else {
+            onPrimaryOnly()
+            return
+        }
+
+        let names = active.map { status -> String in
+            if !status.displayName.isEmpty { return status.displayName }
+            return (status.configuredPath as NSString).lastPathComponent
+        }.joined(separator: "、")
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L("rebuild.scopeConfirm.title")
+        alert.informativeText = String(format: L("rebuild.scopeConfirm.message"), names)
+        alert.addButton(withTitle: L("rebuild.scopeConfirm.primaryOnly"))
+        alert.addButton(withTitle: L("rebuild.scopeConfirm.all"))
+        alert.addButton(withTitle: L("rebuild.scopeConfirm.cancel"))
+
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { response in
+            switch response {
+            case .alertFirstButtonReturn:
+                onPrimaryOnly()
+            case .alertSecondButtonReturn:
+                onRebuildAll()
+            default:
+                break
+            }
+        }
+
+        if let window, window.isVisible {
+            alert.beginSheetModal(for: window, completionHandler: handleResponse)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            handleResponse(alert.runModal())
+        }
+    }
+}
+
+/// 主窗口顶部非阻塞外置卷状态横幅的展示状态模型。
+enum VolumeBannerState: Equatable {
+    case hidden
+    case syncing(volumes: [FfiVolumeStatus], totalScanned: UInt64, hasPendingConfirmations: Bool)
+    case needsConfirmation(volumes: [FfiVolumeStatus])
+}
+
+/// 纯函数状态解析器：按「扫描中 > 待确认 > 隐藏」优先级与会话级收起集合推导横幅状态与展示文案。
+enum VolumeBannerResolver {
+    static func resolve(
+        statuses: [FfiVolumeStatus],
+        dismissedVolumeIds: Set<String>
+    ) -> VolumeBannerState {
+        let syncing = statuses.filter { $0.state == .syncing }
+        let pending = statuses.filter { $0.state == .needsConfirmation }
+
+        if !syncing.isEmpty {
+            let totalScanned = syncing.reduce(UInt64(0)) { $0 &+ $1.scannedCount }
+            return .syncing(
+                volumes: syncing,
+                totalScanned: totalScanned,
+                hasPendingConfirmations: !pending.isEmpty
+            )
+        }
+
+        if !pending.isEmpty {
+            let hasUndismissed = pending.contains { !dismissedVolumeIds.contains($0.volumeId) }
+            if hasUndismissed {
+                return .needsConfirmation(volumes: pending)
+            }
+        }
+
+        return .hidden
+    }
+
+    static func displayName(for status: FfiVolumeStatus) -> String {
+        if !status.displayName.isEmpty {
+            return status.displayName
+        }
+        return (status.configuredPath as NSString).lastPathComponent
+    }
+
+    static func message(
+        for state: VolumeBannerState,
+        localize: (String) -> String = { L($0) }
+    ) -> String {
+        switch state {
+        case .hidden:
+            return ""
+        case let .syncing(volumes, totalScanned, _):
+            guard let first = volumes.first else { return "" }
+            let name = displayName(for: first)
+            if volumes.count == 1 {
+                if totalScanned > 0 {
+                    return String(format: localize("volume.banner.syncing.single"), name, formatFileCount(totalScanned))
+                }
+                return String(format: localize("volume.banner.syncing.singleNoCount"), name)
+            } else {
+                if totalScanned > 0 {
+                    return String(format: localize("volume.banner.syncing.multi"), name, volumes.count, formatFileCount(totalScanned))
+                }
+                return String(format: localize("volume.banner.syncing.multiNoCount"), name, volumes.count)
+            }
+        case let .needsConfirmation(volumes):
+            guard let first = volumes.first else { return "" }
+            let name = displayName(for: first)
+            if volumes.count == 1 {
+                switch first.confirmReason ?? .initialScan {
+                case .initialScan:
+                    return String(format: localize("volume.banner.confirm.initialScan"), name)
+                case .filterWidened:
+                    return String(format: localize("volume.banner.confirm.filterWidened"), name)
+                case .journalInvalidated:
+                    return String(format: localize("volume.banner.confirm.journalInvalidated"), name)
+                case .schemaUpgrade:
+                    return String(format: localize("volume.banner.confirm.schemaUpgrade"), name)
+                }
+            } else {
+                return String(format: localize("volume.banner.confirm.multi"), name, volumes.count)
+            }
+        }
     }
 }
 
 // MARK: - Event Handler (Rust -> Swift callbacks)
 
-private final class NotificationEventHandler: EventHandler, @unchecked Sendable {
+final class NotificationEventHandler: EventHandler, @unchecked Sendable {
     /// Source tag included in notifications so the UI can distinguish
     /// events from initialize vs rebuild.
     let source: String
@@ -700,6 +950,13 @@ private final class NotificationEventHandler: EventHandler, @unchecked Sendable 
 
     func onWatcherError(msg: String) {
         print("[Lokii] Watcher error: \(msg)")
+        DispatchQueue.main.async { [source] in
+            NotificationCenter.default.post(
+                name: SearchEngine.watcherErrorNotification,
+                object: nil,
+                userInfo: ["message": msg, "source": source]
+            )
+        }
     }
 
     func onConfigReloaded() {

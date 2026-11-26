@@ -6,13 +6,17 @@ use crate::fsevents;
 use crate::indexer::IndexStore;
 use crate::path_utils::{path_starts_with_ci, paths_equal_ci};
 use crate::scanner::{self, VolumeScanError};
+use crate::scope_diff::{diff_volume_scope, VolumeScopeAction, VolumeScopeSnapshot};
+pub use crate::scope_diff::VolumeConfirmReason;
 use crate::search::{
     self, CaseSensitivity, MultiSearchResult, QueryFilter, SearchMode, SearchShard,
 };
 use crate::volumes::{
-    list_mounted_volumes, list_mounted_volumes_fast, normalize_network_source,
-    partition_index_paths, strip_mount_drift_suffix, MountedFsInfo, MountedPathTarget,
-    ResolvedMountMatch, VolumeIdentity, VolumeKind, VolumeManifest, VolumeRecord,
+    fstype_supports_persistent_fsevents_journal, is_rotational_device,
+    legacy_volume_filter_fingerprint, list_mounted_volumes, list_mounted_volumes_fast,
+    normalize_network_source, partition_index_paths, strip_mount_drift_suffix, MountedFsInfo,
+    MountedPathTarget, ResolvedMountMatch, VolumeIdentity, VolumeKind, VolumeManifest,
+    VolumeRecord,
 };
 use crate::watcher::{
     self, apply_batch, resolve_changes, Change, DEFAULT_DEBOUNCE_MS, MAX_BATCH_SIZE, MAX_DEBOUNCE,
@@ -22,7 +26,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,11 +40,17 @@ const MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const UNMOUNT_GRACE_PERIOD: Duration = Duration::from_secs(15);
 /// shortcut: 固定 4 个卷任务 worker；每个卡死的卷各占住一个，其余卷继续，卷更多且多个同时卡死时仍会排队，按实测再调。
 const WORKER_THREADS: usize = 4;
+const VOLUME_GAP_QUIET: Duration = Duration::from_secs(2);
+const VOLUME_GAP_REPLAYS: u8 = 3;
+const SCAN_PROGRESS_NOTIFY_INTERVAL: Duration = Duration::from_millis(150);
+
+type JournalUuidProvider = Arc<dyn Fn(&Path) -> Option<String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeState {
     Online,
     Syncing,
+    NeedsConfirmation,
     Offline,
     Missing,
 }
@@ -56,10 +66,14 @@ pub struct VolumeStatusInfo {
     pub entry_count: u64,
     pub last_sync_at: Option<u64>,
     pub is_remounted: bool,
+    pub has_cache: bool,
+    pub confirm_reason: Option<VolumeConfirmReason>,
+    pub scanned_count: u64,
+    pub supports_persistent_journal: bool,
 }
 
 struct VolumeStreamHandle {
-    stream: Mutex<Option<fsevents::Stream>>,
+    stream: Arc<Mutex<Option<fsevents::Stream>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -116,16 +130,20 @@ struct VolumeSlot {
     display_name: String,
     kind: VolumeKind,
     fstype: String,
+    from_name: String,
     identity: VolumeIdentity,
     state: VolumeState,
     entry_count: u64,
     last_sync_at: Option<u64>,
     last_event_id: Option<u64>,
     journal_uuid: Option<String>,
-    dirty_filter: bool,
-    filter_fingerprint: Option<u64>,
-    pruned_for_fp: Option<u64>,
-    scan_pending_filter_update: bool,
+    scope_snapshot: Option<VolumeScopeSnapshot>,
+    dirty_upper_bound: bool,
+    pending_confirm_reason: Option<VolumeConfirmReason>,
+    in_flight_scan_snapshot: Option<VolumeScopeSnapshot>,
+    in_flight_prune_snapshot: Option<VolumeScopeSnapshot>,
+    stream_snapshot: Option<VolumeScopeSnapshot>,
+    scanned_count: Arc<AtomicU64>,
     is_remounted: bool,
     has_cache: bool,
     dirty_cache: bool,
@@ -161,22 +179,20 @@ impl VolumeSlot {
             last_event_id: self.last_event_id,
             journal_uuid: self.journal_uuid.clone(),
             entry_count: self.entry_count,
-            dirty_filter: self.dirty_filter,
-            filter_fingerprint: self.filter_fingerprint,
-            // Never persist pruned_for_fp to manifest.json while the pruned shard cache is still unflushed.
-            pruned_for_fp: if self.dirty_cache {
-                None
-            } else {
-                self.pruned_for_fp
-            },
+            scope_snapshot: self.scope_snapshot.clone(),
+            dirty_upper_bound: self.dirty_upper_bound,
+            pending_confirm_reason: self.pending_confirm_reason,
+            dirty_filter: false,
+            filter_fingerprint: None,
         }
     }
 
     fn status_info(&self) -> VolumeStatusInfo {
         let active_path = match self.state {
-            VolumeState::Online | VolumeState::Syncing | VolumeState::Missing => {
-                Some(self.active_configured_path.clone())
-            }
+            VolumeState::Online
+            | VolumeState::Syncing
+            | VolumeState::NeedsConfirmation
+            | VolumeState::Missing => Some(self.active_configured_path.clone()),
             VolumeState::Offline => None,
         };
         VolumeStatusInfo {
@@ -189,13 +205,27 @@ impl VolumeSlot {
             entry_count: self.entry_count,
             last_sync_at: self.last_sync_at,
             is_remounted: self.is_remounted,
+            has_cache: self.has_cache,
+            confirm_reason: (self.state == VolumeState::NeedsConfirmation)
+                .then_some(self.pending_confirm_reason)
+                .flatten(),
+            scanned_count: if self.state == VolumeState::Syncing {
+                self.scanned_count.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            supports_persistent_journal: self.kind == VolumeKind::LocalExternal
+                && fstype_supports_persistent_fsevents_journal(&self.fstype),
         }
     }
 
     fn checkpoint(&self) -> Option<cache::Checkpoint> {
         self.last_event_id.map(|event_id| cache::Checkpoint {
             event_id,
-            fingerprint: self.filter_fingerprint.unwrap_or(0),
+            fingerprint: self
+                .scope_snapshot
+                .as_ref()
+                .map_or(0, VolumeScopeSnapshot::fingerprint_fnv1a),
         })
     }
 
@@ -226,38 +256,52 @@ impl VolumeSlot {
                 || path_starts_with_ci(Path::new(&self.configured_path), mount_path)
         }
     }
+
+    fn live_stream_allowed(&self) -> bool {
+        self.state == VolumeState::Online
+            || (self.state == VolumeState::NeedsConfirmation
+                && self
+                    .pending_confirm_reason
+                    .is_some_and(VolumeConfirmReason::allows_live_stream))
+    }
 }
 
 struct CoordinatorInner {
     config: AppConfig,
-    current_filter_fp: u64,
     manifest: VolumeManifest,
     slots: Vec<VolumeSlot>,
     on_status_change: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     prune_runs: usize,
+    #[cfg(test)]
+    scan_runs: usize,
 }
 
 struct ScanJob {
     volume_id: String,
     generation: u64,
     kind: VolumeKind,
-    configured_path: String,
+    fstype: String,
+    mount_root: PathBuf,
+    subpath: String,
     root: PathBuf,
-    config: AppConfig,
-    filter_fingerprint: u64,
+    target_snapshot: VolumeScopeSnapshot,
+    use_serial_scan: bool,
+    scanned_count: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
 }
 
 struct AttachStreamJob {
     volume_id: String,
     generation: u64,
-    configured_path: String,
+    mount_root: PathBuf,
+    subpath: String,
+    fstype: String,
     active_path: PathBuf,
     since_event_id: Option<u64>,
     stored_journal_uuid: Option<String>,
     require_journal_verify: bool,
-    config: AppConfig,
+    target_snapshot: VolumeScopeSnapshot,
     cancel: Arc<AtomicBool>,
     store: IndexStore,
 }
@@ -340,6 +384,11 @@ impl WorkerQueue {
         self.cvar.notify_all();
     }
 
+    fn remove_volume(&self, volume_id: &str) {
+        let mut guard = self.state.lock();
+        guard.queue.retain(|existing| existing.volume_id() != volume_id);
+    }
+
     /// 取出首个所属卷当前不在执行的任务，并把它标记为执行中。
     /// 返回的 guard 在 drop 时释放标记，调用方无法忘记释放。
     fn pop_blocking(&self) -> Option<(WorkerTask, RunningTaskGuard<'_>)> {
@@ -418,8 +467,9 @@ struct PruneJob {
     generation: u64,
     configured_path: String,
     active_configured_path: String,
-    config: AppConfig,
-    target_fp: u64,
+    target_snapshot: VolumeScopeSnapshot,
+    clear_filter_widened: bool,
+    reattach_stream_after: bool,
     cancel: Arc<AtomicBool>,
     store: IndexStore,
 }
@@ -427,6 +477,7 @@ struct PruneJob {
 #[derive(Default)]
 struct TransitionEffects {
     handles_to_drop: Vec<VolumeStreamHandle>,
+    cancelled_volume_ids: Vec<String>,
     files_to_delete: Vec<(String, PathBuf)>,
     cache_saves: Vec<CacheSave>,
     tasks: Vec<WorkerTask>,
@@ -542,6 +593,9 @@ impl TransitionEffects {
         queue: &WorkerQueue,
     ) {
         drop(self.handles_to_drop);
+        for volume_id in &self.cancelled_volume_ids {
+            queue.remove_volume(volume_id);
+        }
         for (volume_id, path) in self.files_to_delete {
             unlink_orphan_cache_if_still_absent(inner, &volume_id, &path);
         }
@@ -566,20 +620,25 @@ pub struct VolumeCoordinator {
     manifest_save_lock: Arc<Mutex<()>>,
     mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
     fast_mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
-    fda_checker: Arc<dyn Fn() -> bool + Send + Sync>,
+    journal_uuid_provider: JournalUuidProvider,
+    /// 挂载瞬间等待 `fseventsd` 加载卷 `.fseventsd/fseventsd-uuid` 的最大退避窗口（生产环境 3s，单测默认 0）。
+    journal_ready_wait: Duration,
     worker_queue: Arc<WorkerQueue>,
     worker_threads: Mutex<Vec<JoinHandle<()>>>,
     monitor_stop: Arc<(Mutex<bool>, Condvar)>,
     monitor_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+const JOURNAL_READY_MAX_WAIT: Duration = Duration::from_secs(3);
+
 impl VolumeCoordinator {
     pub fn new(cache_dir: PathBuf) -> Self {
-        Self::with_mount_lister_impl(
+        Self::with_providers(
             cache_dir,
             Arc::new(list_mounted_volumes),
             Arc::new(list_mounted_volumes_fast),
-            Arc::new(crate::permissions::has_full_disk_access),
+            Arc::new(fsevents::journal_uuid_for_path),
+            JOURNAL_READY_MAX_WAIT,
         )
     }
 
@@ -589,11 +648,12 @@ impl VolumeCoordinator {
         mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
     ) -> Self {
         let fast_mount_lister = Arc::clone(&mount_lister);
-        Self::with_mount_lister_impl(
+        Self::with_providers(
             cache_dir,
             mount_lister,
             fast_mount_lister,
-            Arc::new(crate::permissions::has_full_disk_access),
+            Arc::new(fsevents::journal_uuid_for_path),
+            Duration::ZERO,
         )
     }
 
@@ -601,29 +661,51 @@ impl VolumeCoordinator {
     pub(crate) fn with_mount_and_fda_lister(
         cache_dir: PathBuf,
         mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
-        fda_checker: Arc<dyn Fn() -> bool + Send + Sync>,
+        _fda_checker: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
         let fast_mount_lister = Arc::clone(&mount_lister);
-        Self::with_mount_lister_impl(cache_dir, mount_lister, fast_mount_lister, fda_checker)
+        Self::with_providers(
+            cache_dir,
+            mount_lister,
+            fast_mount_lister,
+            Arc::new(fsevents::journal_uuid_for_path),
+            Duration::ZERO,
+        )
     }
 
-    fn with_mount_lister_impl(
+    #[cfg(test)]
+    pub(crate) fn with_mount_and_journal_provider(
+        cache_dir: PathBuf,
+        mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
+        journal_uuid_provider: JournalUuidProvider,
+    ) -> Self {
+        let fast_mount_lister = Arc::clone(&mount_lister);
+        Self::with_providers(
+            cache_dir,
+            mount_lister,
+            fast_mount_lister,
+            journal_uuid_provider,
+            Duration::ZERO,
+        )
+    }
+
+    fn with_providers(
         cache_dir: PathBuf,
         mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
         fast_mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
-        fda_checker: Arc<dyn Fn() -> bool + Send + Sync>,
+        journal_uuid_provider: JournalUuidProvider,
+        journal_ready_wait: Duration,
     ) -> Self {
         let default_cfg = AppConfig::default();
-        let current_filter_fp =
-            crate::volumes::volume_filter_fingerprint(&default_cfg, fda_checker());
         let inner = Arc::new(RwLock::new(CoordinatorInner {
             config: default_cfg,
-            current_filter_fp,
             manifest: VolumeManifest::default(),
             slots: Vec::new(),
             on_status_change: None,
             #[cfg(test)]
             prune_runs: 0,
+            #[cfg(test)]
+            scan_runs: 0,
         }));
         let worker_queue = Arc::new(WorkerQueue::new());
         Self {
@@ -632,7 +714,8 @@ impl VolumeCoordinator {
             manifest_save_lock: Arc::new(Mutex::new(())),
             mount_lister,
             fast_mount_lister,
-            fda_checker,
+            journal_uuid_provider,
+            journal_ready_wait,
             worker_queue,
             worker_threads: Mutex::new(Vec::new()),
             monitor_stop: Arc::new((Mutex::new(false), Condvar::new())),
@@ -654,11 +737,21 @@ impl VolumeCoordinator {
             let manifest_save_lock = Arc::clone(&self.manifest_save_lock);
             let queue = Arc::clone(&self.worker_queue);
             let mount_lister = Arc::clone(&self.mount_lister);
+            let journal_uuid_provider = Arc::clone(&self.journal_uuid_provider);
+            let journal_ready_wait = self.journal_ready_wait;
             let volumes_dir = self.volumes_dir();
             let handle = std::thread::Builder::new()
                 .name(format!("volume-worker-{index}"))
                 .spawn(move || {
-                    run_worker_loop(inner, manifest_save_lock, queue, mount_lister, volumes_dir)
+                    run_worker_loop(
+                        inner,
+                        manifest_save_lock,
+                        queue,
+                        mount_lister,
+                        journal_uuid_provider,
+                        journal_ready_wait,
+                        volumes_dir,
+                    )
                 })
                 .expect("spawn volume-worker");
             guard.push(handle);
@@ -720,8 +813,6 @@ impl VolumeCoordinator {
         let volumes_dir = self.volumes_dir();
         let manifest = VolumeManifest::load_from_dir(&volumes_dir);
         let mounts = (self.mount_lister)();
-        let has_fda = (self.fda_checker)();
-        let current_fp = crate::volumes::volume_filter_fingerprint(config, has_fda);
         let partition = partition_index_paths(config, &manifest, &mounts);
 
         let (loaded_count, effects) = {
@@ -735,7 +826,6 @@ impl VolumeCoordinator {
                     }
                 }
                 inner.config = config.clone();
-                inner.current_filter_fp = current_fp;
                 inner.manifest = manifest;
                 inner.on_status_change = Some(on_status_change);
                 let snap = inner.manifest.clone();
@@ -756,6 +846,7 @@ impl VolumeCoordinator {
             let mut effects = TransitionEffects::default();
             effects.handles_to_drop = old_handles;
 
+            let empty_added = HashSet::new();
             let loaded = reconcile_partition_locked(
                 &mut inner,
                 &partition.mounted_targets,
@@ -763,6 +854,7 @@ impl VolumeCoordinator {
                 &volumes_dir,
                 &mut preloaded,
                 false,
+                &empty_added,
                 &mut effects,
             );
             (loaded, effects)
@@ -786,7 +878,7 @@ impl VolumeCoordinator {
         let inner = Arc::clone(&self.inner);
         let manifest_save_lock = Arc::clone(&self.manifest_save_lock);
         let mount_lister = Arc::clone(&self.mount_lister);
-        let fda_checker = Arc::clone(&self.fda_checker);
+        let fast_mount_lister = Arc::clone(&self.fast_mount_lister);
         let worker_queue = Arc::clone(&self.worker_queue);
         let volumes_dir = self.volumes_dir();
         let stop = Arc::clone(&self.monitor_stop);
@@ -797,9 +889,9 @@ impl VolumeCoordinator {
             .name("volume-monitor".to_string())
             .spawn(move || {
                 let (lock, cvar) = &*stop;
+                let mut last_fast_sig: Option<Vec<(String, String, String, bool)>> = None;
                 let mut last_mounts: Option<Vec<MountedFsInfo>> = None;
                 let mut last_index_cfg: Option<IndexConfig> = None;
-                let mut last_filter_fp: Option<u64> = None;
                 loop {
                     {
                         let mut stopped = lock.lock();
@@ -812,23 +904,16 @@ impl VolumeCoordinator {
                         }
                     }
 
-                    let has_fda = (fda_checker)();
                     let (cfg_changed, rescan_minutes, cfg_opt) = {
                         let guard = config_store.read();
                         let rescan_mins = guard.index.network_rescan_minutes;
-                        let new_fp = crate::volumes::volume_filter_fingerprint(&guard, has_fda);
-                        if last_index_cfg.as_ref() == Some(&guard.index)
-                            && last_filter_fp == Some(new_fp)
-                        {
+                        if last_index_cfg.as_ref() == Some(&guard.index) {
                             (false, rescan_mins, None)
                         } else {
                             let inner_guard = inner.read();
-                            if inner_guard.config.index == guard.index
-                                && inner_guard.current_filter_fp == new_fp
-                            {
+                            if inner_guard.config.index == guard.index {
                                 // 已由前序 on_config_updated 完成对账，仅同步本地游标避免重复全量对账
                                 last_index_cfg = Some(guard.index.clone());
-                                last_filter_fp = Some(new_fp);
                                 (false, rescan_mins, None)
                             } else {
                                 (true, rescan_mins, Some(guard.clone()))
@@ -836,27 +921,43 @@ impl VolumeCoordinator {
                         }
                     };
 
-                    let mounts = (mount_lister)();
-                    let mounts_changed = last_mounts.as_ref() != Some(&mounts);
+                    // 先通过零 getattrlist 的轻量挂载表探测是否发生挂载点/设备变化，避免定期唤醒休眠机械硬盘
+                    let fast_mounts = (fast_mount_lister)();
+                    let fast_sig: Vec<(String, String, String, bool)> = fast_mounts
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.mount_point.clone(),
+                                m.from_name.clone(),
+                                m.fstype.clone(),
+                                m.is_local,
+                            )
+                        })
+                        .collect();
+                    let fast_changed = last_fast_sig.as_ref() != Some(&fast_sig);
+
+                    let now = Instant::now();
+                    let has_pending_grace_or_retry = {
+                        let guard = inner.read();
+                        guard.slots.iter().any(|slot| {
+                            slot.unmounting_until.is_some()
+                                || (slot.state == VolumeState::Offline
+                                    && slot.next_reconnect_retry.is_some_and(|until| now >= until))
+                        })
+                    };
 
                     if cfg_changed {
+                        let mounts = (mount_lister)();
                         let cfg = cfg_opt.unwrap_or_else(|| config_store.read().clone());
                         last_index_cfg = Some(cfg.index.clone());
-                        last_filter_fp =
-                            Some(crate::volumes::volume_filter_fingerprint(&cfg, has_fda));
+                        last_fast_sig = Some(fast_sig);
                         last_mounts = Some(mounts.clone());
-                        // 配置变更必须走完整 on_config_updated 对账（含过滤器 diff、移除槽位回收），
-                        // 严禁走 refresh_mounts_locked 直接覆写 guard.config 吞掉 dirty_filter。
-                        let effects = apply_config_update(
-                            &inner,
-                            &mounts,
-                            &volumes_dir,
-                            &cfg,
-                            has_fda,
-                        );
+                        let effects = apply_config_update(&inner, &mounts, &volumes_dir, &cfg);
                         effects.execute(&inner, &manifest_save_lock, &volumes_dir, &worker_queue);
-                    } else {
-                        let now = Instant::now();
+                    } else if fast_changed || has_pending_grace_or_retry {
+                        let mounts = (mount_lister)();
+                        let mounts_changed = last_mounts.as_ref() != Some(&mounts);
+                        last_fast_sig = Some(fast_sig);
                         let needs_slot_reconcile = {
                             let guard = inner.read();
                             guard.slots.iter().any(|slot| {
@@ -868,8 +969,6 @@ impl VolumeCoordinator {
                                         && resolve_slot_mount(slot, &mounts).is_some())
                             })
                         };
-
-                        // 挂载表未变化且无卸载宽限期或可恢复离线卷时直接跳过全量对账，零克隆、零写锁
                         if mounts_changed || needs_slot_reconcile {
                             last_mounts = Some(mounts.clone());
                             let effects =
@@ -897,14 +996,33 @@ impl VolumeCoordinator {
                             let rescan_effects = {
                                 let mut guard = inner.write();
                                 let cfg_snap = guard.config.clone();
-                                let filter_fp = guard.current_filter_fp;
                                 let mut eff = TransitionEffects::default();
                                 let mut changed = false;
+                                #[cfg(test)]
+                                let mut started_scans = 0usize;
                                 for slot in &mut guard.slots {
                                     if network_slot_rescan_due(slot, base_interval, now_unix) {
-                                        prepare_slot_for_scan(slot, &cfg_snap, filter_fp, &mut eff);
+                                        let target_snapshot = VolumeScopeSnapshot::from_config(
+                                            &cfg_snap,
+                                            Path::new(&slot.configured_path),
+                                            Path::new(&slot.active_configured_path),
+                                        );
+                                        prepare_slot_for_scan(
+                                            slot,
+                                            &cfg_snap,
+                                            target_snapshot,
+                                            &mut eff,
+                                        );
+                                        #[cfg(test)]
+                                        {
+                                            started_scans += 1;
+                                        }
                                         changed = true;
                                     }
+                                }
+                                #[cfg(test)]
+                                {
+                                    guard.scan_runs += started_scans;
                                 }
                                 if changed {
                                     eff.notify = guard.on_status_change.clone();
@@ -969,6 +1087,7 @@ impl VolumeCoordinator {
                     configured_path: slot.configured_path.clone(),
                     active_configured_path: slot.active_configured_path.clone(),
                     display_name: slot.display_name.clone(),
+                    // NeedsConfirmation 保持旧缓存在线可搜（is_offline = false）
                     is_offline: matches!(slot.state, VolumeState::Offline | VolumeState::Missing),
                 })
                 .collect()
@@ -1039,7 +1158,6 @@ impl VolumeCoordinator {
         let effects = {
             let mut inner = self.inner.write();
             let cfg_snap = inner.config.clone();
-            let current_fp = inner.current_filter_fp;
             let mut effects = TransitionEffects::default();
             let mut changed_records = Vec::new();
             let mut any_matched = false;
@@ -1051,10 +1169,7 @@ impl VolumeCoordinator {
                     slot.is_remounted = false;
                     slot.unmounting_until = Some(unmount_deadline);
                     slot.skip_missing_rescan = false;
-                    // Mounted rescans skip pre-pruning; when willUnmount interrupts a
-                    // dirty-filter scan and drops back to Offline, enqueue pruning right
-                    // away so newly excluded entries are not exposed during unmount grace.
-                    enqueue_prune_if_needed(slot, &cfg_snap, current_fp, &mut effects);
+                    reconcile_offline_slot_scope(slot, &cfg_snap, &mut effects);
                     slot.entry_count = slot.store.len() as u64;
                     if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
                         if slot.dirty_cache {
@@ -1095,19 +1210,17 @@ impl VolumeCoordinator {
     }
 
     pub fn on_config_updated(&self, new_config: &AppConfig) {
-        let has_fda = (self.fda_checker)();
-        let new_fp = crate::volumes::volume_filter_fingerprint(new_config, has_fda);
-        // 若卷协调器内部已与目标索引配置及权限指纹一致，跳过重复挂载表探测与对账（防止前端写盘触发多路重复回调）
+        // 外置卷完全不受本地 FDA 权限影响，仅按 IndexConfig 变更对账；
+        // 若卷协调器内部已与目标索引配置一致，跳过重复挂载表探测与对账。
         {
             let inner = self.inner.read();
-            if inner.config.index == new_config.index && inner.current_filter_fp == new_fp {
+            if inner.config.index == new_config.index {
                 return;
             }
         }
         let volumes_dir = self.volumes_dir();
         let mounts = (self.mount_lister)();
-        let effects =
-            apply_config_update(&self.inner, &mounts, &volumes_dir, new_config, has_fda);
+        let effects = apply_config_update(&self.inner, &mounts, &volumes_dir, new_config);
         self.execute_effects(effects);
     }
 
@@ -1154,11 +1267,116 @@ impl VolumeCoordinator {
     }
 
     pub fn rescan_volume(&self, path_or_id: &str) -> Result<bool, String> {
+        self.start_scan_for_slot(path_or_id, false)
+    }
+
+    /// 确认并启动单个处于 `NeedsConfirmation` 状态的卷扫描。
+    pub fn confirm_volume_scan(&self, path_or_id: &str) -> Result<bool, String> {
+        self.start_scan_for_slot(path_or_id, true)
+    }
+
+    /// 一键确认所有当前在线且处于 `NeedsConfirmation` 状态的卷，返回实际启动的卷数量。
+    pub fn confirm_all_pending_volume_scans(&self) -> u32 {
         let mounts = (self.mount_lister)();
         let (started, effects) = {
             let mut inner = self.inner.write();
             let cfg_snap = inner.config.clone();
-            let filter_fp = inner.current_filter_fp;
+            let manifest_snap = inner.manifest.clone();
+            let mut effects = TransitionEffects::default();
+            let mut started = 0u32;
+
+            for slot in &mut inner.slots {
+                if slot.state != VolumeState::NeedsConfirmation {
+                    continue;
+                }
+                let Some(resolved) = resolve_slot_mount(slot, &mounts) else {
+                    continue;
+                };
+                bind_resolved_mount_for_scan(slot, &resolved, &manifest_snap, &cfg_snap, &mut effects);
+                let target_snapshot = VolumeScopeSnapshot::from_config(
+                    &cfg_snap,
+                    Path::new(&slot.configured_path),
+                    Path::new(&slot.active_configured_path),
+                );
+                prepare_slot_for_scan(slot, &cfg_snap, target_snapshot, &mut effects);
+                started += 1;
+            }
+            #[cfg(test)]
+            {
+                inner.scan_runs += started as usize;
+            }
+            if started > 0 {
+                effects.notify = inner.on_status_change.clone();
+            }
+            (started, effects)
+        };
+
+        self.execute_effects(effects);
+        started
+    }
+
+    /// 取消指定正在扫描的外置卷/网络卷，无损保留原有缓存与待确认原因。
+    pub fn cancel_volume_scan(&self, path_or_id: &str) -> Result<bool, String> {
+        let (cancelled, effects) = {
+            let mut inner = self.inner.write();
+            let cfg_snap = inner.config.clone();
+            let mut effects = TransitionEffects::default();
+            let Some(slot) = inner
+                .slots
+                .iter_mut()
+                .find(|s| s.matches_path_or_id(path_or_id) && s.state == VolumeState::Syncing)
+            else {
+                return Ok(false);
+            };
+
+            cancel_slot_work(slot, &mut effects);
+            let target_snapshot = VolumeScopeSnapshot::from_config(
+                &cfg_snap,
+                Path::new(&slot.configured_path),
+                Path::new(&slot.active_configured_path),
+            );
+
+            if !slot.has_cache {
+                slot.pending_confirm_reason = Some(
+                    slot.pending_confirm_reason
+                        .unwrap_or(VolumeConfirmReason::InitialScan),
+                );
+                slot.state = VolumeState::NeedsConfirmation;
+            } else if let Some(reason) = slot.pending_confirm_reason {
+                slot.state = VolumeState::NeedsConfirmation;
+                if reason.allows_live_stream() && slot.kind == VolumeKind::LocalExternal {
+                    enqueue_attach_stream_for_slot(slot, target_snapshot, true, &mut effects);
+                }
+            } else {
+                slot.state = VolumeState::Online;
+                if slot.kind == VolumeKind::LocalExternal {
+                    enqueue_attach_stream_for_slot(slot, target_snapshot, true, &mut effects);
+                }
+            }
+
+            let record = (!matches!(slot.identity, VolumeIdentity::PendingPath { .. }))
+                .then(|| slot.to_record());
+            if let Some(rec) = record {
+                inner.manifest.upsert(rec);
+                effects.save_manifest = true;
+            }
+            effects.notify = inner.on_status_change.clone();
+            (true, effects)
+        };
+
+        self.execute_effects(effects);
+        Ok(cancelled)
+    }
+
+    fn start_scan_for_slot(
+        &self,
+        path_or_id: &str,
+        require_needs_confirmation: bool,
+    ) -> Result<bool, String> {
+        let mounts = (self.mount_lister)();
+        let (started, effects) = {
+            let mut inner = self.inner.write();
+            let cfg_snap = inner.config.clone();
             let manifest_snap = inner.manifest.clone();
             let mut effects = TransitionEffects::default();
             let Some(slot) = inner
@@ -1168,40 +1386,25 @@ impl VolumeCoordinator {
             else {
                 return Ok(false);
             };
+            if require_needs_confirmation && slot.state != VolumeState::NeedsConfirmation {
+                return Ok(false);
+            }
 
-            let matched_mount = resolve_slot_mount(slot, &mounts);
-            let Some(resolved) = matched_mount else {
+            let Some(resolved) = resolve_slot_mount(slot, &mounts) else {
                 return Ok(false);
             };
 
-            let new_vid = resolved.identity.volume_id();
-            if slot.volume_id != new_vid {
-                reset_slot_for_volume_swap(
-                    slot,
-                    &resolved,
-                    &manifest_snap,
-                    None,
-                    filter_fp,
-                    &mut effects,
-                );
-            } else {
-                slot.identity = resolved.identity;
-                slot.kind = resolved.kind;
-                slot.fstype = resolved.fstype;
-                slot.subpath = resolved.subpath;
-                slot.display_name = resolved.display_name;
+            bind_resolved_mount_for_scan(slot, &resolved, &manifest_snap, &cfg_snap, &mut effects);
+            let target_snapshot = VolumeScopeSnapshot::from_config(
+                &cfg_snap,
+                Path::new(&slot.configured_path),
+                Path::new(&slot.active_configured_path),
+            );
+            prepare_slot_for_scan(slot, &cfg_snap, target_snapshot, &mut effects);
+            #[cfg(test)]
+            {
+                inner.scan_runs += 1;
             }
-
-            let mount_root_str = resolved.mount_root.to_string_lossy().to_string();
-            let active_path_str = join_mount_subpath(&resolved.mount_root, &slot.subpath);
-            let is_remounted = !str_paths_equal_ci(&active_path_str, &slot.configured_path);
-
-            slot.unmounting_until = None;
-            slot.next_reconnect_retry = None;
-            slot.active_mount_root = Some(mount_root_str);
-            slot.active_configured_path = active_path_str;
-            slot.is_remounted = is_remounted;
-            prepare_slot_for_scan(slot, &cfg_snap, filter_fp, &mut effects);
             effects.notify = inner.on_status_change.clone();
             (true, effects)
         };
@@ -1217,6 +1420,10 @@ impl VolumeCoordinator {
             .iter()
             .map(VolumeSlot::status_info)
             .collect()
+    }
+
+    pub(crate) fn manifest_snapshot(&self) -> VolumeManifest {
+        self.inner.read().manifest.clone()
     }
 
     pub fn total_entry_count(&self, primary: &IndexStore) -> u64 {
@@ -1263,10 +1470,7 @@ impl VolumeCoordinator {
                 slot.entry_count = slot.store.len() as u64;
                 if slot.dirty_cache {
                     saves.push(slot.cache_save(&volumes_dir));
-                    // dirty_records is only upserted after save_dirty_caches_and_mark succeeds.
-                    let mut rec = slot.to_record();
-                    rec.pruned_for_fp = slot.pruned_for_fp;
-                    dirty_records.push((slot.generation, rec));
+                    dirty_records.push((slot.generation, slot.to_record()));
                 } else {
                     clean_records.push((slot.generation, slot.to_record()));
                 }
@@ -1308,6 +1512,11 @@ impl VolumeCoordinator {
     #[cfg(test)]
     pub(crate) fn prune_run_count(&self) -> usize {
         self.inner.read().prune_runs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_run_count(&self) -> usize {
+        self.inner.read().scan_runs
     }
 
     #[cfg(test)]
@@ -1592,6 +1801,7 @@ fn resolve_mounted_for_target(
         display_name,
         kind,
         fstype: m.fstype.clone(),
+        from_name: m.from_name.clone(),
         identity: matched_identity,
     })
 }
@@ -1600,32 +1810,232 @@ fn cancel_slot_work(slot: &mut VolumeSlot, effects: &mut TransitionEffects) {
     slot.cancel_token.store(true, Ordering::SeqCst);
     slot.generation = slot.generation.wrapping_add(1);
     slot.cancel_token = Arc::new(AtomicBool::new(false));
+    slot.in_flight_scan_snapshot = None;
+    slot.in_flight_prune_snapshot = None;
+    slot.stream_snapshot = None;
+    slot.scanned_count.store(0, Ordering::Relaxed);
+    effects.cancelled_volume_ids.push(slot.volume_id.clone());
     if let Some(handle) = slot.stream_handle.take() {
         effects.handles_to_drop.push(handle);
     }
 }
 
+fn config_matches_serial_scan_paths(
+    config: &AppConfig,
+    configured_path: &str,
+    active_configured_path: &str,
+) -> bool {
+    let serial_paths = config.resolve_serial_scan_paths();
+    if serial_paths.is_empty() {
+        return false;
+    }
+    let configured = Path::new(configured_path);
+    let active = Path::new(active_configured_path);
+    serial_paths.iter().any(|sp| {
+        paths_equal_ci(configured, sp)
+            || path_starts_with_ci(configured, sp)
+            || paths_equal_ci(active, sp)
+            || path_starts_with_ci(active, sp)
+    })
+}
+
 fn prepare_slot_for_scan(
     slot: &mut VolumeSlot,
     config: &AppConfig,
-    filter_fingerprint: u64,
+    target_snapshot: VolumeScopeSnapshot,
     effects: &mut TransitionEffects,
 ) {
     cancel_slot_work(slot, effects);
     slot.state = VolumeState::Syncing;
-    slot.scan_pending_filter_update = false;
     slot.skip_missing_rescan = false;
     slot.last_rescan_triggered = Some(Instant::now());
+    slot.scanned_count.store(0, Ordering::Relaxed);
+    slot.in_flight_scan_snapshot = Some(target_snapshot.clone());
+
+    let mount_root = slot
+        .active_mount_root
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&slot.active_configured_path));
+    let use_serial_scan = slot.kind == VolumeKind::Network
+        || is_rotational_device(&slot.from_name)
+        || config_matches_serial_scan_paths(
+            config,
+            &slot.configured_path,
+            &slot.active_configured_path,
+        );
+
     effects.tasks.push(WorkerTask::Scan(ScanJob {
         volume_id: slot.volume_id.clone(),
         generation: slot.generation,
         kind: slot.kind,
-        configured_path: slot.configured_path.clone(),
+        fstype: slot.fstype.clone(),
+        mount_root,
+        subpath: slot.subpath.clone(),
         root: PathBuf::from(&slot.active_configured_path),
-        config: config.clone(),
-        filter_fingerprint,
+        target_snapshot,
+        use_serial_scan,
+        scanned_count: Arc::clone(&slot.scanned_count),
         cancel: Arc::clone(&slot.cancel_token),
     }));
+}
+
+fn enqueue_attach_stream_for_slot(
+    slot: &mut VolumeSlot,
+    target_snapshot: VolumeScopeSnapshot,
+    require_journal_verify: bool,
+    effects: &mut TransitionEffects,
+) {
+    if slot.kind != VolumeKind::LocalExternal {
+        return;
+    }
+    let mount_root = slot
+        .active_mount_root
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&slot.active_configured_path));
+    if let Some(old) = slot.stream_handle.take() {
+        effects.handles_to_drop.push(old);
+    }
+    slot.stream_snapshot = Some(target_snapshot.clone());
+    effects.tasks.push(WorkerTask::AttachStream(AttachStreamJob {
+        volume_id: slot.volume_id.clone(),
+        generation: slot.generation,
+        mount_root,
+        subpath: slot.subpath.clone(),
+        fstype: slot.fstype.clone(),
+        active_path: PathBuf::from(&slot.active_configured_path),
+        since_event_id: slot.last_event_id,
+        stored_journal_uuid: slot.journal_uuid.clone(),
+        require_journal_verify,
+        target_snapshot,
+        cancel: Arc::clone(&slot.cancel_token),
+        store: slot.store.clone(),
+    }));
+}
+
+fn enqueue_prune_for_slot(
+    slot: &mut VolumeSlot,
+    target_snapshot: VolumeScopeSnapshot,
+    clear_filter_widened: bool,
+    reattach_stream_after: bool,
+    effects: &mut TransitionEffects,
+) {
+    if !slot.has_cache || slot.store.is_empty() {
+        return;
+    }
+    if slot
+        .in_flight_prune_snapshot
+        .as_ref()
+        .is_some_and(|s| s.semantically_eq(&target_snapshot))
+    {
+        return;
+    }
+    if let Some(old) = slot.stream_handle.take() {
+        effects.handles_to_drop.push(old);
+    }
+    slot.stream_snapshot = None;
+    slot.in_flight_prune_snapshot = Some(target_snapshot.clone());
+    effects.tasks.push(WorkerTask::Prune(PruneJob {
+        volume_id: slot.volume_id.clone(),
+        generation: slot.generation,
+        configured_path: slot.configured_path.clone(),
+        active_configured_path: slot.active_configured_path.clone(),
+        target_snapshot,
+        clear_filter_widened,
+        reattach_stream_after,
+        cancel: Arc::clone(&slot.cancel_token),
+        store: slot.store.clone(),
+    }));
+}
+
+fn bind_resolved_mount_for_scan(
+    slot: &mut VolumeSlot,
+    resolved: &ResolvedMountMatch,
+    manifest: &VolumeManifest,
+    config: &AppConfig,
+    effects: &mut TransitionEffects,
+) {
+    let new_vid = resolved.identity.volume_id();
+    if slot.volume_id != new_vid {
+        reset_slot_for_volume_swap(slot, resolved, manifest, None, config, effects);
+    } else {
+        slot.identity = resolved.identity.clone();
+        slot.kind = resolved.kind;
+        slot.fstype = resolved.fstype.clone();
+        slot.from_name = resolved.from_name.clone();
+        slot.subpath = resolved.subpath.clone();
+        slot.display_name = resolved.display_name.clone();
+    }
+
+    let mount_root_str = resolved.mount_root.to_string_lossy().to_string();
+    let active_path_str = join_mount_subpath(&resolved.mount_root, &slot.subpath);
+    let is_remounted = !str_paths_equal_ci(&active_path_str, &slot.configured_path);
+
+    slot.unmounting_until = None;
+    slot.next_reconnect_retry = None;
+    slot.active_mount_root = Some(mount_root_str);
+    slot.active_configured_path = active_path_str;
+    slot.is_remounted = is_remounted;
+}
+
+/// 兼容 `v0.2.0` / `main` 旧版 `manifest.json` 升级认领与新版快照恢复。
+/// 返回 `(scope_snapshot, dirty_upper_bound, pending_confirm_reason, needs_manifest_upgrade)`。
+fn resolve_record_scope_on_load(
+    rec: &VolumeRecord,
+    config: &AppConfig,
+    active_configured_path: &str,
+    has_cache: bool,
+    loaded_cp_fp: Option<u64>,
+) -> (
+    Option<VolumeScopeSnapshot>,
+    bool,
+    Option<VolumeConfirmReason>,
+    bool,
+) {
+    if rec.scope_snapshot.is_some() {
+        return (
+            rec.scope_snapshot.clone(),
+            rec.dirty_upper_bound,
+            rec.pending_confirm_reason,
+            false,
+        );
+    }
+    if !has_cache {
+        return (None, false, rec.pending_confirm_reason, false);
+    }
+    if rec.pending_confirm_reason.is_some() {
+        // 新版 manifest 显式落盘的 scope_snapshot=None 待确认记录（例如旧版未认领或损坏恢复），
+        // 绝不按旧版无指纹记录认领为当前配置。
+        return (None, rec.dirty_upper_bound, rec.pending_confirm_reason, false);
+    }
+
+    // 旧版 manifest 升级认领：同时匹配 has_fda=false/true 两个旧指纹，彻底免疫升级前后 FDA 变化误伤外置盘
+    let legacy_fps = [
+        legacy_volume_filter_fingerprint(config, false),
+        legacy_volume_filter_fingerprint(config, true),
+    ];
+    let saved_legacy_fp = rec.filter_fingerprint.or(loaded_cp_fp);
+    let legacy_claimable = !rec.dirty_filter
+        && (saved_legacy_fp.is_none()
+            || saved_legacy_fp.is_some_and(|fp| legacy_fps.contains(&fp)));
+
+    if legacy_claimable {
+        let claimed = VolumeScopeSnapshot::from_config(
+            config,
+            Path::new(&rec.configured_path),
+            Path::new(active_configured_path),
+        );
+        (Some(claimed), false, rec.pending_confirm_reason, true)
+    } else {
+        // 旧 dirty_filter=true 或离线改配置导致旧指纹不匹配：保持 scope_snapshot=None，
+        // 转入 NeedsConfirmation(FilterWidened)，不做 ABA 自动回退。
+        let merged = VolumeConfirmReason::merge(
+            rec.pending_confirm_reason,
+            VolumeConfirmReason::FilterWidened,
+        );
+        (None, false, Some(merged), true)
+    }
 }
 
 fn reset_slot_for_volume_swap(
@@ -1633,7 +2043,7 @@ fn reset_slot_for_volume_swap(
     res: &ResolvedMountMatch,
     manifest: &VolumeManifest,
     preloaded: Option<PreloadedCache>,
-    current_filter_fp: u64,
+    config: &AppConfig,
     effects: &mut TransitionEffects,
 ) -> u64 {
     cancel_slot_work(slot, effects);
@@ -1644,9 +2054,10 @@ fn reset_slot_for_volume_swap(
     slot.identity = res.identity.clone();
     slot.kind = res.kind;
     slot.fstype = res.fstype.clone();
+    slot.from_name = res.from_name.clone();
     slot.subpath = res.subpath.clone();
     slot.display_name = res.display_name.clone();
-    slot.active_configured_path = active_str;
+    slot.active_configured_path = active_str.clone();
     slot.active_mount_root = None;
     slot.store = IndexStore::new();
     slot.entry_count = 0;
@@ -1655,10 +2066,13 @@ fn reset_slot_for_volume_swap(
     slot.cache_seq = slot.cache_seq.wrapping_add(1);
     slot.saved_cache_seq = slot.cache_seq;
     slot.cache_persistence = CachePersistence::default();
-    slot.dirty_filter = false;
-    slot.filter_fingerprint = None;
-    slot.pruned_for_fp = None;
-    slot.scan_pending_filter_update = false;
+    slot.scope_snapshot = None;
+    slot.dirty_upper_bound = false;
+    slot.pending_confirm_reason = None;
+    slot.in_flight_scan_snapshot = None;
+    slot.in_flight_prune_snapshot = None;
+    slot.stream_snapshot = None;
+    slot.scanned_count.store(0, Ordering::Relaxed);
     slot.is_remounted = false;
     slot.last_sync_at = None;
     slot.last_event_id = None;
@@ -1683,16 +2097,17 @@ fn reset_slot_for_volume_swap(
             slot.active_configured_path = rec.active_configured_path.clone();
             slot.last_sync_at = rec.last_sync_at;
             slot.journal_uuid = rec.journal_uuid.clone();
-        }
-        let saved_fp = rec_opt.and_then(|r| r.filter_fingerprint).or(cp_fp);
-        let fp_mismatch = saved_fp.is_some_and(|fp| fp != current_filter_fp);
-        slot.dirty_filter = rec_opt.is_some_and(|r| r.dirty_filter) || fp_mismatch;
-        slot.filter_fingerprint = if slot.dirty_filter {
-            saved_fp
+            let (snap, dirty_ub, reason, _) =
+                resolve_record_scope_on_load(rec, config, &active_str, true, cp_fp);
+            slot.scope_snapshot = snap;
+            slot.dirty_upper_bound = dirty_ub;
+            slot.pending_confirm_reason = reason;
         } else {
-            Some(saved_fp.unwrap_or(current_filter_fp))
-        };
-        slot.pruned_for_fp = rec_opt.and_then(|r| r.pruned_for_fp);
+            // manifest 缺失/损坏但分片 .cache 存在：无快照且无日志证明 -> JournalInvalidated
+            slot.scope_snapshot = None;
+            slot.dirty_upper_bound = false;
+            slot.pending_confirm_reason = Some(VolumeConfirmReason::JournalInvalidated);
+        }
         return count;
     }
     0
@@ -1720,6 +2135,7 @@ fn resolve_slot_mount(slot: &VolumeSlot, mounts: &[MountedFsInfo]) -> Option<Res
             display_name: slot.display_name.clone(),
             kind,
             fstype: m.fstype.clone(),
+            from_name: m.from_name.clone(),
             identity,
         });
     }
@@ -1748,10 +2164,69 @@ fn resolve_slot_mount(slot: &VolumeSlot, mounts: &[MountedFsInfo]) -> Option<Res
         display_name: slot.display_name.clone(),
         kind,
         fstype: best.fstype.clone(),
+        from_name: best.from_name.clone(),
         identity,
     })
 }
 
+/// 对处于 `Offline` 状态的已缓存槽位按新配置执行三分法对账，返回是否需要更新 manifest。
+fn reconcile_offline_slot_scope(
+    slot: &mut VolumeSlot,
+    config: &AppConfig,
+    effects: &mut TransitionEffects,
+) -> bool {
+    if !slot.has_cache {
+        return false;
+    }
+    let Some(old_snap) = slot.scope_snapshot.clone() else {
+        // scope_snapshot == None（旧版未认领或损坏 manifest）不做 ABA 自动回退
+        return false;
+    };
+    let target_snapshot = VolumeScopeSnapshot::from_config(
+        config,
+        Path::new(&slot.configured_path),
+        Path::new(&slot.active_configured_path),
+    );
+    match diff_volume_scope(&old_snap, &target_snapshot, slot.dirty_upper_bound) {
+        VolumeScopeAction::FullRebuild { reason } => {
+            slot.in_flight_prune_snapshot = None;
+            let merged = VolumeConfirmReason::merge(slot.pending_confirm_reason, reason);
+            if slot.pending_confirm_reason != Some(merged) {
+                slot.pending_confirm_reason = Some(merged);
+                true
+            } else {
+                false
+            }
+        }
+        VolumeScopeAction::PruneOnly => {
+            let clear_widened = slot.pending_confirm_reason.is_none()
+                || slot.pending_confirm_reason == Some(VolumeConfirmReason::FilterWidened);
+            if slot.store.is_empty() {
+                slot.scope_snapshot = Some(target_snapshot);
+                slot.dirty_upper_bound = false;
+                slot.in_flight_prune_snapshot = None;
+                if clear_widened && slot.pending_confirm_reason == Some(VolumeConfirmReason::FilterWidened) {
+                    slot.pending_confirm_reason = None;
+                }
+                true
+            } else {
+                enqueue_prune_for_slot(slot, target_snapshot, clear_widened, false, effects);
+                false
+            }
+        }
+        VolumeScopeAction::NoOp => {
+            slot.in_flight_prune_snapshot = None;
+            if slot.pending_confirm_reason == Some(VolumeConfirmReason::FilterWidened) {
+                slot.pending_confirm_reason = None;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reconcile_partition_locked(
     inner: &mut CoordinatorInner,
     targets: &[MountedPathTarget],
@@ -1759,6 +2234,7 @@ fn reconcile_partition_locked(
     volumes_dir: &Path,
     preloaded: &mut HashMap<String, PreloadedCache>,
     force_retry_missing: bool,
+    newly_added_paths: &HashSet<String>,
     effects: &mut TransitionEffects,
 ) -> u64 {
     let mut loaded_total = 0u64;
@@ -1767,7 +2243,7 @@ fn reconcile_partition_locked(
     // 将本轮对账产出的槽位先暂存至独立容器，循环结束后统一写回 inner.slots，
     // 防止同批次不同配置路径在循环中途互相抢占刚完成对账的槽位。
     let mut reconciled_slots = Vec::with_capacity(targets.len());
-    let current_filter_fp = inner.current_filter_fp;
+    let cfg_snap = inner.config.clone();
 
     for target in targets {
         let configured_str = target.configured_path.to_string_lossy().to_string();
@@ -1793,18 +2269,7 @@ fn reconcile_partition_locked(
         );
 
         let mut slot = if let Some(idx) = existing_idx {
-            let mut existing = inner.slots.remove(idx);
-            if existing.has_cache
-                && existing
-                    .filter_fingerprint
-                    .is_some_and(|fp| fp != current_filter_fp)
-            {
-                if !existing.dirty_filter {
-                    slot_manifest_dirty = true;
-                }
-                existing.dirty_filter = true;
-            }
-            existing
+            inner.slots.remove(idx)
         } else if let Some(rec) = manifest_record.clone() {
             let store = IndexStore::new();
             let mut has_cache = false;
@@ -1827,22 +2292,21 @@ fn reconcile_partition_locked(
                         .and_then(|cp| (cp.fingerprint != 0).then_some(cp.fingerprint));
                 }
             }
-            let saved_fp = rec.filter_fingerprint.or(loaded_cp_fp);
-            let fp_mismatch = saved_fp.is_some_and(|fp| fp != current_filter_fp);
-            let effective_dirty_filter = rec.dirty_filter || fp_mismatch;
-            if effective_dirty_filter && !rec.dirty_filter {
+            let active_for_claim = resolved
+                .as_ref()
+                .map(|r| join_mount_subpath(&r.mount_root, &r.subpath))
+                .unwrap_or_else(|| rec.active_configured_path.clone());
+            let (scope_snapshot, dirty_upper_bound, pending_confirm_reason, upgraded) =
+                resolve_record_scope_on_load(
+                    &rec,
+                    &cfg_snap,
+                    &active_for_claim,
+                    has_cache,
+                    loaded_cp_fp,
+                );
+            if upgraded {
                 slot_manifest_dirty = true;
             }
-            let effective_fp = if effective_dirty_filter {
-                saved_fp
-            } else if has_cache {
-                if saved_fp.is_none() {
-                    slot_manifest_dirty = true;
-                }
-                Some(saved_fp.unwrap_or(current_filter_fp))
-            } else {
-                saved_fp
-            };
             VolumeSlot {
                 volume_id: rec.volume_id,
                 configured_path: configured_str.clone(),
@@ -1852,21 +2316,28 @@ fn reconcile_partition_locked(
                 display_name: rec.display_name,
                 kind: rec.kind,
                 fstype: rec.fstype,
+                from_name: resolved
+                    .as_ref()
+                    .map(|r| r.from_name.clone())
+                    .unwrap_or_default(),
                 identity: rec.identity,
                 state: VolumeState::Offline,
                 entry_count: store.len() as u64,
                 last_sync_at: rec.last_sync_at,
                 // 以 .cache 内嵌检查点为准，防止 manifest 超前导致漏重放 FSEvents 事件
-                last_event_id: if has_cache { loaded_event_id.or(rec.last_event_id) } else { rec.last_event_id },
-                journal_uuid: rec.journal_uuid,
-                dirty_filter: effective_dirty_filter,
-                filter_fingerprint: effective_fp,
-                pruned_for_fp: if keep_manifest_identity && has_cache {
-                    rec.pruned_for_fp
+                last_event_id: if has_cache {
+                    loaded_event_id.or(rec.last_event_id)
                 } else {
-                    None
+                    rec.last_event_id
                 },
-                scan_pending_filter_update: false,
+                journal_uuid: rec.journal_uuid,
+                scope_snapshot,
+                dirty_upper_bound,
+                pending_confirm_reason,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache,
                 dirty_cache: false,
@@ -1889,25 +2360,18 @@ fn reconcile_partition_locked(
             let store = IndexStore::new();
             let mut has_cache = false;
             let mut last_event_id = None;
-            let mut loaded_cp_fp = None;
+            let mut pending_confirm_reason = None;
             if let Some(loaded) = preloaded.remove(&vid) {
                 let count = loaded.compact.len() as u64;
                 store.replace_compact(loaded.compact);
                 loaded_total += count;
                 has_cache = true;
                 last_event_id = loaded.checkpoint.map(|cp| cp.event_id);
-                loaded_cp_fp = loaded
-                    .checkpoint
-                    .and_then(|cp| (cp.fingerprint != 0).then_some(cp.fingerprint));
+                // manifest.json 损坏或丢失但分片 .cache 尚存：缺失 scope_snapshot 与 journal_uuid，
+                // 无论 APFS 还是 ExFAT 均直接进入 NeedsConfirmation(JournalInvalidated) 且不挂流
+                pending_confirm_reason = Some(VolumeConfirmReason::JournalInvalidated);
+                slot_manifest_dirty = true;
             }
-            let fp_mismatch = loaded_cp_fp.is_some_and(|fp| fp != current_filter_fp);
-            let effective_fp = if fp_mismatch {
-                loaded_cp_fp
-            } else if has_cache {
-                Some(loaded_cp_fp.unwrap_or(current_filter_fp))
-            } else {
-                loaded_cp_fp
-            };
             VolumeSlot {
                 volume_id: vid,
                 configured_path: configured_str.clone(),
@@ -1917,16 +2381,20 @@ fn reconcile_partition_locked(
                 display_name: res.display_name.clone(),
                 kind: res.kind,
                 fstype: res.fstype.clone(),
+                from_name: res.from_name.clone(),
                 identity: res.identity.clone(),
                 state: VolumeState::Offline,
                 entry_count: store.len() as u64,
                 last_sync_at: None,
                 last_event_id,
                 journal_uuid: None,
-                dirty_filter: fp_mismatch,
-                filter_fingerprint: effective_fp,
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache,
                 dirty_cache: false,
@@ -1961,16 +2429,20 @@ fn reconcile_partition_locked(
                 display_name,
                 kind: VolumeKind::Network,
                 fstype: String::new(),
+                from_name: String::new(),
                 identity: pending_id,
                 state: VolumeState::Offline,
                 entry_count: 0,
                 last_sync_at: None,
                 last_event_id: None,
                 journal_uuid: None,
-                dirty_filter: false,
-                filter_fingerprint: None,
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: false,
                 dirty_cache: false,
@@ -1991,6 +2463,7 @@ fn reconcile_partition_locked(
 
         let prev_state = slot.state;
         let prev_active = slot.active_mount_root.clone();
+        let prev_reason = slot.pending_confirm_reason;
 
         let suppressed_by_unmount = resolved.as_ref().is_some_and(|res| {
             slot.volume_id == res.identity.volume_id()
@@ -2016,7 +2489,7 @@ fn reconcile_partition_locked(
                     &res,
                     &inner.manifest,
                     preloaded.remove(&new_vid),
-                    current_filter_fp,
+                    &cfg_snap,
                     effects,
                 );
                 status_changed = true;
@@ -2027,6 +2500,7 @@ fn reconcile_partition_locked(
                 slot.identity = res.identity;
                 slot.kind = res.kind;
                 slot.fstype = res.fstype;
+                slot.from_name = res.from_name;
                 slot.subpath = res.subpath;
                 slot.display_name = res.display_name;
                 if meta_changed {
@@ -2049,14 +2523,14 @@ fn reconcile_partition_locked(
                 {
                     eprintln!("[Lokii] failed to rebase volume {}: {err}", slot.display_name);
                     slot.has_cache = false;
+                    slot.scope_snapshot = None;
+                    slot.dirty_upper_bound = false;
                 } else {
                     slot.active_configured_path = new_active_path.clone();
                     slot.is_remounted = is_remounted;
-                    if !slot.dirty_filter {
-                        slot.dirty_cache = true;
-                        slot.cache_seq = slot.cache_seq.wrapping_add(1);
-                        effects.cache_saves.push(slot.cache_save(volumes_dir));
-                    }
+                    slot.dirty_cache = true;
+                    slot.cache_seq = slot.cache_seq.wrapping_add(1);
+                    effects.cache_saves.push(slot.cache_save(volumes_dir));
                     manifest_changed = true;
                 }
             } else {
@@ -2076,24 +2550,283 @@ fn reconcile_partition_locked(
             slot.active_mount_root = Some(mount_root_str.clone());
             slot.entry_count = slot.store.len() as u64;
 
-            let already_syncing_same = !swapped
+            let target_snapshot = VolumeScopeSnapshot::from_config(
+                &cfg_snap,
+                Path::new(&slot.configured_path),
+                Path::new(&slot.active_configured_path),
+            );
+            let is_newly_added =
+                newly_added_paths.contains(&slot.configured_path.to_ascii_lowercase());
+
+            // 若槽位正在同一挂载根上扫描：配置未影响本卷过滤快照时保持 Syncing 不中断；
+            // 若本卷过滤规则实际发生变化则取消旧扫并按新快照重新决策。
+            let keep_syncing = if !swapped
                 && prev_state == VolumeState::Syncing
                 && prev_active.as_deref() == Some(mount_root_str.as_str())
-                && !slot.scan_pending_filter_update;
-
-            if same_missing_mount {
-                // Keep Missing until explicit rescan, mount, or filter update rather than spinning every poll.
-                slot.state = VolumeState::Missing;
-                enqueue_prune_if_needed(&slot, &inner.config, current_filter_fp, effects);
-            } else if already_syncing_same {
-                // 同一挂载根上仍有在途扫描任务（含手动重扫与网络卷周期重扫）时保持 Syncing，
-                // 避免监控轮询因为已有旧缓存而把扫描中的槽位提前覆写回 Online。
-                slot.state = VolumeState::Syncing;
-            } else if slot.dirty_filter || !slot.has_cache {
-                // Mounted slots entering a rescan rebuild their store directly, so skip pre-pruning.
-                prepare_slot_for_scan(&mut slot, &inner.config, current_filter_fp, effects);
+            {
+                if slot
+                    .in_flight_scan_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.semantically_eq(&target_snapshot))
+                {
+                    true
+                } else {
+                    cancel_slot_work(&mut slot, effects);
+                    false
+                }
             } else {
-                slot.state = VolumeState::Online;
+                false
+            };
+
+            if keep_syncing {
+                slot.state = VolumeState::Syncing;
+            } else if !slot.has_cache {
+                if same_missing_mount {
+                    slot.state = VolumeState::Missing;
+                } else if is_newly_added {
+                    // 设置页主动新加且当前已挂载、无既有缓存 -> 直接进入 Syncing
+                    prepare_slot_for_scan(&mut slot, &cfg_snap, target_snapshot, effects);
+                    #[cfg(test)]
+                    {
+                        inner.scan_runs += 1;
+                    }
+                } else {
+                    // 启动/热插拔/取消首扫等被动触发 -> NeedsConfirmation(InitialScan)
+                    if let Some(h) = slot.stream_handle.take() {
+                        effects.handles_to_drop.push(h);
+                    }
+                    slot.stream_snapshot = None;
+                    slot.pending_confirm_reason = Some(VolumeConfirmReason::merge(
+                        slot.pending_confirm_reason,
+                        VolumeConfirmReason::InitialScan,
+                    ));
+                    slot.state = VolumeState::NeedsConfirmation;
+                    if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+                        inner.manifest.upsert(slot.to_record());
+                        manifest_changed = manifest_changed
+                            || slot_manifest_dirty
+                            || swapped
+                            || prev_state != VolumeState::NeedsConfirmation
+                            || prev_reason != slot.pending_confirm_reason;
+                    }
+                }
+            } else if let Some(old_snap) = slot.scope_snapshot.clone() {
+                let diff = diff_volume_scope(&old_snap, &target_snapshot, slot.dirty_upper_bound);
+                if same_missing_mount {
+                    match diff {
+                        VolumeScopeAction::NoOp => {
+                            slot.state = VolumeState::Missing;
+                        }
+                        VolumeScopeAction::PruneOnly => {
+                            slot.state = VolumeState::Missing;
+                            let clear_widened = slot.pending_confirm_reason.is_none()
+                                || slot.pending_confirm_reason
+                                    == Some(VolumeConfirmReason::FilterWidened);
+                            if slot.store.is_empty() {
+                                slot.scope_snapshot = Some(target_snapshot);
+                                slot.dirty_upper_bound = false;
+                                if clear_widened
+                                    && slot.pending_confirm_reason
+                                        == Some(VolumeConfirmReason::FilterWidened)
+                                {
+                                    slot.pending_confirm_reason = None;
+                                }
+                                inner.manifest.upsert(slot.to_record());
+                                manifest_changed = true;
+                            } else {
+                                enqueue_prune_for_slot(
+                                    &mut slot,
+                                    target_snapshot,
+                                    clear_widened,
+                                    false,
+                                    effects,
+                                );
+                            }
+                        }
+                        VolumeScopeAction::FullRebuild { reason } => {
+                            slot.skip_missing_rescan = false;
+                            slot.pending_confirm_reason = Some(VolumeConfirmReason::merge(
+                                slot.pending_confirm_reason,
+                                reason,
+                            ));
+                            slot.state = VolumeState::NeedsConfirmation;
+                            if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+                                inner.manifest.upsert(slot.to_record());
+                                manifest_changed = true;
+                            }
+                        }
+                    }
+                } else {
+                    match diff {
+                        VolumeScopeAction::FullRebuild { reason } => {
+                            let merged =
+                                VolumeConfirmReason::merge(slot.pending_confirm_reason, reason);
+                            slot.pending_confirm_reason = Some(merged);
+                            slot.state = VolumeState::NeedsConfirmation;
+                            slot.in_flight_prune_snapshot = None;
+
+                            if merged.allows_live_stream() && slot.kind == VolumeKind::LocalExternal
+                            {
+                                let stream_matches = slot.stream_handle.is_some()
+                                    && slot
+                                        .stream_snapshot
+                                        .as_ref()
+                                        .is_some_and(|s| s.semantically_eq(&target_snapshot));
+                                if !stream_matches {
+                                    enqueue_attach_stream_for_slot(
+                                        &mut slot,
+                                        target_snapshot,
+                                        true,
+                                        effects,
+                                    );
+                                }
+                            } else {
+                                if let Some(h) = slot.stream_handle.take() {
+                                    effects.handles_to_drop.push(h);
+                                }
+                                slot.stream_snapshot = None;
+                            }
+
+                            if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+                                inner.manifest.upsert(slot.to_record());
+                                manifest_changed = manifest_changed
+                                    || slot_manifest_dirty
+                                    || swapped
+                                    || path_shifted
+                                    || meta_changed
+                                    || prev_state != VolumeState::NeedsConfirmation
+                                    || prev_reason != slot.pending_confirm_reason;
+                            }
+                        }
+                        VolumeScopeAction::PruneOnly => {
+                            let blocked_by_higher = slot
+                                .pending_confirm_reason
+                                .is_some_and(|r| r != VolumeConfirmReason::FilterWidened);
+                            let clear_widened = !blocked_by_higher;
+                            let reattach_after =
+                                !blocked_by_higher && slot.kind == VolumeKind::LocalExternal;
+
+                            if slot.store.is_empty() {
+                                slot.scope_snapshot = Some(target_snapshot.clone());
+                                slot.dirty_upper_bound = false;
+                                slot.in_flight_prune_snapshot = None;
+                                if clear_widened {
+                                    slot.pending_confirm_reason = None;
+                                    slot.state = VolumeState::Online;
+                                    if slot.kind == VolumeKind::LocalExternal
+                                        && slot.stream_handle.is_none()
+                                    {
+                                        enqueue_attach_stream_for_slot(
+                                            &mut slot,
+                                            target_snapshot,
+                                            true,
+                                            effects,
+                                        );
+                                    }
+                                } else {
+                                    slot.state = VolumeState::NeedsConfirmation;
+                                    if let Some(h) = slot.stream_handle.take() {
+                                        effects.handles_to_drop.push(h);
+                                    }
+                                    slot.stream_snapshot = None;
+                                }
+                                if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+                                    inner.manifest.upsert(slot.to_record());
+                                    manifest_changed = true;
+                                }
+                            } else {
+                                slot.state = if blocked_by_higher
+                                    || prev_state == VolumeState::NeedsConfirmation
+                                {
+                                    VolumeState::NeedsConfirmation
+                                } else {
+                                    VolumeState::Online
+                                };
+                                enqueue_prune_for_slot(
+                                    &mut slot,
+                                    target_snapshot,
+                                    clear_widened,
+                                    reattach_after,
+                                    effects,
+                                );
+                            }
+                        }
+                        VolumeScopeAction::NoOp => {
+                            if slot.pending_confirm_reason
+                                == Some(VolumeConfirmReason::FilterWidened)
+                            {
+                                // 离线或网络卷放宽后未产生 dirty_upper_bound，ABA 回退直接恢复干净状态
+                                slot.pending_confirm_reason = None;
+                                slot_manifest_dirty = true;
+                            }
+                            if slot.pending_confirm_reason.is_some() {
+                                // 存在高优先级原因（JournalInvalidated / SchemaUpgrade / InitialScan）
+                                slot.state = VolumeState::NeedsConfirmation;
+                                if let Some(h) = slot.stream_handle.take() {
+                                    effects.handles_to_drop.push(h);
+                                }
+                                slot.stream_snapshot = None;
+                                if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+                                    inner.manifest.upsert(slot.to_record());
+                                    manifest_changed = manifest_changed
+                                        || slot_manifest_dirty
+                                        || swapped
+                                        || path_shifted
+                                        || meta_changed
+                                        || prev_state != VolumeState::NeedsConfirmation
+                                        || prev_reason != slot.pending_confirm_reason;
+                                }
+                            } else {
+                                slot.state = VolumeState::Online;
+                                if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+                                    inner.manifest.upsert(slot.to_record());
+                                    manifest_changed = manifest_changed
+                                        || slot_manifest_dirty
+                                        || swapped
+                                        || path_shifted
+                                        || meta_changed
+                                        || prev_state != VolumeState::Online
+                                        || prev_reason != slot.pending_confirm_reason;
+                                }
+                                if slot.kind == VolumeKind::LocalExternal
+                                    && slot.stream_handle.is_none()
+                                {
+                                    enqueue_attach_stream_for_slot(
+                                        &mut slot,
+                                        target_snapshot,
+                                        true,
+                                        effects,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // has_cache == true 且 scope_snapshot == None（旧版未认领或损坏 manifest）：
+                // 不做 ABA 自动回退；按有效原因决定是否允许挂实时流
+                let reason = slot
+                    .pending_confirm_reason
+                    .unwrap_or(VolumeConfirmReason::FilterWidened);
+                slot.pending_confirm_reason = Some(reason);
+                slot.state = VolumeState::NeedsConfirmation;
+
+                if reason.allows_live_stream() && slot.kind == VolumeKind::LocalExternal {
+                    let stream_matches = slot.stream_handle.is_some()
+                        && slot
+                            .stream_snapshot
+                            .as_ref()
+                            .is_some_and(|s| s.semantically_eq(&target_snapshot));
+                    if !stream_matches {
+                        enqueue_attach_stream_for_slot(&mut slot, target_snapshot, true, effects);
+                    }
+                } else {
+                    if let Some(h) = slot.stream_handle.take() {
+                        effects.handles_to_drop.push(h);
+                    }
+                    slot.stream_snapshot = None;
+                }
+
                 if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
                     inner.manifest.upsert(slot.to_record());
                     manifest_changed = manifest_changed
@@ -2101,21 +2834,8 @@ fn reconcile_partition_locked(
                         || swapped
                         || path_shifted
                         || meta_changed
-                        || prev_state != VolumeState::Online;
-                }
-                if slot.kind == VolumeKind::LocalExternal && slot.stream_handle.is_none() {
-                    effects.tasks.push(WorkerTask::AttachStream(AttachStreamJob {
-                        volume_id: slot.volume_id.clone(),
-                        generation: slot.generation,
-                        configured_path: slot.configured_path.clone(),
-                        active_path: PathBuf::from(&new_active_path),
-                        since_event_id: slot.last_event_id,
-                        stored_journal_uuid: slot.journal_uuid.clone(),
-                        require_journal_verify: true,
-                        config: inner.config.clone(),
-                        cancel: Arc::clone(&slot.cancel_token),
-                        store: slot.store.clone(),
-                    }));
+                        || prev_state != VolumeState::NeedsConfirmation
+                        || prev_reason != slot.pending_confirm_reason;
                 }
             }
         } else {
@@ -2133,7 +2853,9 @@ fn reconcile_partition_locked(
             slot.active_mount_root = None;
             slot.is_remounted = false;
             slot.skip_missing_rescan = false;
-            enqueue_prune_if_needed(&slot, &inner.config, current_filter_fp, effects);
+            if reconcile_offline_slot_scope(&mut slot, &cfg_snap, effects) {
+                slot_manifest_dirty = true;
+            }
             slot.entry_count = slot.store.len() as u64;
             if (prev_state != VolumeState::Offline || slot_manifest_dirty)
                 && !matches!(slot.identity, VolumeIdentity::PendingPath { .. })
@@ -2146,7 +2868,10 @@ fn reconcile_partition_locked(
             }
         }
 
-        if slot.state != prev_state || slot.active_mount_root != prev_active {
+        if slot.state != prev_state
+            || slot.active_mount_root != prev_active
+            || slot.pending_confirm_reason != prev_reason
+        {
             status_changed = true;
         }
         reconciled_slots.push(slot);
@@ -2162,75 +2887,15 @@ fn reconcile_partition_locked(
     loaded_total
 }
 
-fn enqueue_prune_if_needed(
-    slot: &VolumeSlot,
-    config: &AppConfig,
-    target_fp: u64,
-    effects: &mut TransitionEffects,
-) {
-    if !slot.dirty_filter
-        || !slot.has_cache
-        || slot.store.is_empty()
-        || slot.pruned_for_fp == Some(target_fp)
-    {
-        return;
-    }
-    effects.tasks.push(WorkerTask::Prune(PruneJob {
-        volume_id: slot.volume_id.clone(),
-        generation: slot.generation,
-        configured_path: slot.configured_path.clone(),
-        active_configured_path: slot.active_configured_path.clone(),
-        config: config.clone(),
-        target_fp,
-        cancel: Arc::clone(&slot.cancel_token),
-        store: slot.store.clone(),
-    }));
-}
-
-/// Compiles a volume-scoped filter that also rebases `exclude_paths` anchored under
-/// `configured_path` onto a drifted `active_configured_path` (e.g. `-1` mount suffix),
-/// keeping offline pruning, online scans, and incremental FSEvents streams consistent.
-fn compile_volume_filter(
-    configured_path: &str,
-    active_configured_path: &str,
-    config: &AppConfig,
-) -> (CompiledFilter, bool) {
-    let mut effective_config = config.clone();
-    if !str_paths_equal_ci(configured_path, active_configured_path) {
-        let configured_root = Path::new(configured_path);
-        for ex in config.resolve_exclude_paths() {
-            if let Ok(rel) = ex.strip_prefix(configured_root) {
-                let rebased = Path::new(active_configured_path).join(rel);
-                effective_config
-                    .index
-                    .exclude_paths
-                    .push(rebased.to_string_lossy().to_string());
-            } else if path_starts_with_ci(&ex, configured_root) {
-                // Handle case-folded configured_path vs filesystem casing on macOS.
-                let comp_count = configured_root.components().count();
-                let rel: PathBuf = ex.components().skip(comp_count).collect();
-                let rebased = Path::new(active_configured_path).join(rel);
-                effective_config
-                    .index
-                    .exclude_paths
-                    .push(rebased.to_string_lossy().to_string());
-            }
-        }
-    }
-    let active_root = Path::new(active_configured_path);
-    let filter = CompiledFilter::for_volume(&effective_config, active_root);
-    let include_hidden = effective_config.index.include_hidden;
-    (filter, include_hidden)
-}
-
-/// Immediately evicts entries from non-scanning (offline/missing) cached shards
-/// asynchronously on `worker_queue` outside caller threads and `CoordinatorInner`'s
-/// write lock so multi-million-entry retains and cache `sync_data()` flushes never
-/// stall the main thread, startup readiness, or concurrent searches, while keeping
-/// `dirty_filter = true` until replug.
+/// 在后台 `worker_queue` 执行已缓存卷分片的内存裁剪与落盘（允许作用于 Online / NeedsConfirmation / Offline / Missing，
+/// 仅跳过 Syncing），并在 `.cache` 安全刷盘后再原子推进 `scope_snapshot` 与持久化 `manifest.json`。
+#[allow(clippy::too_many_arguments)]
 fn execute_prune_job(
     inner: &Arc<RwLock<CoordinatorInner>>,
-    manifest_save_lock: &Mutex<()>,
+    manifest_save_lock: &Arc<Mutex<()>>,
+    queue: &Arc<WorkerQueue>,
+    journal_uuid_provider: &JournalUuidProvider,
+    journal_ready_wait: Duration,
     volumes_dir: &Path,
     job: PruneJob,
 ) {
@@ -2240,30 +2905,44 @@ fn execute_prune_job(
 
     let should_prune = {
         let guard = inner.read();
-        guard.current_filter_fp == job.target_fp
-            && guard.slots.iter().any(|slot| {
-                slot.volume_id == job.volume_id
-                    && slot.generation == job.generation
-                    && !slot.cancel_token.load(Ordering::SeqCst)
-                    && str_paths_equal_ci(&slot.configured_path, &job.configured_path)
-                    && str_paths_equal_ci(&slot.active_configured_path, &job.active_configured_path)
-                    && slot.dirty_filter
-                    && slot.has_cache
-                    && !slot.store.is_empty()
-                    && slot.pruned_for_fp != Some(job.target_fp)
-                    && !matches!(slot.state, VolumeState::Syncing | VolumeState::Online)
-            })
+        guard.slots.iter().any(|slot| {
+            if slot.volume_id != job.volume_id
+                || slot.generation != job.generation
+                || slot.cancel_token.load(Ordering::SeqCst)
+                || !str_paths_equal_ci(&slot.configured_path, &job.configured_path)
+                || !str_paths_equal_ci(&slot.active_configured_path, &job.active_configured_path)
+                || !slot.has_cache
+                || slot.store.is_empty()
+                || slot.state == VolumeState::Syncing
+            {
+                return false;
+            }
+            let live_target = VolumeScopeSnapshot::from_config(
+                &guard.config,
+                Path::new(&slot.configured_path),
+                Path::new(&slot.active_configured_path),
+            );
+            live_target.semantically_eq(&job.target_snapshot)
+        })
     };
     if !should_prune {
+        let mut guard = inner.write();
+        if let Some(slot) = guard.slots.iter_mut().find(|slot| {
+            slot.volume_id == job.volume_id
+                && slot.generation == job.generation
+                && slot
+                    .in_flight_prune_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.semantically_eq(&job.target_snapshot))
+        }) {
+            slot.in_flight_prune_snapshot = None;
+        }
         return;
     }
 
-    let (filter, include_hidden) = compile_volume_filter(
-        &job.configured_path,
-        &job.active_configured_path,
-        &job.config,
-    );
     let active_root = Path::new(&job.active_configured_path);
+    let filter = CompiledFilter::for_volume_snapshot(&job.target_snapshot, active_root);
+    let include_hidden = job.target_snapshot.include_hidden;
     let removed = job.store.retain_paths(|path, is_dir| {
         // If the store was concurrently rebased onto a drifted mount root while off-lock,
         // leave entries untouched rather than letting a stale prefix HardDrop the whole shard.
@@ -2276,7 +2955,7 @@ fn execute_prune_job(
 
     let cache_save = {
         let mut guard = inner.write();
-        let fp_still_current = guard.current_filter_fp == job.target_fp;
+        let cfg_snap = guard.config.clone();
         let Some(slot) = guard.slots.iter_mut().find(|slot| {
             slot.volume_id == job.volume_id
                 && slot.generation == job.generation
@@ -2284,16 +2963,31 @@ fn execute_prune_job(
                 && str_paths_equal_ci(&slot.configured_path, &job.configured_path)
                 && str_paths_equal_ci(&slot.active_configured_path, &job.active_configured_path)
                 && slot.has_cache
-                && !matches!(slot.state, VolumeState::Syncing | VolumeState::Online)
+                && slot.state != VolumeState::Syncing
         }) else {
+            if let Some(stale_slot) = guard.slots.iter_mut().find(|slot| {
+                slot.volume_id == job.volume_id
+                    && slot.generation == job.generation
+                    && slot
+                        .in_flight_prune_snapshot
+                        .as_ref()
+                        .is_some_and(|s| s.semantically_eq(&job.target_snapshot))
+            }) {
+                stale_slot.in_flight_prune_snapshot = None;
+            }
             return;
         };
+        let live_target = VolumeScopeSnapshot::from_config(
+            &cfg_snap,
+            Path::new(&slot.configured_path),
+            Path::new(&slot.active_configured_path),
+        );
+        if !live_target.semantically_eq(&job.target_snapshot) && removed == 0 {
+            // 内存索引未发生删减，直接安全放弃且不写盘
+            slot.in_flight_prune_snapshot = None;
+            return;
+        }
         slot.entry_count = slot.store.len() as u64;
-        slot.pruned_for_fp = if fp_still_current {
-            Some(job.target_fp)
-        } else {
-            None
-        };
         if removed > 0 {
             slot.dirty_cache = true;
             slot.cache_seq = slot.cache_seq.wrapping_add(1);
@@ -2304,8 +2998,7 @@ fn execute_prune_job(
         }
     };
 
-    // Flush the pruned shard cache before updating manifest.json so a crash or I/O error
-    // never persists pruned_for_fp against an unpruned cache file.
+    // 先刷盘裁剪后的分片 .cache，确认落盘后再推进 manifest 中的 scope_snapshot
     if let Some(save) = cache_save {
         save_dirty_caches_and_mark(inner, vec![save]);
     }
@@ -2313,6 +3006,9 @@ fn execute_prune_job(
     enum PruneCommitState {
         Ready {
             manifest_to_save: Option<VolumeManifest>,
+            reattach_job: Option<AttachStreamJob>,
+            follow_up_handles: Vec<VolumeStreamHandle>,
+            follow_up_tasks: Vec<WorkerTask>,
             notify: Option<Arc<dyn Fn() + Send + Sync>>,
         },
         UnlinkOrphan,
@@ -2322,38 +3018,175 @@ fn execute_prune_job(
     let _mguard = manifest_save_lock.lock();
     let commit = {
         let mut guard = inner.write();
-        let maybe_slot_rec = guard
-            .slots
-            .iter()
-            .find(|slot| {
-                slot.volume_id == job.volume_id
-                    && slot.generation == job.generation
-                    && !slot.cancel_token.load(Ordering::SeqCst)
-            })
-            .map(|slot| {
-                let rec = (!slot.dirty_cache
-                    && !matches!(slot.identity, VolumeIdentity::PendingPath { .. }))
-                .then(|| slot.to_record());
-                let pruned_current = slot.pruned_for_fp == Some(job.target_fp);
-                (rec, pruned_current)
-            });
-        if let Some((maybe_rec, _pruned_current)) = maybe_slot_rec {
-            #[cfg(test)]
-            if _pruned_current && guard.current_filter_fp == job.target_fp {
-                // Count completed prune passes even when 0 entries were removed so callers
-                // can verify repeated reconciles never re-run retain_paths.
-                guard.prune_runs += 1;
-            }
-            let manifest_to_save = maybe_rec.map(|rec| {
-                guard.manifest.upsert(rec);
-                guard.manifest.clone()
-            });
-            let notify = (removed > 0)
-                .then(|| guard.on_status_change.clone())
-                .flatten();
-            PruneCommitState::Ready {
-                manifest_to_save,
-                notify,
+        let cfg_snap = guard.config.clone();
+        let slot_idx = guard.slots.iter().position(|slot| {
+            slot.volume_id == job.volume_id
+                && slot.generation == job.generation
+                && !slot.cancel_token.load(Ordering::SeqCst)
+                && slot.state != VolumeState::Syncing
+        });
+        if let Some(idx) = slot_idx {
+            let live_target = VolumeScopeSnapshot::from_config(
+                &cfg_snap,
+                Path::new(&guard.slots[idx].configured_path),
+                Path::new(&guard.slots[idx].active_configured_path),
+            );
+            let target_matches_live = live_target.semantically_eq(&job.target_snapshot);
+            if !target_matches_live && removed == 0 {
+                guard.slots[idx].in_flight_prune_snapshot = None;
+                PruneCommitState::Aborted
+            } else {
+                let mut state_changed = false;
+                let mut reattach_job = None;
+                let mut follow_up_eff = TransitionEffects::default();
+                let can_advance_manifest = !guard.slots[idx].dirty_cache;
+                let mut should_upsert_manifest = can_advance_manifest;
+
+                if can_advance_manifest {
+                    let slot = &mut guard.slots[idx];
+                    slot.scope_snapshot = Some(job.target_snapshot.clone());
+                    slot.dirty_upper_bound = false;
+                    slot.in_flight_prune_snapshot = None;
+
+                    if target_matches_live {
+                        if job.clear_filter_widened
+                            && slot.pending_confirm_reason == Some(VolumeConfirmReason::FilterWidened)
+                        {
+                            slot.pending_confirm_reason = None;
+                            if slot.state == VolumeState::NeedsConfirmation {
+                                slot.state = VolumeState::Online;
+                                state_changed = true;
+                            }
+                        }
+                        if job.reattach_stream_after
+                            && slot.state == VolumeState::Online
+                            && slot.kind == VolumeKind::LocalExternal
+                            && slot.stream_handle.is_none()
+                        {
+                            if let Some(mr) = slot.active_mount_root.as_deref() {
+                                slot.stream_snapshot = Some(job.target_snapshot.clone());
+                                reattach_job = Some(AttachStreamJob {
+                                    volume_id: slot.volume_id.clone(),
+                                    generation: slot.generation,
+                                    mount_root: PathBuf::from(mr),
+                                    subpath: slot.subpath.clone(),
+                                    fstype: slot.fstype.clone(),
+                                    active_path: PathBuf::from(&slot.active_configured_path),
+                                    since_event_id: slot.last_event_id,
+                                    stored_journal_uuid: slot.journal_uuid.clone(),
+                                    require_journal_verify: true,
+                                    target_snapshot: job.target_snapshot.clone(),
+                                    cancel: Arc::clone(&slot.cancel_token),
+                                    store: slot.store.clone(),
+                                });
+                            }
+                        }
+                    } else {
+                        // 裁剪期间配置发生变更且内存/磁盘已按 job.target_snapshot 删减条目：
+                        // 基于已落盘的 job.target_snapshot 与最新 live_target 重新对账，杜绝改回宽配置后静默丢条目。
+                        match diff_volume_scope(&job.target_snapshot, &live_target, false) {
+                            VolumeScopeAction::FullRebuild { reason } => {
+                                let merged =
+                                    VolumeConfirmReason::merge(slot.pending_confirm_reason, reason);
+                                if slot.pending_confirm_reason != Some(merged) {
+                                    slot.pending_confirm_reason = Some(merged);
+                                    state_changed = true;
+                                }
+                                if slot.state == VolumeState::Online {
+                                    slot.state = VolumeState::NeedsConfirmation;
+                                    state_changed = true;
+                                }
+                                if slot.state == VolumeState::NeedsConfirmation
+                                    && merged.allows_live_stream()
+                                    && slot.kind == VolumeKind::LocalExternal
+                                    && slot.stream_handle.is_none()
+                                {
+                                    if let Some(mr) = slot.active_mount_root.as_deref() {
+                                        slot.stream_snapshot = Some(live_target.clone());
+                                        reattach_job = Some(AttachStreamJob {
+                                            volume_id: slot.volume_id.clone(),
+                                            generation: slot.generation,
+                                            mount_root: PathBuf::from(mr),
+                                            subpath: slot.subpath.clone(),
+                                            fstype: slot.fstype.clone(),
+                                            active_path: PathBuf::from(&slot.active_configured_path),
+                                            since_event_id: slot.last_event_id,
+                                            stored_journal_uuid: slot.journal_uuid.clone(),
+                                            require_journal_verify: true,
+                                            target_snapshot: live_target,
+                                            cancel: Arc::clone(&slot.cancel_token),
+                                            store: slot.store.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                            VolumeScopeAction::PruneOnly => {
+                                let blocked_by_higher = slot
+                                    .pending_confirm_reason
+                                    .is_some_and(|r| r != VolumeConfirmReason::FilterWidened);
+                                let clear_widened = !blocked_by_higher;
+                                let reattach_after = !blocked_by_higher
+                                    && slot.state == VolumeState::Online
+                                    && slot.kind == VolumeKind::LocalExternal;
+                                enqueue_prune_for_slot(
+                                    slot,
+                                    live_target,
+                                    clear_widened,
+                                    reattach_after,
+                                    &mut follow_up_eff,
+                                );
+                            }
+                            VolumeScopeAction::NoOp => {}
+                        }
+                    }
+                } else {
+                    let slot = &mut guard.slots[idx];
+                    slot.in_flight_prune_snapshot = None;
+                    if !target_matches_live && removed > 0 {
+                        // 即使本次 .cache 未能推进落盘，内存已被裁减，必须标记脏上界/待确认防止永久漏文件
+                        slot.dirty_upper_bound = true;
+                        if let VolumeScopeAction::FullRebuild { reason } =
+                            diff_volume_scope(&job.target_snapshot, &live_target, true)
+                        {
+                            let merged =
+                                VolumeConfirmReason::merge(slot.pending_confirm_reason, reason);
+                            if slot.pending_confirm_reason != Some(merged) {
+                                slot.pending_confirm_reason = Some(merged);
+                                state_changed = true;
+                            }
+                            if slot.state == VolumeState::Online {
+                                slot.state = VolumeState::NeedsConfirmation;
+                                state_changed = true;
+                            }
+                            should_upsert_manifest = true;
+                        }
+                    }
+                }
+
+                #[cfg(test)]
+                if can_advance_manifest {
+                    guard.prune_runs += 1;
+                }
+
+                let manifest_to_save = if should_upsert_manifest
+                    && !matches!(guard.slots[idx].identity, VolumeIdentity::PendingPath { .. })
+                {
+                    let rec = guard.slots[idx].to_record();
+                    guard.manifest.upsert(rec);
+                    Some(guard.manifest.clone())
+                } else {
+                    None
+                };
+                let notify = (removed > 0 || state_changed)
+                    .then(|| guard.on_status_change.clone())
+                    .flatten();
+                PruneCommitState::Ready {
+                    manifest_to_save,
+                    reattach_job,
+                    follow_up_handles: follow_up_eff.handles_to_drop,
+                    follow_up_tasks: follow_up_eff.tasks,
+                    notify,
+                }
             }
         } else {
             let has_slot = guard.slots.iter().any(|s| s.volume_id == job.volume_id);
@@ -2373,12 +3206,30 @@ fn execute_prune_job(
     match commit {
         PruneCommitState::Ready {
             manifest_to_save,
+            reattach_job,
+            follow_up_handles,
+            follow_up_tasks,
             notify,
         } => {
             if let Some(manifest) = manifest_to_save {
                 let _ = manifest.save_atomic(volumes_dir);
             }
             drop(_mguard);
+            drop(follow_up_handles);
+            for task in follow_up_tasks {
+                queue.enqueue(task);
+            }
+            if let Some(attach_job) = reattach_job {
+                attach_stream_for_job(
+                    inner,
+                    manifest_save_lock,
+                    queue,
+                    journal_uuid_provider,
+                    journal_ready_wait,
+                    volumes_dir,
+                    attach_job,
+                );
+            }
             if let Some(cb) = notify {
                 cb();
             }
@@ -2392,13 +3243,13 @@ fn execute_prune_job(
     }
 }
 
-/// 统一处理索引配置变更对卷协调器的影响：比对过滤器规则变更、回收已移除卷槽位与缓存文件、更新 `inner.config` 并对账分片。
+/// 统一处理索引配置变更对卷协调器的影响：按卷独立计算 `VolumeScopeSnapshot` 三分法 Diff、
+/// 识别主动新加卷、回收已移除卷槽位与缓存文件，更新 `inner.config` 并对账分片。
 fn apply_config_update(
     inner: &Arc<RwLock<CoordinatorInner>>,
     mounts: &[MountedFsInfo],
     volumes_dir: &Path,
     new_config: &AppConfig,
-    has_fda: bool,
 ) -> TransitionEffects {
     let manifest_snapshot = inner.read().manifest.clone();
     let partition = partition_index_paths(new_config, &manifest_snapshot, mounts);
@@ -2412,23 +3263,29 @@ fn apply_config_update(
 
     let mut guard = inner.write();
     let mut effects = TransitionEffects::default();
-    let new_fp = crate::volumes::volume_filter_fingerprint(new_config, has_fda);
-    let filter_changed = filter_rules_differ(&guard.config.index, &new_config.index)
-        || guard.current_filter_fp != new_fp;
-    guard.current_filter_fp = new_fp;
-
     let mut manifest_dirty = false;
-    if filter_changed {
-        for slot in &mut guard.slots {
-            slot.dirty_filter = true;
-            slot.pruned_for_fp = None;
-            slot.scan_pending_filter_update = true;
-            slot.skip_missing_rescan = false;
-        }
-        for rec in &mut guard.manifest.records {
-            rec.dirty_filter = true;
-            rec.pruned_for_fp = None;
-            manifest_dirty = true;
+
+    let prev_configured_paths: Vec<PathBuf> = guard
+        .config
+        .index
+        .index_paths
+        .iter()
+        .map(|raw| crate::config::expand_tilde(raw))
+        .collect();
+    let mut newly_added_paths: HashSet<String> = HashSet::new();
+    for target in &partition.mounted_targets {
+        let already_in_cfg = prev_configured_paths
+            .iter()
+            .any(|p| paths_equal_ci(p, &target.configured_path));
+        let already_in_slots = guard.slots.iter().any(|s| {
+            paths_equal_ci(Path::new(&s.configured_path), &target.configured_path)
+                || target
+                    .mounted
+                    .as_ref()
+                    .is_some_and(|m| m.identity.volume_id() == s.volume_id)
+        });
+        if !already_in_cfg && !already_in_slots {
+            newly_added_paths.insert(target.configured_path.to_string_lossy().to_ascii_lowercase());
         }
     }
 
@@ -2476,13 +3333,14 @@ fn apply_config_update(
         volumes_dir,
         &mut preloaded,
         false,
+        &newly_added_paths,
         &mut effects,
     );
 
     if manifest_dirty {
         effects.save_manifest = true;
     }
-    if !removed_ids.is_empty() || filter_changed {
+    if !removed_ids.is_empty() {
         effects.notify = guard.on_status_change.clone();
     }
     effects
@@ -2508,6 +3366,7 @@ fn refresh_mounts_locked(
     );
     let mut guard = inner.write();
     let mut effects = TransitionEffects::default();
+    let empty_added = HashSet::new();
     reconcile_partition_locked(
         &mut guard,
         &partition.mounted_targets,
@@ -2515,6 +3374,7 @@ fn refresh_mounts_locked(
         volumes_dir,
         &mut preloaded,
         force_retry_missing,
+        &empty_added,
         &mut effects,
     );
     effects
@@ -2525,6 +3385,8 @@ fn run_worker_loop(
     manifest_save_lock: Arc<Mutex<()>>,
     queue: Arc<WorkerQueue>,
     mount_lister: Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
+    journal_uuid_provider: JournalUuidProvider,
+    journal_ready_wait: Duration,
     volumes_dir: PathBuf,
 ) {
     while let Some((task, _running)) = queue.pop_blocking() {
@@ -2535,15 +3397,33 @@ fn run_worker_loop(
                     &manifest_save_lock,
                     &queue,
                     &mount_lister,
+                    &journal_uuid_provider,
+                    journal_ready_wait,
                     &volumes_dir,
                     job,
                 );
             }
             WorkerTask::AttachStream(job) => {
-                attach_stream_for_job(&inner, &queue, job);
+                attach_stream_for_job(
+                    &inner,
+                    &manifest_save_lock,
+                    &queue,
+                    &journal_uuid_provider,
+                    journal_ready_wait,
+                    &volumes_dir,
+                    job,
+                );
             }
             WorkerTask::Prune(job) => {
-                execute_prune_job(&inner, &manifest_save_lock, &volumes_dir, job);
+                execute_prune_job(
+                    &inner,
+                    &manifest_save_lock,
+                    &queue,
+                    &journal_uuid_provider,
+                    journal_ready_wait,
+                    &volumes_dir,
+                    job,
+                );
             }
         }
     }
@@ -2674,11 +3554,14 @@ fn commit_scan_phase3(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_scan_job(
     inner: &Arc<RwLock<CoordinatorInner>>,
-    manifest_save_lock: &Mutex<()>,
+    manifest_save_lock: &Arc<Mutex<()>>,
     queue: &Arc<WorkerQueue>,
     mount_lister: &Arc<dyn Fn() -> Vec<MountedFsInfo> + Send + Sync>,
+    journal_uuid_provider: &JournalUuidProvider,
+    journal_ready_wait: Duration,
     volumes_dir: &Path,
     job: ScanJob,
 ) {
@@ -2692,13 +3575,17 @@ fn execute_scan_job(
         0
     };
     let journal_uuid = if job.kind == VolumeKind::LocalExternal {
-        fsevents::journal_uuid_for_path(&job.root)
+        let wait = if fstype_supports_persistent_fsevents_journal(&job.fstype) {
+            journal_ready_wait
+        } else {
+            journal_ready_wait.min(Duration::from_millis(500))
+        };
+        poll_live_journal_uuid(journal_uuid_provider, &job.root, &job.cancel, wait)
     } else {
         None
     };
 
-    let (filter, _) =
-        compile_volume_filter(&job.configured_path, &job.root.to_string_lossy(), &job.config);
+    let filter = CompiledFilter::for_volume_snapshot(&job.target_snapshot, &job.root);
     let mount_root_check = job.root.clone();
     let lister = Arc::clone(mount_lister);
     let is_mounted = move || {
@@ -2710,9 +3597,23 @@ fn execute_scan_job(
     };
 
     let scan_started = Instant::now();
-    let mut progress = |_count: u64| {};
-    // 本地外置高速卷启用多线程 DFS 并行扫描；网络共享卷保持单线程批量读取，规避 SMB 并发锁竞争
-    let scan_result = if job.kind == VolumeKind::LocalExternal {
+    let notify_cb = inner.read().on_status_change.clone();
+    let scanned_counter = Arc::clone(&job.scanned_count);
+    let mut last_notify = Instant::now()
+        .checked_sub(SCAN_PROGRESS_NOTIFY_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut progress = |count: u64| {
+        scanned_counter.store(count, Ordering::Relaxed);
+        if last_notify.elapsed() >= SCAN_PROGRESS_NOTIFY_INTERVAL {
+            last_notify = Instant::now();
+            if let Some(ref cb) = notify_cb {
+                cb();
+            }
+        }
+    };
+
+    // 非旋转本地外置卷（SSD）启用多线程并行扫描；机械硬盘（HDD）、用户指定串行卷与网络卷采用单线程批量读取
+    let scan_result = if job.kind == VolumeKind::LocalExternal && !job.use_serial_scan {
         scanner::scan_volume_compact_atomic_parallel(
             &job.root,
             &filter,
@@ -2741,7 +3642,6 @@ fn execute_scan_job(
 
             let commit = {
                 let mut guard = inner.write();
-                let current_filter_fp = guard.current_filter_fp;
                 let Some(slot) = guard.slots.iter_mut().find(|s| {
                     s.volume_id == job.volume_id
                         && s.generation == job.generation
@@ -2751,11 +3651,14 @@ fn execute_scan_job(
                 };
 
                 let stale_handle = slot.stream_handle.take();
+                slot.stream_snapshot = None;
+                slot.in_flight_scan_snapshot = None;
+                slot.in_flight_prune_snapshot = None;
+                slot.scanned_count.store(0, Ordering::Relaxed);
                 slot.store.replace_compact(compact);
-                slot.dirty_filter = current_filter_fp != job.filter_fingerprint;
-                slot.filter_fingerprint = Some(job.filter_fingerprint);
-                slot.pruned_for_fp = None;
-                slot.scan_pending_filter_update = false;
+                slot.scope_snapshot = Some(job.target_snapshot.clone());
+                slot.dirty_upper_bound = false;
+                slot.pending_confirm_reason = None;
                 // Retain dirty_cache = true and leave manifest untouched until .cache is saved on disk.
                 slot.dirty_cache = true;
                 slot.cache_seq = slot.cache_seq.wrapping_add(1);
@@ -2789,16 +3692,22 @@ fn execute_scan_job(
             if job.kind == VolumeKind::LocalExternal && !job.cancel.load(Ordering::SeqCst) {
                 attach_stream_for_job(
                     inner,
+                    manifest_save_lock,
                     queue,
+                    journal_uuid_provider,
+                    journal_ready_wait,
+                    volumes_dir,
                     AttachStreamJob {
                         volume_id: job.volume_id,
                         generation: job.generation,
-                        configured_path: job.configured_path,
+                        mount_root: job.mount_root,
+                        subpath: job.subpath,
+                        fstype: job.fstype,
                         active_path: job.root,
                         since_event_id: checkpoint.map(|c| c.event_id),
                         stored_journal_uuid: journal_uuid,
                         require_journal_verify: false,
-                        config: job.config,
+                        target_snapshot: job.target_snapshot,
                         cancel: job.cancel,
                         store,
                     },
@@ -2816,7 +3725,6 @@ fn execute_scan_job(
             let (dropped_handles, pending_save, pending_prune, notify) = {
                 let mut guard = inner.write();
                 let cfg_snap = guard.config.clone();
-                let current_fp = guard.current_filter_fp;
                 let Some(slot) = guard.slots.iter_mut().find(|s| {
                     s.volume_id == job.volume_id
                         && s.generation == job.generation
@@ -2833,11 +3741,10 @@ fn execute_scan_job(
                 // 扫描期间遇到临时断连时设置 30 秒退避重试，避免网络恢复后永远停留在 Offline，也避免死挂载高频打扰
                 slot.next_reconnect_retry = Some(Instant::now() + Duration::from_secs(30));
                 slot.entry_count = slot.store.len() as u64;
-                // Mounted rescan skipped pre-pruning; now that the slot fell back to Offline with
-                // its prior cached store still searchable, prune any newly excluded entries.
-                enqueue_prune_if_needed(slot, &cfg_snap, current_fp, &mut eff);
-                let save = (slot.dirty_cache && !matches!(slot.identity, VolumeIdentity::PendingPath { .. }))
-                    .then(|| slot.cache_save(volumes_dir));
+                reconcile_offline_slot_scope(slot, &cfg_snap, &mut eff);
+                let save = (slot.dirty_cache
+                    && !matches!(slot.identity, VolumeIdentity::PendingPath { .. }))
+                .then(|| slot.cache_save(volumes_dir));
                 let rec = (!matches!(slot.identity, VolumeIdentity::PendingPath { .. }))
                     .then(|| slot.to_record());
                 if let Some(rec) = rec {
@@ -2869,7 +3776,6 @@ fn execute_scan_job(
             let (stale_handles, pending_prune, notify) = {
                 let mut guard = inner.write();
                 let cfg_snap = guard.config.clone();
-                let current_fp = guard.current_filter_fp;
                 let Some(slot) = guard.slots.iter_mut().find(|s| {
                     s.volume_id == job.volume_id
                         && s.generation == job.generation
@@ -2881,9 +3787,12 @@ fn execute_scan_job(
                 if let Some(h) = slot.stream_handle.take() {
                     eff.handles_to_drop.push(h);
                 }
+                slot.in_flight_scan_snapshot = None;
+                slot.stream_snapshot = None;
+                slot.scanned_count.store(0, Ordering::Relaxed);
                 slot.state = VolumeState::Missing;
                 slot.skip_missing_rescan = true;
-                enqueue_prune_if_needed(slot, &cfg_snap, current_fp, &mut eff);
+                reconcile_offline_slot_scope(slot, &cfg_snap, &mut eff);
                 (eff.handles_to_drop, eff.tasks, guard.on_status_change.clone())
             };
             drop(stale_handles);
@@ -2897,173 +3806,509 @@ fn execute_scan_job(
     }
 }
 
+fn open_volume_stream(
+    mount_root: &Path,
+    subpath: &str,
+    active_path: &Path,
+    since: u64,
+    tx: mpsc::Sender<Vec<fsevents::Event>>,
+) -> Option<fsevents::Stream> {
+    match fsevents::watch_device(mount_root, subpath, since, tx.clone()) {
+        Some(stream) => Some(stream),
+        None => fsevents::watch(&[active_path.to_path_buf()], since, tx),
+    }
+}
+
+enum StreamStartPlan {
+    Start {
+        since: u64,
+        new_journal_uuid: Option<String>,
+        persist_manifest: bool,
+    },
+    KeepWithoutStream {
+        new_journal_uuid: Option<String>,
+        persist_manifest: bool,
+    },
+    InvalidateJournal,
+}
+
+fn plan_stream_start(
+    persistent: bool,
+    require_journal_verify: bool,
+    stored_journal_uuid: Option<&str>,
+    live_uuid: Option<&str>,
+    since_event_id: Option<u64>,
+    now_id: u64,
+) -> StreamStartPlan {
+    if !require_journal_verify {
+        let since = since_event_id
+            .filter(|&id| id > 0 && id <= now_id)
+            .unwrap_or(fsevents::SINCE_NOW);
+        if live_uuid.is_some() || !persistent {
+            return StreamStartPlan::Start {
+                since,
+                new_journal_uuid: live_uuid.map(str::to_owned),
+                persist_manifest: false,
+            };
+        }
+        return StreamStartPlan::KeepWithoutStream {
+            new_journal_uuid: None,
+            persist_manifest: false,
+        };
+    }
+
+    // require_journal_verify == true（冷/热重启、拔插重挂、在线裁剪续接、FilterWidened 实时流）：
+    // 同挂载会话内（UUID 匹配且检查点有效）：APFS/HFS+ 与 ExFAT 均从 last_event_id 回放历史并续接实时流
+    if live_uuid.is_some() && stored_journal_uuid == live_uuid {
+        if let Some(id) = since_event_id.filter(|&id| id > 0 && id <= now_id) {
+            return StreamStartPlan::Start {
+                since: id,
+                new_journal_uuid: live_uuid.map(str::to_owned),
+                persist_manifest: false,
+            };
+        }
+        if persistent {
+            return StreamStartPlan::InvalidateJournal;
+        }
+        return StreamStartPlan::Start {
+            since: fsevents::SINCE_NOW,
+            new_journal_uuid: live_uuid.map(str::to_owned),
+            persist_manifest: false,
+        };
+    }
+
+    // 跨重启/拔插导致 UUID 轮换或缺失：
+    // APFS/HFS+ 持久日志卷明确失效 -> NeedsConfirmation(JournalInvalidated)；
+    // ExFAT/FAT32/NTFS 等非持久日志卷静默更新 UUID、复用旧缓存并从 SINCE_NOW 接实时流。
+    if persistent {
+        StreamStartPlan::InvalidateJournal
+    } else {
+        StreamStartPlan::Start {
+            since: fsevents::SINCE_NOW,
+            new_journal_uuid: live_uuid.map(str::to_owned),
+            persist_manifest: stored_journal_uuid != live_uuid,
+        }
+    }
+}
+
+/// macOS 挂载卷时，`NSWorkspace.didMountNotification` 常比 `fseventsd` 加载 `.fseventsd/fseventsd-uuid`
+/// 早数十至数百毫秒（大容量机械盘唤醒时可达 1~2 秒）；仅在首次返回 `None` 时按短退避重试，
+/// 一旦拿到 UUID 或取消标记置位立即返回，彻底消除插盘瞬间的 `JournalInvalidated` 误判。
+fn poll_live_journal_uuid(
+    provider: &JournalUuidProvider,
+    path: &Path,
+    cancel: &AtomicBool,
+    max_wait: Duration,
+) -> Option<String> {
+    if let Some(uuid) = (provider)(path) {
+        return Some(uuid);
+    }
+    if max_wait.is_zero() {
+        return None;
+    }
+    let deadline = Instant::now() + max_wait;
+    let mut step = Duration::from_millis(100);
+    while Instant::now() < deadline {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(step.min(remaining));
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(uuid) = (provider)(path) {
+            return Some(uuid);
+        }
+        step = (step * 2).min(Duration::from_millis(500));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attach_stream_for_job(
     inner: &Arc<RwLock<CoordinatorInner>>,
-    queue: &Arc<WorkerQueue>,
+    manifest_save_lock: &Arc<Mutex<()>>,
+    _queue: &Arc<WorkerQueue>,
+    journal_uuid_provider: &JournalUuidProvider,
+    journal_ready_wait: Duration,
+    volumes_dir: &Path,
     job: AttachStreamJob,
 ) {
     if job.cancel.load(Ordering::SeqCst) {
         return;
     }
-    let Some(live_uuid) = fsevents::journal_uuid_for_path(&job.active_path) else {
-        if job.require_journal_verify {
-            enqueue_rescan_from_stream(inner, queue, &job.volume_id, job.generation);
-        }
-        return;
-    };
 
-    // When attaching to a pre-existing cache, prove the FSEvents journal UUID matches
-    // and our checkpoint event ID is valid; otherwise fall back to a clean rescan.
-    if let Some(ref saved_uuid) = job.stored_journal_uuid {
-        if *saved_uuid != live_uuid {
-            enqueue_rescan_from_stream(inner, queue, &job.volume_id, job.generation);
-            return;
-        }
-    } else if job.require_journal_verify {
-        enqueue_rescan_from_stream(inner, queue, &job.volume_id, job.generation);
+    let persistent = fstype_supports_persistent_fsevents_journal(&job.fstype);
+    let wait = if persistent || job.stored_journal_uuid.is_some() {
+        journal_ready_wait
+    } else {
+        Duration::ZERO
+    };
+    let live_uuid = poll_live_journal_uuid(journal_uuid_provider, &job.active_path, &job.cancel, wait);
+    if job.cancel.load(Ordering::SeqCst) {
         return;
     }
-
     let now_id = fsevents::current_event_id();
-    let since = match (
-        job.stored_journal_uuid.as_ref(),
-        job.since_event_id,
+
+    let (since, new_journal_uuid, mut persist_manifest) = match plan_stream_start(
+        persistent,
         job.require_journal_verify,
+        job.stored_journal_uuid.as_deref(),
+        live_uuid.as_deref(),
+        job.since_event_id,
+        now_id,
     ) {
-        (Some(_), Some(id), _) if id > 0 && id <= now_id => id,
-        (Some(_), Some(_), _) => {
-            enqueue_rescan_from_stream(inner, queue, &job.volume_id, job.generation);
+        StreamStartPlan::Start {
+            since,
+            new_journal_uuid,
+            persist_manifest,
+        } => (since, new_journal_uuid, persist_manifest),
+        StreamStartPlan::KeepWithoutStream {
+            new_journal_uuid,
+            persist_manifest,
+        } => {
+            update_slot_journal_metadata_only(
+                inner,
+                manifest_save_lock,
+                volumes_dir,
+                &job.volume_id,
+                job.generation,
+                new_journal_uuid,
+                persist_manifest,
+            );
             return;
         }
-        (_, _, true) => {
-            enqueue_rescan_from_stream(inner, queue, &job.volume_id, job.generation);
+        StreamStartPlan::InvalidateJournal => {
+            mark_journal_invalidated_from_stream(
+                inner,
+                manifest_save_lock,
+                volumes_dir,
+                &job.volume_id,
+                job.generation,
+            );
             return;
         }
-        (_, Some(id), false) if id > 0 && id <= now_id => id,
-        (_, _, false) => now_id,
     };
 
     let (tx, rx) = mpsc::channel();
-    let Some(stream) = fsevents::watch(&[job.active_path.clone()], since, tx) else {
-        if job.require_journal_verify {
-            enqueue_rescan_from_stream(inner, queue, &job.volume_id, job.generation);
+    let stream_opt = open_volume_stream(&job.mount_root, &job.subpath, &job.active_path, since, tx);
+    let Some(stream) = stream_opt else {
+        if persistent && job.require_journal_verify {
+            mark_journal_invalidated_from_stream(
+                inner,
+                manifest_save_lock,
+                volumes_dir,
+                &job.volume_id,
+                job.generation,
+            );
+        } else {
+            update_slot_journal_metadata_only(
+                inner,
+                manifest_save_lock,
+                volumes_dir,
+                &job.volume_id,
+                job.generation,
+                new_journal_uuid,
+                persist_manifest,
+            );
         }
         return;
     };
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::clone(&stop);
+    let stream_slot = Arc::new(Mutex::new(Some(stream)));
+    let stream_slot_loop = Arc::clone(&stream_slot);
     let weak_inner = Arc::downgrade(inner);
-    let queue_clone = Arc::clone(queue);
+    let manifest_lock_loop = Arc::clone(manifest_save_lock);
+    let volumes_dir_loop = volumes_dir.to_path_buf();
     let volume_id = job.volume_id.clone();
     let generation = job.generation;
     let active_root = job.active_path.clone();
-    let (filter, include_hidden) = compile_volume_filter(
-        &job.configured_path,
-        &job.active_path.to_string_lossy(),
-        &job.config,
-    );
+    let reopen_mount_root = job.mount_root.clone();
+    let reopen_subpath = job.subpath.clone();
+    let reopen_active_path = job.active_path.clone();
+    let filter = CompiledFilter::for_volume_snapshot(&job.target_snapshot, &job.active_path);
+    let include_hidden = job.target_snapshot.include_hidden;
     let store = job.store.clone();
     let notify = inner.read().on_status_change.clone();
+    let initial_seen = if since == fsevents::SINCE_NOW {
+        now_id
+    } else {
+        since
+    };
 
+    let loop_mount_root = reopen_mount_root.clone();
     let thread = std::thread::Builder::new()
         .name(format!("vol-fs-{}", &volume_id[..volume_id.len().min(8)]))
         .spawn(move || {
             run_volume_stream_loop(
                 rx,
+                stream_slot_loop,
                 stop_flag,
                 weak_inner,
-                queue_clone,
+                manifest_lock_loop,
+                volumes_dir_loop,
                 volume_id,
                 generation,
+                loop_mount_root,
                 active_root,
                 store,
                 filter,
                 include_hidden,
-                since,
+                initial_seen,
+                VOLUME_GAP_QUIET,
                 notify,
+                move |replay_since| {
+                    let (new_tx, new_rx) = mpsc::channel();
+                    let new_stream = open_volume_stream(
+                        &reopen_mount_root,
+                        &reopen_subpath,
+                        &reopen_active_path,
+                        replay_since,
+                        new_tx,
+                    )?;
+                    Some((new_stream, new_rx))
+                },
             );
         })
         .ok();
 
     let handle = VolumeStreamHandle {
-        stream: Mutex::new(Some(stream)),
+        stream: stream_slot,
         stop,
         thread,
     };
 
-    let stale = {
+    let (stale, should_save_manifest) = {
         let mut guard = inner.write();
-        if let Some(slot) = guard.slots.iter_mut().find(|s| {
+        if let Some(idx) = guard.slots.iter().position(|s| {
             s.volume_id == job.volume_id
                 && s.generation == job.generation
-                && s.state == VolumeState::Online
+                && s.live_stream_allowed()
                 && !s.cancel_token.load(Ordering::SeqCst)
         }) {
-            slot.journal_uuid = Some(live_uuid);
-            slot.stream_handle.replace(handle)
+            let slot = &mut guard.slots[idx];
+            if slot.journal_uuid != new_journal_uuid {
+                slot.journal_uuid = new_journal_uuid;
+                persist_manifest = true;
+            }
+            slot.stream_snapshot = Some(job.target_snapshot);
+            if slot.state == VolumeState::NeedsConfirmation && !slot.dirty_upper_bound {
+                slot.dirty_upper_bound = true;
+                persist_manifest = true;
+            }
+            let stale_handle = slot.stream_handle.replace(handle);
+            let save = if persist_manifest
+                && !matches!(slot.identity, VolumeIdentity::PendingPath { .. })
+            {
+                let rec = slot.to_record();
+                guard.manifest.upsert(rec);
+                true
+            } else {
+                false
+            };
+            (stale_handle, save)
         } else {
-            Some(handle)
+            (Some(handle), false)
         }
     };
     drop(stale);
+    if should_save_manifest {
+        save_latest_manifest_locked(inner, manifest_save_lock, volumes_dir);
+    }
+}
+
+fn update_slot_journal_metadata_only(
+    inner: &Arc<RwLock<CoordinatorInner>>,
+    manifest_save_lock: &Mutex<()>,
+    volumes_dir: &Path,
+    volume_id: &str,
+    generation: u64,
+    new_journal_uuid: Option<String>,
+    persist_manifest: bool,
+) {
+    let should_save = {
+        let mut guard = inner.write();
+        if let Some(idx) = guard.slots.iter().position(|s| {
+            s.volume_id == volume_id
+                && s.generation == generation
+                && s.live_stream_allowed()
+                && !s.cancel_token.load(Ordering::SeqCst)
+        }) {
+            let changed = guard.slots[idx].journal_uuid != new_journal_uuid;
+            guard.slots[idx].journal_uuid = new_journal_uuid;
+            guard.slots[idx].stream_snapshot = None;
+            if (persist_manifest || changed)
+                && !matches!(guard.slots[idx].identity, VolumeIdentity::PendingPath { .. })
+            {
+                let rec = guard.slots[idx].to_record();
+                guard.manifest.upsert(rec);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if should_save {
+        save_latest_manifest_locked(inner, manifest_save_lock, volumes_dir);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_volume_stream_loop(
-    rx: mpsc::Receiver<Vec<fsevents::Event>>,
+fn run_volume_stream_loop<R>(
+    mut rx: mpsc::Receiver<Vec<fsevents::Event>>,
+    stream_slot: Arc<Mutex<Option<fsevents::Stream>>>,
     stop: Arc<AtomicBool>,
     weak_inner: Weak<RwLock<CoordinatorInner>>,
-    queue: Arc<WorkerQueue>,
+    manifest_save_lock: Arc<Mutex<()>>,
+    volumes_dir: PathBuf,
     volume_id: String,
     generation: u64,
+    mount_root: PathBuf,
     active_root: PathBuf,
     store: IndexStore,
     filter: CompiledFilter,
     include_hidden: bool,
     initial_seen: u64,
+    gap_quiet: Duration,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
-) {
+    mut reopen_stream: R,
+) where
+    R: FnMut(u64) -> Option<(fsevents::Stream, mpsc::Receiver<Vec<fsevents::Event>>)>,
+{
     let mut pending: HashMap<PathBuf, Change> = HashMap::new();
     let mut pending_events = 0usize;
     let mut first_pending: Option<Instant> = None;
+    let mut applied_id = initial_seen;
     let mut seen = initial_seen;
-    let mut need_rescan = false;
+    let mut gap_at: Option<Instant> = None;
+    let mut gap_replays: u8 = 0;
+    let mut journal_invalidated = false;
 
     while !stop.load(Ordering::Acquire) {
-        let timeout = match first_pending {
-            Some(first) => Duration::from_millis(DEFAULT_DEBOUNCE_MS)
-                .min(MAX_DEBOUNCE.saturating_sub(first.elapsed())),
-            None => Duration::from_millis(DEFAULT_DEBOUNCE_MS),
+        if let Some(drop_instant) = gap_at {
+            if drop_instant.elapsed() >= gap_quiet {
+                // 静默窗口结束，从已安全应用的 applied_id 重开设备级流补齐历史事件
+                if let Some((new_stream, new_rx)) = reopen_stream(applied_id) {
+                    let old_stream = {
+                        let mut slot_guard = stream_slot.lock();
+                        if stop.load(Ordering::Acquire) {
+                            drop(new_stream);
+                            break;
+                        }
+                        slot_guard.replace(new_stream)
+                    };
+                    drop(old_stream);
+                    rx = new_rx;
+                    gap_replays = gap_replays.saturating_add(1);
+                    gap_at = None;
+                    pending.clear();
+                    pending_events = 0;
+                    first_pending = None;
+                    seen = applied_id;
+                    continue;
+                } else {
+                    journal_invalidated = true;
+                    break;
+                }
+            }
+        }
+
+        let timeout = if let Some(drop_instant) = gap_at {
+            gap_quiet
+                .saturating_sub(drop_instant.elapsed())
+                .max(Duration::from_millis(5))
+        } else {
+            match first_pending {
+                Some(first) => Duration::from_millis(DEFAULT_DEBOUNCE_MS)
+                    .min(MAX_DEBOUNCE.saturating_sub(first.elapsed())),
+                None => Duration::from_millis(DEFAULT_DEBOUNCE_MS),
+            }
         };
+
         let quiet = match rx.recv_timeout(timeout) {
             Ok(batch) => {
                 for ev in batch {
                     if ev.flags & fsevents::HISTORY_DONE != 0 {
+                        if gap_at.is_none() {
+                            gap_replays = 0;
+                        }
+                        continue;
+                    }
+                    if ev.flags & (fsevents::IDS_WRAPPED | fsevents::KERNEL_DROPPED) != 0 {
+                        journal_invalidated = true;
+                        break;
+                    }
+                    if ev.flags & fsevents::USER_DROPPED != 0 {
+                        if gap_replays >= VOLUME_GAP_REPLAYS {
+                            journal_invalidated = true;
+                            break;
+                        }
+                        // 纯 USER_DROPPED：冻结 applied_id，丢弃未刷盘暂存事件，待静默 2s 后历史重放
+                        gap_at = Some(Instant::now());
+                        pending.clear();
+                        pending_events = 0;
+                        first_pending = None;
+                        continue;
+                    }
+                    if gap_at.is_some() {
+                        // 等待 USER_DROPPED 静默重放期间不推进 seen/applied_id
                         continue;
                     }
                     seen = seen.max(ev.id);
-                    if ev.flags
-                        & (fsevents::IDS_WRAPPED | fsevents::KERNEL_DROPPED | fsevents::USER_DROPPED)
-                        != 0
-                    {
-                        need_rescan = true;
-                        break;
-                    }
-                    if ev.flags & (fsevents::MUST_SCAN_SUBDIRS | fsevents::MOUNT_CHANGED) != 0 {
+
+                    // 仅检查 MUST_SCAN_SUBDIRS；不再监听 MOUNT_CHANGED（挂载生命周期由 NSWorkspace 与协调器管理）
+                    if ev.flags & fsevents::MUST_SCAN_SUBDIRS != 0 {
                         if path_starts_with_ci(&active_root, &ev.path) {
-                            need_rescan = true;
+                            // 根级或根祖先 MUST_SCAN_SUBDIRS 表示本会话改动已明确丢失 -> 受控确认
+                            journal_invalidated = true;
                             break;
                         }
                         if path_starts_with_ci(&ev.path, &active_root)
                             && !filter.is_excluded(&ev.path)
                             && (include_hidden || !is_under_hidden_dir(&active_root, &ev.path))
                         {
-                            // Directory subtree must be reconciled from disk cleanly.
+                            // 监听根内部局部子目录：按常规子树回扫处理
                             let entry = pending.entry(ev.path).or_default();
                             entry.flags |= fsevents::ITEM_CREATED;
                             pending_events += 1;
                             first_pending.get_or_insert_with(Instant::now);
+                        }
+                        continue;
+                    }
+                    if ev.flags & fsevents::MOUNT_CHANGED != 0 {
+                        continue;
+                    }
+                    // 根路径普通事件纵深防御：
+                    // 1. 整卷挂载点根（active_root == mount_root）始终跳过：既防挂载幽灵事件触发同步全扫，也防卸载时误清离线缓存；
+                    // 2. 卷内子路径根（active_root != mount_root）若在卷仍挂载时被删移，则仅清理该子树；
+                    //    若被原位替换（ROOT_CHANGED）则标为日志失效交由用户确认。
+                    if paths_equal_ci(&ev.path, &active_root) {
+                        let is_subpath_root = !paths_equal_ci(&active_root, &mount_root);
+                        if is_subpath_root
+                            && ev.flags
+                                & (fsevents::ITEM_REMOVED
+                                    | fsevents::ITEM_RENAMED
+                                    | fsevents::ROOT_CHANGED)
+                                != 0
+                            && mount_root.exists()
+                        {
+                            if std::fs::symlink_metadata(&active_root).is_err() {
+                                let entry = pending.entry(ev.path).or_default();
+                                entry.flags |= fsevents::ITEM_REMOVED;
+                                pending_events += 1;
+                                first_pending.get_or_insert_with(Instant::now);
+                            } else if ev.flags & fsevents::ROOT_CHANGED != 0 {
+                                journal_invalidated = true;
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -3087,8 +4332,11 @@ fn run_volume_stream_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
-        if need_rescan || stop.load(Ordering::Acquire) {
+        if journal_invalidated || stop.load(Ordering::Acquire) {
             break;
+        }
+        if gap_at.is_some() {
+            continue;
         }
 
         let overdue = first_pending.is_some_and(|t| t.elapsed() >= MAX_DEBOUNCE);
@@ -3099,14 +4347,15 @@ fn run_volume_stream_loop(
             let (batch, renames) = resolve_changes(drained, &store);
             match apply_batch(batch, renames, &store, &filter, include_hidden) {
                 Ok((added, removed)) => {
+                    applied_id = seen;
                     if let Some(arc) = weak_inner.upgrade() {
                         let mut guard = arc.write();
                         if let Some(slot) = guard.slots.iter_mut().find(|s| {
                             s.volume_id == volume_id
                                 && s.generation == generation
-                                && s.state == VolumeState::Online
+                                && s.live_stream_allowed()
                         }) {
-                            slot.last_event_id = Some(seen);
+                            slot.last_event_id = Some(applied_id);
                             slot.entry_count = slot.store.len() as u64;
                             slot.dirty_cache = true;
                             slot.cache_seq = slot.cache_seq.wrapping_add(1);
@@ -3114,6 +4363,9 @@ fn run_volume_stream_loop(
                                 .cache_persistence
                                 .applied_events
                                 .saturating_add(applied_events);
+                            if slot.state == VolumeState::NeedsConfirmation {
+                                slot.dirty_upper_bound = true;
+                            }
                         }
                     }
                     if added + removed > 0 {
@@ -3123,58 +4375,72 @@ fn run_volume_stream_loop(
                     }
                 }
                 Err(_) => {
-                    need_rescan = true;
+                    journal_invalidated = true;
                     break;
                 }
             }
         }
     }
 
-    if need_rescan && !stop.load(Ordering::Acquire) {
+    if journal_invalidated && !stop.load(Ordering::Acquire) {
         if let Some(arc) = weak_inner.upgrade() {
-            enqueue_rescan_from_stream(&arc, &queue, &volume_id, generation);
+            mark_journal_invalidated_from_stream(
+                &arc,
+                &manifest_save_lock,
+                &volumes_dir,
+                &volume_id,
+                generation,
+            );
         }
     }
 }
 
-fn enqueue_rescan_from_stream(
+/// 当持久日志卷 UUID 失效或运行期发生不可恢复丢事件（根级 MUST_SCAN_SUBDIRS / KERNEL_DROPPED /
+/// IDS_WRAPPED / 连续 3 次 USER_DROPPED 重放失败）时，停止实时流、保留旧缓存只读可搜，
+/// 并按优先级升格为 `NeedsConfirmation(JournalInvalidated)`，绝不静默排入 `ScanJob`。
+fn mark_journal_invalidated_from_stream(
     inner: &Arc<RwLock<CoordinatorInner>>,
-    queue: &Arc<WorkerQueue>,
+    manifest_save_lock: &Mutex<()>,
+    volumes_dir: &Path,
     volume_id: &str,
     generation: u64,
 ) {
-    let mut guard = inner.write();
-    let cfg = guard.config.clone();
-    let filter_fp = guard.current_filter_fp;
-    let Some(slot) = guard.slots.iter_mut().find(|s| {
-        s.volume_id == volume_id
-            && s.generation == generation
-            && s.state == VolumeState::Online
-            && !s.cancel_token.load(Ordering::SeqCst)
-    }) else {
-        return;
+    let (stale_handle, should_save_manifest, notify) = {
+        let mut guard = inner.write();
+        let Some(idx) = guard.slots.iter().position(|s| {
+            s.volume_id == volume_id
+                && s.generation == generation
+                && matches!(s.state, VolumeState::Online | VolumeState::NeedsConfirmation)
+                && !s.cancel_token.load(Ordering::SeqCst)
+        }) else {
+            return;
+        };
+        let slot = &mut guard.slots[idx];
+        slot.cancel_token.store(true, Ordering::SeqCst);
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.cancel_token = Arc::new(AtomicBool::new(false));
+        slot.stream_snapshot = None;
+        slot.in_flight_prune_snapshot = None;
+        let stale = slot.stream_handle.take();
+        slot.pending_confirm_reason = Some(VolumeConfirmReason::merge(
+            slot.pending_confirm_reason,
+            VolumeConfirmReason::JournalInvalidated,
+        ));
+        slot.state = VolumeState::NeedsConfirmation;
+        let save = if !matches!(slot.identity, VolumeIdentity::PendingPath { .. }) {
+            let rec = slot.to_record();
+            guard.manifest.upsert(rec);
+            true
+        } else {
+            false
+        };
+        (stale, save, guard.on_status_change.clone())
     };
-    // Do not drop slot.stream_handle here because this may execute on vol-fs-*;
-    // exiting the loop finishes the thread cleanly and execute_scan_job drops the handle later.
-    slot.cancel_token.store(true, Ordering::SeqCst);
-    slot.generation = slot.generation.wrapping_add(1);
-    slot.cancel_token = Arc::new(AtomicBool::new(false));
-    slot.state = VolumeState::Syncing;
-    slot.skip_missing_rescan = false;
-    slot.last_rescan_triggered = Some(Instant::now());
-    let job = ScanJob {
-        volume_id: slot.volume_id.clone(),
-        generation: slot.generation,
-        kind: slot.kind,
-        configured_path: slot.configured_path.clone(),
-        root: PathBuf::from(&slot.active_configured_path),
-        config: cfg,
-        filter_fingerprint: filter_fp,
-        cancel: Arc::clone(&slot.cancel_token),
-    };
-    let notify = guard.on_status_change.clone();
-    drop(guard);
-    queue.enqueue(WorkerTask::Scan(job));
+    // VolumeStreamHandle::drop 内已规避当前线程 self-join，可安全在 vol-fs-* 线程上释放流句柄
+    drop(stale_handle);
+    if should_save_manifest {
+        save_latest_manifest_locked(inner, manifest_save_lock, volumes_dir);
+    }
     if let Some(cb) = notify {
         cb();
     }
@@ -3188,10 +4454,13 @@ fn is_under_hidden_dir(root: &Path, path: &Path) -> bool {
     })
 }
 
-/// 判断在线网络卷是否到达周期重扫时机：在用户配置间隔基础上引入上次扫描耗时 5 倍的自适应冷却（上限 6 小时），
-/// 防止大容量慢速 NAS 扫描完成后短时间内连续重扫占满网络与 CPU，也防止偶发慢扫长期压制后续自动同步。
+/// 判断在线网络卷是否到达周期重扫时机：仅允许干净 `Online` 且无待确认原因的网络卷触发，
+/// 在用户配置间隔基础上引入上次扫描耗时 5 倍的自适应冷却（上限 6 小时）。
 fn network_slot_rescan_due(slot: &VolumeSlot, base_interval: Duration, now_unix: u64) -> bool {
-    if slot.kind != VolumeKind::Network || slot.state != VolumeState::Online {
+    if slot.kind != VolumeKind::Network
+        || slot.state != VolumeState::Online
+        || slot.pending_confirm_reason.is_some()
+    {
         return false;
     }
     let adaptive_cap = base_interval.max(Duration::from_secs(6 * 3600));
@@ -3221,9 +4490,7 @@ fn persist_dirty_caches(
     let any_due = {
         let guard = inner.read();
         guard.slots.iter().any(|slot| {
-            slot.dirty_cache
-                && slot.state == VolumeState::Online
-                && slot.cache_persistence.is_due(now)
+            slot.dirty_cache && slot.live_stream_allowed() && slot.cache_persistence.is_due(now)
         })
     };
     if !any_due {
@@ -3235,9 +4502,7 @@ fn persist_dirty_caches(
         let mut saves = Vec::new();
         let mut records = Vec::new();
         for slot in &guard.slots {
-            if slot.dirty_cache
-                && slot.state == VolumeState::Online
-                && slot.cache_persistence.is_due(now)
+            if slot.dirty_cache && slot.live_stream_allowed() && slot.cache_persistence.is_due(now)
             {
                 saves.push(slot.cache_save(volumes_dir));
                 records.push((slot.generation, slot.to_record()));
@@ -3272,15 +4537,6 @@ fn persist_dirty_caches(
     if updated {
         save_latest_manifest_locked(inner, manifest_save_lock, volumes_dir);
     }
-}
-
-fn filter_rules_differ(old: &IndexConfig, new: &IndexConfig) -> bool {
-    old.exclude != new.exclude
-        || old.exclude_paths != new.exclude_paths
-        || old.include_hidden != new.include_hidden
-        || old.index_apps != new.index_apps
-        || old.exclude_sensitive != new.exclude_sensitive
-        || old.sensitive_names != new.sensitive_names
 }
 
 fn current_unix_secs() -> u64 {
@@ -3376,9 +4632,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         }
     }
 
@@ -3683,9 +4941,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count: 1,
-            dirty_filter: true, // force background rescan on init
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: Some(VolumeConfirmReason::FilterWidened),
+            dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         let sentinel_path = format!("{disk_str}/prior_snapshot.txt");
         seed_volume_cache(
@@ -3720,6 +4980,8 @@ mod tests {
 
         let loaded = coord.initialize(&config, Arc::new(|| {}));
         assert_eq!(loaded, 1);
+        assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+        assert_eq!(coord.confirm_volume_scan(&record.volume_id), Ok(true));
 
         // Grab cancel token before unmount
         let token = coord.slot_cancel_token(&record.volume_id).unwrap();
@@ -3805,13 +5067,16 @@ mod tests {
         );
         coord.initialize(&config, Arc::new(|| {}));
 
-        // 1. Change filter rule while offline -> dirty_filter = true in manifest
+        // 1. Widen filter rule while offline -> pending_confirm_reason = Some(FilterWidened) in manifest
         let mut updated_filter_cfg = config.clone();
-        updated_filter_cfg.index.exclude.push("secret_dir".to_string());
+        updated_filter_cfg.index.include_hidden = true;
         coord.on_config_updated(&updated_filter_cfg);
 
         let m_after_filter = VolumeManifest::load_from_dir(&volumes_dir);
-        assert!(m_after_filter.records.iter().all(|r| r.dirty_filter));
+        assert!(m_after_filter
+            .records
+            .iter()
+            .all(|r| r.pending_confirm_reason == Some(VolumeConfirmReason::FilterWidened)));
 
         // 2. Remove VolA from index_paths -> VolA .cache & manifest record removed
         let mut removed_cfg = updated_filter_cfg.clone();
@@ -3859,12 +5124,14 @@ mod tests {
             fstype: "apfs".to_string(),
             identity: identity.clone(),
             last_sync_at: Some(1_700_000_000),
-            last_event_id: None,
-            journal_uuid: None,
+            last_event_id: Some(fsevents::current_event_id()),
+            journal_uuid: fsevents::journal_uuid_for_path(&disk_root),
             entry_count: 2,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -3890,13 +5157,14 @@ mod tests {
         );
         coord.initialize(&config, Arc::new(|| {}));
 
-        // Add exclusion while offline
+        // Add exclusion while offline -> PruneOnly evicts hidden.txt and advances snapshot
         let mut new_cfg = config.clone();
         new_cfg.index.exclude_paths.push(format!("{disk_str}/secret"));
         coord.on_config_updated(&new_cfg);
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
         assert_eq!(coord.statuses()[0].state, VolumeState::Offline);
 
-        // Now plug disk in and notify
+        // Now plug disk in and notify -> directly Online without full rescan
         let mut online_mounts = base_mounts();
         online_mounts.push(MountedFsInfo {
             mount_point: disk_str.clone(),
@@ -3909,15 +5177,9 @@ mod tests {
         });
         *mounts.lock() = online_mounts;
         coord.notify_volume_mounted(&disk_root);
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if coord.statuses()[0].state == VolumeState::Online {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
         assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+        assert_eq!(coord.scan_run_count(), 0);
 
         let primary = IndexStore::new();
         let (keep_hits, _, _, _) = coord.search(
@@ -3940,7 +5202,8 @@ mod tests {
         assert!(secret_hits.is_empty());
 
         let m_final = VolumeManifest::load_from_dir(&volumes_dir);
-        assert!(!m_final.records[0].dirty_filter);
+        assert_eq!(m_final.records[0].pending_confirm_reason, None);
+        assert!(m_final.records[0].scope_snapshot.is_some());
     }
 
     #[test]
@@ -3975,6 +5238,8 @@ mod tests {
         );
 
         coord.initialize(&config, Arc::new(|| {}));
+        assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+        assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if coord.statuses()[0].state == VolumeState::Missing {
@@ -4046,9 +5311,11 @@ mod tests {
             last_event_id: Some(fsevents::current_event_id()),
             journal_uuid: fsevents::journal_uuid_for_path(&disk_root),
             entry_count: 1,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -4121,6 +5388,15 @@ mod tests {
             subpath: String::new(),
         }
         .volume_id();
+
+        // Passive swap to uncached Disk B wipes Disk A and waits for confirmation
+        assert_eq!(coord.statuses()[0].volume_id, expected_vid_b);
+        assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+        assert_eq!(
+            coord.statuses()[0].confirm_reason,
+            Some(VolumeConfirmReason::InitialScan)
+        );
+        assert_eq!(coord.confirm_volume_scan(&expected_vid_b), Ok(true));
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -4207,6 +5483,8 @@ mod tests {
                 Arc::new(move || mounts_read.lock().clone()),
             );
             coord.initialize(&config, Arc::new(|| {}));
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if coord.statuses()[0].state == VolumeState::Online {
@@ -4258,7 +5536,8 @@ mod tests {
     }
 
     #[test]
-    fn reconnecting_cached_local_external_with_missing_or_mismatched_journal_triggers_rescan() {
+    fn reconnecting_cached_local_external_with_missing_or_mismatched_journal_enters_needs_confirmation()
+    {
         for stored_journal in [None, Some("STALE-MISMATCHED-UUID".to_string())] {
             let cache_dir = TempDir::new().unwrap();
             let volumes_dir = cache_dir.path().join("volumes");
@@ -4286,9 +5565,11 @@ mod tests {
                 last_event_id: stored_journal.as_ref().map(|_| 1),
                 journal_uuid: stored_journal,
                 entry_count: 1,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
                 dirty_filter: false,
                 filter_fingerprint: None,
-                pruned_for_fp: None,
             };
             seed_volume_cache(
                 &volumes_dir,
@@ -4325,7 +5606,27 @@ mod tests {
             );
 
             coord.initialize(&config, Arc::new(|| {}));
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            // 持久日志卷 UUID 缺失或不匹配：绝不静默全扫，转入 NeedsConfirmation(JournalInvalidated) 并保留旧缓存可搜
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::JournalInvalidated)
+            );
             let primary = IndexStore::new();
+            let (stale_hits, _, _, _) = coord.search(
+                &primary,
+                "stale_cached.txt",
+                SearchMode::Auto,
+                CaseSensitivity::Auto,
+                10,
+                false,
+            );
+            assert_eq!(stale_hits.len(), 1);
+
+            // 用户确认后才执行扫描并补齐离线新增文件
+            assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut found = false;
             while Instant::now() < deadline {
@@ -4343,10 +5644,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(30));
             }
-            assert!(
-                found,
-                "cached LocalExternal without matching journal UUID must trigger fallback rescan"
-            );
+            assert!(found, "confirming JournalInvalidated volume must rescan cleanly");
         }
     }
 
@@ -4380,6 +5678,7 @@ mod tests {
             Arc::new(move || mounts_read.lock().clone()),
         );
         coord.initialize(&config, Arc::new(|| {}));
+        assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
         coord.start_monitor(config_store, Arc::new(|| {}));
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4438,6 +5737,7 @@ mod tests {
             Arc::new(move || mounts_read.lock().clone()),
         );
         coord.initialize(&config, Arc::new(|| {}));
+        assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -4448,19 +5748,12 @@ mod tests {
         }
         assert_eq!(coord.statuses()[0].state, VolumeState::Missing);
 
-        // Trigger filter change (dirty_filter = true) while subpath is Missing;
-        // it runs once to settle on Missing, then must not spin every 3s monitor tick.
+        // Trigger filter narrowing while subpath is Missing: stays Missing and never spins.
         let mut updated = config.clone();
         updated.index.exclude.push("tmp_ignored".to_string());
         config_store.update(updated.clone());
         coord.on_config_updated(&updated);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if coord.statuses()[0].state == VolumeState::Missing {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
         assert_eq!(coord.statuses()[0].state, VolumeState::Missing);
 
         let gen_after_settle = coord.slot_generation(&configured_str).unwrap();
@@ -4471,7 +5764,7 @@ mod tests {
         assert_eq!(
             coord.slot_generation(&configured_str),
             Some(gen_after_settle),
-            "monitor poll must not repeatedly re-trigger Syncing on Missing + dirty_filter"
+            "monitor poll must not repeatedly re-trigger Syncing on Missing"
         );
     }
 
@@ -4481,15 +5774,23 @@ mod tests {
         let active_cancel_2 = Arc::new(AtomicBool::new(false));
         let active_cancel_1 = Arc::new(AtomicBool::new(false));
         let cancelled_3 = Arc::new(AtomicBool::new(true));
+        let snap = VolumeScopeSnapshot::from_config(
+            &AppConfig::default(),
+            Path::new("/Volumes/A"),
+            Path::new("/Volumes/A"),
+        );
 
         queue.enqueue(WorkerTask::Scan(ScanJob {
             volume_id: "vid-a".to_string(),
             generation: 2,
             kind: VolumeKind::LocalExternal,
-            configured_path: "/Volumes/A".to_string(),
+            fstype: "apfs".to_string(),
+            mount_root: PathBuf::from("/Volumes/A"),
+            subpath: String::new(),
             root: PathBuf::from("/Volumes/A"),
-            config: AppConfig::default(),
-            filter_fingerprint: 0,
+            target_snapshot: snap.clone(),
+            use_serial_scan: false,
+            scanned_count: Arc::new(AtomicU64::new(0)),
             cancel: Arc::clone(&active_cancel_2),
         }));
 
@@ -4497,12 +5798,14 @@ mod tests {
         queue.enqueue(WorkerTask::AttachStream(AttachStreamJob {
             volume_id: "vid-a".to_string(),
             generation: 1,
-            configured_path: "/Volumes/A".to_string(),
+            mount_root: PathBuf::from("/Volumes/A"),
+            subpath: String::new(),
+            fstype: "apfs".to_string(),
             active_path: PathBuf::from("/Volumes/A"),
             since_event_id: Some(1),
             stored_journal_uuid: None,
             require_journal_verify: false,
-            config: AppConfig::default(),
+            target_snapshot: snap.clone(),
             cancel: active_cancel_1,
             store: IndexStore::new(),
         }));
@@ -4511,12 +5814,14 @@ mod tests {
         queue.enqueue(WorkerTask::AttachStream(AttachStreamJob {
             volume_id: "vid-a".to_string(),
             generation: 3,
-            configured_path: "/Volumes/A".to_string(),
+            mount_root: PathBuf::from("/Volumes/A"),
+            subpath: String::new(),
+            fstype: "apfs".to_string(),
             active_path: PathBuf::from("/Volumes/A"),
             since_event_id: Some(1),
             stored_journal_uuid: None,
             require_journal_verify: false,
-            config: AppConfig::default(),
+            target_snapshot: snap.clone(),
             cancel: cancelled_3,
             store: IndexStore::new(),
         }));
@@ -4526,10 +5831,13 @@ mod tests {
             volume_id: "vid-b".to_string(),
             generation: 1,
             kind: VolumeKind::Network,
-            configured_path: "/Volumes/B".to_string(),
+            fstype: "smbfs".to_string(),
+            mount_root: PathBuf::from("/Volumes/B"),
+            subpath: String::new(),
             root: PathBuf::from("/Volumes/B"),
-            config: AppConfig::default(),
-            filter_fingerprint: 0,
+            target_snapshot: snap.clone(),
+            use_serial_scan: true,
+            scanned_count: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
         }));
 
@@ -4546,20 +5854,26 @@ mod tests {
             volume_id: "vid-a".to_string(),
             generation: 2,
             kind: VolumeKind::LocalExternal,
-            configured_path: "/Volumes/A".to_string(),
+            fstype: "apfs".to_string(),
+            mount_root: PathBuf::from("/Volumes/A"),
+            subpath: String::new(),
             root: PathBuf::from("/Volumes/A"),
-            config: AppConfig::default(),
-            filter_fingerprint: 0,
+            target_snapshot: snap.clone(),
+            use_serial_scan: false,
+            scanned_count: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
         }));
         queue.enqueue(WorkerTask::Scan(ScanJob {
             volume_id: "vid-a".to_string(),
             generation: 4,
             kind: VolumeKind::LocalExternal,
-            configured_path: "/Volumes/A".to_string(),
+            fstype: "apfs".to_string(),
+            mount_root: PathBuf::from("/Volumes/A"),
+            subpath: String::new(),
             root: PathBuf::from("/Volumes/A"),
-            config: AppConfig::default(),
-            filter_fingerprint: 0,
+            target_snapshot: snap,
+            use_serial_scan: false,
+            scanned_count: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
         }));
         let newest = queue.pop_blocking().unwrap().0;
@@ -4593,9 +5907,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count: 2,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -4724,6 +6040,7 @@ mod tests {
                 display_name: "Orphan".to_string(),
                 kind: VolumeKind::Network,
                 fstype: "smbfs".to_string(),
+                from_name: "//nas/orphan".to_string(),
                 identity: VolumeIdentity::Network {
                     fstype: "smbfs".to_string(),
                     normalized_source: "//nas/orphan".to_string(),
@@ -4734,10 +6051,13 @@ mod tests {
                 last_sync_at: Some(1_700_000_000),
                 last_event_id: None,
                 journal_uuid: None,
-                dirty_filter: false,
-                filter_fingerprint: None,
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: true,
                 dirty_cache: true,
@@ -4812,6 +6132,7 @@ mod tests {
                 display_name: "Race".to_string(),
                 kind: VolumeKind::Network,
                 fstype: "smbfs".to_string(),
+                from_name: "//nas/race".to_string(),
                 identity: VolumeIdentity::Network {
                     fstype: "smbfs".to_string(),
                     normalized_source: "//nas/race".to_string(),
@@ -4822,10 +6143,13 @@ mod tests {
                 last_sync_at: Some(1_700_000_000),
                 last_event_id: Some(77),
                 journal_uuid: None,
-                dirty_filter: false,
-                filter_fingerprint: None,
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: true,
                 dirty_cache: true,
@@ -4868,12 +6192,18 @@ mod tests {
         WorkerTask::AttachStream(AttachStreamJob {
             volume_id: volume_id.to_string(),
             generation,
-            configured_path: "/tmp".to_string(),
+            mount_root: PathBuf::from("/tmp"),
+            subpath: String::new(),
+            fstype: "apfs".to_string(),
             active_path: PathBuf::from("/tmp"),
             since_event_id: None,
             stored_journal_uuid: None,
             require_journal_verify: false,
-            config: AppConfig::default(),
+            target_snapshot: VolumeScopeSnapshot::from_config(
+                &AppConfig::default(),
+                Path::new("/tmp"),
+                Path::new("/tmp"),
+            ),
             cancel: Arc::new(AtomicBool::new(false)),
             store: IndexStore::new(),
         })
@@ -4939,6 +6269,11 @@ mod tests {
         {
             let mut inner = coord.inner.write();
             inner.config = cfg.clone();
+            let snap = VolumeScopeSnapshot::from_config(
+                &cfg,
+                Path::new("/Volumes/NasSync"),
+                Path::new("/Volumes/NasSync"),
+            );
             inner.slots.push(VolumeSlot {
                 volume_id: vid,
                 configured_path: "/Volumes/NasSync".to_string(),
@@ -4948,6 +6283,7 @@ mod tests {
                 display_name: "NasSync".to_string(),
                 kind: VolumeKind::Network,
                 fstype: "smbfs".to_string(),
+                from_name: "//nas.local/NasSync".to_string(),
                 identity: VolumeIdentity::Network {
                     fstype: "smbfs".to_string(),
                     normalized_source: "//nas.local/NasSync".to_string(),
@@ -4958,10 +6294,13 @@ mod tests {
                 last_sync_at: Some(1_700_000_000),
                 last_event_id: None,
                 journal_uuid: None,
-                dirty_filter: false,
-                filter_fingerprint: None,
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: Some(snap.clone()),
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: Some(snap),
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: true,
                 dirty_cache: false,
@@ -5003,6 +6342,7 @@ mod tests {
             display_name: "SlowNas".to_string(),
             kind: VolumeKind::Network,
             fstype: "smbfs".to_string(),
+            from_name: "//nas.local/SlowNas".to_string(),
             identity: VolumeIdentity::Network {
                 fstype: "smbfs".to_string(),
                 normalized_source: "//nas.local/SlowNas".to_string(),
@@ -5013,10 +6353,13 @@ mod tests {
             last_sync_at: Some(now_unix.saturating_sub(120)),
             last_event_id: None,
             journal_uuid: None,
-            dirty_filter: false,
-            filter_fingerprint: None,
-            pruned_for_fp: None,
-            scan_pending_filter_update: false,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
+            in_flight_scan_snapshot: None,
+            in_flight_prune_snapshot: None,
+            stream_snapshot: None,
+            scanned_count: Arc::new(AtomicU64::new(0)),
             is_remounted: false,
             has_cache: true,
             dirty_cache: false,
@@ -5040,6 +6383,12 @@ mod tests {
         // 超过 300 秒冷却期后应触发周期重扫
         slot.last_sync_at = Some(now_unix.saturating_sub(305));
         assert!(network_slot_rescan_due(&slot, Duration::from_secs(60), now_unix));
+
+        // 存在待确认原因或处于 NeedsConfirmation 时禁止周期重扫越权覆盖
+        slot.pending_confirm_reason = Some(VolumeConfirmReason::FilterWidened);
+        assert!(!network_slot_rescan_due(&slot, Duration::from_secs(60), now_unix));
+        slot.state = VolumeState::NeedsConfirmation;
+        assert!(!network_slot_rescan_due(&slot, Duration::from_secs(60), now_unix));
     }
 
     #[test]
@@ -5301,9 +6650,11 @@ mod tests {
             last_event_id: Some(live_event_id),
             journal_uuid: live_journal,
             entry_count: 2,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -5386,7 +6737,7 @@ mod tests {
         config.index.index_paths = vec![disk_str.clone()];
         config.index.include_hidden = true;
 
-        // 1. Initial launch with FDA=false while mounted: full scan completes and stores filter_fingerprint.
+        // 1. Initial launch with FDA=false while mounted: confirm scan completes and stores scope_snapshot.
         {
             let mut m = base_mounts();
             m.extend(mounted.clone());
@@ -5396,6 +6747,7 @@ mod tests {
                 Arc::new(|| false),
             );
             coord.initialize(&config, Arc::new(|| {}));
+            assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline && coord.statuses()[0].state != VolumeState::Online {
                 std::thread::sleep(Duration::from_millis(25));
@@ -5406,16 +6758,16 @@ mod tests {
 
         let manifest_after_scan = VolumeManifest::load_from_dir(&volumes_dir);
         assert_eq!(manifest_after_scan.records.len(), 1);
-        assert!(manifest_after_scan.records[0].filter_fingerprint.is_some());
-        assert!(!manifest_after_scan.records[0].dirty_filter);
+        assert!(manifest_after_scan.records[0].scope_snapshot.is_some());
+        assert_eq!(manifest_after_scan.records[0].pending_confirm_reason, None);
 
-        // 2. While quit and unplugged, user edits config.toml to exclude `secret/` (and later flips FDA).
+        // 2. While quit and unplugged, user edits config.toml to exclude `secret/` (narrowing -> PruneOnly)
+        // and flips FDA (completely isolated from external volumes).
         let mut offline_edited_config = config.clone();
         offline_edited_config
             .index
             .exclude_paths
             .push(format!("{disk_str}/secret"));
-        // Also verify removing a non-excluded file on disk won't prevent full replug rescan later.
         let primary = IndexStore::new();
         let mounts_state = Arc::new(Mutex::new(base_mounts()));
         let mounts_read = Arc::clone(&mounts_state);
@@ -5454,38 +6806,23 @@ mod tests {
                 true,
             );
             assert_eq!(keep_hits.len(), 1);
-            assert!(
-                VolumeManifest::load_from_dir(&volumes_dir).records[0].dirty_filter,
-                "dirty_filter must remain true until a real mounted rescan finishes"
-            );
+            let m_after_prune = VolumeManifest::load_from_dir(&volumes_dir);
+            assert_eq!(m_after_prune.records[0].pending_confirm_reason, None);
+            assert!(m_after_prune.records[0]
+                .scope_snapshot
+                .as_ref()
+                .unwrap()
+                .exclude_subpaths
+                .contains(&"secret".to_string()));
 
-            // Write a brand new file to the disk before replugging so only a real rescan finds it.
-            std::fs::write(disk_root.join("post_offline.txt"), "fresh").unwrap();
-
+            // Replug after pure narrowing + FDA flip -> directly Online with ZERO full rescan!
             let mut replugged = base_mounts();
             replugged.extend(mounted);
             *mounts_state.lock() = replugged;
             coord.notify_volume_mounted(&disk_root);
-
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline && coord.statuses()[0].state != VolumeState::Online {
-                std::thread::sleep(Duration::from_millis(25));
-            }
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
             assert_eq!(coord.statuses()[0].state, VolumeState::Online);
-            let (fresh_hits, _, _, _) = coord.search(
-                &primary,
-                "post_offline.txt",
-                SearchMode::Auto,
-                CaseSensitivity::Auto,
-                10,
-                true,
-            );
-            assert_eq!(
-                fresh_hits.len(),
-                1,
-                "replug after offline config/FDA change must trigger a full rescan"
-            );
-            assert!(!VolumeManifest::load_from_dir(&volumes_dir).records[0].dirty_filter);
+            assert_eq!(coord.scan_run_count(), 0);
         }
     }
 
@@ -5509,7 +6846,8 @@ mod tests {
             cfg.index.include_hidden = true;
             cfg
         };
-        let fp_initial = crate::volumes::volume_filter_fingerprint(&config_initial, true);
+        let initial_snap =
+            VolumeScopeSnapshot::from_config(&config_initial, &orig_root, &drifted_root);
 
         let identity = VolumeIdentity::LocalUuid {
             uuid: "OFFLINE-EVICT-UUID".to_string(),
@@ -5529,9 +6867,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count: 2,
+            scope_snapshot: Some(initial_snap),
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
-            filter_fingerprint: Some(fp_initial),
-            pruned_for_fp: None,
+            filter_fingerprint: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -5603,15 +6943,22 @@ mod tests {
         assert_eq!(pub_hits.len(), 1);
         assert_eq!(coord.statuses()[0].entry_count, 1);
 
-        // Verify the pruned cache was also persisted to disk and dirty_filter remains true.
+        // Verify the pruned cache and advanced scope_snapshot were persisted to disk.
         let (persisted_compact, _) =
             cache::load_compact(&volumes_dir.join(format!("{}.cache", record.volume_id))).unwrap();
         assert_eq!(persisted_compact.len(), 1);
-        assert!(VolumeManifest::load_from_dir(&volumes_dir).records[0].dirty_filter);
+        let saved = VolumeManifest::load_from_dir(&volumes_dir);
+        assert_eq!(saved.records[0].pending_confirm_reason, None);
+        assert!(saved.records[0]
+            .scope_snapshot
+            .as_ref()
+            .unwrap()
+            .exclude_subpaths
+            .contains(&"private".to_string()));
     }
 
     #[test]
-    fn fda_only_flip_triggers_volume_rescan() {
+    fn fda_only_flip_does_not_rescan_external_volume() {
         let cache_dir = TempDir::new().unwrap();
         let volumes_dir = cache_dir.path().join("volumes");
         let disk_dir = TempDir::new().unwrap();
@@ -5642,6 +6989,7 @@ mod tests {
                 Arc::new(|| false),
             );
             coord.initialize(&config, Arc::new(|| {}));
+            assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline && coord.statuses()[0].state != VolumeState::Online {
                 std::thread::sleep(Duration::from_millis(25));
@@ -5650,8 +6998,7 @@ mod tests {
             coord.persist_all();
         }
 
-        // Write a file while app is closed; keep AppConfig byte-identical and flip only has_fda false -> true.
-        std::fs::write(disk_root.join("fda_rescan_added.txt"), "new").unwrap();
+        // Flip only has_fda false -> true while keeping config identical: zero rescan!
         let mut m = base_mounts();
         m.extend(mounted);
         let coord = VolumeCoordinator::with_mount_and_fda_lister(
@@ -5660,30 +7007,21 @@ mod tests {
             Arc::new(|| true),
         );
         coord.initialize(&config, Arc::new(|| {}));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let primary = IndexStore::new();
-        let mut found = false;
-        while Instant::now() < deadline {
-            let (hits, _, _, _) = coord.search(
-                &primary,
-                "fda_rescan_added.txt",
-                SearchMode::Auto,
-                CaseSensitivity::Auto,
-                10,
-                false,
-            );
-            if !hits.is_empty() && coord.statuses()[0].state == VolumeState::Online {
-                found = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(found, "FDA-only flip with identical config must trigger rescan");
-        assert!(!VolumeManifest::load_from_dir(&volumes_dir).records[0].dirty_filter);
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+        assert_eq!(
+            coord.scan_run_count(),
+            0,
+            "FDA-only flip must NEVER trigger external volume rescan"
+        );
+        assert_eq!(
+            VolumeManifest::load_from_dir(&volumes_dir).records[0].pending_confirm_reason,
+            None
+        );
     }
 
     #[test]
-    fn legacy_zero_fingerprint_upgrades_without_spurious_rescan_and_persists_fp() {
+    fn legacy_zero_fingerprint_upgrades_without_spurious_rescan_and_persists_snapshot() {
         let cache_dir = TempDir::new().unwrap();
         let volumes_dir = cache_dir.path().join("volumes");
         let mounts_parent = TempDir::new().unwrap();
@@ -5709,9 +7047,11 @@ mod tests {
             last_event_id: Some(123),
             journal_uuid: None,
             entry_count: 1,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         let compact = CompactIndex::from_entries(vec![make_entry(
             "legacy_file.txt",
@@ -5734,7 +7074,8 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.index.index_paths = vec![disk_str.clone()];
-        let expected_fp = crate::volumes::volume_filter_fingerprint(&config, true);
+        let expected_snap =
+            VolumeScopeSnapshot::from_config(&config, &disk_root, &disk_root);
 
         let coord = VolumeCoordinator::with_mount_and_fda_lister(
             cache_dir.path().to_path_buf(),
@@ -5743,11 +7084,16 @@ mod tests {
         );
         coord.initialize(&config, Arc::new(|| {}));
         assert_eq!(coord.prune_run_count(), 0);
+        assert_eq!(coord.scan_run_count(), 0);
         assert_eq!(coord.statuses()[0].state, VolumeState::Offline);
 
         let upgraded = VolumeManifest::load_from_dir(&volumes_dir);
-        assert_eq!(upgraded.records[0].filter_fingerprint, Some(expected_fp));
-        assert!(!upgraded.records[0].dirty_filter);
+        assert_eq!(upgraded.records[0].scope_snapshot, Some(expected_snap));
+        assert_eq!(upgraded.records[0].pending_confirm_reason, None);
+        // 新版 manifest.json 不再写出旧 dirty_filter / filter_fingerprint 字段
+        let raw_json = std::fs::read_to_string(volumes_dir.join("manifest.json")).unwrap();
+        assert!(!raw_json.contains("\"dirty_filter\""));
+        assert!(!raw_json.contains("\"filter_fingerprint\""));
     }
 
     #[test]
@@ -5760,7 +7106,6 @@ mod tests {
         config.index.include_hidden = true;
         config.index.exclude.clear();
 
-        let fp_initial = crate::volumes::volume_filter_fingerprint(&config, true);
         let mut record = make_network_record(
             root_str,
             root_str,
@@ -5771,7 +7116,11 @@ mod tests {
             4,
             false,
         );
-        record.filter_fingerprint = Some(fp_initial);
+        record.scope_snapshot = Some(VolumeScopeSnapshot::from_config(
+            &config,
+            Path::new(root_str),
+            Path::new(root_str),
+        ));
         seed_volume_cache(
             &volumes_dir,
             &record,
@@ -5822,15 +7171,14 @@ mod tests {
     }
 
     #[test]
-    fn repeated_reconciles_do_not_reprune_and_mounted_rescan_skips_prune() {
-        // Part 1: Offline shard prunes once per fingerprint across repeated mount polls and restarts.
+    fn repeated_reconciles_do_not_reprune_and_mounted_confirm_scan_skips_prune() {
+        // Part 1: Offline shard prunes once per scope_snapshot across repeated mount polls and restarts.
         let cache_dir = TempDir::new().unwrap();
         let volumes_dir = cache_dir.path().join("volumes");
         let root_str = "/Volumes/NoReprune";
         let mut config = AppConfig::default();
         config.index.index_paths = vec![root_str.to_string()];
         config.index.include_hidden = true;
-        let fp_initial = crate::volumes::volume_filter_fingerprint(&config, true);
 
         let mut record = make_network_record(
             root_str,
@@ -5842,7 +7190,11 @@ mod tests {
             2,
             false,
         );
-        record.filter_fingerprint = Some(fp_initial);
+        record.scope_snapshot = Some(VolumeScopeSnapshot::from_config(
+            &config,
+            Path::new(root_str),
+            Path::new(root_str),
+        ));
         seed_volume_cache(
             &volumes_dir,
             &record,
@@ -5857,7 +7209,11 @@ mod tests {
 
         let mut edited_cfg = config.clone();
         edited_cfg.index.exclude.push("blocked".to_string());
-        let expected_pruned_fp = crate::volumes::volume_filter_fingerprint(&edited_cfg, true);
+        let expected_snap = VolumeScopeSnapshot::from_config(
+            &edited_cfg,
+            Path::new(root_str),
+            Path::new(root_str),
+        );
 
         {
             let coord = VolumeCoordinator::with_mount_and_fda_lister(
@@ -5872,11 +7228,11 @@ mod tests {
             assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
             assert_eq!(coord.prune_run_count(), 1);
             assert_eq!(
-                VolumeManifest::load_from_dir(&volumes_dir).records[0].pruned_for_fp,
-                Some(expected_pruned_fp)
+                VolumeManifest::load_from_dir(&volumes_dir).records[0].scope_snapshot,
+                Some(expected_snap)
             );
 
-            // Repeated mount-table reconciles while still offline/dirty_filter must NOT re-prune.
+            // Repeated mount-table reconciles while still offline must NOT re-prune.
             let dummy_mounts = base_mounts();
             coord.execute_effects(refresh_mounts_locked(
                 &coord.inner,
@@ -5891,14 +7247,10 @@ mod tests {
                 false,
             ));
             assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
-            assert_eq!(
-                coord.prune_run_count(),
-                1,
-                "repeated mount reconciles must skip pruning when pruned_for_fp matches"
-            );
+            assert_eq!(coord.prune_run_count(), 1);
         }
 
-        // Restarting with the same edited config still skips pruning because pruned_for_fp persisted.
+        // Restarting with the same edited config still skips pruning because scope_snapshot persisted.
         {
             let coord_restart = VolumeCoordinator::with_mount_and_fda_lister(
                 cache_dir.path().to_path_buf(),
@@ -5907,14 +7259,10 @@ mod tests {
             );
             coord_restart.initialize(&edited_cfg, Arc::new(|| {}));
             assert!(coord_restart.wait_for_workers_idle(Duration::from_secs(5)));
-            assert_eq!(
-                coord_restart.prune_run_count(),
-                0,
-                "restart at already-pruned offline fingerprint must not re-run retain_paths"
-            );
+            assert_eq!(coord_restart.prune_run_count(), 0);
         }
 
-        // Part 2: Mounted slot about to rescan must NOT run a prune pass.
+        // Part 2: Mounted FilterWidened slot enters NeedsConfirmation and skips pruning on confirm scan.
         let mounted_cache = TempDir::new().unwrap();
         let mounted_vols = mounted_cache.path().join("volumes");
         let disk_dir = TempDir::new().unwrap();
@@ -5937,12 +7285,14 @@ mod tests {
             fstype: "apfs".to_string(),
             identity: id_mounted,
             last_sync_at: Some(1_700_000_000),
-            last_event_id: None,
-            journal_uuid: None,
+            last_event_id: Some(fsevents::current_event_id()),
+            journal_uuid: Some("MOUNTED-NO-PRUNE-JUUID".to_string()),
             entry_count: 1,
-            dirty_filter: true,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: Some(VolumeConfirmReason::FilterWidened),
+            dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         seed_volume_cache(
             &mounted_vols,
@@ -5967,17 +7317,20 @@ mod tests {
         mounted_cfg.index.index_paths = vec![disk_str];
         mounted_cfg.index.exclude.push("blocked".to_string());
 
-        let coord_mounted = VolumeCoordinator::with_mount_and_fda_lister(
+        let coord_mounted = VolumeCoordinator::with_mount_and_journal_provider(
             mounted_cache.path().to_path_buf(),
             Arc::new(move || online_mounts.clone()),
-            Arc::new(|| true),
+            Arc::new(|_| Some("MOUNTED-NO-PRUNE-JUUID".to_string())),
         );
         coord_mounted.initialize(&mounted_cfg, Arc::new(|| {}));
+        assert!(coord_mounted.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord_mounted.statuses()[0].state, VolumeState::NeedsConfirmation);
         assert_eq!(
-            coord_mounted.prune_run_count(),
-            0,
-            "mounted slot entering rescan must skip pre-pruning"
+            coord_mounted.statuses()[0].confirm_reason,
+            Some(VolumeConfirmReason::FilterWidened)
         );
+        assert_eq!(coord_mounted.prune_run_count(), 0);
+        assert_eq!(coord_mounted.confirm_all_pending_volume_scans(), 1);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline && coord_mounted.statuses()[0].state != VolumeState::Online {
             std::thread::sleep(Duration::from_millis(25));
@@ -5996,7 +7349,11 @@ mod tests {
         config.index.index_paths = vec![orig_root.to_string()];
         config.index.exclude.push("blocked".to_string());
         config.index.include_hidden = true;
-        let target_fp = crate::volumes::volume_filter_fingerprint(&config, true);
+        let target_snap = VolumeScopeSnapshot::from_config(
+            &config,
+            Path::new(orig_root),
+            Path::new(orig_root),
+        );
 
         let identity = VolumeIdentity::LocalUuid {
             uuid: "EXT-DRIFT-PRUNE-GUARD".to_string(),
@@ -6021,7 +7378,6 @@ mod tests {
         let stale_effects = {
             let mut inner = coord.inner.write();
             inner.config = config.clone();
-            inner.current_filter_fp = target_fp;
             inner.slots.push(VolumeSlot {
                 volume_id: vid.clone(),
                 configured_path: orig_root.to_string(),
@@ -6031,16 +7387,20 @@ mod tests {
                 display_name: "Drive".to_string(),
                 kind: VolumeKind::LocalExternal,
                 fstype: "apfs".to_string(),
+                from_name: "/dev/disk45s1".to_string(),
                 identity,
                 state: VolumeState::Offline,
                 entry_count: 3,
                 last_sync_at: Some(1_700_000_000),
                 last_event_id: None,
                 journal_uuid: None,
-                dirty_filter: true,
-                filter_fingerprint: Some(target_fp.wrapping_add(1)),
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: true,
                 dirty_cache: false,
@@ -6058,11 +7418,12 @@ mod tests {
                 skip_missing_rescan: false,
             });
             let mut effects = TransitionEffects::default();
-            enqueue_prune_if_needed(&inner.slots[0], &config, target_fp, &mut effects);
+            enqueue_prune_for_slot(&mut inner.slots[0], target_snap.clone(), true, false, &mut effects);
 
             // Simulate mount-root drift between enqueue and off-lock prune execution.
             store.write().rebase_mount_root(orig_root, drifted_root).unwrap();
             inner.slots[0].active_configured_path = drifted_root.to_string();
+            inner.slots[0].in_flight_prune_snapshot = None;
             inner.slots[0].is_remounted = true;
             effects
         };
@@ -6072,20 +7433,25 @@ mod tests {
 
         assert_eq!(coord.prune_run_count(), 0, "drifted job must be skipped");
         assert_eq!(store.len(), 3, "drifted store must not be wiped");
-        assert_eq!(coord.inner.read().slots[0].pruned_for_fp, None);
+        assert_eq!(coord.inner.read().slots[0].scope_snapshot, None);
 
         // Fresh enqueue against the updated drifted_root prunes only excluded entries.
+        let drifted_snap = VolumeScopeSnapshot::from_config(
+            &config,
+            Path::new(orig_root),
+            Path::new(drifted_root),
+        );
         let fresh_effects = {
-            let inner = coord.inner.read();
+            let mut inner = coord.inner.write();
             let mut effects = TransitionEffects::default();
-            enqueue_prune_if_needed(&inner.slots[0], &config, target_fp, &mut effects);
+            enqueue_prune_for_slot(&mut inner.slots[0], drifted_snap.clone(), true, false, &mut effects);
             effects
         };
         coord.execute_effects(fresh_effects);
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
 
         assert_eq!(coord.prune_run_count(), 1);
-        assert_eq!(coord.inner.read().slots[0].pruned_for_fp, Some(target_fp));
+        assert_eq!(coord.inner.read().slots[0].scope_snapshot, Some(drifted_snap));
         let remaining_paths: Vec<String> = store
             .read()
             .iter()
@@ -6097,7 +7463,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_prune_job_skips_stale_target_fingerprint_and_ab_a_toggle_reprunes() {
+    fn execute_prune_job_skips_stale_target_snapshot_and_narrow_then_widen_flow() {
         let cache_dir = TempDir::new().unwrap();
         let volumes_dir = cache_dir.path().join("volumes");
         let root_str = "/Volumes/FpGuard";
@@ -6106,12 +7472,12 @@ mod tests {
         cfg_a.index.index_paths = vec![root_str.to_string()];
         cfg_a.index.include_hidden = true;
         cfg_a.index.exclude = vec!["alpha".to_string()];
-        let fp_a = crate::volumes::volume_filter_fingerprint(&cfg_a, true);
+        let snap_a = VolumeScopeSnapshot::from_config(&cfg_a, Path::new(root_str), Path::new(root_str));
 
         let mut cfg_b = cfg_a.clone();
         cfg_b.index.exclude.push("beta".to_string());
-        let fp_b = crate::volumes::volume_filter_fingerprint(&cfg_b, true);
-        assert_ne!(fp_a, fp_b);
+        let snap_b = VolumeScopeSnapshot::from_config(&cfg_b, Path::new(root_str), Path::new(root_str));
+        assert_ne!(snap_a, snap_b);
 
         let mut record = make_network_record(
             root_str,
@@ -6123,7 +7489,7 @@ mod tests {
             3,
             false,
         );
-        record.filter_fingerprint = Some(fp_a);
+        record.scope_snapshot = Some(snap_a.clone());
         seed_volume_cache(
             &volumes_dir,
             &record,
@@ -6144,41 +7510,44 @@ mod tests {
         coord.initialize(&cfg_a, Arc::new(|| {}));
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
 
-        // Enqueue a job with stale target_fp while inner.current_filter_fp has moved on.
-        let stale_fp = fp_a.wrapping_add(123);
+        // Enqueue a job with stale target_snapshot while inner.config has moved to cfg_b.
+        let mut stale_snap = snap_a.clone();
+        stale_snap.exclude.push("stale_only".to_string());
         let stale_effects = {
             let mut inner = coord.inner.write();
-            inner.current_filter_fp = fp_b;
-            inner.slots[0].dirty_filter = true;
+            inner.config = cfg_b.clone();
             let mut effects = TransitionEffects::default();
-            enqueue_prune_if_needed(&inner.slots[0], &cfg_a, stale_fp, &mut effects);
+            enqueue_prune_for_slot(&mut inner.slots[0], stale_snap, true, false, &mut effects);
             effects
         };
         coord.execute_effects(stale_effects);
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
-        assert_eq!(coord.prune_run_count(), 0, "stale target_fp job must be skipped");
+        assert_eq!(coord.prune_run_count(), 0, "stale target_snapshot job must be skipped");
         assert_eq!(coord.inner.read().slots[0].store.len(), 2);
-        assert_eq!(coord.inner.read().slots[0].pruned_for_fp, None);
 
-        // Toggle fpA -> fpB -> fpA while offline: filter_changed must clear pruned_for_fp.
+        // Reset inner.config to cfg_a, then narrow cfg_a -> cfg_b (PruneOnly) and widen cfg_b -> cfg_a (FilterWidened).
         {
             let mut inner = coord.inner.write();
-            inner.current_filter_fp = fp_a;
             inner.config = cfg_a.clone();
-            inner.slots[0].dirty_filter = false;
+            inner.slots[0].in_flight_prune_snapshot = None;
         }
         coord.on_config_updated(&cfg_b);
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
         assert_eq!(coord.prune_run_count(), 1);
-        assert_eq!(coord.inner.read().slots[0].pruned_for_fp, Some(fp_b));
+        assert_eq!(coord.inner.read().slots[0].scope_snapshot, Some(snap_b.clone()));
+        assert_eq!(coord.inner.read().slots[0].store.len(), 1);
 
+        // Removing "beta" from exclude widens relative to snap_b -> pending_confirm_reason = FilterWidened
         coord.on_config_updated(&cfg_a);
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
-        assert_eq!(coord.prune_run_count(), 2);
-        assert_eq!(coord.inner.read().slots[0].pruned_for_fp, Some(fp_a));
+        assert_eq!(coord.prune_run_count(), 1);
         assert_eq!(
-            VolumeManifest::load_from_dir(&volumes_dir).records[0].pruned_for_fp,
-            Some(fp_a)
+            VolumeManifest::load_from_dir(&volumes_dir).records[0].pending_confirm_reason,
+            Some(VolumeConfirmReason::FilterWidened)
+        );
+        assert_eq!(
+            VolumeManifest::load_from_dir(&volumes_dir).records[0].scope_snapshot,
+            Some(snap_b)
         );
     }
 
@@ -6213,6 +7582,7 @@ mod tests {
             Arc::new(|| true),
         );
         coord.initialize(&config, Arc::new(|| {}));
+        assert_eq!(coord.confirm_all_pending_volume_scans(), 1);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline && coord.statuses()[0].state != VolumeState::Online {
             std::thread::sleep(Duration::from_millis(25));
@@ -6234,7 +7604,7 @@ mod tests {
         );
         assert_eq!(coord.statuses()[0].state, VolumeState::Offline);
 
-        // Hot replug while cache is already clean (!dirty_filter): AttachStreamJob must enqueue & attach.
+        // Hot replug while cache is already clean: AttachStreamJob must enqueue & attach.
         let mut replugged = base_mounts();
         replugged.extend(mounted);
         *mounts_state.lock() = replugged;
@@ -6248,17 +7618,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_prune_cache_save_does_not_persist_pruned_for_fp_on_later_reconcile() {
+    fn failed_prune_cache_save_does_not_advance_scope_snapshot_until_persisted() {
         let cache_dir = TempDir::new().unwrap();
         let volumes_dir = cache_dir.path().join("volumes");
         let root_a = "/Volumes/DirtyPruneA";
         let root_b = "/Volumes/DirtyPruneB";
 
         let mut config = AppConfig::default();
-        // Put root_b before root_a so slot B flips manifest_changed = true before slot A is reconciled.
         config.index.index_paths = vec![root_b.to_string(), root_a.to_string()];
         config.index.include_hidden = true;
-        let fp_initial = crate::volumes::volume_filter_fingerprint(&config, true);
+        let snap_a_initial =
+            VolumeScopeSnapshot::from_config(&config, Path::new(root_a), Path::new(root_a));
+        let snap_b_initial =
+            VolumeScopeSnapshot::from_config(&config, Path::new(root_b), Path::new(root_b));
 
         let mut rec_a = make_network_record(
             root_a,
@@ -6270,7 +7642,7 @@ mod tests {
             2,
             false,
         );
-        rec_a.filter_fingerprint = Some(fp_initial);
+        rec_a.scope_snapshot = Some(snap_a_initial.clone());
         let mut rec_b = make_network_record(
             root_b,
             root_b,
@@ -6281,7 +7653,7 @@ mod tests {
             1,
             false,
         );
-        rec_b.filter_fingerprint = Some(fp_initial);
+        rec_b.scope_snapshot = Some(snap_b_initial);
 
         seed_volume_cache(
             &volumes_dir,
@@ -6316,11 +7688,12 @@ mod tests {
 
         let mut updated = config.clone();
         updated.index.exclude.push("blocked".to_string());
-        let target_fp = crate::volumes::volume_filter_fingerprint(&updated, true);
+        let snap_a_updated =
+            VolumeScopeSnapshot::from_config(&updated, Path::new(root_a), Path::new(root_a));
         coord.on_config_updated(&updated);
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
 
-        // In memory: slot A stays marked pruned_for_fp (no repeat prune spin) with dirty_cache = true.
+        // Slot A's cache flush failed -> scope_snapshot must NOT advance in memory or manifest.json!
         {
             let guard = coord.inner.read();
             let slot_a = guard
@@ -6328,22 +7701,24 @@ mod tests {
                 .iter()
                 .find(|s| s.volume_id == rec_a.volume_id)
                 .unwrap();
-            assert_eq!(slot_a.pruned_for_fp, Some(target_fp));
             assert!(slot_a.dirty_cache);
-            assert_eq!(slot_a.to_record().pruned_for_fp, None);
+            assert_eq!(slot_a.scope_snapshot, Some(snap_a_initial.clone()));
         }
+        let saved_manifest = VolumeManifest::load_from_dir(&volumes_dir);
+        let saved_a = saved_manifest
+            .records
+            .iter()
+            .find(|r| r.volume_id == rec_a.volume_id)
+            .unwrap();
+        assert_eq!(
+            saved_a.scope_snapshot,
+            Some(snap_a_initial),
+            "manifest must not advance scope_snapshot while pruned shard failed to flush"
+        );
 
-        // Trigger another reconcile where slot B changes state while slot A is still dirty_cache.
-        // Slot B's manifest_changed must NOT spill over and upsert slot A's unflushed record.
-        {
-            let mut guard = coord.inner.write();
-            let slot_b = guard
-                .slots
-                .iter_mut()
-                .find(|s| s.volume_id == rec_b.volume_id)
-                .unwrap();
-            slot_b.state = VolumeState::Online;
-        }
+        // Once the disk obstacle is cleared, persist_all flushes slot A and next reconcile cleanly advances scope_snapshot.
+        std::fs::remove_dir_all(&cache_a).unwrap();
+        coord.persist_all();
         let dummy_mounts = base_mounts();
         coord.execute_effects(refresh_mounts_locked(
             &coord.inner,
@@ -6352,63 +7727,13 @@ mod tests {
             false,
         ));
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
-
-        let saved_manifest = VolumeManifest::load_from_dir(&volumes_dir);
-        let saved_a = saved_manifest
-            .records
-            .iter()
-            .find(|r| r.volume_id == rec_a.volume_id)
-            .unwrap();
-        assert_eq!(
-            saved_a.entry_count, 2,
-            "neighbor slot state change must not leak and upsert slot A's unflushed record"
-        );
-        assert_eq!(
-            saved_a.pruned_for_fp, None,
-            "manifest must not persist pruned_for_fp while pruned shard failed to flush"
-        );
-        assert_eq!(coord.prune_run_count(), 2, "must not re-prune slot A on later reconcile");
-
-        // Even if slot A itself transitions Online -> Offline while still dirty_cache,
-        // its unflushed pruned_for_fp must remain masked as None in manifest.json.
-        {
-            let mut guard = coord.inner.write();
-            let slot_a = guard
-                .slots
-                .iter_mut()
-                .find(|s| s.volume_id == rec_a.volume_id)
-                .unwrap();
-            slot_a.state = VolumeState::Online;
-        }
-        coord.execute_effects(refresh_mounts_locked(
-            &coord.inner,
-            &dummy_mounts,
-            &volumes_dir,
-            false,
-        ));
-        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
-        let saved_manifest_self = VolumeManifest::load_from_dir(&volumes_dir);
-        let saved_a_self = saved_manifest_self
-            .records
-            .iter()
-            .find(|r| r.volume_id == rec_a.volume_id)
-            .unwrap();
-        assert_eq!(saved_a_self.entry_count, 1);
-        assert_eq!(
-            saved_a_self.pruned_for_fp, None,
-            "self-triggered reconcile must still mask pruned_for_fp while dirty_cache is true"
-        );
-
-        // Once the disk obstacle is cleared, persist_all flushes slot A and persists pruned_for_fp.
-        std::fs::remove_dir_all(&cache_a).unwrap();
-        coord.persist_all();
         let flushed_manifest = VolumeManifest::load_from_dir(&volumes_dir);
         let flushed_a = flushed_manifest
             .records
             .iter()
             .find(|r| r.volume_id == rec_a.volume_id)
             .unwrap();
-        assert_eq!(flushed_a.pruned_for_fp, Some(target_fp));
+        assert_eq!(flushed_a.scope_snapshot, Some(snap_a_updated));
         let (reloaded_a, _) = cache::load_compact(&cache_a).unwrap();
         assert_eq!(reloaded_a.len(), 1);
     }
@@ -6459,16 +7784,20 @@ mod tests {
                 display_name: "StaleGenSave".to_string(),
                 kind: VolumeKind::LocalExternal,
                 fstype: "apfs".to_string(),
+                from_name: "/dev/disk50s1".to_string(),
                 identity,
                 state: VolumeState::Online,
                 entry_count: 2,
                 last_sync_at: Some(1_700_000_000),
                 last_event_id: Some(200),
                 journal_uuid: None,
-                dirty_filter: false,
-                filter_fingerprint: Some(42),
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: true,
                 dirty_cache: true,
@@ -6534,7 +7863,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.index.index_paths = vec![missing_sub_str.clone()];
         cfg.index.include_hidden = true;
-        let fp_old = crate::volumes::volume_filter_fingerprint(&cfg, true);
+        let old_snap = VolumeScopeSnapshot::from_config(&cfg, &missing_sub, &missing_sub);
 
         let identity = VolumeIdentity::LocalUuid {
             uuid: "EXT-SCAN-FAIL-MISSING".to_string(),
@@ -6554,9 +7883,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count: 2,
+            scope_snapshot: Some(old_snap),
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
-            filter_fingerprint: Some(fp_old),
-            pruned_for_fp: None,
+            filter_fingerprint: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -6591,6 +7922,9 @@ mod tests {
         );
         coord.initialize(&edited, Arc::new(|| {}));
         assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+        // Explicitly trigger rescan against vanished subpath -> falls back to Missing while keeping pruned cache
+        assert_eq!(coord.rescan_volume(&missing_sub_str), Ok(true));
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
         assert_eq!(coord.statuses()[0].state, VolumeState::Missing);
         let primary = IndexStore::new();
         assert!(
@@ -6598,7 +7932,7 @@ mod tests {
                 .search(&primary, "secret.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, true)
                 .0
                 .is_empty(),
-            "RootUnavailable scan fallback to Missing must prune newly excluded entries"
+            "RootUnavailable scan fallback to Missing must preserve pruned exclusions"
         );
         assert_eq!(
             coord
@@ -6621,7 +7955,7 @@ mod tests {
         let mut cfg2 = AppConfig::default();
         cfg2.index.index_paths = vec![disk_str2.clone()];
         cfg2.index.include_hidden = true;
-        let fp_old2 = crate::volumes::volume_filter_fingerprint(&cfg2, true);
+        let snap_old2 = VolumeScopeSnapshot::from_config(&cfg2, &disk_root2, &disk_root2);
 
         let mut rec2 = make_network_record(
             &disk_str2,
@@ -6633,7 +7967,7 @@ mod tests {
             2,
             false,
         );
-        rec2.filter_fingerprint = Some(fp_old2);
+        rec2.scope_snapshot = Some(snap_old2);
         seed_volume_cache(
             &volumes_dir2,
             &rec2,
@@ -6649,13 +7983,13 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_ref = Arc::clone(&calls);
         let disk_str2_clone = disk_str2.clone();
-        // First mount_lister call (initialize) sees the share mounted; subsequent call inside
-        // scan_volume_compact_atomic's is_mounted check reports disconnected.
+        // First two mount_lister calls (initialize + rescan_volume) see the share mounted;
+        // subsequent call inside scan_volume_compact_atomic's is_mounted check reports disconnected.
         let coord2 = VolumeCoordinator::with_mount_and_fda_lister(
             cache_dir2.path().to_path_buf(),
             Arc::new(move || {
                 let mut m = base_mounts();
-                if calls_ref.fetch_add(1, Ordering::SeqCst) == 0 {
+                if calls_ref.fetch_add(1, Ordering::SeqCst) < 2 {
                     m.push(MountedFsInfo {
                         mount_point: disk_str2_clone.clone(),
                         fstype: "smbfs".to_string(),
@@ -6674,13 +8008,15 @@ mod tests {
         edited2.index.exclude.push("blocked".to_string());
         coord2.initialize(&edited2, Arc::new(|| {}));
         assert!(coord2.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord2.rescan_volume(&disk_str2), Ok(true));
+        assert!(coord2.wait_for_workers_idle(Duration::from_secs(5)));
         assert_eq!(coord2.statuses()[0].state, VolumeState::Offline);
         assert!(
             coord2
                 .search(&primary, "secret.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, true)
                 .0
                 .is_empty(),
-            "Disconnected scan fallback to Offline must prune newly excluded entries"
+            "Disconnected scan fallback to Offline must keep newly excluded entries pruned"
         );
         assert_eq!(
             coord2
@@ -6791,7 +8127,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.index.index_paths = vec![orig_str.clone()];
         config.index.include_hidden = true;
-        let fp_initial = crate::volumes::volume_filter_fingerprint(&config, true);
+        let initial_snap = VolumeScopeSnapshot::from_config(&config, &orig_root, &drifted_root);
 
         let identity = VolumeIdentity::LocalUuid {
             uuid: "EXT-DRIFT-SCAN-EXCLUDE".to_string(),
@@ -6808,12 +8144,14 @@ mod tests {
             fstype: "apfs".to_string(),
             identity,
             last_sync_at: Some(1_700_000_000),
-            last_event_id: None,
-            journal_uuid: None,
+            last_event_id: Some(fsevents::current_event_id()),
+            journal_uuid: fsevents::journal_uuid_for_path(&drifted_root),
             entry_count: 2,
+            scope_snapshot: Some(initial_snap),
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
-            filter_fingerprint: Some(fp_initial),
-            pruned_for_fp: None,
+            filter_fingerprint: None,
         };
         seed_volume_cache(
             &volumes_dir,
@@ -6851,7 +8189,7 @@ mod tests {
             "offline prune must remove configured exclude_paths under drifted mount"
         );
 
-        // Replug at the drifted mount root (`Drive-1`): full rescan must keep `private/tax.pdf` excluded.
+        // Replug at the drifted mount root (`Drive-1`) then run explicit rescan: must keep `private/tax.pdf` excluded.
         let mut replugged = base_mounts();
         replugged.push(MountedFsInfo {
             mount_point: drifted_str.clone(),
@@ -6864,6 +8202,11 @@ mod tests {
         });
         *mounts_state.lock() = replugged;
         coord.notify_volume_mounted(&drifted_root);
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+        assert_eq!(coord.scan_run_count(), 0);
+
+        assert_eq!(coord.rescan_volume(&orig_str), Ok(true));
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline && coord.statuses()[0].state != VolumeState::Online {
             std::thread::sleep(Duration::from_millis(25));
@@ -6888,15 +8231,18 @@ mod tests {
     }
 
     #[test]
-    fn will_unmount_during_dirty_filter_rescan_prunes_offline_cache_immediately() {
+    fn will_unmount_during_narrowing_rescan_prunes_offline_cache_immediately() {
         let cache_dir = TempDir::new().unwrap();
         let volumes_dir = cache_dir.path().join("volumes");
         let root_str = "/Volumes/WillUnmountPrune";
-        let mut cfg = AppConfig::default();
-        cfg.index.index_paths = vec![root_str.to_string()];
+        let mut old_cfg = AppConfig::default();
+        old_cfg.index.index_paths = vec![root_str.to_string()];
+        old_cfg.index.include_hidden = true;
+        let old_snap =
+            VolumeScopeSnapshot::from_config(&old_cfg, Path::new(root_str), Path::new(root_str));
+
+        let mut cfg = old_cfg.clone();
         cfg.index.exclude.push("blocked".to_string());
-        cfg.index.include_hidden = true;
-        let current_fp = crate::volumes::volume_filter_fingerprint(&cfg, true);
 
         let identity = VolumeIdentity::LocalUuid {
             uuid: "EXT-WILL-UNMOUNT-PRUNE".to_string(),
@@ -6922,7 +8268,6 @@ mod tests {
         {
             let mut inner = coord.inner.write();
             inner.config = cfg;
-            inner.current_filter_fp = current_fp;
             inner.slots.push(VolumeSlot {
                 volume_id: vid,
                 configured_path: root_str.to_string(),
@@ -6932,16 +8277,20 @@ mod tests {
                 display_name: "WillUnmountPrune".to_string(),
                 kind: VolumeKind::LocalExternal,
                 fstype: "apfs".to_string(),
+                from_name: "/dev/disk73s1".to_string(),
                 identity,
                 state: VolumeState::Syncing,
                 entry_count: 2,
                 last_sync_at: Some(1_700_000_000),
                 last_event_id: None,
                 journal_uuid: None,
-                dirty_filter: true,
-                filter_fingerprint: Some(current_fp.wrapping_add(1)),
-                pruned_for_fp: None,
-                scan_pending_filter_update: false,
+                scope_snapshot: Some(old_snap),
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
                 is_remounted: false,
                 has_cache: true,
                 dirty_cache: false,
@@ -6971,7 +8320,7 @@ mod tests {
                 .search(&primary, "secret.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, true)
                 .0
                 .is_empty(),
-            "willUnmount interrupting a dirty-filter scan must prune excluded entries immediately"
+            "willUnmount interrupting a scan must prune excluded entries immediately"
         );
         assert_eq!(
             coord
@@ -6980,5 +8329,1388 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn cross_volume_isolation_and_online_drifted_prune() {
+        let cache_dir = TempDir::new().unwrap();
+        let mounts_parent = TempDir::new().unwrap();
+        let parent_canon = mounts_parent.path().canonicalize().unwrap();
+        let orig_root = parent_canon.join("Work22T");
+        let drifted_root = parent_canon.join("Work22T-1");
+        let local_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(drifted_root.join("Cache")).unwrap();
+        std::fs::write(drifted_root.join("keep.txt"), "ok").unwrap();
+        std::fs::write(drifted_root.join("Cache/junk.tmp"), "drop").unwrap();
+
+        let orig_str = orig_root.to_string_lossy().to_string();
+        let drifted_str = drifted_root.to_string_lossy().to_string();
+        let local_str = local_dir.path().canonicalize().unwrap().to_string_lossy().to_string();
+
+        let mut config = AppConfig::default();
+        config.index.index_paths = vec![local_str.clone(), orig_str.clone()];
+        config.index.index_apps = false;
+        config.index.include_hidden = false;
+
+        let mut mounts = base_mounts();
+        mounts.push(MountedFsInfo {
+            mount_point: drifted_str.clone(),
+            fstype: "apfs".to_string(),
+            from_name: "/dev/disk80s1".to_string(),
+            is_local: true,
+            uuid: Some("EXT-ISOLATION-UUID".to_string()),
+            total_bytes: 22_000_000_000_000,
+            volume_name: "Work22T-1".to_string(),
+        });
+        let mounts_arc = Arc::new(Mutex::new(mounts));
+        let mounts_read = Arc::clone(&mounts_arc);
+        let fda = Arc::new(AtomicBool::new(false));
+        let fda_read = Arc::clone(&fda);
+
+        let coord = VolumeCoordinator::with_mount_and_fda_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(move || mounts_read.lock().clone()),
+            Arc::new(move || fda_read.load(Ordering::SeqCst)),
+        );
+
+        // Seed cached slot on drifted mount and initialize -> Online with live stream
+        let identity = VolumeIdentity::LocalUuid {
+            uuid: "EXT-ISOLATION-UUID".to_string(),
+            subpath: String::new(),
+        };
+        let volumes_dir = cache_dir.path().join("volumes");
+        let init_snap = VolumeScopeSnapshot::from_config(&config, &orig_root, &drifted_root);
+        let rec = VolumeRecord {
+            volume_id: identity.volume_id(),
+            configured_path: orig_str.clone(),
+            active_configured_path: drifted_str.clone(),
+            active_mount_root: Some(drifted_str.clone()),
+            subpath: String::new(),
+            display_name: "Work22T".to_string(),
+            kind: VolumeKind::LocalExternal,
+            fstype: "apfs".to_string(),
+            identity,
+            last_sync_at: Some(1_700_000_000),
+            last_event_id: Some(fsevents::current_event_id()),
+            journal_uuid: fsevents::journal_uuid_for_path(&drifted_root),
+            entry_count: 2,
+            scope_snapshot: Some(init_snap),
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
+            dirty_filter: false,
+            filter_fingerprint: None,
+        };
+        seed_volume_cache(
+            &volumes_dir,
+            &rec,
+            vec![
+                make_entry("keep.txt", &format!("{drifted_str}/keep.txt"), false),
+                make_entry("junk.tmp", &format!("{drifted_str}/Cache/junk.tmp"), false),
+            ],
+        );
+        let mut manifest = VolumeManifest::default();
+        manifest.upsert(rec);
+        manifest.save_atomic(&volumes_dir).unwrap();
+
+        coord.initialize(&config, Arc::new(|| {}));
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+        assert_eq!(coord.scan_run_count(), 0);
+        let gen_before = coord.slot_generation(&orig_str).unwrap();
+        assert!(coord.inner.read().slots[0].stream_handle.is_some());
+
+        // 1. Mutate local index_paths, toggle index_apps, exclude a local path, flip has_fda:
+        //    external volume MUST stay Online with scan_runs == 0 and untouched generation/stream!
+        let mut cfg_local_edits = config.clone();
+        cfg_local_edits.index.index_paths.push("/tmp".to_string());
+        cfg_local_edits.index.index_apps = true;
+        cfg_local_edits.index.exclude_paths.push(format!("{local_str}/local_skip"));
+        fda.store(true, Ordering::SeqCst);
+        coord.on_config_updated(&cfg_local_edits);
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord.scan_run_count(), 0);
+        assert_eq!(coord.prune_run_count(), 0);
+        assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+        assert_eq!(coord.slot_generation(&orig_str), Some(gen_before));
+        assert!(coord.inner.read().slots[0].stream_handle.is_some());
+
+        // 2. Add configured exclude path `/Volumes/Work22T/Cache` while online in `-1` drifted state:
+        //    PruneOnly evicts Cache/junk.tmp, advances scope_snapshot, keeps Online, reattaches stream, scan_runs == 0!
+        let mut cfg_vol_exclude = cfg_local_edits.clone();
+        cfg_vol_exclude.index.exclude_paths.push(format!("{orig_str}/Cache"));
+        coord.on_config_updated(&cfg_vol_exclude);
+        assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord.scan_run_count(), 0);
+        assert_eq!(coord.prune_run_count(), 1);
+        assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+        assert!(coord.inner.read().slots[0].stream_handle.is_some());
+
+        let primary = IndexStore::new();
+        assert!(coord
+            .search(&primary, "junk.tmp", SearchMode::Auto, CaseSensitivity::Auto, 10, true)
+            .0
+            .is_empty());
+        assert_eq!(
+            coord
+                .search(&primary, "keep.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, true)
+                .0
+                .len(),
+            1
+        );
+        let saved = VolumeManifest::load_from_dir(&volumes_dir);
+        assert!(saved.records[0]
+            .scope_snapshot
+            .as_ref()
+            .unwrap()
+            .exclude_subpaths
+            .contains(&"Cache".to_string()));
+    }
+
+    #[test]
+    fn stream_loop_ignores_mount_and_root_events_replays_user_dropped_and_invalidates_journal() {
+        // Test 1: MOUNT_CHANGED + root ITEM_CREATED + 2x USER_DROPPED replay cleanly; 4th USER_DROPPED -> JournalInvalidated
+        for fstype in ["apfs", "exfat"] {
+            let cache_dir = TempDir::new().unwrap();
+            let volumes_dir = cache_dir.path().join("volumes");
+            let disk_dir = TempDir::new().unwrap();
+            let disk_root = disk_dir.path().canonicalize().unwrap();
+            let disk_str = disk_root.to_string_lossy().to_string();
+            // Create a disk file that is NOT in the store: if root ITEM_CREATED triggered dir_creates scan, it would appear!
+            std::fs::write(disk_root.join("unindexed_canary.txt"), "canary").unwrap();
+
+            let identity = VolumeIdentity::LocalUuid {
+                uuid: format!("STREAM-GUARD-{fstype}"),
+                subpath: String::new(),
+            };
+            let vid = identity.volume_id();
+            let store = IndexStore::new();
+            store.replace_compact(
+                CompactIndex::from_entries(vec![make_entry(
+                    "kept.txt",
+                    &format!("{disk_str}/kept.txt"),
+                    false,
+                )])
+                .unwrap(),
+            );
+            let cfg = AppConfig::default();
+            let snap = VolumeScopeSnapshot::from_config(&cfg, &disk_root, &disk_root);
+
+            let coord = VolumeCoordinator::with_mount_lister(
+                cache_dir.path().to_path_buf(),
+                Arc::new(base_mounts),
+            );
+            {
+                let mut inner = coord.inner.write();
+                inner.slots.push(VolumeSlot {
+                    volume_id: vid.clone(),
+                    configured_path: disk_str.clone(),
+                    active_configured_path: disk_str.clone(),
+                    active_mount_root: Some(disk_str.clone()),
+                    subpath: String::new(),
+                    display_name: "StreamGuard".to_string(),
+                    kind: VolumeKind::LocalExternal,
+                    fstype: fstype.to_string(),
+                    from_name: "/dev/disk81s1".to_string(),
+                    identity,
+                    state: VolumeState::Online,
+                    entry_count: 1,
+                    last_sync_at: Some(1_700_000_000),
+                    last_event_id: Some(500),
+                    journal_uuid: Some("UUID-1".to_string()),
+                    scope_snapshot: Some(snap.clone()),
+                    dirty_upper_bound: false,
+                    pending_confirm_reason: None,
+                    in_flight_scan_snapshot: None,
+                    in_flight_prune_snapshot: None,
+                    stream_snapshot: Some(snap.clone()),
+                    scanned_count: Arc::new(AtomicU64::new(0)),
+                    is_remounted: false,
+                    has_cache: true,
+                    dirty_cache: false,
+                    cache_seq: 0,
+                    saved_cache_seq: 0,
+                    cache_persistence: CachePersistence::default(),
+                    generation: 1,
+                    cancel_token: Arc::new(AtomicBool::new(false)),
+                    store: store.clone(),
+                    stream_handle: None,
+                    last_rescan_triggered: None,
+                    last_scan_duration: None,
+                    next_reconnect_retry: None,
+                    unmounting_until: None,
+                    skip_missing_rescan: false,
+                });
+            }
+
+            let (tx1, rx1) = mpsc::channel();
+            let reopen_txs: Arc<Mutex<Vec<mpsc::Sender<Vec<fsevents::Event>>>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let reopen_ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+            let reopen_txs_cb = Arc::clone(&reopen_txs);
+            let reopen_ids_cb = Arc::clone(&reopen_ids);
+            let dummy_dir = TempDir::new().unwrap();
+            let dummy_root = dummy_dir.path().canonicalize().unwrap();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_loop = Arc::clone(&stop);
+            let stream_slot = Arc::new(Mutex::new(None));
+            let weak_inner = Arc::downgrade(&coord.inner);
+            let manifest_lock = Arc::clone(&coord.manifest_save_lock);
+            let vdir = volumes_dir.clone();
+            let vid_loop = vid.clone();
+            let active_loop = disk_root.clone();
+            let mount_loop = disk_root.clone();
+            let store_loop = store.clone();
+            let filter = CompiledFilter::for_volume_snapshot(&snap, &disk_root);
+
+            let handle = std::thread::spawn(move || {
+                run_volume_stream_loop(
+                    rx1,
+                    stream_slot,
+                    stop_loop,
+                    weak_inner,
+                    manifest_lock,
+                    vdir,
+                    vid_loop,
+                    1,
+                    mount_loop,
+                    active_loop,
+                    store_loop,
+                    filter,
+                    false,
+                    500,
+                    Duration::from_millis(25),
+                    None,
+                    move |since| {
+                        reopen_ids_cb.lock().push(since);
+                        let (ntx, nrx) = mpsc::channel();
+                        reopen_txs_cb.lock().push(ntx);
+                        let (sink_tx, _sink_rx) = mpsc::channel();
+                        let s = fsevents::watch(&[dummy_root.clone()], fsevents::SINCE_NOW, sink_tx)?;
+                        Some((s, nrx))
+                    },
+                );
+            });
+
+            // 1. Inject MOUNT_CHANGED and root ITEM_CREATED | ITEM_IS_DIR -> must be ignored (no full scan!)
+            tx1.send(vec![
+                fsevents::Event {
+                    path: disk_root.clone(),
+                    flags: fsevents::MOUNT_CHANGED,
+                    id: 501,
+                    inode: None,
+                },
+                fsevents::Event {
+                    path: disk_root.clone(),
+                    flags: fsevents::ITEM_CREATED | 0x0002_0000, // ItemIsDir
+                    id: 502,
+                    inode: None,
+                },
+            ])
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(
+                store.len(),
+                1,
+                "root ITEM_CREATED must never trigger dir_creates scan of unindexed_canary.txt"
+            );
+
+            // 2. Inject 1st & 2nd USER_DROPPED | MUST_SCAN_SUBDIRS -> silent replay from applied_id (500)
+            tx1.send(vec![fsevents::Event {
+                path: disk_root.clone(),
+                flags: fsevents::USER_DROPPED | fsevents::MUST_SCAN_SUBDIRS,
+                id: 503,
+                inode: None,
+            }])
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && reopen_txs.lock().is_empty() {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            assert_eq!(reopen_ids.lock().as_slice(), &[500]);
+            assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+
+            // Drop 2, 3, 4 without HISTORY_DONE -> 3 replays allowed, 4th drop -> JournalInvalidated
+            for attempt in 1..=3 {
+                let latest_tx = reopen_txs.lock().last().unwrap().clone();
+                latest_tx
+                    .send(vec![fsevents::Event {
+                        path: disk_root.clone(),
+                        flags: fsevents::USER_DROPPED | fsevents::MUST_SCAN_SUBDIRS,
+                        id: 503 + attempt as u64,
+                        inode: None,
+                    }])
+                    .unwrap();
+                if attempt < 3 {
+                    let dl = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < dl && reopen_txs.lock().len() <= attempt {
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                    assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+                }
+            }
+
+            handle.join().unwrap();
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::JournalInvalidated)
+            );
+            assert_eq!(store.len(), 1, "old cache must remain intact");
+        }
+
+        // Test 2: Root MUST_SCAN_SUBDIRS, KERNEL_DROPPED, IDS_WRAPPED on both apfs and exfat -> JournalInvalidated
+        for (fstype, flags) in [
+            ("apfs", fsevents::MUST_SCAN_SUBDIRS),
+            ("exfat", fsevents::MUST_SCAN_SUBDIRS),
+            ("apfs", fsevents::KERNEL_DROPPED),
+            ("exfat", fsevents::IDS_WRAPPED),
+        ] {
+            let cache_dir = TempDir::new().unwrap();
+            let volumes_dir = cache_dir.path().join("volumes");
+            let disk_root = PathBuf::from("/Volumes/DropMatrix");
+            let identity = VolumeIdentity::LocalUuid {
+                uuid: format!("DROP-{fstype}-{flags}"),
+                subpath: String::new(),
+            };
+            let vid = identity.volume_id();
+            let store = IndexStore::new();
+            store.replace_compact(
+                CompactIndex::from_entries(vec![make_entry(
+                    "kept.txt",
+                    "/Volumes/DropMatrix/kept.txt",
+                    false,
+                )])
+                .unwrap(),
+            );
+            let snap = VolumeScopeSnapshot::from_config(&AppConfig::default(), &disk_root, &disk_root);
+            let coord = VolumeCoordinator::with_mount_lister(
+                cache_dir.path().to_path_buf(),
+                Arc::new(base_mounts),
+            );
+            {
+                let mut inner = coord.inner.write();
+                inner.slots.push(VolumeSlot {
+                    volume_id: vid.clone(),
+                    configured_path: "/Volumes/DropMatrix".to_string(),
+                    active_configured_path: "/Volumes/DropMatrix".to_string(),
+                    active_mount_root: Some("/Volumes/DropMatrix".to_string()),
+                    subpath: String::new(),
+                    display_name: "DropMatrix".to_string(),
+                    kind: VolumeKind::LocalExternal,
+                    fstype: fstype.to_string(),
+                    from_name: "/dev/disk82s1".to_string(),
+                    identity,
+                    state: VolumeState::Online,
+                    entry_count: 1,
+                    last_sync_at: Some(1_700_000_000),
+                    last_event_id: Some(700),
+                    journal_uuid: Some("UUID-2".to_string()),
+                    scope_snapshot: Some(snap.clone()),
+                    dirty_upper_bound: false,
+                    pending_confirm_reason: None,
+                    in_flight_scan_snapshot: None,
+                    in_flight_prune_snapshot: None,
+                    stream_snapshot: Some(snap.clone()),
+                    scanned_count: Arc::new(AtomicU64::new(0)),
+                    is_remounted: false,
+                    has_cache: true,
+                    dirty_cache: false,
+                    cache_seq: 0,
+                    saved_cache_seq: 0,
+                    cache_persistence: CachePersistence::default(),
+                    generation: 1,
+                    cancel_token: Arc::new(AtomicBool::new(false)),
+                    store: store.clone(),
+                    stream_handle: None,
+                    last_rescan_triggered: None,
+                    last_scan_duration: None,
+                    next_reconnect_retry: None,
+                    unmounting_until: None,
+                    skip_missing_rescan: false,
+                });
+            }
+
+            let (tx, rx) = mpsc::channel();
+            tx.send(vec![fsevents::Event {
+                path: disk_root.clone(),
+                flags,
+                id: 701,
+                inode: None,
+            }])
+            .unwrap();
+            let filter = CompiledFilter::for_volume_snapshot(&snap, &disk_root);
+            run_volume_stream_loop(
+                rx,
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::downgrade(&coord.inner),
+                Arc::clone(&coord.manifest_save_lock),
+                volumes_dir,
+                vid,
+                1,
+                disk_root.clone(),
+                disk_root,
+                store.clone(),
+                filter,
+                false,
+                700,
+                Duration::from_millis(20),
+                None,
+                |_| None,
+            );
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::JournalInvalidated)
+            );
+            assert_eq!(store.len(), 1);
+        }
+    }
+
+    #[test]
+    fn exfat_ntfs_apfs_journal_split_matrix() {
+        let cases: &[(&str, Option<&str>, Option<&str>, VolumeState, Option<VolumeConfirmReason>, bool)] = &[
+            // ExFAT 同挂载会话重启应用（UUID 匹配）-> 历史追赶并保持 Online
+            ("exfat", Some("EXFAT-UUID-1"), Some("EXFAT-UUID-1"), VolumeState::Online, None, false),
+            // ExFAT 跨关机重启 UUID 轮换 -> 静默更新 UUID、复用旧缓存保持 Online
+            ("exfat", Some("EXFAT-UUID-OLD"), Some("EXFAT-UUID-NEW"), VolumeState::Online, None, false),
+            // NTFS live_uuid == None -> 复用旧缓存保持 Online
+            ("ntfs", None, None, VolumeState::Online, None, false),
+            // APFS UUID 不匹配 -> NeedsConfirmation(JournalInvalidated) 且保留旧缓存
+            ("apfs", Some("APFS-UUID-OLD"), Some("APFS-UUID-NEW"), VolumeState::NeedsConfirmation, Some(VolumeConfirmReason::JournalInvalidated), true),
+        ];
+
+        for (idx, (fstype, saved_uuid, live_uuid, expected_state, expected_reason, expected_persistent)) in
+            cases.iter().enumerate()
+        {
+            let cache_dir = TempDir::new().unwrap();
+            let volumes_dir = cache_dir.path().join("volumes");
+            let disk_dir = TempDir::new().unwrap();
+            let disk_root = disk_dir.path().canonicalize().unwrap();
+            let disk_str = disk_root.to_string_lossy().to_string();
+
+            let mut cfg = AppConfig::default();
+            cfg.index.index_paths = vec![disk_str.clone()];
+            let snap = VolumeScopeSnapshot::from_config(&cfg, &disk_root, &disk_root);
+
+            let identity = VolumeIdentity::LocalUuid {
+                uuid: format!("MATRIX-{fstype}-{idx}"),
+                subpath: String::new(),
+            };
+            let rec = VolumeRecord {
+                volume_id: identity.volume_id(),
+                configured_path: disk_str.clone(),
+                active_configured_path: disk_str.clone(),
+                active_mount_root: Some(disk_str.clone()),
+                subpath: String::new(),
+                display_name: format!("Vol{idx}"),
+                kind: VolumeKind::LocalExternal,
+                fstype: (*fstype).to_string(),
+                identity,
+                last_sync_at: Some(1_700_000_000),
+                last_event_id: Some(fsevents::current_event_id()),
+                journal_uuid: saved_uuid.map(str::to_string),
+                entry_count: 1,
+                scope_snapshot: Some(snap),
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                dirty_filter: false,
+                filter_fingerprint: None,
+            };
+            seed_volume_cache(
+                &volumes_dir,
+                &rec,
+                vec![make_entry("cached.txt", &format!("{disk_str}/cached.txt"), false)],
+            );
+            let mut manifest = VolumeManifest::default();
+            manifest.upsert(rec);
+            manifest.save_atomic(&volumes_dir).unwrap();
+
+            let mut mounts = base_mounts();
+            mounts.push(MountedFsInfo {
+                mount_point: disk_str.clone(),
+                fstype: (*fstype).to_string(),
+                from_name: format!("/dev/disk9{idx}s1"),
+                is_local: true,
+                uuid: Some(format!("MATRIX-{fstype}-{idx}")),
+                total_bytes: 1_000_000,
+                volume_name: format!("Vol{idx}"),
+            });
+            let live_owned = live_uuid.map(str::to_string);
+            let coord = VolumeCoordinator::with_mount_and_journal_provider(
+                cache_dir.path().to_path_buf(),
+                Arc::new(move || mounts.clone()),
+                Arc::new(move |_| live_owned.clone()),
+            );
+
+            coord.initialize(&cfg, Arc::new(|| {}));
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+
+            let st = &coord.statuses()[0];
+            assert_eq!(st.state, *expected_state, "case {idx} ({fstype})");
+            assert_eq!(st.confirm_reason, *expected_reason, "case {idx} ({fstype})");
+            assert_eq!(st.supports_persistent_journal, *expected_persistent);
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(st.entry_count, 1, "old cache must remain intact");
+
+            if *fstype == "exfat" && saved_uuid != live_uuid {
+                let updated_manifest = VolumeManifest::load_from_dir(&volumes_dir);
+                assert_eq!(
+                    updated_manifest.records[0].journal_uuid.as_deref(),
+                    *live_uuid,
+                    "ExFAT rotated UUID must be silently persisted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn needs_confirmation_priority_aba_rollback_and_lossless_cancel() {
+        let cache_dir = TempDir::new().unwrap();
+        let volumes_dir = cache_dir.path().join("volumes");
+        let disk_dir = TempDir::new().unwrap();
+        let disk_root = disk_dir.path().canonicalize().unwrap();
+        let disk_str = disk_root.to_string_lossy().to_string();
+        std::fs::write(disk_root.join("base.txt"), "ok").unwrap();
+
+        let mut base_cfg = AppConfig::default();
+        base_cfg.index.index_paths = vec![disk_str.clone()];
+        base_cfg.index.include_hidden = false;
+
+        let mut mounts = base_mounts();
+        mounts.push(MountedFsInfo {
+            mount_point: disk_str.clone(),
+            fstype: "apfs".to_string(),
+            from_name: "/dev/disk85s1".to_string(),
+            is_local: true,
+            uuid: Some("EXT-ABA-UUID".to_string()),
+            total_bytes: 500_000,
+            volume_name: "AbaDisk".to_string(),
+        });
+        let mounts_state = Arc::new(Mutex::new(mounts.clone()));
+        let live_journal = Arc::new(Mutex::new(Some("JUUID-A".to_string())));
+
+        // 1. Seed online APFS volume -> widen filter -> NeedsConfirmation(FilterWidened) + live stream + dirty_upper_bound
+        let identity = VolumeIdentity::LocalUuid {
+            uuid: "EXT-ABA-UUID".to_string(),
+            subpath: String::new(),
+        };
+        let base_snap = VolumeScopeSnapshot::from_config(&base_cfg, &disk_root, &disk_root);
+        let init_rec = VolumeRecord {
+            volume_id: identity.volume_id(),
+            configured_path: disk_str.clone(),
+            active_configured_path: disk_str.clone(),
+            active_mount_root: Some(disk_str.clone()),
+            subpath: String::new(),
+            display_name: "AbaDisk".to_string(),
+            kind: VolumeKind::LocalExternal,
+            fstype: "apfs".to_string(),
+            identity,
+            last_sync_at: Some(1_700_000_000),
+            last_event_id: Some(fsevents::current_event_id()),
+            journal_uuid: Some("JUUID-A".to_string()),
+            entry_count: 1,
+            scope_snapshot: Some(base_snap.clone()),
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
+            dirty_filter: false,
+            filter_fingerprint: None,
+        };
+        seed_volume_cache(
+            &volumes_dir,
+            &init_rec,
+            vec![make_entry("base.txt", &format!("{disk_str}/base.txt"), false)],
+        );
+        let mut manifest = VolumeManifest::default();
+        manifest.upsert(init_rec.clone());
+        manifest.save_atomic(&volumes_dir).unwrap();
+
+        let mut widened_cfg = base_cfg.clone();
+        widened_cfg.index.include_hidden = true;
+
+        let primary = IndexStore::new();
+        {
+            let m_read = Arc::clone(&mounts_state);
+            let j_read = Arc::clone(&live_journal);
+            let coord = VolumeCoordinator::with_mount_and_journal_provider(
+                cache_dir.path().to_path_buf(),
+                Arc::new(move || m_read.lock().clone()),
+                Arc::new(move |_| j_read.lock().clone()),
+            );
+            coord.initialize(&base_cfg, Arc::new(|| {}));
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+
+            coord.on_config_updated(&widened_cfg);
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::FilterWidened)
+            );
+            assert!(coord.inner.read().slots[0].dirty_upper_bound);
+            assert!(coord.inner.read().slots[0].stream_handle.is_some());
+
+            // Write a hidden file during deferral -> ingested via widened live stream!
+            std::thread::sleep(Duration::from_millis(250));
+            std::fs::write(disk_root.join(".deferred_hidden.txt"), "h").unwrap();
+            let dl = Instant::now() + Duration::from_secs(8);
+            let mut saw_hidden = false;
+            while Instant::now() < dl {
+                if !coord
+                    .search(&primary, ".deferred_hidden.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, false)
+                    .0
+                    .is_empty()
+                {
+                    saw_hidden = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            assert!(saw_hidden, "live stream must ingest hidden file during FilterWidened deferral");
+            coord.persist_all();
+        }
+
+        // 2. Restart with widened_cfg -> stays NeedsConfirmation(FilterWidened) with live stream
+        {
+            let m_read = Arc::clone(&mounts_state);
+            let j_read = Arc::clone(&live_journal);
+            let coord = VolumeCoordinator::with_mount_and_journal_provider(
+                cache_dir.path().to_path_buf(),
+                Arc::new(move || m_read.lock().clone()),
+                Arc::new(move |_| j_read.lock().clone()),
+            );
+            coord.initialize(&widened_cfg, Arc::new(|| {}));
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::FilterWidened)
+            );
+            assert!(coord.inner.read().slots[0].stream_handle.is_some());
+
+            // Online ABA rollback back to base_cfg -> auto PruneJob evicts .deferred_hidden.txt & restores Online!
+            coord.on_config_updated(&base_cfg);
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.prune_run_count(), 1);
+            assert_eq!(coord.statuses()[0].state, VolumeState::Online);
+            assert!(!coord.inner.read().slots[0].dirty_upper_bound);
+            assert!(coord
+                .search(&primary, ".deferred_hidden.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, true)
+                .0
+                .is_empty());
+
+            // Widen again, go offline, rotate journal UUID -> replug: JournalInvalidated overrides FilterWidened & no stream!
+            coord.on_config_updated(&widened_cfg);
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            *mounts_state.lock() = base_mounts();
+            coord.notify_volume_will_unmount(&disk_root);
+            let saved_ev_id = coord.inner.read().slots[0].last_event_id;
+            *live_journal.lock() = Some("JUUID-ROTATED".to_string());
+            *mounts_state.lock() = mounts.clone();
+            coord.notify_volume_mounted(&disk_root);
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::JournalInvalidated)
+            );
+            assert!(
+                coord.inner.read().slots[0].stream_handle.is_none(),
+                "JournalInvalidated must NOT attach live stream"
+            );
+            assert_eq!(coord.inner.read().slots[0].last_event_id, saved_ev_id);
+
+            // Cancel flow 1: confirm scan on NeedsConfirmation then cancel immediately -> preserves old cache & returns to NeedsConfirmation
+            {
+                let mut inner = coord.inner.write();
+                inner.slots[0].state = VolumeState::Syncing;
+            }
+            assert_eq!(coord.cancel_volume_scan(&init_rec.volume_id), Ok(true));
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::JournalInvalidated)
+            );
+            assert_eq!(
+                coord
+                    .search(&primary, "base.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, false)
+                    .0
+                    .len(),
+                1
+            );
+        }
+
+        // 3. Cancel flow 2: actively adding an uncached mounted volume enters Syncing; cancel restores NeedsConfirmation(InitialScan)
+        let cache_dir2 = TempDir::new().unwrap();
+        let disk2 = TempDir::new().unwrap();
+        let disk2_root = disk2.path().canonicalize().unwrap();
+        let disk2_str = disk2_root.to_string_lossy().to_string();
+        let mut mounts2 = base_mounts();
+        mounts2.push(MountedFsInfo {
+            mount_point: disk2_str.clone(),
+            fstype: "apfs".to_string(),
+            from_name: "/dev/disk86s1".to_string(),
+            is_local: true,
+            uuid: Some("EXT-ACTIVE-ADD-CANCEL".to_string()),
+            total_bytes: 500_000,
+            volume_name: "NewDisk".to_string(),
+        });
+        let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        let gate_cb = Arc::clone(&gate);
+        let main_tid = std::thread::current().id();
+        let coord2 = VolumeCoordinator::with_mount_lister(
+            cache_dir2.path().to_path_buf(),
+            Arc::new(move || {
+                if std::thread::current().id() != main_tid {
+                    let (lock, cvar) = &*gate_cb;
+                    let mut hold = lock.lock().unwrap();
+                    while *hold {
+                        hold = cvar.wait(hold).unwrap();
+                    }
+                }
+                mounts2.clone()
+            }),
+        );
+        let mut cfg_before = AppConfig::default();
+        cfg_before.index.index_paths = vec![];
+        coord2.initialize(&cfg_before, Arc::new(|| {}));
+
+        let mut cfg_after = cfg_before.clone();
+        cfg_after.index.index_paths = vec![disk2_str.clone()];
+        coord2.on_config_updated(&cfg_after);
+        assert_eq!(coord2.statuses()[0].state, VolumeState::Syncing);
+        assert_eq!(coord2.cancel_volume_scan(&disk2_str), Ok(true));
+        {
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = false;
+            cvar.notify_all();
+        }
+        assert!(coord2.wait_for_workers_idle(Duration::from_secs(5)));
+        assert_eq!(coord2.statuses()[0].state, VolumeState::NeedsConfirmation);
+        assert_eq!(
+            coord2.statuses()[0].confirm_reason,
+            Some(VolumeConfirmReason::InitialScan)
+        );
+        assert!(!coord2.statuses()[0].has_cache);
+    }
+
+    #[test]
+    fn legacy_manifest_upgrade_and_corrupt_manifest_boundary_cases() {
+        // Case 1: d410c85 manifest with legacy fp(has_fda=false) claimed cleanly even when has_fda=true
+        {
+            let cache_dir = TempDir::new().unwrap();
+            let volumes_dir = cache_dir.path().join("volumes");
+            let root_str = "/Volumes/LegacyClaim";
+            let mut cfg = AppConfig::default();
+            cfg.index.index_paths = vec![root_str.to_string()];
+            let legacy_fp_no_fda = legacy_volume_filter_fingerprint(&cfg, false);
+
+            let mut rec = make_network_record(
+                root_str,
+                root_str,
+                None,
+                "",
+                "LegacyClaim",
+                "//nas/LegacyClaim",
+                1,
+                false,
+            );
+            rec.filter_fingerprint = Some(legacy_fp_no_fda);
+            seed_volume_cache(
+                &volumes_dir,
+                &rec,
+                vec![make_entry("a.txt", "/Volumes/LegacyClaim/a.txt", false)],
+            );
+            // Serialize legacy JSON explicitly with dirty_filter and filter_fingerprint
+            let legacy_json = serde_json::json!({
+                "records": [{
+                    "volume_id": rec.volume_id,
+                    "configured_path": rec.configured_path,
+                    "active_configured_path": rec.active_configured_path,
+                    "active_mount_root": rec.active_mount_root,
+                    "subpath": rec.subpath,
+                    "display_name": rec.display_name,
+                    "kind": rec.kind,
+                    "fstype": rec.fstype,
+                    "identity": rec.identity,
+                    "last_sync_at": rec.last_sync_at,
+                    "last_event_id": rec.last_event_id,
+                    "journal_uuid": rec.journal_uuid,
+                    "entry_count": rec.entry_count,
+                    "dirty_filter": false,
+                    "filter_fingerprint": legacy_fp_no_fda,
+                    "pruned_for_fp": null
+                }]
+            });
+            std::fs::write(
+                volumes_dir.join("manifest.json"),
+                serde_json::to_string_pretty(&legacy_json).unwrap(),
+            )
+            .unwrap();
+
+            let coord = VolumeCoordinator::with_mount_and_fda_lister(
+                cache_dir.path().to_path_buf(),
+                Arc::new(base_mounts),
+                Arc::new(|| true),
+            );
+            coord.initialize(&cfg, Arc::new(|| {}));
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.prune_run_count(), 0);
+            let saved = VolumeManifest::load_from_dir(&volumes_dir);
+            assert!(saved.records[0].scope_snapshot.is_some());
+            assert_eq!(saved.records[0].pending_confirm_reason, None);
+            let raw = std::fs::read_to_string(volumes_dir.join("manifest.json")).unwrap();
+            assert!(!raw.contains("\"dirty_filter\""));
+            assert!(!raw.contains("\"filter_fingerprint\""));
+        }
+
+        // Case 2: dirty_filter == false but legacy filter_fingerprint mismatches (offline edit) ->
+        // scope_snapshot == None, NeedsConfirmation(FilterWidened), modifying config does NOT trigger ABA rollback!
+        {
+            let cache_dir = TempDir::new().unwrap();
+            let volumes_dir = cache_dir.path().join("volumes");
+            let disk_dir = TempDir::new().unwrap();
+            let disk_root = disk_dir.path().canonicalize().unwrap();
+            let disk_str = disk_root.to_string_lossy().to_string();
+
+            let mut cfg = AppConfig::default();
+            cfg.index.index_paths = vec![disk_str.clone()];
+            let identity = VolumeIdentity::LocalUuid {
+                uuid: "LEGACY-MISMATCH-UUID".to_string(),
+                subpath: String::new(),
+            };
+            let vid = identity.volume_id();
+            let rec = VolumeRecord {
+                volume_id: vid.clone(),
+                configured_path: disk_str.clone(),
+                active_configured_path: disk_str.clone(),
+                active_mount_root: Some(disk_str.clone()),
+                subpath: String::new(),
+                display_name: "LegacyMismatch".to_string(),
+                kind: VolumeKind::LocalExternal,
+                fstype: "exfat".to_string(),
+                identity: identity.clone(),
+                last_sync_at: Some(1_700_000_000),
+                last_event_id: Some(10),
+                journal_uuid: Some("EXFAT-J".to_string()),
+                entry_count: 1,
+                scope_snapshot: None,
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                dirty_filter: false,
+                filter_fingerprint: Some(0xDEAD_BEEF_1234_5678),
+            };
+            seed_volume_cache(
+                &volumes_dir,
+                &rec,
+                vec![make_entry("doc.txt", &format!("{disk_str}/doc.txt"), false)],
+            );
+            let legacy_json = serde_json::json!({
+                "records": [{
+                    "volume_id": rec.volume_id,
+                    "configured_path": rec.configured_path,
+                    "active_configured_path": rec.active_configured_path,
+                    "active_mount_root": rec.active_mount_root,
+                    "subpath": rec.subpath,
+                    "display_name": rec.display_name,
+                    "kind": rec.kind,
+                    "fstype": rec.fstype,
+                    "identity": rec.identity,
+                    "last_sync_at": rec.last_sync_at,
+                    "last_event_id": rec.last_event_id,
+                    "journal_uuid": rec.journal_uuid,
+                    "entry_count": rec.entry_count,
+                    "dirty_filter": false,
+                    "filter_fingerprint": 0xDEAD_BEEF_1234_5678u64
+                }]
+            });
+            std::fs::write(
+                volumes_dir.join("manifest.json"),
+                serde_json::to_string_pretty(&legacy_json).unwrap(),
+            )
+            .unwrap();
+
+            let mut mounts = base_mounts();
+            mounts.push(MountedFsInfo {
+                mount_point: disk_str.clone(),
+                fstype: "exfat".to_string(),
+                from_name: "/dev/disk88s1".to_string(),
+                is_local: true,
+                uuid: Some("LEGACY-MISMATCH-UUID".to_string()),
+                total_bytes: 500_000,
+                volume_name: "LegacyMismatch".to_string(),
+            });
+            let coord = VolumeCoordinator::with_mount_lister(
+                cache_dir.path().to_path_buf(),
+                Arc::new(move || mounts.clone()),
+            );
+            coord.initialize(&cfg, Arc::new(|| {}));
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::FilterWidened)
+            );
+            assert!(coord.inner.read().slots[0].scope_snapshot.is_none());
+
+            // Modifying config while scope_snapshot == None must NOT trigger ABA rollback
+            let mut next_cfg = cfg.clone();
+            next_cfg.index.exclude.push("unrelated".to_string());
+            coord.on_config_updated(&next_cfg);
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.prune_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+        }
+
+        // Case 3: Corrupt manifest.json with surviving .cache on both APFS and ExFAT ->
+        // directly NeedsConfirmation(JournalInvalidated), no live stream, old cache searchable
+        for fstype in ["apfs", "exfat"] {
+            let cache_dir = TempDir::new().unwrap();
+            let volumes_dir = cache_dir.path().join("volumes");
+            let disk_dir = TempDir::new().unwrap();
+            let disk_root = disk_dir.path().canonicalize().unwrap();
+            let disk_str = disk_root.to_string_lossy().to_string();
+
+            let identity = VolumeIdentity::LocalUuid {
+                uuid: format!("CORRUPT-MANIFEST-{fstype}"),
+                subpath: String::new(),
+            };
+            let vid = identity.volume_id();
+            std::fs::create_dir_all(&volumes_dir).unwrap();
+            let compact = CompactIndex::from_entries(vec![make_entry(
+                "survivor.txt",
+                &format!("{disk_str}/survivor.txt"),
+                false,
+            )])
+            .unwrap();
+            cache::save_compact(
+                &compact,
+                Some(cache::Checkpoint {
+                    event_id: 99,
+                    fingerprint: 0,
+                }),
+                &volumes_dir.join(format!("{vid}.cache")),
+            )
+            .unwrap();
+            // Write corrupted JSON as manifest.json
+            std::fs::write(volumes_dir.join("manifest.json"), b"{corrupt json").unwrap();
+
+            let mut cfg = AppConfig::default();
+            cfg.index.index_paths = vec![disk_str.clone()];
+            let mut mounts = base_mounts();
+            mounts.push(MountedFsInfo {
+                mount_point: disk_str.clone(),
+                fstype: fstype.to_string(),
+                from_name: "/dev/disk89s1".to_string(),
+                is_local: true,
+                uuid: Some(format!("CORRUPT-MANIFEST-{fstype}")),
+                total_bytes: 500_000,
+                volume_name: "CorruptVol".to_string(),
+            });
+            let coord = VolumeCoordinator::with_mount_lister(
+                cache_dir.path().to_path_buf(),
+                Arc::new(move || mounts.clone()),
+            );
+            coord.initialize(&cfg, Arc::new(|| {}));
+            assert!(coord.wait_for_workers_idle(Duration::from_secs(5)));
+            assert_eq!(coord.scan_run_count(), 0);
+            assert_eq!(coord.statuses()[0].state, VolumeState::NeedsConfirmation);
+            assert_eq!(
+                coord.statuses()[0].confirm_reason,
+                Some(VolumeConfirmReason::JournalInvalidated)
+            );
+            assert!(
+                coord.inner.read().slots[0].stream_handle.is_none(),
+                "corrupt manifest must not attach live stream even on {fstype}"
+            );
+            assert_eq!(coord.inner.read().slots[0].last_event_id, Some(99));
+            let primary = IndexStore::new();
+            assert_eq!(
+                coord
+                    .search(&primary, "survivor.txt", SearchMode::Auto, CaseSensitivity::Auto, 10, false)
+                    .0
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn poll_live_journal_uuid_waits_for_delayed_fseventsd_and_honors_cancel() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_cb = Arc::clone(&attempts);
+        let provider: JournalUuidProvider = Arc::new(move |_| {
+            let n = attempts_cb.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                None
+            } else {
+                Some("DELAYED-APFS-UUID".to_string())
+            }
+        });
+        let cancel = AtomicBool::new(false);
+        let got = poll_live_journal_uuid(
+            &provider,
+            Path::new("/Volumes/DelayedAPFS"),
+            &cancel,
+            Duration::from_secs(2),
+        );
+        assert_eq!(got.as_deref(), Some("DELAYED-APFS-UUID"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        // Cancelled token must abort retry immediately without waiting full timeout.
+        let never: JournalUuidProvider = Arc::new(|_| None);
+        let cancelled = AtomicBool::new(true);
+        let start = Instant::now();
+        let none = poll_live_journal_uuid(
+            &never,
+            Path::new("/Volumes/CancelledAPFS"),
+            &cancelled,
+            Duration::from_secs(5),
+        );
+        assert_eq!(none, None);
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn aborted_prune_job_clears_in_flight_prune_snapshot_for_re_enqueue() {
+        let cache_dir = TempDir::new().unwrap();
+        let disk_str = "/Volumes/OfflinePruneAbort".to_string();
+        let mut cfg_s0 = AppConfig::default();
+        cfg_s0.index.index_paths = vec![disk_str.clone()];
+        cfg_s0.index.exclude = vec![];
+        cfg_s0.index.include_hidden = true;
+
+        let snap_s0 =
+            VolumeScopeSnapshot::from_config(&cfg_s0, Path::new(&disk_str), Path::new(&disk_str));
+        let mut cfg_s1 = cfg_s0.clone();
+        cfg_s1.index.exclude = vec!["dropme".to_string()];
+        let snap_s1 =
+            VolumeScopeSnapshot::from_config(&cfg_s1, Path::new(&disk_str), Path::new(&disk_str));
+        let mut cfg_s2 = cfg_s0.clone();
+        cfg_s2.index.exclude = vec!["other".to_string()];
+
+        let store = IndexStore::new();
+        let compact = crate::compact_index::CompactIndex::from_entries(vec![
+            make_entry("keep.txt", &format!("{disk_str}/keep.txt"), false),
+            make_entry("drop.txt", &format!("{disk_str}/dropme/drop.txt"), false),
+        ])
+        .unwrap();
+        store.replace_compact(compact);
+
+        let identity = VolumeIdentity::LocalUuid {
+            uuid: "ABORT-PRUNE-UUID".to_string(),
+            subpath: String::new(),
+        };
+        let vid = identity.volume_id();
+        let coord = VolumeCoordinator::with_mount_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(base_mounts),
+        );
+        {
+            let mut guard = coord.inner.write();
+            guard.config = cfg_s1.clone();
+            guard.slots.push(VolumeSlot {
+                volume_id: vid.clone(),
+                configured_path: disk_str.clone(),
+                active_configured_path: disk_str.clone(),
+                active_mount_root: None,
+                subpath: String::new(),
+                display_name: "OfflinePruneAbort".to_string(),
+                kind: VolumeKind::LocalExternal,
+                fstype: "apfs".to_string(),
+                from_name: "/dev/disk91s1".to_string(),
+                identity,
+                state: VolumeState::Offline,
+                entry_count: 2,
+                last_sync_at: Some(1_700_000_000),
+                last_event_id: Some(10),
+                journal_uuid: Some("ABORT-JUUID".to_string()),
+                scope_snapshot: Some(snap_s0),
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
+                is_remounted: false,
+                has_cache: true,
+                dirty_cache: false,
+                cache_seq: 0,
+                saved_cache_seq: 0,
+                cache_persistence: CachePersistence::default(),
+                generation: 1,
+                cancel_token: Arc::new(AtomicBool::new(false)),
+                store: store.clone(),
+                stream_handle: None,
+                last_rescan_triggered: None,
+                last_scan_duration: None,
+                next_reconnect_retry: None,
+                unmounting_until: None,
+                skip_missing_rescan: false,
+            });
+        }
+
+        // 1. 入队 S1 裁剪任务
+        let mut eff1 = TransitionEffects::default();
+        {
+            let mut guard = coord.inner.write();
+            reconcile_offline_slot_scope(&mut guard.slots[0], &cfg_s1, &mut eff1);
+            assert!(guard.slots[0].in_flight_prune_snapshot.is_some());
+        }
+        let job_s1 = match eff1.tasks.pop() {
+            Some(WorkerTask::Prune(job)) => job,
+            other => panic!("expected PruneJob, got {:?}", other.is_some()),
+        };
+
+        // 2. 在 job_s1 执行前配置改为 S2（live_target != S1），令其命中 !should_prune 早退
+        coord.inner.write().config = cfg_s2;
+        execute_prune_job(
+            &coord.inner,
+            &coord.manifest_save_lock,
+            &coord.worker_queue,
+            &coord.journal_uuid_provider,
+            Duration::ZERO,
+            &coord.volumes_dir(),
+            job_s1,
+        );
+        assert!(
+            coord.inner.read().slots[0]
+                .in_flight_prune_snapshot
+                .is_none(),
+            "aborted prune job must clear in_flight_prune_snapshot so future identical prunes are not deadlocked"
+        );
+
+        // 3. 切回 S1 后必须允许重新入队并成功完成裁剪
+        let mut eff2 = TransitionEffects::default();
+        {
+            let mut guard = coord.inner.write();
+            guard.config = cfg_s1.clone();
+            reconcile_offline_slot_scope(&mut guard.slots[0], &cfg_s1, &mut eff2);
+        }
+        let job_s1_retry = match eff2.tasks.pop() {
+            Some(WorkerTask::Prune(job)) => job,
+            _ => panic!("re-enqueue after aborted prune must produce a fresh PruneJob"),
+        };
+        execute_prune_job(
+            &coord.inner,
+            &coord.manifest_save_lock,
+            &coord.worker_queue,
+            &coord.journal_uuid_provider,
+            Duration::ZERO,
+            &coord.volumes_dir(),
+            job_s1_retry,
+        );
+        let guard = coord.inner.read();
+        assert_eq!(guard.slots[0].scope_snapshot.as_ref(), Some(&snap_s1));
+        assert!(guard.slots[0].in_flight_prune_snapshot.is_none());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn subpath_root_move_evicts_subtree_while_whole_volume_root_keeps_cache() {
+        let cache_dir = TempDir::new().unwrap();
+        let disk_dir = TempDir::new().unwrap();
+        let mount_root = disk_dir.path().canonicalize().unwrap();
+        let subpath_root = mount_root.join("Work");
+        let moved_dest = mount_root.join("WorkMoved");
+        std::fs::create_dir_all(&subpath_root).unwrap();
+        let file = subpath_root.join("doc.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let cfg = AppConfig::default();
+        let snap = VolumeScopeSnapshot::from_config(&cfg, &subpath_root, &subpath_root);
+        let store = IndexStore::new();
+        let compact = crate::compact_index::CompactIndex::from_entries(vec![
+            make_entry("Work", &subpath_root.to_string_lossy(), true),
+            make_entry("doc.txt", &file.to_string_lossy(), false),
+        ])
+        .unwrap();
+        store.replace_compact(compact);
+
+        let coord = VolumeCoordinator::with_mount_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(base_mounts),
+        );
+        // 移走卷内子路径，卷挂载点仍存在 -> 收到根路径 ITEM_RENAMED 后清理子树
+        std::fs::rename(&subpath_root, &moved_dest).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let store_loop = store.clone();
+        let filter = CompiledFilter::for_volume_snapshot(&snap, &subpath_root);
+        let volumes_dir = cache_dir.path().join("volumes");
+        let handle = std::thread::spawn(move || {
+            run_volume_stream_loop(
+                rx,
+                Arc::new(Mutex::new(None)),
+                stop_loop,
+                Arc::downgrade(&coord.inner),
+                Arc::clone(&coord.manifest_save_lock),
+                volumes_dir,
+                "subpath-vid".to_string(),
+                1,
+                mount_root,
+                subpath_root,
+                store_loop,
+                filter,
+                true,
+                100,
+                Duration::from_millis(20),
+                None,
+                |_| None,
+            );
+        });
+        tx.send(vec![fsevents::Event {
+            path: moved_dest.with_file_name("Work"),
+            flags: fsevents::ITEM_RENAMED,
+            id: 101,
+            inode: None,
+        }])
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !store.is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::SeqCst);
+        drop(tx);
+        let _ = handle.join();
+        assert!(
+            store.is_empty(),
+            "moved volume subpath root must evict stale subtree entries"
+        );
+    }
+
+    #[test]
+    fn prune_reverted_mid_flight_after_removing_entries_marks_filter_widened_instead_of_losing_files()
+    {
+        let cache_dir = TempDir::new().unwrap();
+        let disk_str = "/Volumes/MidFlightPruneRevert".to_string();
+        let mut cfg_o = AppConfig::default();
+        cfg_o.index.index_paths = vec![disk_str.clone()];
+        cfg_o.index.exclude = vec![];
+        cfg_o.index.include_hidden = true;
+        let snap_o =
+            VolumeScopeSnapshot::from_config(&cfg_o, Path::new(&disk_str), Path::new(&disk_str));
+
+        let mut cfg_a = cfg_o.clone();
+        cfg_a.index.exclude = vec!["dropme".to_string()];
+        let snap_a =
+            VolumeScopeSnapshot::from_config(&cfg_a, Path::new(&disk_str), Path::new(&disk_str));
+
+        let store = IndexStore::new();
+        let compact = crate::compact_index::CompactIndex::from_entries(vec![
+            make_entry("keep.txt", &format!("{disk_str}/keep.txt"), false),
+            make_entry("drop.txt", &format!("{disk_str}/dropme/drop.txt"), false),
+        ])
+        .unwrap();
+        store.replace_compact(compact);
+
+        let identity = VolumeIdentity::LocalUuid {
+            uuid: "MID-FLIGHT-PRUNE-UUID".to_string(),
+            subpath: String::new(),
+        };
+        let vid = identity.volume_id();
+        let coord = Arc::new(VolumeCoordinator::with_mount_lister(
+            cache_dir.path().to_path_buf(),
+            Arc::new(base_mounts),
+        ));
+        {
+            let mut guard = coord.inner.write();
+            guard.config = cfg_a.clone();
+            guard.slots.push(VolumeSlot {
+                volume_id: vid.clone(),
+                configured_path: disk_str.clone(),
+                active_configured_path: disk_str.clone(),
+                active_mount_root: None,
+                subpath: String::new(),
+                display_name: "MidFlightPruneRevert".to_string(),
+                kind: VolumeKind::LocalExternal,
+                fstype: "apfs".to_string(),
+                from_name: "/dev/disk92s1".to_string(),
+                identity,
+                state: VolumeState::Offline,
+                entry_count: 2,
+                last_sync_at: Some(1_700_000_000),
+                last_event_id: Some(10),
+                journal_uuid: Some("MID-FLIGHT-JUUID".to_string()),
+                scope_snapshot: Some(snap_o),
+                dirty_upper_bound: false,
+                pending_confirm_reason: None,
+                in_flight_scan_snapshot: None,
+                in_flight_prune_snapshot: None,
+                stream_snapshot: None,
+                scanned_count: Arc::new(AtomicU64::new(0)),
+                is_remounted: false,
+                has_cache: true,
+                dirty_cache: false,
+                cache_seq: 0,
+                saved_cache_seq: 0,
+                cache_persistence: CachePersistence::default(),
+                generation: 1,
+                cancel_token: Arc::new(AtomicBool::new(false)),
+                store: store.clone(),
+                stream_handle: None,
+                last_rescan_triggered: None,
+                last_scan_duration: None,
+                next_reconnect_retry: None,
+                unmounting_until: None,
+                skip_missing_rescan: false,
+            });
+        }
+
+        let mut eff = TransitionEffects::default();
+        {
+            let mut guard = coord.inner.write();
+            reconcile_offline_slot_scope(&mut guard.slots[0], &cfg_a, &mut eff);
+        }
+        let job_a = match eff.tasks.pop() {
+            Some(WorkerTask::Prune(job)) => job,
+            _ => panic!("expected PruneJob"),
+        };
+
+        // 持住 store 读锁让 execute_prune_job 通过 should_prune 后停在 retain_paths 写锁前，
+        // 期间并发把配置改回原值 O，再释放读锁令其执行完裁剪并进入复核阶段。
+        let hold_read = store.read();
+        let coord_worker = Arc::clone(&coord);
+        let worker = std::thread::spawn(move || {
+            execute_prune_job(
+                &coord_worker.inner,
+                &coord_worker.manifest_save_lock,
+                &coord_worker.worker_queue,
+                &coord_worker.journal_uuid_provider,
+                Duration::ZERO,
+                &coord_worker.volumes_dir(),
+                job_a,
+            );
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        coord.inner.write().config = cfg_o;
+        drop(hold_read);
+        worker.join().unwrap();
+
+        let guard = coord.inner.read();
+        assert_eq!(store.len(), 1);
+        assert_eq!(guard.slots[0].entry_count, 1);
+        assert_eq!(
+            guard.slots[0].scope_snapshot.as_ref(),
+            Some(&snap_a),
+            "pruned cache must advance scope_snapshot to match RAM and disk"
+        );
+        assert_eq!(
+            guard.slots[0].pending_confirm_reason,
+            Some(VolumeConfirmReason::FilterWidened),
+            "reverting config back to wider O mid-prune must raise FilterWidened instead of silently losing entries"
+        );
+        assert!(guard.slots[0].in_flight_prune_snapshot.is_none());
     }
 }

@@ -367,6 +367,11 @@ void*_Nonnull uniffi_lokii_core_fn_constructor_lokiicore_new(RustCallStatus *_No
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CANCEL_VOLUME_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CANCEL_VOLUME_SCAN
+int8_t uniffi_lokii_core_fn_method_lokiicore_cancel_volume_scan(void*_Nonnull ptr, RustBuffer path_or_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CHECK_FDA
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CHECK_FDA
 int8_t uniffi_lokii_core_fn_method_lokiicore_check_fda(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -375,6 +380,16 @@ int8_t uniffi_lokii_core_fn_method_lokiicore_check_fda(void*_Nonnull ptr, RustCa
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
 int8_t uniffi_lokii_core_fn_method_lokiicore_clear_volume_cache(void*_Nonnull ptr, RustBuffer path_or_id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CONFIRM_ALL_PENDING_VOLUME_SCANS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CONFIRM_ALL_PENDING_VOLUME_SCANS
+uint32_t uniffi_lokii_core_fn_method_lokiicore_confirm_all_pending_volume_scans(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CONFIRM_VOLUME_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_CONFIRM_VOLUME_SCAN
+int8_t uniffi_lokii_core_fn_method_lokiicore_confirm_volume_scan(void*_Nonnull ptr, RustBuffer path_or_id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
@@ -437,9 +452,19 @@ int8_t uniffi_lokii_core_fn_method_lokiicore_peek_startup_is_cold_start(void*_No
 void uniffi_lokii_core_fn_method_lokiicore_persist_index(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PREVIEW_PRIMARY_SCOPE_ACTION
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_PREVIEW_PRIMARY_SCOPE_ACTION
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_preview_primary_scope_action(void*_Nonnull ptr, RustBuffer draft_config_json, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REBUILD_INDEX
 int8_t uniffi_lokii_core_fn_method_lokiicore_rebuild_index(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REBUILD_PRIMARY_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_REBUILD_PRIMARY_INDEX
+int8_t uniffi_lokii_core_fn_method_lokiicore_rebuild_primary_index(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_RESCAN_VOLUME
@@ -821,6 +846,12 @@ uint16_t uniffi_lokii_core_checksum_method_eventhandler_on_volume_statuses_chang
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CANCEL_VOLUME_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CANCEL_VOLUME_SCAN
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_cancel_volume_scan(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CHECK_FDA
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CHECK_FDA
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_check_fda(void
@@ -830,6 +861,18 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_check_fda(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CLEAR_VOLUME_CACHE
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_clear_volume_cache(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CONFIRM_ALL_PENDING_VOLUME_SCANS
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CONFIRM_ALL_PENDING_VOLUME_SCANS
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_confirm_all_pending_volume_scans(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CONFIRM_VOLUME_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CONFIRM_VOLUME_SCAN
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_confirm_volume_scan(void
     
 );
 #endif
@@ -905,9 +948,21 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_persist_index(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_PREVIEW_PRIMARY_SCOPE_ACTION
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_PREVIEW_PRIMARY_SCOPE_ACTION
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_preview_primary_scope_action(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_REBUILD_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_REBUILD_INDEX
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_rebuild_index(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_REBUILD_PRIMARY_INDEX
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_REBUILD_PRIMARY_INDEX
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_rebuild_primary_index(void
     
 );
 #endif

@@ -15,6 +15,8 @@ const CACHE_VERSION: u32 = 3;
 const CACHE_VERSION_COMPACT: u32 = 4;
 /// Compact payload preceded by a 16-byte [`Checkpoint`] (event id 0 = none).
 const CACHE_VERSION_CHECKPOINT: u32 = 5;
+/// Compact payload preceded by [`Checkpoint`] and an embedded UTF-8 JSON [`PrimaryScopeSnapshot`].
+const CACHE_VERSION_SCOPE_SNAPSHOT: u32 = 6;
 
 /// What the cached snapshot is known to reflect: every FSEvents event up to
 /// `event_id`, scanned under the config/permission state hashed into
@@ -41,6 +43,8 @@ pub enum CacheError {
     },
     /// Failed to decode the cache payload.
     Decode(bitcode::Error),
+    /// Failed to encode or decode the embedded v6 scope snapshot header.
+    InvalidSnapshot(String),
     InvalidIndex(crate::compact_index::IndexError),
 }
 
@@ -57,6 +61,7 @@ impl std::fmt::Display for CacheError {
                 )
             }
             CacheError::Decode(e) => write!(f, "cache decode error: {e}"),
+            CacheError::InvalidSnapshot(msg) => write!(f, "invalid cache scope snapshot: {msg}"),
             CacheError::InvalidIndex(error) => write!(f, "invalid cached index: {error}"),
         }
     }
@@ -206,23 +211,93 @@ pub fn save_compact(
     save_encoded_compact_unlocked(&encoded, checkpoint, path)
 }
 
+/// 将已编码的主索引字节流、回放检查点与结构化 `PrimaryScopeSnapshot` 以 v6 格式单次原子落盘，
+/// 杜绝多文件持久化之间的崩溃失步。
+pub fn save_encoded_compact_with_snapshot(
+    encoded: &[u8],
+    checkpoint: Checkpoint,
+    snapshot: &crate::scope_diff::PrimaryScopeSnapshot,
+    path: &Path,
+) -> Result<(), CacheError> {
+    let snapshot_json = serde_json::to_vec(snapshot)
+        .map_err(|e| CacheError::InvalidSnapshot(e.to_string()))?;
+    let snapshot_len = u32::try_from(snapshot_json.len())
+        .map_err(|_| CacheError::InvalidSnapshot("scope snapshot exceeds u32 length".into()))?;
+
+    let lock = path_write_lock(path);
+    let _guard = lock.lock();
+    write_cache_unlocked(
+        CACHE_VERSION_SCOPE_SNAPSHOT,
+        &[
+            &checkpoint.event_id.to_le_bytes(),
+            &checkpoint.fingerprint.to_le_bytes(),
+            &snapshot_len.to_le_bytes(),
+            &snapshot_json,
+            encoded,
+        ],
+        path,
+    )
+}
+
+/// 将紧凑索引连同检查点与结构化主范围快照原子写入 v6 缓存文件。
+pub fn save_compact_with_snapshot(
+    index: &crate::compact_index::CompactIndex,
+    checkpoint: Checkpoint,
+    snapshot: &crate::scope_diff::PrimaryScopeSnapshot,
+    path: &Path,
+) -> Result<(), CacheError> {
+    let lock = path_write_lock(path);
+    let _guard = lock.lock();
+    let encoded = encode_compact(index);
+    let snapshot_json = serde_json::to_vec(snapshot)
+        .map_err(|e| CacheError::InvalidSnapshot(e.to_string()))?;
+    let snapshot_len = u32::try_from(snapshot_json.len())
+        .map_err(|_| CacheError::InvalidSnapshot("scope snapshot exceeds u32 length".into()))?;
+    write_cache_unlocked(
+        CACHE_VERSION_SCOPE_SNAPSHOT,
+        &[
+            &checkpoint.event_id.to_le_bytes(),
+            &checkpoint.fingerprint.to_le_bytes(),
+            &snapshot_len.to_le_bytes(),
+            &snapshot_json,
+            &encoded,
+        ],
+        path,
+    )
+}
+
 pub fn load_compact(
     path: &Path,
 ) -> Result<(crate::compact_index::CompactIndex, Option<Checkpoint>), CacheError> {
+    let (index, checkpoint, _snapshot) = load_compact_with_snapshot(path)?;
+    Ok((index, checkpoint))
+}
+
+/// 解码 v3/v4/v5/v6 缓存；v6 额外返回内嵌的 `PrimaryScopeSnapshot`，旧版本返回 `None`。
+pub fn load_compact_with_snapshot(
+    path: &Path,
+) -> Result<
+    (
+        crate::compact_index::CompactIndex,
+        Option<Checkpoint>,
+        Option<crate::scope_diff::PrimaryScopeSnapshot>,
+    ),
+    CacheError,
+> {
     let (version, data) = read_cache(path)?;
     let result = match version {
         CACHE_VERSION => {
             let entries: Vec<crate::compact_index::BorrowedFileEntry<'_>> =
                 bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
             crate::compact_index::CompactIndex::from_borrowed_entries(entries)
-                .map(|index| (index, None))
+                .map(|index| (index, None, None))
                 .map_err(CacheError::InvalidIndex)
         }
         CACHE_VERSION_COMPACT => {
             let cache: crate::compact_index::BorrowedCacheIndex<'_> =
                 bitcode::decode(&data[8..]).map_err(CacheError::Decode)?;
             crate::compact_index::CompactIndex::from_borrowed_cache(cache)
-                .map(|index| (index, None))
+                .map(|index| (index, None, None))
                 .map_err(CacheError::InvalidIndex)
         }
         CACHE_VERSION_CHECKPOINT => {
@@ -237,12 +312,41 @@ pub fn load_compact(
             let cache: crate::compact_index::BorrowedCacheIndex<'_> =
                 bitcode::decode(&data[24..]).map_err(CacheError::Decode)?;
             crate::compact_index::CompactIndex::from_borrowed_cache(cache)
-                .map(|index| (index, (checkpoint.event_id != 0).then_some(checkpoint)))
+                .map(|index| (index, (checkpoint.event_id != 0).then_some(checkpoint), None))
+                .map_err(CacheError::InvalidIndex)
+        }
+        CACHE_VERSION_SCOPE_SNAPSHOT => {
+            if data.len() < 28 {
+                return Err(CacheError::TooSmall);
+            }
+            let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+            let checkpoint = Checkpoint {
+                event_id: word(8),
+                fingerprint: word(16),
+            };
+            let snapshot_len = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+            let payload_start = 28usize
+                .checked_add(snapshot_len)
+                .filter(|&end| end <= data.len())
+                .ok_or(CacheError::TooSmall)?;
+            let snapshot: crate::scope_diff::PrimaryScopeSnapshot =
+                serde_json::from_slice(&data[28..payload_start])
+                    .map_err(|e| CacheError::InvalidSnapshot(e.to_string()))?;
+            let cache: crate::compact_index::BorrowedCacheIndex<'_> =
+                bitcode::decode(&data[payload_start..]).map_err(CacheError::Decode)?;
+            crate::compact_index::CompactIndex::from_borrowed_cache(cache)
+                .map(|index| {
+                    (
+                        index,
+                        (checkpoint.event_id != 0).then_some(checkpoint),
+                        Some(snapshot),
+                    )
+                })
                 .map_err(CacheError::InvalidIndex)
         }
         found => Err(CacheError::VersionMismatch {
             found,
-            expected: CACHE_VERSION_CHECKPOINT,
+            expected: CACHE_VERSION_SCOPE_SNAPSHOT,
         }),
     };
     // 零拷贝解码进入字符串池后立即释放原始文件字节缓冲，压低热启动峰值内存
@@ -651,5 +755,60 @@ mod tests {
             Arc::ptr_eq(&lock_before, &lock_after),
             "per-path lock must remain identical before and after parent directory creation"
         );
+    }
+
+    #[test]
+    fn v6_scope_snapshot_roundtrip_and_v5_backward_compat() {
+        let tmp = TempDir::new().unwrap();
+        let v6_path = tmp.path().join("primary_v6.cache");
+        let v5_path = tmp.path().join("primary_v5.cache");
+        let compact = crate::compact_index::CompactIndex::from_entries(make_entries(12)).unwrap();
+
+        let snapshot = crate::scope_diff::PrimaryScopeSnapshot {
+            schema_version: crate::scope_diff::PRIMARY_SCOPE_SCHEMA_VERSION,
+            primary_roots: vec!["/Applications".into(), "/Users/dev".into()],
+            shallow_app_roots: vec!["/Applications".into()],
+            excluded_mount_roots: vec!["/Volumes/Disk".into()],
+            exclude_paths: vec!["/System".into()],
+            exclude: vec!["node_modules".into()],
+            include_hidden: false,
+            exclude_sensitive: true,
+            sensitive_names: vec![".ssh".into()],
+            has_fda: true,
+        };
+        let checkpoint = Checkpoint {
+            event_id: 4242,
+            fingerprint: snapshot.fingerprint_fnv1a(),
+        };
+
+        let encoded = encode_compact(&compact);
+        save_encoded_compact_with_snapshot(&encoded, checkpoint, &snapshot, &v6_path).unwrap();
+
+        let (loaded_v6, loaded_cp, loaded_snap) = load_compact_with_snapshot(&v6_path).unwrap();
+        assert_eq!(loaded_v6.len(), 12);
+        assert_eq!(loaded_cp, Some(checkpoint));
+        assert_eq!(loaded_snap, Some(snapshot));
+
+        // v5 缓存仍可正常解码且 snapshot 为 None
+        save_compact(&compact, Some(checkpoint), &v5_path).unwrap();
+        let (loaded_v5, loaded_v5_cp, loaded_v5_snap) = load_compact_with_snapshot(&v5_path).unwrap();
+        assert_eq!(loaded_v5.len(), 12);
+        assert_eq!(loaded_v5_cp, Some(checkpoint));
+        assert_eq!(loaded_v5_snap, None);
+
+        // 损坏的 v6 快照 JSON 返回 InvalidSnapshot 错误
+        let bad_v6 = tmp.path().join("bad_v6.cache");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(CACHE_MAGIC);
+        raw.extend_from_slice(&CACHE_VERSION_SCOPE_SNAPSHOT.to_le_bytes());
+        raw.extend_from_slice(&1u64.to_le_bytes());
+        raw.extend_from_slice(&2u64.to_le_bytes());
+        raw.extend_from_slice(&4u32.to_le_bytes());
+        raw.extend_from_slice(b"{bad");
+        fs::write(&bad_v6, &raw).unwrap();
+        assert!(matches!(
+            load_compact_with_snapshot(&bad_v6),
+            Err(CacheError::InvalidSnapshot(_))
+        ));
     }
 }
