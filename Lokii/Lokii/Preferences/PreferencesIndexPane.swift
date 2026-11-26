@@ -26,6 +26,19 @@ private enum PreferencesPathNormalizer {
     }
 }
 
+private func volumeConfirmReasonTooltip(_ reason: FfiVolumeConfirmReason?) -> String {
+    switch reason ?? .initialScan {
+    case .initialScan:
+        return L("prefs.volume.confirmReason.initialScan")
+    case .filterWidened:
+        return L("prefs.volume.confirmReason.filterWidened")
+    case .journalInvalidated:
+        return L("prefs.volume.confirmReason.journalInvalidated")
+    case .schemaUpgrade:
+        return L("prefs.volume.confirmReason.schemaUpgrade")
+    }
+}
+
 // MARK: - Interactive Path Row (Non-Blocking Volume & Local Status)
 private struct SettingsPathRow: View {
     let icon: String
@@ -33,6 +46,8 @@ private struct SettingsPathRow: View {
     let availabilityState: SettingsPathAvailabilityState
     var showVolumeMetrics: Bool = true
     var onRescan: (() -> Void)? = nil
+    var onConfirmScan: (() -> Void)? = nil
+    var onCancelScan: (() -> Void)? = nil
     var onClearCache: (() -> Void)? = nil
     var conflict: (label: String, help: String)? = nil
     let onRemove: () -> Void
@@ -41,8 +56,9 @@ private struct SettingsPathRow: View {
 
     private var rowIconName: String {
         switch availabilityState {
-        case let .volumeOnline(_, _, _, kind),
-             let .volumeSyncing(kind),
+        case let .volumeOnline(_, _, _, kind, _),
+             let .volumeSyncing(kind, _),
+             let .volumeNeedsConfirmation(_, _, _, kind, _),
              let .volumeOffline(_, kind):
             if kind == "network" {
                 return "externaldrive.connected.to.line.below"
@@ -61,6 +77,8 @@ private struct SettingsPathRow: View {
         switch availabilityState {
         case .volumeOnline, .volumeSyncing, .localAvailable:
             return .accentColor
+        case .volumeNeedsConfirmation:
+            return .orange
         case .volumeOffline, .volumeUncachedOffline, .localChecking, .localMissing:
             return .secondary
         }
@@ -68,8 +86,9 @@ private struct SettingsPathRow: View {
 
     private var rowIconHelp: String? {
         switch availabilityState {
-        case let .volumeOnline(_, _, _, kind),
-             let .volumeSyncing(kind),
+        case let .volumeOnline(_, _, _, kind, _),
+             let .volumeSyncing(kind, _),
+             let .volumeNeedsConfirmation(_, _, _, kind, _),
              let .volumeOffline(_, kind):
             if kind == "network" {
                 return L("prefs.volume.kind.network")
@@ -78,6 +97,16 @@ private struct SettingsPathRow: View {
             }
             return nil
         case .volumeUncachedOffline, .localAvailable, .localChecking, .localMissing:
+            return nil
+        }
+    }
+
+    private var remountedActivePath: String? {
+        switch availabilityState {
+        case let .volumeOnline(_, activePath, isRemounted, _, _),
+             let .volumeNeedsConfirmation(_, activePath, isRemounted, _, _):
+            return isRemounted ? activePath : nil
+        default:
             return nil
         }
     }
@@ -112,8 +141,7 @@ private struct SettingsPathRow: View {
                     }
                 }
 
-                if case let .volumeOnline(_, activePath, isRemounted, _) = availabilityState,
-                   isRemounted, let activePath {
+                if let activePath = remountedActivePath, !activePath.isEmpty {
                     Text(String(format: L("prefs.volume.status.remounted"), activePath))
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
@@ -145,7 +173,7 @@ private struct SettingsPathRow: View {
     @ViewBuilder
     private var statusBadge: some View {
         switch availabilityState {
-        case let .volumeOnline(entryCount, _, _, _):
+        case let .volumeOnline(entryCount, _, _, kind, supportsPersistentJournal):
             if showVolumeMetrics {
                 HStack(spacing: 4) {
                     Circle()
@@ -155,18 +183,40 @@ private struct SettingsPathRow: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize()
+                    if kind == "local_external" && !supportsPersistentJournal {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                            .help(L("prefs.volume.nonPersistentJournalHint"))
+                    }
                 }
             }
-        case .volumeSyncing:
+        case let .volumeSyncing(_, scannedCount):
             if showVolumeMetrics {
                 HStack(spacing: 4) {
                     ProgressView()
                         .controlSize(.mini)
-                    Text(L("prefs.volume.status.syncing"))
+                    let label = scannedCount > 0
+                        ? String(format: L("prefs.volume.status.syncingWithCount"), formatFileCount(scannedCount))
+                        : L("prefs.volume.status.scanning")
+                    Text(label)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize()
                 }
+            }
+        case let .volumeNeedsConfirmation(_, _, _, _, confirmReason):
+            if showVolumeMetrics {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 6, height: 6)
+                    Text(L("prefs.volume.status.needsConfirmation"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .fixedSize()
+                }
+                .help(volumeConfirmReasonTooltip(confirmReason))
             }
         case let .volumeOffline(entryCount, _):
             HStack(spacing: 4) {
@@ -228,6 +278,22 @@ private struct SettingsPathRow: View {
                     .foregroundStyle(Color.accentColor)
                     .fixedSize()
             }
+        case .volumeNeedsConfirmation:
+            if let onConfirmScan {
+                Button(L("prefs.volume.updateIndex"), action: onConfirmScan)
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                    .fixedSize()
+            }
+        case .volumeSyncing:
+            if let onCancelScan {
+                Button(L("prefs.volume.cancelScan"), action: onCancelScan)
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+            }
         case let .volumeOffline(entryCount, _):
             if entryCount > 0, let onClearCache {
                 Button(L("prefs.volume.clearCache"), action: onClearCache)
@@ -236,7 +302,7 @@ private struct SettingsPathRow: View {
                     .foregroundStyle(.secondary)
                     .fixedSize()
             }
-        case .volumeSyncing, .volumeUncachedOffline, .localAvailable, .localChecking, .localMissing:
+        case .volumeUncachedOffline, .localAvailable, .localChecking, .localMissing:
             EmptyView()
         }
     }
@@ -434,6 +500,8 @@ private struct ManagedVolumeRow: View {
     let item: ManagedVolumeItem
     let onToggle: (Bool) -> Void
     let onRescan: () -> Void
+    let onConfirmScan: () -> Void
+    let onCancelScan: () -> Void
     let onClearCache: () -> Void
 
     private var iconName: String {
@@ -441,6 +509,9 @@ private struct ManagedVolumeRow: View {
     }
 
     private var iconColor: Color {
+        if item.isIndexed && item.status?.state == .needsConfirmation {
+            return .orange
+        }
         if item.isIndexed && item.isMounted {
             return .accentColor
         }
@@ -522,16 +593,36 @@ private struct ManagedVolumeRow: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize()
+                    if status.kind == "local_external" && !status.supportsPersistentJournal {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                            .help(L("prefs.volume.nonPersistentJournalHint"))
+                    }
                 }
             case .syncing:
                 HStack(spacing: 4) {
                     ProgressView()
                         .controlSize(.mini)
-                    Text(L("prefs.volume.status.syncing"))
+                    let label = status.scannedCount > 0
+                        ? String(format: L("prefs.volume.status.syncingWithCount"), formatFileCount(status.scannedCount))
+                        : L("prefs.volume.status.scanning")
+                    Text(label)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize()
                 }
+            case .needsConfirmation:
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 6, height: 6)
+                    Text(L("prefs.volume.status.needsConfirmation"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .fixedSize()
+                }
+                .help(volumeConfirmReasonTooltip(status.confirmReason))
             case .offline:
                 HStack(spacing: 4) {
                     Circle()
@@ -560,7 +651,7 @@ private struct ManagedVolumeRow: View {
             HStack(spacing: 4) {
                 ProgressView()
                     .controlSize(.mini)
-                Text(L("prefs.volume.status.syncing"))
+                Text(L("prefs.volume.status.scanning"))
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .fixedSize()
@@ -587,6 +678,17 @@ private struct ManagedVolumeRow: View {
                     .buttonStyle(.borderless)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Color.accentColor)
+                    .fixedSize()
+            case .needsConfirmation:
+                Button(L("prefs.volume.updateIndex"), action: onConfirmScan)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+                    .fixedSize()
+            case .syncing:
+                Button(L("prefs.volume.cancelScan"), action: onCancelScan)
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
                     .fixedSize()
             case .offline where status.entryCount > 0:
                 Button(L("prefs.volume.clearCache"), action: onClearCache)
@@ -655,6 +757,12 @@ struct PreferencesIndexPane: View {
                                 onRescan: exactStatus.map { status in
                                     { viewModel.rescanVolume(path: status.volumeId) }
                                 },
+                                onConfirmScan: exactStatus.map { status in
+                                    { viewModel.confirmVolumeScan(path: status.volumeId) }
+                                },
+                                onCancelScan: exactStatus.map { status in
+                                    { viewModel.cancelVolumeScan(path: status.volumeId) }
+                                },
                                 onClearCache: exactStatus.map { status in
                                     { pendingClearCachePath = status.volumeId }
                                 },
@@ -713,6 +821,12 @@ struct PreferencesIndexPane: View {
                                 },
                                 onRescan: {
                                     viewModel.rescanVolume(path: volume.configuredPath)
+                                },
+                                onConfirmScan: {
+                                    viewModel.confirmVolumeScan(path: volume.status?.volumeId ?? volume.configuredPath)
+                                },
+                                onCancelScan: {
+                                    viewModel.cancelVolumeScan(path: volume.status?.volumeId ?? volume.configuredPath)
                                 },
                                 onClearCache: {
                                     pendingClearCachePath = volume.configuredPath

@@ -238,7 +238,7 @@
 "prefs.tab.about" = "About";
 "prefs.index.group.paths" = "Index Paths";
 "prefs.index.applications" = "Index Applications";
-"prefs.index.applications.description" = "Add /Applications and the system application folders; app bundle internals stay out of the index.";
+"prefs.index.applications.description" = "Automatically add /Applications and system application folders, indexing app bundles only; if already in Index Paths, normal indexing applies.";
 "prefs.index.applications.conflict" = "The toggle is on, but these folders are covered by your exclude paths or names, so nothing is indexed.";
 "prefs.index.group.excludes" = "Exclude Patterns";
 "prefs.index.group.excludePaths" = "Excluded Paths";
@@ -389,3 +389,35 @@
 "prefs.volume.status.pendingSave" = "Pending save";
 "prefs.volume.includeOffline" = "Include offline volume results";
 "prefs.volume.includeOffline.description" = "Keep cached files searchable after an external or network volume disconnects.";
+"prefs.volume.status.scanning" = "Scanning";
+"prefs.volume.status.syncingWithCount" = "Scanning · %@ items";
+"prefs.volume.status.needsConfirmation" = "Index update needed";
+"prefs.volume.updateIndex" = "Update Index";
+"prefs.volume.cancelScan" = "Cancel";
+"prefs.volume.confirmReason.initialScan" = "No cached index yet. Click Update Index to run the initial scan.";
+"prefs.volume.confirmReason.filterWidened" = "Filter rules were broadened and require a rescan; the cached index remains searchable.";
+"prefs.volume.confirmReason.journalInvalidated" = "The file change journal was reset; rescan to catch up. The cached index remains searchable.";
+"prefs.volume.confirmReason.schemaUpgrade" = "Index format upgraded and requires a rescan; the cached index remains searchable.";
+"prefs.volume.nonPersistentJournalHint" = "Live tracking works while mounted; manually rescan after offline or cross-device edits";
+
+/* Top Volume Confirmation & Syncing Banner */
+"volume.banner.syncing.single" = "Scanning \"%1$@\" · %2$@ items scanned";
+"volume.banner.syncing.singleNoCount" = "Scanning \"%@\"...";
+"volume.banner.syncing.multi" = "Scanning %2$d external volumes including \"%1$@\" · %3$@ items scanned";
+"volume.banner.syncing.multiNoCount" = "Scanning %2$d external volumes including \"%1$@\"...";
+"volume.banner.confirm.initialScan" = "External volume \"%@\" has no cached index yet. Scan now?";
+"volume.banner.confirm.filterWidened" = "External volume \"%@\" needs rescanning after filter changes; cached index remains searchable";
+"volume.banner.confirm.journalInvalidated" = "File change journal for \"%@\" was reset; rescan to catch up (cached index remains searchable)";
+"volume.banner.confirm.schemaUpgrade" = "External volume \"%@\" needs rescanning after index format upgrade; cached index remains searchable";
+"volume.banner.confirm.multi" = "%2$d external volumes including \"%1$@\" need index updates; cached indexes remain searchable";
+"volume.banner.action.updateNow" = "Update Now";
+"volume.banner.action.cancel" = "Cancel";
+"volume.banner.action.manage" = "Manage...";
+"volume.banner.action.later" = "Later";
+
+/* Manual Rebuild Scope Confirmation */
+"rebuild.scopeConfirm.title" = "Choose Index Rebuild Scope";
+"rebuild.scopeConfirm.message" = "Connected external volumes detected (%@). Full rescans of large external drives can take a long time; rebuilding the local index only is recommended.";
+"rebuild.scopeConfirm.primaryOnly" = "Rebuild Local Index Only (Recommended)";
+"rebuild.scopeConfirm.all" = "Rebuild All (Include External Volumes)";
+"rebuild.scopeConfirm.cancel" = "Cancel";

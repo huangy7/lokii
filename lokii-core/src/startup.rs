@@ -1,21 +1,29 @@
 use crate::cache;
 use crate::config::AppConfig;
 use crate::indexer::IndexStore;
+use crate::path_utils::{path_starts_with_ci, paths_equal_ci};
 use crate::scanner;
+use crate::scope_diff::PrimaryScopeSnapshot;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// Result of index initialization.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupMode {
     /// Loaded from cache, user can search immediately; the index service
-    /// catches up from `checkpoint` (or re-verifies without one).
+    /// catches up from `checkpoint` (or runs incremental diff / verification).
     HotStart {
         cached_count: usize,
-        /// Replay point stored with the cache, if it still matches the config.
+        /// Replay point stored with the cache, if trusted for resume or incremental diff.
         checkpoint: Option<cache::Checkpoint>,
+        /// Structural scope snapshot decoded from v6 cache or claimed from v5 cache.
+        saved_snapshot: Option<PrimaryScopeSnapshot>,
+        /// Optional one-shot directory rescans triggered by v5 -> v6 upgrade claim (e.g. non-shallow `.app` bundles).
+        upgrade_rescans: Vec<PathBuf>,
+        /// True when a v5 cache was claimed and should be persisted as v6 on next save.
+        needs_v6_persist: bool,
     },
     /// No cache available, performed full scan.
     ColdStart {
@@ -69,7 +77,8 @@ fn scope_fingerprint(config: &AppConfig) -> u64 {
     scope_fingerprint_with_fda(config, crate::permissions::has_full_disk_access())
 }
 
-/// 复用已探测的 `has_fda` 状态计算全量索引范围指纹，避免后台轮询重复打开系统 `TCC.db`。
+/// 复用已探测的 `has_fda` 状态计算全量索引范围指纹（仅保留给旧单域测试校验）。
+#[cfg(test)]
 pub(crate) fn scope_fingerprint_with_fda(config: &AppConfig, has_fda: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     // A different binary may hash differently; that only costs one full scan.
@@ -85,7 +94,7 @@ pub(crate) fn scope_fingerprint_with_fda(config: &AppConfig, has_fda: bool) -> u
     hasher.finish()
 }
 
-/// Calculate scope fingerprint specifically for the primary local index domain.
+/// Calculate deterministic 64-bit FNV-1a scope fingerprint for the primary local index domain.
 pub fn primary_scope_fingerprint(
     config: &AppConfig,
     primary_roots: &[std::path::PathBuf],
@@ -99,8 +108,19 @@ pub fn primary_scope_fingerprint(
     )
 }
 
-/// 复用已探测的 `has_fda` 状态计算主本地索引域指纹，避免每 15 秒刷新范围时重复触发权限探测。
+/// 复用已探测的 `has_fda` 状态计算确定性 FNV-1a 主本地索引域指纹。
 pub(crate) fn primary_scope_fingerprint_with_fda(
+    config: &AppConfig,
+    primary_roots: &[std::path::PathBuf],
+    excluded_mount_roots: &[std::path::PathBuf],
+    has_fda: bool,
+) -> u64 {
+    PrimaryScopeSnapshot::from_inputs(config, primary_roots, excluded_mount_roots, has_fda)
+        .fingerprint_fnv1a()
+}
+
+/// 兼容 v5 缓存平滑升级认领的旧 `DefaultHasher` 指纹算法（仅用于首次读取 v5 缓存时的校验）。
+pub(crate) fn legacy_primary_scope_fingerprint_with_fda(
     config: &AppConfig,
     primary_roots: &[std::path::PathBuf],
     excluded_mount_roots: &[std::path::PathBuf],
@@ -122,6 +142,45 @@ pub(crate) fn primary_scope_fingerprint_with_fda(
     hasher.finish()
 }
 
+/// 升级认领 v5 -> v6 且 `index_apps == true` 时，收集内存中位于非浅层根下的已有 `.app` 目录路径，
+/// 交由后台 `rescans` 补齐旧版全局浅层跳过的包内子项（如 `Wrapper/`），维持与从零全扫 100% 等价。
+fn collect_v5_non_shallow_app_dirs(
+    store: &IndexStore,
+    snapshot: &PrimaryScopeSnapshot,
+) -> Vec<PathBuf> {
+    let mut app_dirs: Vec<PathBuf> = Vec::new();
+    let guard = store.read();
+    for (_, view) in guard.iter() {
+        if !view.is_dir {
+            continue;
+        }
+        let is_app = view
+            .name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("app"));
+        if !is_app {
+            continue;
+        }
+        let path_str = view.materialize().path;
+        let path = Path::new(&path_str);
+        let deepest = snapshot
+            .primary_roots
+            .iter()
+            .filter(|r| path_starts_with_ci(path, Path::new(r)))
+            .max_by_key(|r| Path::new(r).components().count());
+        let under_shallow = deepest.is_some_and(|r| {
+            snapshot
+                .shallow_app_roots
+                .iter()
+                .any(|s| paths_equal_ci(Path::new(r), Path::new(s)))
+        });
+        if !under_shallow && path.exists() {
+            app_dirs.push(path.to_path_buf());
+        }
+    }
+    app_dirs
+}
+
 /// Save `index` with the replay checkpoint it reflects.
 #[cfg(test)]
 fn save_index(
@@ -134,7 +193,21 @@ fn save_index(
     }
 }
 
-/// 将已在短读锁内完成内存编码的索引字节流连同检查点落盘（完全无锁执行磁盘写入与 `sync_data()`）。
+/// 将已在短读锁内完成内存编码的索引字节流连同检查点与结构化快照原子落盘为 v6 缓存。
+pub fn save_encoded_index_with_snapshot(
+    encoded: &[u8],
+    checkpoint: cache::Checkpoint,
+    snapshot: &PrimaryScopeSnapshot,
+    cache_file: &Path,
+) {
+    if let Err(error) =
+        cache::save_encoded_compact_with_snapshot(encoded, checkpoint, snapshot, cache_file)
+    {
+        eprintln!("[Lokii] index cache save failed: {error}");
+    }
+}
+
+/// 将已在短读锁内完成内存编码的索引字节流连同检查点落盘（v5 兼容入口）。
 pub fn save_encoded_index(encoded: &[u8], checkpoint: cache::Checkpoint, cache_file: &Path) {
     if let Err(error) = cache::save_encoded_compact(encoded, Some(checkpoint), cache_file) {
         eprintln!("[Lokii] index cache save failed: {error}");
@@ -164,6 +237,9 @@ fn initialize_index(
             StartupMode::HotStart {
                 cached_count: count,
                 checkpoint: saved.filter(|saved| saved.fingerprint == fingerprint),
+                saved_snapshot: None,
+                upgrade_rescans: Vec::new(),
+                needs_v6_persist: false,
             }
         }
         Err(_) => {
@@ -226,7 +302,7 @@ pub fn initialize_primary_index_with_progress(
     on_progress: &mut dyn FnMut(&str, u64),
     cache_path: &Path,
 ) -> Result<StartupMode, InitError> {
-    let (mode, cold_checkpoint) = initialize_primary_index_deferred_persist(
+    let (mode, cold_persist) = initialize_primary_index_deferred_persist(
         store,
         config,
         primary_roots,
@@ -235,18 +311,23 @@ pub fn initialize_primary_index_with_progress(
         on_progress,
         cache_path,
     )?;
-    if let Some(checkpoint) = cold_checkpoint {
+    if let Some((checkpoint, snapshot)) = cold_persist {
         let encoded = {
             let guard = store.read();
             cache::encode_compact(&guard)
         };
-        let _ = cache::save_encoded_compact(&encoded, Some(checkpoint), cache_path);
+        let _ = cache::save_encoded_compact_with_snapshot(
+            &encoded,
+            checkpoint,
+            &snapshot,
+            cache_path,
+        );
     }
     Ok(mode)
 }
 
 /// 初始化主索引：冷启动扫盘完成后立即调用 `store.replace_compact(fresh)` 发布索引并返回待落盘的
-/// `Checkpoint`，使调用方得以先向 UI 派发 `on_index_ready` 解锁交互，随后在无锁状态下落盘缓存。
+/// `(Checkpoint, PrimaryScopeSnapshot)`，使调用方得以先向 UI 派发 `on_index_ready` 解锁交互，随后在无锁状态下原子落盘 v6 缓存。
 pub(crate) fn initialize_primary_index_deferred_persist(
     store: &IndexStore,
     config: &AppConfig,
@@ -255,14 +336,31 @@ pub(crate) fn initialize_primary_index_deferred_persist(
     progress: Arc<AtomicUsize>,
     on_progress: &mut dyn FnMut(&str, u64),
     cache_path: &Path,
-) -> Result<(StartupMode, Option<cache::Checkpoint>), InitError> {
+) -> Result<(StartupMode, Option<(cache::Checkpoint, PrimaryScopeSnapshot)>), InitError> {
+    let has_fda = crate::permissions::has_full_disk_access();
+    let current_snapshot = PrimaryScopeSnapshot::from_inputs(
+        config,
+        primary_roots,
+        excluded_mount_roots,
+        has_fda,
+    );
+
     if primary_roots.is_empty() {
         store.replace_compact(crate::compact_index::CompactIndex::new());
         if cache_path.exists() {
-            if let Ok((entries, _)) = cache::load_compact(cache_path) {
+            if let Ok((entries, _, _)) = cache::load_compact_with_snapshot(cache_path) {
                 if !entries.is_empty() {
                     let empty_index = crate::compact_index::CompactIndex::new();
-                    let _ = cache::save_compact(&empty_index, None, cache_path);
+                    let cp = cache::Checkpoint {
+                        event_id: crate::fsevents::current_event_id(),
+                        fingerprint: current_snapshot.fingerprint_fnv1a(),
+                    };
+                    let _ = cache::save_compact_with_snapshot(
+                        &empty_index,
+                        cp,
+                        &current_snapshot,
+                        cache_path,
+                    );
                 }
             }
         }
@@ -271,15 +369,16 @@ pub(crate) fn initialize_primary_index_deferred_persist(
             StartupMode::HotStart {
                 cached_count: 0,
                 checkpoint: None,
+                saved_snapshot: Some(current_snapshot),
+                upgrade_rescans: Vec::new(),
+                needs_v6_persist: false,
             },
             None,
         ));
     }
 
-    let fingerprint = primary_scope_fingerprint(config, primary_roots, excluded_mount_roots);
-
-    match cache::load_compact(cache_path) {
-        Ok((entries, saved)) => {
+    match cache::load_compact_with_snapshot(cache_path) {
+        Ok((entries, saved_cp, Some(saved_snapshot))) => {
             let count = entries.len();
             progress.store(count, std::sync::atomic::Ordering::Relaxed);
             store.replace_compact(entries);
@@ -287,16 +386,66 @@ pub(crate) fn initialize_primary_index_deferred_persist(
             Ok((
                 StartupMode::HotStart {
                     cached_count: count,
-                    checkpoint: saved.filter(|saved| saved.fingerprint == fingerprint),
+                    checkpoint: saved_cp,
+                    saved_snapshot: Some(saved_snapshot),
+                    upgrade_rescans: Vec::new(),
+                    needs_v6_persist: false,
                 },
                 None,
             ))
+        }
+        Ok((entries, saved_cp, None)) => {
+            let count = entries.len();
+            progress.store(count, std::sync::atomic::Ordering::Relaxed);
+            store.replace_compact(entries);
+            on_progress("cached", count as u64);
+
+            // v5 缓存平滑升级认领：使用旧 DefaultHasher 指纹校验，匹配则免全量重扫并升级落盘为 v6
+            let legacy_fp = legacy_primary_scope_fingerprint_with_fda(
+                config,
+                primary_roots,
+                excluded_mount_roots,
+                has_fda,
+            );
+            let claimed = saved_cp.filter(|cp| cp.fingerprint == legacy_fp);
+            if let Some(cp) = claimed {
+                let upgrade_rescans = if config.index.index_apps {
+                    collect_v5_non_shallow_app_dirs(store, &current_snapshot)
+                } else {
+                    Vec::new()
+                };
+                let claimed_cp = cache::Checkpoint {
+                    event_id: cp.event_id,
+                    fingerprint: current_snapshot.fingerprint_fnv1a(),
+                };
+                Ok((
+                    StartupMode::HotStart {
+                        cached_count: count,
+                        checkpoint: Some(claimed_cp),
+                        saved_snapshot: Some(current_snapshot),
+                        upgrade_rescans,
+                        needs_v6_persist: true,
+                    },
+                    None,
+                ))
+            } else {
+                Ok((
+                    StartupMode::HotStart {
+                        cached_count: count,
+                        checkpoint: None,
+                        saved_snapshot: None,
+                        upgrade_rescans: Vec::new(),
+                        needs_v6_persist: true,
+                    },
+                    None,
+                ))
+            }
         }
         Err(_) => {
             let current_event_id = crate::fsevents::current_event_id();
             let checkpoint = cache::Checkpoint {
                 event_id: current_event_id,
-                fingerprint,
+                fingerprint: current_snapshot.fingerprint_fnv1a(),
             };
             let filter = Arc::new(crate::filter::CompiledFilter::from_primary_config(
                 config,
@@ -320,7 +469,7 @@ pub(crate) fn initialize_primary_index_deferred_persist(
                     scanned_count: count,
                     event_id: checkpoint.event_id,
                 },
-                Some(checkpoint),
+                Some((checkpoint, current_snapshot)),
             ))
         }
     }
@@ -461,7 +610,8 @@ mod tests {
             mode,
             StartupMode::HotStart {
                 cached_count: 3,
-                checkpoint: Some(cache::Checkpoint { event_id: 99, .. })
+                checkpoint: Some(cache::Checkpoint { event_id: 99, .. }),
+                ..
             }
         ));
     }
@@ -513,11 +663,84 @@ mod tests {
     }
 
     #[test]
-    fn test_primary_scope_fingerprint_matches_legacy_when_no_mounted_excluded() {
+    fn test_legacy_primary_scope_fingerprint_matches_legacy_when_no_mounted_excluded() {
         let config = AppConfig::default();
         let legacy_fp = scope_fingerprint(&config);
-        let primary_fp = primary_scope_fingerprint(&config, &config.resolve_paths(), &[]);
+        let primary_fp = legacy_primary_scope_fingerprint_with_fda(
+            &config,
+            &config.resolve_paths(),
+            &[],
+            crate::permissions::has_full_disk_access(),
+        );
         assert_eq!(primary_fp, legacy_fp);
+    }
+
+    #[test]
+    fn v5_cache_upgrade_claims_matching_legacy_fingerprint_and_queues_non_shallow_app_backfill() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("home");
+        let app_dir = root.join("MyTool.app");
+        let wrapper_dir = app_dir.join("Wrapper");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        fs::write(wrapper_dir.join("bundle.bin"), "bin").unwrap();
+
+        let mut cfg = make_test_config(&root);
+        cfg.index.index_apps = true;
+        let primary_roots = vec![root.clone()];
+        let has_fda = crate::permissions::has_full_disk_access();
+        let legacy_fp = legacy_primary_scope_fingerprint_with_fda(&cfg, &primary_roots, &[], has_fda);
+
+        let v5_entries = vec![
+            FileEntry {
+                name: "MyTool.app".into(),
+                path: app_dir.to_string_lossy().into_owned(),
+                is_dir: true,
+                size: 0,
+                modified: 0,
+                created_at: 0,
+                extension: String::new(),
+            },
+        ];
+        let compact = crate::compact_index::CompactIndex::from_entries(v5_entries).unwrap();
+        let cache_file = tmp.path().join("index.cache");
+        cache::save_compact(
+            &compact,
+            Some(cache::Checkpoint {
+                event_id: 77,
+                fingerprint: legacy_fp,
+            }),
+            &cache_file,
+        )
+        .unwrap();
+
+        let store = IndexStore::new();
+        let mut on_progress = |_: &str, _: u64| {};
+        let mode = initialize_primary_index(
+            &store,
+            &cfg,
+            &primary_roots,
+            &[],
+            &mut on_progress,
+            &cache_file,
+        )
+        .unwrap();
+
+        match mode {
+            StartupMode::HotStart {
+                cached_count,
+                checkpoint,
+                saved_snapshot,
+                upgrade_rescans,
+                needs_v6_persist,
+            } => {
+                assert_eq!(cached_count, 1);
+                assert_eq!(checkpoint.map(|c| c.event_id), Some(77));
+                assert!(saved_snapshot.is_some());
+                assert!(needs_v6_persist);
+                assert_eq!(upgrade_rescans, vec![app_dir]);
+            }
+            other => panic!("expected claimed HotStart, got {other:?}"),
+        }
     }
 
     #[test]

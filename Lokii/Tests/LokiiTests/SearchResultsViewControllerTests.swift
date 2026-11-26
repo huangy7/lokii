@@ -90,16 +90,40 @@ final class SearchResultsViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.emptyRuleRow.isHidden && manageRulesButton.isHidden)
         controller.emptyState = .noMatches
 
+        XCTAssertTrue(controller.view.subviews.contains(controller.volumeBannerContainer))
         XCTAssertTrue(controller.view.subviews.contains(controller.tableScrollView))
         XCTAssertTrue(controller.view.subviews.contains(controller.separator))
         XCTAssertTrue(controller.view.subviews.contains(controller.bottomBar))
         XCTAssertFalse(controller.tableScrollView.automaticallyAdjustsContentInsets)
         XCTAssertEqual(controller.tableScrollView.contentInsets.top, 0)
         XCTAssertEqual(controller.tableScrollView.contentInsets.bottom, 0)
+        let bannerTopConstraint = controller.view.constraints.first {
+            $0.firstItem as? NSView === controller.volumeBannerContainer && $0.firstAttribute == .top
+        }
+        XCTAssertTrue(bannerTopConstraint?.secondItem is NSLayoutGuide)
         let topConstraint = controller.view.constraints.first {
             $0.firstItem as? NSScrollView == controller.tableScrollView && $0.firstAttribute == .top
         }
-        XCTAssertTrue(topConstraint?.secondItem is NSLayoutGuide)
+        XCTAssertTrue(topConstraint?.secondItem as? NSView === controller.volumeBannerContainer)
+        XCTAssertEqual(topConstraint?.secondAttribute, .bottom)
+        XCTAssertEqual(controller.volumeBannerHeightConstraint?.constant, 0)
+        XCTAssertTrue(controller.volumeBannerContainer.isHidden)
+
+        let pendingVol = TestFixture.volumeStatus(
+            volumeId: "vol-banner",
+            configuredPath: "/Volumes/BannerDisk",
+            activePath: "/Volumes/BannerDisk",
+            displayName: "BannerDisk",
+            kind: "local_external",
+            state: .needsConfirmation,
+            confirmReason: .filterWidened
+        )
+        controller.updateVolumeBanner(state: .needsConfirmation(volumes: [pendingVol]))
+        XCTAssertEqual(controller.volumeBannerHeightConstraint?.constant, 34)
+        XCTAssertFalse(controller.volumeBannerContainer.isHidden)
+        controller.updateVolumeBanner(state: .hidden)
+        XCTAssertEqual(controller.volumeBannerHeightConstraint?.constant, 0)
+        XCTAssertTrue(controller.volumeBannerContainer.isHidden)
         XCTAssertEqual(controller.tableView.numberOfColumns, 6)
         XCTAssertEqual(
             controller.tableView.tableColumns.filter { !$0.isHidden }.map(\.identifier),

@@ -1590,29 +1590,60 @@ mod tests {
         fs::write(tmp.path().join("Demo.app/Info.plist"), "plist").unwrap();
         fs::write(tmp.path().join("notes.txt"), "hello").unwrap();
 
-        let scan = |index_apps: bool| {
+        let scan = |shallow_root: bool, index_apps: bool| {
             let mut config = crate::config::AppConfig::default();
             config.index.index_paths = vec![tmp.path().to_string_lossy().into_owned()];
             config.index.index_apps = index_apps;
+            let filter = if shallow_root {
+                let snap = crate::scope_diff::PrimaryScopeSnapshot {
+                    schema_version: crate::scope_diff::PRIMARY_SCOPE_SCHEMA_VERSION,
+                    primary_roots: vec![tmp.path().to_string_lossy().into_owned()],
+                    shallow_app_roots: vec![tmp.path().to_string_lossy().into_owned()],
+                    excluded_mount_roots: vec![],
+                    exclude_paths: vec![],
+                    exclude: config.index.exclude.clone(),
+                    include_hidden: true,
+                    exclude_sensitive: true,
+                    sensitive_names: config.index.sensitive_names.clone(),
+                    has_fda: true,
+                };
+                crate::filter::CompiledFilter::from_primary_snapshot(&snap)
+            } else {
+                crate::filter::CompiledFilter::from_config(&config)
+            };
             scan_directories(
                 &[tmp.path().to_path_buf()],
-                std::sync::Arc::new(crate::filter::CompiledFilter::from_config(&config)),
+                std::sync::Arc::new(filter),
                 true,
                 make_progress(),
             )
         };
 
-        // 开关关闭：应用包按普通目录递归（main 行为）
-        let names: Vec<String> = scan(false).iter().map(|e| e.name.clone()).collect();
-        assert!(names.contains(&"Info.plist".to_string()));
-        assert!(names.contains(&"tool".to_string()));
+        // 用户显式根（无论 index_apps 开关状态）：应用包按常规规则递归
+        let names_off: Vec<String> = scan(false, false).iter().map(|e| e.name.clone()).collect();
+        assert!(names_off.contains(&"Info.plist".to_string()));
+        assert!(names_off.contains(&"tool".to_string()));
 
-        // 开关打开：包目录自身收录，内部整棵不扫
-        let names: Vec<String> = scan(true).iter().map(|e| e.name.clone()).collect();
-        assert!(names.contains(&"Demo.app".to_string()), "包目录自身应被收录");
-        assert!(!names.contains(&"Info.plist".to_string()), "包内文件不应被收录");
-        assert!(!names.contains(&"Resources".to_string()), "包内目录不应被收录");
-        assert!(names.contains(&"notes.txt".to_string()));
+        let names_explicit_on: Vec<String> =
+            scan(false, true).iter().map(|e| e.name.clone()).collect();
+        assert!(names_explicit_on.contains(&"Info.plist".to_string()));
+        assert!(names_explicit_on.contains(&"tool".to_string()));
+
+        // 浅层应用根：包目录自身收录，内部整棵不扫
+        let names_shallow: Vec<String> = scan(true, true).iter().map(|e| e.name.clone()).collect();
+        assert!(
+            names_shallow.contains(&"Demo.app".to_string()),
+            "包目录自身应被收录"
+        );
+        assert!(
+            !names_shallow.contains(&"Info.plist".to_string()),
+            "包内文件不应被收录"
+        );
+        assert!(
+            !names_shallow.contains(&"Resources".to_string()),
+            "包内目录不应被收录"
+        );
+        assert!(names_shallow.contains(&"notes.txt".to_string()));
     }
 
     #[test]
@@ -2029,10 +2060,11 @@ mod tests {
         };
 
         let names = scan_names(&config);
-        for expected in ["Demo.app", ".visible", "note"] {
+        // 外置卷与 index_apps 彻底解耦：Demo.app 内非 Contents 路径正常收录
+        for expected in ["Demo.app", "internal", ".visible", "note"] {
             assert!(names.contains(expected));
         }
-        for dropped in ["internal", ".keys", "secret", "excluded", "file"] {
+        for dropped in [".keys", "secret", "excluded", "file"] {
             assert!(!names.contains(dropped));
         }
 

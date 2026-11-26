@@ -17,8 +17,21 @@ enum CliInstallState: Equatable {
 
 /// Resolved display status for a configured index or exclude path.
 enum SettingsPathAvailabilityState: Equatable {
-    case volumeOnline(entryCount: UInt64, activePath: String?, isRemounted: Bool, kind: String)
-    case volumeSyncing(kind: String)
+    case volumeOnline(
+        entryCount: UInt64,
+        activePath: String?,
+        isRemounted: Bool,
+        kind: String,
+        supportsPersistentJournal: Bool = true
+    )
+    case volumeSyncing(kind: String, scannedCount: UInt64 = 0)
+    case volumeNeedsConfirmation(
+        entryCount: UInt64,
+        activePath: String?,
+        isRemounted: Bool,
+        kind: String,
+        confirmReason: FfiVolumeConfirmReason?
+    )
     case volumeOffline(entryCount: UInt64, kind: String)
     case volumeUncachedOffline
     case localAvailable
@@ -66,10 +79,19 @@ enum SettingsPathStatusResolver {
                     entryCount: matched.entryCount,
                     activePath: matched.activePath,
                     isRemounted: matched.isRemounted,
-                    kind: matched.kind
+                    kind: matched.kind,
+                    supportsPersistentJournal: matched.supportsPersistentJournal
                 )
             case .syncing:
-                return .volumeSyncing(kind: matched.kind)
+                return .volumeSyncing(kind: matched.kind, scannedCount: matched.scannedCount)
+            case .needsConfirmation:
+                return .volumeNeedsConfirmation(
+                    entryCount: matched.entryCount,
+                    activePath: matched.activePath,
+                    isRemounted: matched.isRemounted,
+                    kind: matched.kind,
+                    confirmReason: matched.confirmReason
+                )
             case .offline:
                 // 仅当内存与磁盘缓存确有条目时才视作“索引已保留”；PendingPath 或缓存已删除（entryCount == 0）归类为未缓存离线
                 if matched.entryCount == 0 {
@@ -199,57 +221,6 @@ enum SettingsPathStatusResolver {
             && components[0] == "/"
             && components[1].caseInsensitiveCompare("Volumes") == .orderedSame
             && !components[2].isEmpty
-    }
-
-    /// 判定当前索引配置草稿相对已保存状态是否需要触发本地主索引全量重建。
-    ///
-    /// 仅追加排除路径、仅调整网络卷定时重扫间隔、或仅增删已识别外置磁盘/网络卷均不触发主索引重建；
-    /// 其余本地目录范围变化、移除排除路径或全局过滤选项变化才需要重建。
-    static func requiresPrimaryRebuild(
-        draftIndexPaths: [String],
-        savedIndexPaths: [String],
-        draftIndexApps: Bool,
-        savedIndexApps: Bool,
-        draftIncludeHidden: Bool,
-        savedIncludeHidden: Bool,
-        draftExcludeSensitive: Bool,
-        savedExcludeSensitive: Bool,
-        draftExcludePatterns: [String],
-        savedExcludePatterns: [String],
-        draftExcludePaths: [String],
-        savedExcludePaths: [String],
-        mountedVolumes: [MountedVolumeEntry],
-        volumeStatuses: [FfiVolumeStatus]
-    ) -> Bool {
-        let normalizedDraft = Set(draftIndexPaths.map { normalizePath($0) })
-        let normalizedSaved = Set(savedIndexPaths.map { normalizePath($0) })
-        let addedPaths = normalizedDraft.subtracting(normalizedSaved)
-        let removedPaths = normalizedSaved.subtracting(normalizedDraft)
-
-        let isManagedVolumePath: (String, Bool) -> Bool = { path, isRemoval in
-            if mountedVolumes.contains(where: { isPath(path, insideOrEqual: $0.path) }) {
-                return true
-            }
-            if matchVolumeStatus(normalizedTarget: path, volumeStatuses: volumeStatuses) != nil {
-                return true
-            }
-            // 移除已清空缓存的离线 /Volumes/* 路径同样只归卷协调器管辖，不触发主索引全量重建
-            if isRemoval && isUnderVolumesNamespace(path) {
-                return true
-            }
-            return false
-        }
-
-        let primaryPathsUnchanged = addedPaths.allSatisfy { isManagedVolumePath($0, false) }
-            && removedPaths.allSatisfy { isManagedVolumePath($0, true) }
-
-        let onlyNonRebuildChanges = primaryPathsUnchanged
-            && (draftIndexApps == savedIndexApps)
-            && (draftIncludeHidden == savedIncludeHidden)
-            && (draftExcludeSensitive == savedExcludeSensitive)
-            && (draftExcludePatterns == savedExcludePatterns)
-            && (savedExcludePaths.allSatisfy { draftExcludePaths.contains($0) })
-        return !onlyNonRebuildChanges
     }
 
     /// 根据内核 IOKit 驱动祖先链与 DiskArbitration 设备元数据，精确判定挂载卷是否为磁盘映像（DMG / ISO / SparseImage）。
@@ -435,19 +406,46 @@ class PreferencesViewModel: ObservableObject {
         didSet {
             guard !isLoading else { return }
             refreshLocalPathChecks()
+            recomputePendingSaveRequiresRebuild()
         }
     }
-    @Published var indexApps: Bool = false
-    @Published var excludePatterns: [String] = LokiiConfig.IndexConfig.defaultExclude
+    @Published var indexApps: Bool = false {
+        didSet {
+            guard !isLoading else { return }
+            recomputePendingSaveRequiresRebuild()
+        }
+    }
+    @Published var excludePatterns: [String] = LokiiConfig.IndexConfig.defaultExclude {
+        didSet {
+            guard !isLoading else { return }
+            recomputePendingSaveRequiresRebuild()
+        }
+    }
     @Published var excludePaths: [String] = LokiiConfig.IndexConfig.defaultExcludePaths {
         didSet {
             guard !isLoading else { return }
             refreshLocalPathChecks()
+            recomputePendingSaveRequiresRebuild()
         }
     }
-    @Published var includeHidden: Bool = false
-    @Published var excludeSensitive: Bool = true
-    @Published var networkRescanMinutes: Int = 30
+    @Published var includeHidden: Bool = false {
+        didSet {
+            guard !isLoading else { return }
+            recomputePendingSaveRequiresRebuild()
+        }
+    }
+    @Published var excludeSensitive: Bool = true {
+        didSet {
+            guard !isLoading else { return }
+            recomputePendingSaveRequiresRebuild()
+        }
+    }
+    @Published var networkRescanMinutes: Int = 30 {
+        didSet {
+            guard !isLoading else { return }
+            recomputePendingSaveRequiresRebuild()
+        }
+    }
 
     /// 内存缓存的外部卷/网络卷状态快照，由检索引擎卷生命周期通知驱动更新
     @Published var volumeStatuses: [FfiVolumeStatus] = []
@@ -469,10 +467,13 @@ class PreferencesViewModel: ObservableObject {
     /// 后台主索引重建进行中标记与实时扫描计数，用于设置页底部闭环反馈
     @Published var isRebuildingIndex: Bool = false
     @Published var rebuildScannedCount: UInt64 = 0
+    /// 缓存当前索引草稿保存是否触发全量重建：仅在草稿/已存配置/卷挂载生命周期/FDA 变更时重算，避免 SwiftUI 高频重绘反复跨 FFI。
+    @Published private(set) var pendingSaveRequiresRebuild: Bool = false
 
     private var volumeStatusObserver: NSObjectProtocol?
     private var indexProgressObserver: NSObjectProtocol?
     private var indexReadyObserver: NSObjectProtocol?
+    private var watcherErrorObserver: NSObjectProtocol?
     private var volumeStatusSubscription: AnyCancellable?
     private var workspaceVolumeObservers: [NSObjectProtocol] = []
     private let pathProbeQueue = DispatchQueue(label: "com.lokii.prefs.pathProbe", qos: .utility)
@@ -488,6 +489,7 @@ class PreferencesViewModel: ObservableObject {
     @Published var savedIncludeHidden: Bool = false
     @Published var savedExcludeSensitive: Bool = true
     private var sensitiveNames: [String] = LokiiConfig.IndexConfig.defaultSensitiveNames
+    private var serialScanPaths: [String] = LokiiConfig.IndexConfig.defaultSerialScanPaths
     @Published var savedNetworkRescanMinutes: Int = 30
 
     @Published var hasFullDiskAccess: Bool = false
@@ -519,6 +521,7 @@ class PreferencesViewModel: ObservableObject {
         ) { [weak self] _ in
             self?.refreshLocalPathChecks()
             self?.refreshMountedVolumes()
+            self?.recomputePendingSaveRequiresRebuild()
         }
         indexProgressObserver = NotificationCenter.default.addObserver(
             forName: SearchEngine.indexProgressNotification,
@@ -542,6 +545,23 @@ class PreferencesViewModel: ObservableObject {
             if source == "rebuild" || self.isRebuildingIndex {
                 self.isRebuildingIndex = false
                 self.rebuildScannedCount = 0
+            }
+        }
+        watcherErrorObserver = NotificationCenter.default.addObserver(
+            forName: SearchEngine.watcherErrorNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let source = note.userInfo?["source"] as? String ?? ""
+            guard source == "rebuild" && self.isRebuildingIndex else { return }
+            self.isRebuildingIndex = false
+            self.rebuildScannedCount = 0
+            let msg = (note.userInfo?["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let msg, !msg.isEmpty {
+                self.indexSaveErrorMessage = msg
+            } else {
+                self.indexSaveErrorMessage = L("prefs.index.saveFailed")
             }
         }
         windowSizeObserver = NotificationCenter.default.addObserver(
@@ -568,6 +588,9 @@ class PreferencesViewModel: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = indexReadyObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = watcherErrorObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = windowSizeObserver {
@@ -623,7 +646,10 @@ class PreferencesViewModel: ObservableObject {
                 kind: status.kind,
                 isIndexed: indexedSet.contains(key),
                 isSavedIndexed: savedIndexedSet.contains(key),
-                isMounted: mountedMatch != nil || status.state == .online || status.state == .syncing,
+                isMounted: mountedMatch != nil
+                    || status.state == .online
+                    || status.state == .syncing
+                    || status.state == .needsConfirmation,
                 status: status
             ))
         }
@@ -811,6 +837,22 @@ class PreferencesViewModel: ObservableObject {
         }
     }
 
+    func confirmVolumeScan(path: String) {
+        volumeActionErrorMessage = nil
+        engine.confirmVolumeScan(pathOrId: path) { [weak self] outcome in
+            guard let self, !outcome.succeeded else { return }
+            self.volumeActionErrorMessage = outcome.errorMessage ?? L("prefs.volume.actionFailed")
+        }
+    }
+
+    func cancelVolumeScan(path: String) {
+        volumeActionErrorMessage = nil
+        engine.cancelVolumeScan(pathOrId: path) { [weak self] outcome in
+            guard let self, !outcome.succeeded else { return }
+            self.volumeActionErrorMessage = outcome.errorMessage ?? L("prefs.volume.actionFailed")
+        }
+    }
+
     func clearVolumeCache(path: String) {
         volumeActionErrorMessage = nil
         engine.clearVolumeCache(pathOrId: path) { [weak self] outcome in
@@ -891,6 +933,7 @@ class PreferencesViewModel: ObservableObject {
 
     func updateFDAStatus() {
         self.hasFullDiskAccess = engine.hasFullDiskAccess
+        recomputePendingSaveRequiresRebuild()
     }
 
     func refreshAvailableTerminals() {
@@ -1121,9 +1164,11 @@ class PreferencesViewModel: ObservableObject {
         self.savedIncludeHidden = config.index.includeHidden
         self.savedExcludeSensitive = config.index.excludeSensitive
         self.sensitiveNames = config.index.sensitiveNames
+        self.serialScanPaths = config.index.serialScanPaths
         self.savedNetworkRescanMinutes = config.index.networkRescanMinutes
         self.includeOfflineResults = engine.includeOfflineResults
         isLoading = false
+        recomputePendingSaveRequiresRebuild()
         refreshAvailableTerminals()
         volumeStatuses = engine.getVolumeStatuses()
         engine.scheduleVolumeStatusesRefresh()
@@ -1149,13 +1194,50 @@ class PreferencesViewModel: ObservableObject {
                 excludeSensitive: savedExcludeSensitive,
                 sensitiveNames: sensitiveNames,
                 maxResults: maxResults,
-                networkRescanMinutes: savedNetworkRescanMinutes
+                networkRescanMinutes: savedNetworkRescanMinutes,
+                serialScanPaths: serialScanPaths
             ),
             window: .init(
                 hideOnBlur: hideOnBlur,
                 rememberPosition: rememberPosition
             )
         ))
+    }
+
+    /// 按当前草稿拼装完整配置对象，供 `previewPrimaryScopeAction` 与保存路径共用。
+    func draftIndexConfig(base: LokiiConfig? = nil) -> LokiiConfig {
+        var config = base ?? LokiiConfig(
+            general: .init(
+                language: language,
+                showInDock: showInDock,
+                terminalBundleId: terminalBundleId,
+                hideResultsWhenEmpty: hideResultsWhenEmpty
+            ),
+            index: .init(
+                indexPaths: indexPaths,
+                indexApps: indexApps,
+                exclude: excludePatterns,
+                excludePaths: excludePaths,
+                includeHidden: includeHidden,
+                excludeSensitive: excludeSensitive,
+                sensitiveNames: sensitiveNames,
+                maxResults: maxResults,
+                networkRescanMinutes: networkRescanMinutes,
+                serialScanPaths: serialScanPaths
+            ),
+            window: .init(
+                hideOnBlur: hideOnBlur,
+                rememberPosition: rememberPosition
+            )
+        )
+        config.index.indexPaths = indexPaths
+        config.index.indexApps = indexApps
+        config.index.exclude = excludePatterns
+        config.index.excludePaths = excludePaths
+        config.index.includeHidden = includeHidden
+        config.index.excludeSensitive = excludeSensitive
+        config.index.networkRescanMinutes = networkRescanMinutes
+        return config
     }
 
     var isIndexDirty: Bool {
@@ -1168,52 +1250,56 @@ class PreferencesViewModel: ObservableObject {
         networkRescanMinutes != savedNetworkRescanMinutes
     }
 
-    /// 供设置页底部主按钮文案与保存流程共享同一重建判定，确保“保存”与“保存并重建”严格一致
-    var pendingSaveRequiresRebuild: Bool {
-        guard isIndexDirty else { return false }
-        return SettingsPathStatusResolver.requiresPrimaryRebuild(
-            draftIndexPaths: indexPaths,
-            savedIndexPaths: savedIndexPaths,
-            draftIndexApps: indexApps,
-            savedIndexApps: savedIndexApps,
-            draftIncludeHidden: includeHidden,
-            savedIncludeHidden: savedIncludeHidden,
-            draftExcludeSensitive: excludeSensitive,
-            savedExcludeSensitive: savedExcludeSensitive,
-            draftExcludePatterns: excludePatterns,
-            savedExcludePatterns: savedExcludePatterns,
-            draftExcludePaths: excludePaths,
-            savedExcludePaths: savedExcludePaths,
-            mountedVolumes: mountedVolumes,
-            volumeStatuses: volumeStatuses
+    /// 重算当前草稿保存是否需要主索引全量重建（直接委托 Rust `preview_primary_scope_action` 单一真相源），
+    /// 供草稿变更、保存、放弃、恢复默认、FDA 与卷挂载变化时按需刷新缓存，避免在 SwiftUI body 内高频调用 FFI。
+    private func recomputePendingSaveRequiresRebuild() {
+        guard !isLoading else { return }
+        let next = isIndexDirty
+            ? (engine.previewPrimaryScopeAction(draftIndexConfig()) == .fullRebuild)
+            : false
+        if pendingSaveRequiresRebuild != next {
+            pendingSaveRequiresRebuild = next
+        }
+    }
+
+    func triggerManualRebuild(window: NSWindow? = NSApp.keyWindow) {
+        guard !isIndexDirty, !isRebuildingIndex, !engine.isScanning else { return }
+        ManualRebuildCoordinator.requestRebuild(
+            window: window,
+            statuses: engine.getVolumeStatuses(),
+            onPrimaryOnly: { [weak self] in
+                self?.startManualRebuild(includeExternal: false)
+            },
+            onRebuildAll: { [weak self] in
+                self?.startManualRebuild(includeExternal: true)
+            }
         )
     }
 
-    func triggerManualRebuild() {
+    private func startManualRebuild(includeExternal: Bool) {
         guard !isIndexDirty, !isRebuildingIndex, !engine.isScanning else { return }
         indexSaveErrorMessage = nil
         isRebuildingIndex = true
         rebuildScannedCount = 0
-        engine.rebuildIndex()
+        if includeExternal {
+            engine.rebuildIndex()
+        } else {
+            engine.rebuildPrimaryIndex()
+        }
     }
 
     func saveIndexChanges() -> Bool {
         indexSaveErrorMessage = nil
-        guard var config = engine.getConfig() else {
+        guard let currentConfig = engine.getConfig() else {
             indexSaveErrorMessage = L("prefs.index.saveFailed")
             return false
         }
-        let needsRebuild = pendingSaveRequiresRebuild
+        let draftConfig = draftIndexConfig(base: currentConfig)
+        let needsRebuild = engine.previewPrimaryScopeAction(draftConfig) == .fullRebuild
 
-        config.index.indexPaths = indexPaths
-        config.index.indexApps = indexApps
-        config.index.exclude = excludePatterns
-        config.index.excludePaths = excludePaths
-        config.index.includeHidden = includeHidden
-        config.index.excludeSensitive = excludeSensitive
-        config.index.networkRescanMinutes = networkRescanMinutes
-
-        let success = engine.updateConfig(config)
+        // 单一路径驱动：无论是否宽化均只调用 updateConfig，由 Rust watcher 唯一负责裁剪/增量补扫/主索引重建，
+        // 绝不在此重复调用 rebuildIndex 或 rebuildPrimaryIndex，彻底消除双扫竞态与外置卷连坐。
+        let success = engine.updateConfig(draftConfig)
         if success {
             savedIndexPaths = indexPaths
             savedIndexApps = indexApps
@@ -1222,10 +1308,10 @@ class PreferencesViewModel: ObservableObject {
             savedIncludeHidden = includeHidden
             savedExcludeSensitive = excludeSensitive
             savedNetworkRescanMinutes = networkRescanMinutes
+            recomputePendingSaveRequiresRebuild()
             if needsRebuild {
                 isRebuildingIndex = true
                 rebuildScannedCount = 0
-                engine.rebuildIndex()
             }
         } else {
             indexSaveErrorMessage = L("prefs.index.saveFailed")
@@ -1234,6 +1320,8 @@ class PreferencesViewModel: ObservableObject {
     }
 
     func discardIndexChanges() {
+        let wasLoading = isLoading
+        isLoading = true
         indexPaths = savedIndexPaths
         indexApps = savedIndexApps
         excludePatterns = savedExcludePatterns
@@ -1241,10 +1329,15 @@ class PreferencesViewModel: ObservableObject {
         includeHidden = savedIncludeHidden
         excludeSensitive = savedExcludeSensitive
         networkRescanMinutes = savedNetworkRescanMinutes
+        isLoading = wasLoading
+        refreshLocalPathChecks()
+        recomputePendingSaveRequiresRebuild()
     }
 
     func restoreIndexDefaults() {
         let defaults = LokiiConfig.defaultConfig.index
+        let wasLoading = isLoading
+        isLoading = true
         indexPaths = defaults.indexPaths
         indexApps = defaults.indexApps
         excludePatterns = defaults.exclude
@@ -1252,20 +1345,24 @@ class PreferencesViewModel: ObservableObject {
         includeHidden = defaults.includeHidden
         excludeSensitive = defaults.excludeSensitive
         networkRescanMinutes = defaults.networkRescanMinutes
+        isLoading = wasLoading
+        refreshLocalPathChecks()
+        recomputePendingSaveRequiresRebuild()
     }
 
     /// 开关打开时内核追加的系统应用索引根；此处仅用于提示与排除规则的冲突。
     static let appIndexRoots = ["/Applications", "/System/Applications", "/System/Cryptexes/App/System/Applications"]
 
-    /// 开关已打开，但相关目录被排除路径或排除名单挡住，实际不会生效。
+    /// 开关已打开且存在自动应用根被排除路径精确同路径（大小写无关、忽略尾随 `/`）排除时返回 true，
+    /// 与后端同深度排除优先规则保持一致（默认 `/System` 排除与名称规则不会挡住系统应用根）。
     var appIndexConflicted: Bool {
+        Self.isAppIndexConflicted(indexApps: indexApps, excludePaths: excludePaths)
+    }
+
+    static func isAppIndexConflicted(indexApps: Bool, excludePaths: [String]) -> Bool {
         guard indexApps else { return false }
-        if excludePatterns.contains("Applications") { return true }
-        return Self.appIndexRoots.contains { root in
-            excludePaths.contains { raw in
-                let path = raw.hasSuffix("/") ? String(raw.dropLast()) : raw
-                return root == path || root.hasPrefix(path + "/")
-            }
+        return appIndexRoots.contains { root in
+            SettingsPathStatusResolver.containsSamePath(excludePaths, root)
         }
     }
 

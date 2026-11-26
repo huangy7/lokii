@@ -5,10 +5,12 @@ use fsevent_sys as fs;
 use fsevent_sys::core_foundation as cf;
 use std::ffi::{c_void, CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) const ITEM_CREATED: u32 = fs::kFSEventStreamEventFlagItemCreated;
+pub(crate) const ITEM_REMOVED: u32 = fs::kFSEventStreamEventFlagItemRemoved;
 pub(crate) const ITEM_RENAMED: u32 = fs::kFSEventStreamEventFlagItemRenamed;
+pub(crate) const ROOT_CHANGED: u32 = fs::kFSEventStreamEventFlagRootChanged;
 pub(crate) const SINCE_NOW: u64 = fs::kFSEventStreamEventIdSinceNow;
 
 /// 系统当前最新的事件 ID。
@@ -146,6 +148,26 @@ unsafe fn cf_string_path(string: cf::CFRef) -> Option<PathBuf> {
     cf_string_with_bytes(string, |bytes| PathBuf::from(OsStr::from_bytes(bytes)))
 }
 
+struct StreamContext {
+    tx: std::sync::mpsc::Sender<Vec<Event>>,
+    /// 设备级流（`FSEventStreamCreateRelativeToDevice`）对应的卷挂载根；
+    /// 非空时，macOS 回调返回的路径均为相对卷根路径，投递前统一与 `mount_root` 拼接。
+    mount_root: Option<PathBuf>,
+}
+
+fn join_device_relative(mount_root: &Path, raw: PathBuf) -> PathBuf {
+    let bytes = raw.as_os_str().as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && bytes[start] == b'/' {
+        start += 1;
+    }
+    if start == bytes.len() {
+        mount_root.to_path_buf()
+    } else {
+        mount_root.join(OsStr::from_bytes(&bytes[start..]))
+    }
+}
+
 extern "C" fn on_stream_events(
     _stream: fs::FSEventStreamRef,
     info: *mut c_void,
@@ -154,12 +176,16 @@ extern "C" fn on_stream_events(
     flags: *const u32,
     ids: *const u64,
 ) {
-    let tx = unsafe { &*(info as *const std::sync::mpsc::Sender<Vec<Event>>) };
+    let ctx = unsafe { &*(info as *const StreamContext) };
     let (path_key, inode_key) = extended_keys();
     let batch = (0..count)
         .map(|i| unsafe {
             let entry = cf::CFArrayGetValueAtIndex(paths, i as cf::CFIndex);
-            let path = cf_string_path(CFDictionaryGetValue(entry, path_key)).unwrap_or_default();
+            let raw_path = cf_string_path(CFDictionaryGetValue(entry, path_key)).unwrap_or_default();
+            let path = match ctx.mount_root {
+                Some(ref mount_root) => join_device_relative(mount_root, raw_path),
+                None => raw_path,
+            };
             let number = CFDictionaryGetValue(entry, inode_key);
             let mut inode = 0i64;
             let inode = (!number.is_null()
@@ -175,12 +201,12 @@ extern "C" fn on_stream_events(
         })
         .collect();
     // 回调只拷贝后投递：在派发队列上排队太久，fseventsd 会丢事件。
-    let _ = tx.send(batch);
+    let _ = ctx.tx.send(batch);
 }
 
-extern "C" fn release_sender(info: *const c_void) {
+extern "C" fn release_context(info: *const c_void) {
     if !info.is_null() {
-        drop(unsafe { Box::from_raw(info as *mut std::sync::mpsc::Sender<Vec<Event>>) });
+        drop(unsafe { Box::from_raw(info as *mut StreamContext) });
     }
 }
 
@@ -204,6 +230,30 @@ impl Drop for Stream {
             dispatch_release(self.queue);
         }
     }
+}
+
+/// 查询路径所在文件系统在内核挂载表中的真实挂载根（`statfs.f_mntonname`），零磁盘 I/O。
+fn real_mount_root_for(path: &Path) -> Option<PathBuf> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    let bytes = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_bytes();
+    Some(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+unsafe fn start_stream_on_queue(stream: fs::FSEventStreamRef) -> Option<Stream> {
+    let attr = dispatch_queue_attr_make_with_qos_class(
+        std::ptr::null(),
+        QOS_CLASS_USER_INITIATED,
+        0,
+    );
+    let queue = dispatch_queue_create(c"lokii.fsevents".as_ptr(), attr);
+    FSEventStreamSetDispatchQueue(stream, queue);
+    let stream = Stream { stream, queue };
+    (fs::FSEventStreamStart(stream.stream) != 0).then_some(stream)
 }
 
 /// 从 `since`（事件 ID，或 `kFSEventStreamEventIdSinceNow`）起监听 `roots`，事件按批投递到 `tx`。
@@ -234,9 +284,12 @@ pub(crate) fn watch(
         }
         let context = fs::FSEventStreamContext {
             version: 0,
-            info: Box::into_raw(Box::new(tx)) as *mut c_void,
+            info: Box::into_raw(Box::new(StreamContext {
+                tx,
+                mount_root: None,
+            })) as *mut c_void,
             retain: None,
-            release: Some(release_sender),
+            release: Some(release_context),
             copy_description: None,
         };
         let stream = fs::FSEventStreamCreate(
@@ -249,22 +302,92 @@ pub(crate) fn watch(
             fs::kFSEventStreamCreateFlagFileEvents
                 | fs::kFSEventStreamCreateFlagNoDefer
                 | fs::kFSEventStreamCreateFlagUseCFTypes
+                | fs::kFSEventStreamCreateFlagWatchRoot
                 | CREATE_FLAG_USE_EXTENDED_DATA,
         );
         cf::CFRelease(array);
         if stream.is_null() {
-            release_sender(context.info);
+            release_context(context.info);
             return None;
         }
-        let attr = dispatch_queue_attr_make_with_qos_class(
-            std::ptr::null(),
-            QOS_CLASS_USER_INITIATED,
-            0,
+        start_stream_on_queue(stream)
+    }
+}
+
+/// 通过设备级 `FSEventStreamCreateRelativeToDevice` 监听指定卷（或其相对子目录），
+/// 天然隔离启动卷挂载点 `ItemCreated` 幽灵事件，并与主机级流共享同一全局事件 ID 空间。
+///
+/// 仅当 `mount_root` 与内核 `statfs.f_mntonname` 真实挂载点一致且 `dev != 0` 时建流，
+/// 否则返回 `None` 供调用方安全回退到主机级 [`watch`]。
+pub(crate) fn watch_device(
+    mount_root: &Path,
+    relative_subpath: &str,
+    since: u64,
+    tx: std::sync::mpsc::Sender<Vec<Event>>,
+) -> Option<Stream> {
+    use std::os::unix::fs::MetadataExt;
+
+    let real_mount = real_mount_root_for(mount_root)?;
+    if !crate::path_utils::paths_equal_ci(&real_mount, mount_root) {
+        return None;
+    }
+
+    let dev = std::fs::metadata(mount_root).ok()?.dev() as libc::dev_t;
+    if dev == 0 {
+        return None;
+    }
+
+    let rel = relative_subpath.trim_matches('/');
+    let c_rel = CString::new(rel).ok()?;
+
+    unsafe {
+        let array = cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 1, &cf::kCFTypeArrayCallBacks);
+        let string = cf::CFStringCreateWithCString(
+            cf::kCFAllocatorDefault,
+            c_rel.as_ptr(),
+            cf::kCFStringEncodingUTF8,
         );
-        let queue = dispatch_queue_create(c"lokii.fsevents".as_ptr(), attr);
-        FSEventStreamSetDispatchQueue(stream, queue);
-        let stream = Stream { stream, queue };
-        (fs::FSEventStreamStart(stream.stream) != 0).then_some(stream)
+        if string.is_null() {
+            cf::CFRelease(array);
+            return None;
+        }
+        cf::CFArrayAppendValue(array, string);
+        cf::CFRelease(string);
+
+        let context = fs::FSEventStreamContext {
+            version: 0,
+            info: Box::into_raw(Box::new(StreamContext {
+                tx,
+                mount_root: Some(mount_root.to_path_buf()),
+            })) as *mut c_void,
+            retain: None,
+            release: Some(release_context),
+            copy_description: None,
+        };
+        let mut create_flags = fs::kFSEventStreamCreateFlagFileEvents
+            | fs::kFSEventStreamCreateFlagNoDefer
+            | fs::kFSEventStreamCreateFlagUseCFTypes
+            | CREATE_FLAG_USE_EXTENDED_DATA;
+        // 卷内子路径根启用 WatchRoot 以感知子目录原位替换；整卷挂载点不启用，避免挂载生命周期噪声。
+        if !rel.is_empty() {
+            create_flags |= fs::kFSEventStreamCreateFlagWatchRoot;
+        }
+        let stream = fs::FSEventStreamCreateRelativeToDevice(
+            cf::kCFAllocatorDefault,
+            on_stream_events,
+            &context,
+            dev,
+            array,
+            since,
+            0.05,
+            create_flags,
+        );
+        cf::CFRelease(array);
+        if stream.is_null() {
+            release_context(context.info);
+            return None;
+        }
+        start_stream_on_queue(stream)
     }
 }
 
@@ -361,5 +484,109 @@ mod tests {
                 assert_eq!(parsed, Some(PathBuf::from(expected)));
             }
         }
+    }
+
+    #[test]
+    fn join_device_relative_joins_onto_mount_root_without_duplicating_subpath() {
+        let mount = Path::new("/Volumes/WorkDisk");
+        assert_eq!(
+            join_device_relative(mount, PathBuf::from("")),
+            PathBuf::from("/Volumes/WorkDisk")
+        );
+        assert_eq!(
+            join_device_relative(mount, PathBuf::from("/")),
+            PathBuf::from("/Volumes/WorkDisk")
+        );
+        assert_eq!(
+            join_device_relative(mount, PathBuf::from("sub/after.txt")),
+            PathBuf::from("/Volumes/WorkDisk/sub/after.txt")
+        );
+        assert_eq!(
+            join_device_relative(mount, PathBuf::from("/sub/after.txt")),
+            PathBuf::from("/Volumes/WorkDisk/sub/after.txt")
+        );
+    }
+
+    #[test]
+    fn watch_device_replays_history_and_joins_subpath_without_duplication() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mount_root = real_mount_root_for(&sub).expect("real mount root");
+        // macOS APFS 数据卷通过 firmlink 挂接 /private/var 等目录：
+        // statfs 返回真实挂载点 /System/Volumes/Data，而设备相对路径去掉根斜杠即为卷内路径。
+        let rel_sub = sub
+            .strip_prefix(&mount_root)
+            .or_else(|_| sub.strip_prefix("/"))
+            .expect("temp dir under its mount root")
+            .to_string_lossy()
+            .to_string();
+        let expected_sub = mount_root.join(&rel_sub);
+
+        // 非真实挂载根应安全返回 None，以便调用方回退到主机流
+        let (fallback_tx, _fallback_rx) = std::sync::mpsc::channel();
+        assert!(watch_device(&sub, "", SINCE_NOW, fallback_tx).is_none());
+
+        let since = current_event_id();
+        let hist_file = sub.join("before.txt");
+        let expected_hist = expected_sub.join("before.txt");
+        std::fs::write(&hist_file, "hist").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _stream = watch_device(&mount_root, &rel_sub, since, tx).expect("device stream");
+        let hist_events = collect_until(&rx, |events| {
+            events.iter().any(|e| e.flags & HISTORY_DONE != 0)
+        });
+        let done_pos = hist_events.iter().position(|e| e.flags & HISTORY_DONE != 0);
+        let hist_pos = hist_events.iter().position(|e| e.path == expected_hist);
+        assert!(
+            matches!((hist_pos, done_pos), (Some(h), Some(d)) if h < d),
+            "expected {expected_hist:?} before HISTORY_DONE, got {hist_events:?}"
+        );
+
+        let live_file = sub.join("after.txt");
+        let expected_live = expected_sub.join("after.txt");
+        std::fs::write(&live_file, "live").unwrap();
+        let live_ino = std::fs::metadata(&live_file).unwrap().ino();
+        let live_events =
+            collect_until(&rx, |events| events.iter().any(|e| e.path == expected_live));
+        let live_ev = live_events
+            .iter()
+            .find(|e| e.path == expected_live)
+            .expect("live device event for after.txt");
+        assert!(live_ev.id > 0 && live_ev.flags & ITEM_CREATED != 0, "{live_ev:?}");
+        assert_eq!(live_ev.inode, Some(live_ino));
+    }
+
+    #[test]
+    fn watch_emits_root_changed_when_watched_root_is_replaced_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("out");
+        let backup = base.join("out.old");
+        let fresh = base.join("new_out");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join("fresh.txt"), "new").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _stream = watch(&[target.clone()], SINCE_NOW, tx).expect("watch stream");
+        std::thread::sleep(Duration::from_millis(150));
+
+        std::fs::rename(&target, &backup).unwrap();
+        std::fs::rename(&fresh, &target).unwrap();
+
+        let events = collect_until(&rx, |evts| {
+            evts.iter().any(|e| e.flags & ROOT_CHANGED != 0)
+        });
+        assert!(
+            events.iter().any(|e| e.flags & ROOT_CHANGED != 0),
+            "WatchRoot stream must deliver ROOT_CHANGED on in-place root replacement, got {events:?}"
+        );
     }
 }

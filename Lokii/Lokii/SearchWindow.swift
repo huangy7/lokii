@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 import Quartz
 import SwiftUI
@@ -117,6 +118,9 @@ final class SearchWindow: NSWindowController {
     private var indexingState: IndexingState = .initializing {
         didSet { updateEmptyState() }
     }
+    private var volumeStatusCancellable: AnyCancellable?
+    /// 本次会话中用户点「稍后再说」收起的待确认卷 ID 集合；有新卷进入待确认或重启后自动重新展示。
+    private var dismissedConfirmVolumeIds: Set<String> = []
 
     init(engine: SearchEngine) {
         self.engine = engine
@@ -170,6 +174,33 @@ final class SearchWindow: NSWindowController {
         searchResultsViewController.onManageIndexRules = {
             (NSApp.delegate as? AppDelegate)?.openIndexPreferences()
         }
+        searchResultsViewController.onVolumeBannerConfirmAll = { [weak engine] in
+            engine?.confirmAllPendingVolumeScans()
+        }
+        searchResultsViewController.onVolumeBannerCancelSyncing = { [weak engine] in
+            guard let engine else { return }
+            let syncingVolumes = engine.getVolumeStatuses().filter { $0.state == .syncing }
+            for status in syncingVolumes {
+                engine.cancelVolumeScan(pathOrId: status.volumeId)
+            }
+        }
+        searchResultsViewController.onVolumeBannerManage = {
+            (NSApp.delegate as? AppDelegate)?.openIndexPreferences()
+        }
+        searchResultsViewController.onVolumeBannerDismiss = { [weak self, weak engine] in
+            guard let self, let engine else { return }
+            let pendingIds = engine.getVolumeStatuses()
+                .filter { $0.state == .needsConfirmation }
+                .map(\.volumeId)
+            self.dismissedConfirmVolumeIds.formUnion(pendingIds)
+            self.refreshVolumeBanner(with: engine.getVolumeStatuses())
+        }
+        volumeStatusCancellable = engine.$volumeStatuses
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] statuses in
+                self?.refreshVolumeBanner(with: statuses)
+            }
+        refreshVolumeBanner(with: engine.getVolumeStatuses())
         searchResultsViewController.onSelectSyntaxExample = { [weak self] example in
             self?.applySyntaxExample(example)
         }
@@ -239,8 +270,20 @@ final class SearchWindow: NSWindowController {
     }
 
     deinit {
+        volumeStatusCancellable?.cancel()
         cancelPendingScreenOverflowCheck()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    private func refreshVolumeBanner(with statuses: [FfiVolumeStatus]) {
+        // 离开待确认态（例如确认扫描完成后或取消回退前）自动从收起集合清理，确保后续再次需要确认时正常弹出。
+        let currentPendingIds = Set(statuses.filter { $0.state == .needsConfirmation }.map(\.volumeId))
+        dismissedConfirmVolumeIds.formIntersection(currentPendingIds)
+        let bannerState = VolumeBannerResolver.resolve(
+            statuses: statuses,
+            dismissedVolumeIds: dismissedConfirmVolumeIds
+        )
+        searchResultsViewController.updateVolumeBanner(state: bannerState)
     }
 
     override func showWindow(_ sender: Any?) {
@@ -598,6 +641,8 @@ final class SearchWindow: NSWindowController {
                        name: SearchEngine.indexReadyNotification, object: nil)
         nc.addObserver(self, selector: #selector(onIndexUpdated(_:)),
                        name: SearchEngine.indexUpdatedNotification, object: nil)
+        nc.addObserver(self, selector: #selector(onWatcherError(_:)),
+                       name: SearchEngine.watcherErrorNotification, object: nil)
         nc.addObserver(self, selector: #selector(onStartupMode(_:)),
                        name: SearchEngine.startupModeNotification, object: nil)
         nc.addObserver(self, selector: #selector(onInitializationFailed(_:)),
@@ -751,6 +796,17 @@ final class SearchWindow: NSWindowController {
         let total = note.userInfo?["total"] as? UInt64 ?? 0
         statusText = .formatted("search.indexedCount", formatFileCount(total))
         overlayState?.scannedCount = total
+    }
+
+    @objc private func onWatcherError(_ note: Notification) {
+        guard indexingState == .rebuilding else { return }
+        let source = note.userInfo?["source"] as? String ?? ""
+        guard source == "rebuild" else { return }
+        hideInlineProgress()
+        searchResultsViewController.setRebuildSpinning(false)
+        searchResultsViewController.setRebuildEnabled(true)
+        indexingState = .idle
+        statusText = .formatted("search.indexedCount", formatFileCount(engine.stats.totalCount))
     }
 
     @objc private func onStartupMode(_ note: Notification) {
@@ -1072,12 +1128,35 @@ final class SearchWindow: NSWindowController {
             return
         }
 
+        ManualRebuildCoordinator.requestRebuild(
+            window: window,
+            statuses: engine.getVolumeStatuses(),
+            onPrimaryOnly: { [weak self] in
+                self?.performManualRebuild(includeExternal: false)
+            },
+            onRebuildAll: { [weak self] in
+                self?.performManualRebuild(includeExternal: true)
+            }
+        )
+    }
+
+    private func performManualRebuild(includeExternal: Bool) {
+        guard indexingState == .idle else { return }
+        if engine.isScanning {
+            searchResultsViewController.notifyBackgroundIndexingActive()
+            return
+        }
+
         indexingState = .rebuilding
         searchResultsViewController.setRebuildEnabled(false)
         searchResultsViewController.setRebuildSpinning(true)
         showInlineProgress()
         statusText = .key("search.indexing")
-        engine.rebuildIndex()
+        if includeExternal {
+            engine.rebuildIndex()
+        } else {
+            engine.rebuildPrimaryIndex()
+        }
     }
 
     // MARK: - Search

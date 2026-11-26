@@ -70,7 +70,11 @@ enum TestFixture {
         state: FfiVolumeState,
         entryCount: UInt64 = 0,
         lastSyncAt: UInt64? = nil,
-        isRemounted: Bool = false
+        isRemounted: Bool = false,
+        hasCache: Bool = false,
+        confirmReason: FfiVolumeConfirmReason? = nil,
+        scannedCount: UInt64 = 0,
+        supportsPersistentJournal: Bool = true
     ) -> FfiVolumeStatus {
         FfiVolumeStatus(
             volumeId: volumeId,
@@ -81,7 +85,11 @@ enum TestFixture {
             state: state,
             entryCount: entryCount,
             lastSyncAt: lastSyncAt,
-            isRemounted: isRemounted
+            isRemounted: isRemounted,
+            hasCache: hasCache,
+            confirmReason: confirmReason,
+            scannedCount: scannedCount,
+            supportsPersistentJournal: supportsPersistentJournal
         )
     }
 }

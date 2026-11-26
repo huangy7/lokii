@@ -1229,6 +1229,30 @@ final class SearchResultsViewController: NSViewController {
     /// 上下文作用域租约：当面包屑弹出右键菜单时临时接管有效载荷，规避与主列表选区发生交叉错位
     var activeContextMenuPayload: [URL]?
 
+    /// 点击时不抢占搜索框 First Responder 的横幅按钮
+    private final class NonActivatingBannerButton: NSButton {
+        override var acceptsFirstResponder: Bool { false }
+    }
+
+    // MARK: - Top Volume Banner (Non-Blocking Collapsible Bar)
+    private static let volumeBannerExpandedHeight: CGFloat = 34
+    let volumeBannerContainer = NSView()
+    private let volumeBannerSeparator = NSBox()
+    private let volumeBannerStack = NSStackView()
+    private let volumeBannerSpinner = NSProgressIndicator()
+    private let volumeBannerIcon = NSImageView()
+    private let volumeBannerLabel = NSTextField(labelWithString: "")
+    private let volumeBannerPrimaryButton = NonActivatingBannerButton()
+    private let volumeBannerManageButton = NonActivatingBannerButton()
+    private let volumeBannerDismissButton = NonActivatingBannerButton()
+    var volumeBannerHeightConstraint: NSLayoutConstraint?
+    private var currentVolumeBannerState: VolumeBannerState = .hidden
+
+    var onVolumeBannerConfirmAll: (() -> Void)?
+    var onVolumeBannerCancelSyncing: (() -> Void)?
+    var onVolumeBannerManage: (() -> Void)?
+    var onVolumeBannerDismiss: (() -> Void)?
+
     // MARK: - Empty State View
     enum EmptyState: Equatable {
         case noMatches
@@ -1486,6 +1510,8 @@ final class SearchResultsViewController: NSViewController {
         let containerView = NSView()
         containerView.wantsLayer = true
 
+        setupVolumeBanner(in: containerView)
+
         tableScrollView.translatesAutoresizingMaskIntoConstraints = false
         tableScrollView.documentView = tableView
         tableScrollView.hasVerticalScroller = true
@@ -1511,10 +1537,17 @@ final class SearchResultsViewController: NSViewController {
 
         setupEmptyState(in: containerView)
 
+        let bannerHeight = volumeBannerContainer.heightAnchor.constraint(equalToConstant: 0)
+        volumeBannerHeightConstraint = bannerHeight
+
         NSLayoutConstraint.activate([
-            // 顶端锚定至安全区布局辅助线，使表头与滚动视口始终对齐至窗口工具栏底缘，
-            // 滚动时列表内容在表头底线处干净截断
-            tableScrollView.topAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.topAnchor),
+            // 顶部外置卷横幅锚定至安全区顶缘，收起时高度为 0pt，展开时平滑推出 34pt，不遮挡表头与空态引导
+            volumeBannerContainer.topAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.topAnchor),
+            volumeBannerContainer.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            volumeBannerContainer.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+            bannerHeight,
+
+            tableScrollView.topAnchor.constraint(equalTo: volumeBannerContainer.bottomAnchor),
             tableScrollView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
             tableScrollView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             tableScrollView.bottomAnchor.constraint(equalTo: separator.topAnchor),
@@ -1534,6 +1567,200 @@ final class SearchResultsViewController: NSViewController {
         ])
 
         self.view = containerView
+        renderVolumeBanner(animated: false)
+    }
+
+    private func setupVolumeBanner(in containerView: NSView) {
+        volumeBannerContainer.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerContainer.wantsLayer = true
+        volumeBannerContainer.isHidden = true
+        containerView.addSubview(volumeBannerContainer)
+
+        volumeBannerStack.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerStack.orientation = .horizontal
+        volumeBannerStack.alignment = .centerY
+        volumeBannerStack.spacing = 8
+        volumeBannerContainer.addSubview(volumeBannerStack)
+
+        volumeBannerSpinner.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerSpinner.style = .spinning
+        volumeBannerSpinner.controlSize = .small
+        volumeBannerSpinner.isDisplayedWhenStopped = false
+        volumeBannerSpinner.setContentHuggingPriority(.required, for: .horizontal)
+
+        volumeBannerIcon.translatesAutoresizingMaskIntoConstraints = false
+        let iconConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        volumeBannerIcon.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(iconConfig)
+        volumeBannerIcon.contentTintColor = .systemOrange
+        volumeBannerIcon.setContentHuggingPriority(.required, for: .horizontal)
+
+        volumeBannerLabel.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerLabel.font = .systemFont(ofSize: 12)
+        volumeBannerLabel.textColor = .labelColor
+        volumeBannerLabel.lineBreakMode = .byTruncatingTail
+        volumeBannerLabel.maximumNumberOfLines = 1
+        volumeBannerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        volumeBannerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.fittingSizeCompression, for: .horizontal)
+
+        volumeBannerPrimaryButton.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerPrimaryButton.bezelStyle = .rounded
+        volumeBannerPrimaryButton.controlSize = .small
+        volumeBannerPrimaryButton.font = .systemFont(ofSize: 11.5, weight: .medium)
+        volumeBannerPrimaryButton.refusesFirstResponder = true
+        volumeBannerPrimaryButton.focusRingType = .none
+        volumeBannerPrimaryButton.target = self
+        volumeBannerPrimaryButton.action = #selector(volumeBannerPrimaryClicked)
+        volumeBannerPrimaryButton.setContentHuggingPriority(.required, for: .horizontal)
+        volumeBannerPrimaryButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        volumeBannerManageButton.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerManageButton.isBordered = false
+        volumeBannerManageButton.font = .systemFont(ofSize: 11.5, weight: .medium)
+        volumeBannerManageButton.contentTintColor = .controlAccentColor
+        volumeBannerManageButton.refusesFirstResponder = true
+        volumeBannerManageButton.focusRingType = .none
+        volumeBannerManageButton.target = self
+        volumeBannerManageButton.action = #selector(volumeBannerManageClicked)
+        volumeBannerManageButton.setContentHuggingPriority(.required, for: .horizontal)
+        volumeBannerManageButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        volumeBannerDismissButton.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerDismissButton.isBordered = false
+        volumeBannerDismissButton.font = .systemFont(ofSize: 11.5)
+        volumeBannerDismissButton.contentTintColor = .secondaryLabelColor
+        volumeBannerDismissButton.refusesFirstResponder = true
+        volumeBannerDismissButton.focusRingType = .none
+        volumeBannerDismissButton.target = self
+        volumeBannerDismissButton.action = #selector(volumeBannerDismissClicked)
+        volumeBannerDismissButton.setContentHuggingPriority(.required, for: .horizontal)
+        volumeBannerDismissButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        volumeBannerStack.addArrangedSubview(volumeBannerSpinner)
+        volumeBannerStack.addArrangedSubview(volumeBannerIcon)
+        volumeBannerStack.addArrangedSubview(volumeBannerLabel)
+        volumeBannerStack.addArrangedSubview(spacer)
+        volumeBannerStack.addArrangedSubview(volumeBannerPrimaryButton)
+        volumeBannerStack.addArrangedSubview(volumeBannerManageButton)
+        volumeBannerStack.addArrangedSubview(volumeBannerDismissButton)
+
+        volumeBannerSeparator.translatesAutoresizingMaskIntoConstraints = false
+        volumeBannerSeparator.boxType = .separator
+        volumeBannerContainer.addSubview(volumeBannerSeparator)
+
+        NSLayoutConstraint.activate([
+            volumeBannerStack.leadingAnchor.constraint(equalTo: volumeBannerContainer.leadingAnchor, constant: 12),
+            volumeBannerStack.trailingAnchor.constraint(equalTo: volumeBannerContainer.trailingAnchor, constant: -12),
+            volumeBannerStack.centerYAnchor.constraint(equalTo: volumeBannerContainer.centerYAnchor),
+
+            volumeBannerSpinner.widthAnchor.constraint(equalToConstant: 14),
+            volumeBannerSpinner.heightAnchor.constraint(equalToConstant: 14),
+            volumeBannerIcon.widthAnchor.constraint(equalToConstant: 15),
+            volumeBannerIcon.heightAnchor.constraint(equalToConstant: 15),
+
+            volumeBannerSeparator.leadingAnchor.constraint(equalTo: volumeBannerContainer.leadingAnchor),
+            volumeBannerSeparator.trailingAnchor.constraint(equalTo: volumeBannerContainer.trailingAnchor),
+            volumeBannerSeparator.bottomAnchor.constraint(equalTo: volumeBannerContainer.bottomAnchor),
+        ])
+    }
+
+    /// 更新顶部非阻塞外置卷提示横幅；高度平滑切换且绝不抢占搜索框焦点。
+    func updateVolumeBanner(state: VolumeBannerState) {
+        let visibilityChanged = (currentVolumeBannerState == .hidden) != (state == .hidden)
+        currentVolumeBannerState = state
+        renderVolumeBanner(animated: visibilityChanged)
+    }
+
+    private func renderVolumeBanner(animated: Bool) {
+        let message = VolumeBannerResolver.message(for: currentVolumeBannerState)
+        volumeBannerLabel.stringValue = message
+        volumeBannerLabel.toolTip = message.isEmpty ? nil : message
+
+        let targetHeight: CGFloat
+        switch currentVolumeBannerState {
+        case .hidden:
+            targetHeight = 0
+            volumeBannerSpinner.stopAnimation(nil)
+            volumeBannerSpinner.isHidden = true
+            volumeBannerIcon.isHidden = true
+            volumeBannerPrimaryButton.isHidden = true
+            volumeBannerManageButton.isHidden = true
+            volumeBannerDismissButton.isHidden = true
+
+        case let .syncing(_, _, hasPendingConfirmations):
+            targetHeight = Self.volumeBannerExpandedHeight
+            volumeBannerContainer.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.06).cgColor
+            volumeBannerSpinner.isHidden = false
+            volumeBannerSpinner.startAnimation(nil)
+            volumeBannerIcon.isHidden = true
+            volumeBannerPrimaryButton.isHidden = false
+            volumeBannerPrimaryButton.bezelColor = nil
+            volumeBannerPrimaryButton.title = L("volume.banner.action.cancel")
+            volumeBannerManageButton.isHidden = !hasPendingConfirmations
+            volumeBannerManageButton.title = L("volume.banner.action.manage")
+            volumeBannerDismissButton.isHidden = true
+
+        case .needsConfirmation:
+            targetHeight = Self.volumeBannerExpandedHeight
+            volumeBannerContainer.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.08).cgColor
+            volumeBannerSpinner.stopAnimation(nil)
+            volumeBannerSpinner.isHidden = true
+            volumeBannerIcon.isHidden = false
+            volumeBannerPrimaryButton.isHidden = false
+            volumeBannerPrimaryButton.bezelColor = .controlAccentColor
+            volumeBannerPrimaryButton.title = L("volume.banner.action.updateNow")
+            volumeBannerManageButton.isHidden = false
+            volumeBannerManageButton.title = L("volume.banner.action.manage")
+            volumeBannerDismissButton.isHidden = false
+            volumeBannerDismissButton.title = L("volume.banner.action.later")
+        }
+
+        let isCollapsing = (targetHeight == 0)
+        if !isCollapsing {
+            volumeBannerContainer.isHidden = false
+        }
+
+        let shouldAnimate = animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && view.window != nil
+        if shouldAnimate {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.16
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                self.volumeBannerHeightConstraint?.animator().constant = targetHeight
+                self.view.layoutSubtreeIfNeeded()
+            }, completionHandler: { [weak self] in
+                guard let self else { return }
+                if self.currentVolumeBannerState == .hidden {
+                    self.volumeBannerContainer.isHidden = true
+                }
+            })
+        } else {
+            volumeBannerHeightConstraint?.constant = targetHeight
+            volumeBannerContainer.isHidden = isCollapsing
+            view.needsLayout = true
+        }
+    }
+
+    @objc private func volumeBannerPrimaryClicked() {
+        switch currentVolumeBannerState {
+        case .syncing:
+            onVolumeBannerCancelSyncing?()
+        case .needsConfirmation:
+            onVolumeBannerConfirmAll?()
+        case .hidden:
+            break
+        }
+    }
+
+    @objc private func volumeBannerManageClicked() {
+        onVolumeBannerManage?()
+    }
+
+    @objc private func volumeBannerDismissClicked() {
+        onVolumeBannerDismiss?()
     }
 
     private func setupEmptyState(in containerView: NSView) {
@@ -2621,6 +2848,7 @@ final class SearchResultsViewController: NSViewController {
             statusFeedbackCapsule.label.stringValue = L("search.backgroundRefresh")
         }
         renderEmptyState()
+        renderVolumeBanner(animated: false)
         updateFDAButtonContent()
     }
 

@@ -396,9 +396,11 @@ mod tests {
             last_event_id: None,
             journal_uuid: None,
             entry_count: 1,
+            scope_snapshot: None,
+            dirty_upper_bound: false,
+            pending_confirm_reason: None,
             dirty_filter: false,
             filter_fingerprint: None,
-            pruned_for_fp: None,
         };
         let compact = CompactIndex::from_entries(vec![entry("report.rs", "/Volumes/Docs/report.rs")]).unwrap();
         cache::save_compact(&compact, None, &volumes_dir.join(format!("{}.cache", record.volume_id))).unwrap();

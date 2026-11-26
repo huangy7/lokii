@@ -1,5 +1,5 @@
-use crate::config::AppConfig;
-use crate::path_utils::path_starts_with_ci;
+use crate::config::{expand_tilde, AppConfig};
+use crate::path_utils::{path_starts_with_ci, paths_equal_ci};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -11,10 +11,16 @@ struct NormalizedPrefix {
     raw: PathBuf,
     prefix_str: String,
     depth: usize,
+    /// 该索引根是否启用 `.app` 浅层容器策略（仅对 `index_apps` 自动追加且未被用户覆盖的系统应用根为 `true`）。
+    shallow_apps: bool,
 }
 
 impl NormalizedPrefix {
     fn new(path: PathBuf) -> Self {
+        Self::with_shallow_apps(path, false)
+    }
+
+    fn with_shallow_apps(path: PathBuf, shallow_apps: bool) -> Self {
         let depth = path.components().count();
         let mut s = path.to_string_lossy().to_string();
         #[cfg(target_os = "macos")]
@@ -28,6 +34,7 @@ impl NormalizedPrefix {
             raw: path,
             prefix_str: s,
             depth,
+            shallow_apps,
         }
     }
 
@@ -140,14 +147,16 @@ pub(crate) struct DirChildContext {
     has_child_prefix_override: bool,
     /// 本次遍历是否包含用户隐藏文件。
     include_hidden: bool,
+    /// 父目录最深匹配根是否启用 `.app` 浅层容器策略。
+    shallow_apps: bool,
 }
 
-/// 统一索引范围策略：按严格优先级裁决显式排除、系统噪声、用户隐藏开关与浅层容器目录。
+/// 统一索引范围策略：按严格优先级裁决显式排除、系统噪声、用户隐藏开关与按根浅层容器目录。
 ///
 /// 构造期完成路径展开与前缀预编译，确保扫描和事件热路径保持零额外字符串规范化开销。
 #[derive(Clone)]
 pub struct IndexScopePolicy {
-    /// Normalized include root paths from config `index_paths`.
+    /// Normalized include root paths from config `index_paths` and uncovered shallow app roots.
     include_roots: Vec<NormalizedPrefix>,
     /// Normalized exclude path prefixes from config `exclude_paths`.
     excluded_prefixes: Vec<NormalizedPrefix>,
@@ -159,8 +168,6 @@ pub struct IndexScopePolicy {
     exclude_sensitive: bool,
     /// Names matched by the sensitive protection (user-configurable).
     sensitive_names: Vec<String>,
-    /// 应用开关：开启时 `.app` 作为浅层容器收录，包内不递归。
-    index_apps: bool,
 }
 
 /// 保留旧称别名以兼容既有调用点。
@@ -179,8 +186,15 @@ impl IndexScopePolicy {
         Self::from_resolved_roots(config, config.resolve_paths_lexical())
     }
 
-    fn from_resolved_roots(config: &AppConfig, roots: Vec<PathBuf>) -> Self {
-        let include_roots = roots.into_iter().map(NormalizedPrefix::new).collect();
+    /// 内部纯词法构造器：仅展开用户显式 `index_paths`（全标 `shallow_apps = false`），
+    /// 绝不调用 `resolve_shallow_app_roots()`，用于打破 `resolve_shallow_app_roots` 的自递归环。
+    pub(crate) fn from_user_roots_lexical(config: &AppConfig) -> Self {
+        let include_roots = config
+            .index
+            .index_paths
+            .iter()
+            .map(|p| NormalizedPrefix::with_shallow_apps(expand_tilde(p), false))
+            .collect();
         let excluded_prefixes = config
             .resolve_exclude_paths()
             .into_iter()
@@ -195,7 +209,70 @@ impl IndexScopePolicy {
             include_hidden: config.index.include_hidden,
             exclude_sensitive: config.index.exclude_sensitive,
             sensitive_names: config.index.sensitive_names.clone(),
-            index_apps: config.index.index_apps,
+        }
+    }
+
+    fn from_resolved_roots(config: &AppConfig, roots: Vec<PathBuf>) -> Self {
+        let shallow_app_roots = config.resolve_shallow_app_roots();
+        let include_roots = roots
+            .into_iter()
+            .map(|root| {
+                let is_shallow = shallow_app_roots
+                    .iter()
+                    .any(|shallow| paths_equal_ci(&root, shallow));
+                NormalizedPrefix::with_shallow_apps(root, is_shallow)
+            })
+            .collect();
+        let excluded_prefixes = config
+            .resolve_exclude_paths()
+            .into_iter()
+            .map(NormalizedPrefix::new)
+            .collect();
+        let excluded_names: HashSet<String> = config.index.exclude.iter().cloned().collect();
+
+        Self {
+            include_roots,
+            excluded_prefixes,
+            excluded_names,
+            include_hidden: config.index.include_hidden,
+            exclude_sensitive: config.index.exclude_sensitive,
+            sensitive_names: config.index.sensitive_names.clone(),
+        }
+    }
+
+    /// 从结构化 `PrimaryScopeSnapshot` 构造纯词法过滤策略，供 `scope_diff` 精确判定旧范围覆盖。
+    pub(crate) fn from_primary_snapshot(
+        snapshot: &crate::scope_diff::PrimaryScopeSnapshot,
+    ) -> Self {
+        let include_roots = snapshot
+            .primary_roots
+            .iter()
+            .map(|root| {
+                let path = PathBuf::from(root);
+                let is_shallow = snapshot
+                    .shallow_app_roots
+                    .iter()
+                    .any(|s| paths_equal_ci(&path, Path::new(s)));
+                NormalizedPrefix::with_shallow_apps(path, is_shallow)
+            })
+            .collect();
+        let mut excluded_prefixes: Vec<NormalizedPrefix> = snapshot
+            .exclude_paths
+            .iter()
+            .map(|p| NormalizedPrefix::new(PathBuf::from(p)))
+            .collect();
+        for m in &snapshot.excluded_mount_roots {
+            excluded_prefixes.push(NormalizedPrefix::new(PathBuf::from(m)));
+        }
+        let excluded_names: HashSet<String> = snapshot.exclude.iter().cloned().collect();
+
+        Self {
+            include_roots,
+            excluded_prefixes,
+            excluded_names,
+            include_hidden: snapshot.include_hidden,
+            exclude_sensitive: snapshot.exclude_sensitive,
+            sensitive_names: snapshot.sensitive_names.clone(),
         }
     }
 
@@ -218,10 +295,16 @@ impl IndexScopePolicy {
         primary_roots: &[PathBuf],
         mounted_exclude_roots: &[PathBuf],
     ) -> Self {
+        let shallow_app_roots = config.resolve_shallow_app_roots();
         let include_roots = primary_roots
             .iter()
             .cloned()
-            .map(NormalizedPrefix::new)
+            .map(|root| {
+                let is_shallow = shallow_app_roots
+                    .iter()
+                    .any(|shallow| paths_equal_ci(&root, shallow));
+                NormalizedPrefix::with_shallow_apps(root, is_shallow)
+            })
             .collect();
         let mut excluded_prefixes: Vec<NormalizedPrefix> = config
             .resolve_exclude_paths()
@@ -240,38 +323,45 @@ impl IndexScopePolicy {
             include_hidden: config.index.include_hidden,
             exclude_sensitive: config.index.exclude_sensitive,
             sensitive_names: config.index.sensitive_names.clone(),
-            index_apps: config.index.index_apps,
         }
     }
 
-    /// Construct a filter isolated for a specific mounted volume.
+    /// Construct a filter isolated for a specific mounted volume (always `shallow_apps = false`).
     pub fn for_volume(config: &AppConfig, active_root: &Path) -> Self {
-        let include_roots = vec![NormalizedPrefix::new(active_root.to_path_buf())];
-        // Strip out exclude paths that match active_root itself or are an ancestor of active_root
-        let excluded_prefixes: Vec<NormalizedPrefix> = config
-            .resolve_exclude_paths()
-            .into_iter()
-            .filter(|ex| !path_starts_with_ci(active_root, ex))
-            .map(NormalizedPrefix::new)
+        let snapshot = crate::scope_diff::VolumeScopeSnapshot::from_config(
+            config,
+            active_root,
+            active_root,
+        );
+        Self::for_volume_snapshot(&snapshot, active_root)
+    }
+
+    /// 直接基于结构化 `VolumeScopeSnapshot`（相对子路径拼回当前 `active_root`）编译外置卷过滤器，
+    /// 保证快照与运行期扫描/裁剪/实时流过滤语义 100% 同源并天然免疫 `-1` 挂载点漂移。
+    pub fn for_volume_snapshot(
+        snapshot: &crate::scope_diff::VolumeScopeSnapshot,
+        active_root: &Path,
+    ) -> Self {
+        let include_roots = vec![NormalizedPrefix::with_shallow_apps(
+            active_root.to_path_buf(),
+            false,
+        )];
+        let excluded_prefixes: Vec<NormalizedPrefix> = snapshot
+            .exclude_subpaths
+            .iter()
+            .filter(|sub| !sub.is_empty())
+            .map(|sub| NormalizedPrefix::new(active_root.join(sub)))
             .collect();
-        let excluded_names: HashSet<String> = config.index.exclude.iter().cloned().collect();
+        let excluded_names: HashSet<String> = snapshot.exclude.iter().cloned().collect();
 
         Self {
             include_roots,
             excluded_prefixes,
             excluded_names,
-            include_hidden: config.index.include_hidden,
-            exclude_sensitive: config.index.exclude_sensitive,
-            sensitive_names: config.index.sensitive_names.clone(),
-            index_apps: config.index.index_apps,
+            include_hidden: snapshot.include_hidden,
+            exclude_sensitive: snapshot.exclude_sensitive,
+            sensitive_names: snapshot.sensitive_names.clone(),
         }
-    }
-
-    pub(crate) fn same_scan_options(&self, other: &Self) -> bool {
-        self.include_hidden == other.include_hidden
-            && self.exclude_sensitive == other.exclude_sensitive
-            && self.sensitive_names == other.sensitive_names
-            && self.index_apps == other.index_apps
     }
 
     /// 是否有排除前缀位于 `path` 之下：用于判断该目录内部是否还藏有需要单独监听的目标。
@@ -327,14 +417,15 @@ impl IndexScopePolicy {
     /// 5. 应用开关开启时，`.app` 包目录只收录自身，包内条目一律丢弃。
     pub fn evaluate_with_hidden(&self, path: &Path, is_dir: bool, include_hidden: bool) -> ScopeDecision {
         let path_str = path.to_string_lossy();
-        let in_depth = deepest_matching_depth(&self.include_roots, &path_str);
+        let matched_root = deepest_matching_prefix(&self.include_roots, &path_str);
 
         // 配置了索引根却未命中任何根：该路径不属于索引范围
-        if !self.include_roots.is_empty() && in_depth.is_none() {
+        if !self.include_roots.is_empty() && matched_root.is_none() {
             return ScopeDecision::HardDrop;
         }
 
-        let in_depth = in_depth.unwrap_or(0);
+        let in_depth = matched_root.map(|r| r.depth).unwrap_or(0);
+        let shallow_apps = matched_root.is_some_and(|r| r.shallow_apps);
 
         if let Some(ex_depth) = deepest_matching_depth(&self.excluded_prefixes, &path_str) {
             if ex_depth >= in_depth {
@@ -353,7 +444,7 @@ impl IndexScopePolicy {
             }
         }
 
-        // 第 3 层优先级：排除目录名与 macOS 包目录（只作用在显式索引根之后的相对组件）
+        // 第 3 层优先级：排除目录名与按根启用的 macOS 应用包浅层容器（只作用在索引根之后的相对组件）
         let mut comps = path
             .components()
             .skip(in_depth)
@@ -375,9 +466,9 @@ impl IndexScopePolicy {
             {
                 return ScopeDecision::HardDrop;
             }
-            if self.index_apps && is_app_bundle_name(&name) {
+            if shallow_apps && is_app_bundle_name(&name) {
                 return if comps.peek().is_some() {
-                    // 包内部：与 Finder 把包当作单个文件的语义一致
+                    // 包内部：仅对浅层应用根生效，只收录应用包自身
                     ScopeDecision::HardDrop
                 } else if is_dir {
                     ScopeDecision::IndexShallowContainer
@@ -407,10 +498,13 @@ impl IndexScopePolicy {
             .any(|p| p.depth == child_depth && path_starts_with_ci(&p.raw, dir));
         let parent_admitted =
             self.evaluate_with_hidden(dir, true, include_hidden) == ScopeDecision::IndexNormally;
+        let shallow_apps = deepest_matching_prefix(&self.include_roots, &dir.to_string_lossy())
+            .is_some_and(|p| p.shallow_apps);
         DirChildContext {
             parent_admitted,
             has_child_prefix_override: has_child_include || has_child_exclude,
             include_hidden,
+            shallow_apps,
         }
     }
 
@@ -449,7 +543,7 @@ impl IndexScopePolicy {
         {
             return ScopeDecision::HardDrop;
         }
-        if self.index_apps && is_app_bundle_name(child_name) {
+        if ctx.shallow_apps && is_app_bundle_name(child_name) {
             return if is_dir {
                 ScopeDecision::IndexShallowContainer
             } else {
@@ -503,6 +597,7 @@ mod tests {
             sensitive_names: AppConfig::default().index.sensitive_names,
             max_results: 500,
             network_rescan_minutes: 5,
+            serial_scan_paths: vec![],
         };
         CompiledFilter::from_config(&config)
     }
@@ -902,6 +997,7 @@ mod tests {
                 sensitive_names: AppConfig::default().index.sensitive_names,
                 max_results: 500,
                 network_rescan_minutes: 5,
+                serial_scan_paths: vec![],
             };
             CompiledFilter::from_config(&config)
         };
@@ -976,48 +1072,125 @@ mod tests {
             ScopeDecision::IndexNormally
         );
 
+        // 用户显式将 /Applications 加入 index_paths 时，无论 index_apps 开关状态均按常规规则索引
         config.index.index_apps = true;
-        let on = IndexScopePolicy::from_config(&config);
+        let explicit_on = IndexScopePolicy::from_config(&config);
         assert_eq!(
-            on.evaluate(Path::new("/Applications/WeChat.app"), true),
-            ScopeDecision::IndexShallowContainer
+            explicit_on.evaluate(Path::new("/Applications/WeChat.app"), true),
+            ScopeDecision::IndexNormally
         );
         assert_eq!(
-            on.evaluate(Path::new("/Applications/WeChat.app/Info.plist"), false),
-            ScopeDecision::HardDrop
+            explicit_on.evaluate(Path::new("/Applications/WeChat.app/Info.plist"), false),
+            ScopeDecision::IndexNormally
         );
         assert_eq!(
-            on.evaluate(
+            explicit_on.evaluate(
                 Path::new("/Applications/WeChat.app/Contents/MacOS/WeChat"),
                 false
             ),
             ScopeDecision::HardDrop
         );
-        // 只有 .app 被当作应用包，其他包类型维持原行为
-        assert_eq!(
-            on.evaluate(Path::new("/Applications/Demo.framework"), true),
-            ScopeDecision::IndexNormally
-        );
-        // 普通文件即使扩展名像应用包也不受影响
-        assert_eq!(
-            on.evaluate(Path::new("/Applications/Notes.app"), false),
-            ScopeDecision::IndexNormally
-        );
 
-        // 索引根只有 ~ 时，开关追加的 /System/Applications 仍能穿透默认 /System 排除
+        // 索引根只有 ~ 时，自动追加的 /Applications 与 /System/Applications 启用浅层容器（只收录 .app 自身），
+        // 且 ~ 与外置卷完全不受 index_apps 影响
         config.index.index_paths = vec!["~".to_string()];
         config.index.exclude_paths = AppConfig::default().index.exclude_paths;
-        let system_policy = IndexScopePolicy::from_config(&config);
+        let auto_policy = IndexScopePolicy::from_config_lexical(&config);
         assert_eq!(
-            system_policy.evaluate(Path::new("/System/Applications/Calculator.app"), true),
+            auto_policy.evaluate(Path::new("/Applications/WeChat.app"), true),
             ScopeDecision::IndexShallowContainer
         );
         assert_eq!(
-            system_policy.evaluate(
+            auto_policy.evaluate(Path::new("/Applications/WeChat.app/Info.plist"), false),
+            ScopeDecision::HardDrop
+        );
+        assert_eq!(
+            auto_policy.evaluate(
+                Path::new("/Applications/WeChat.app/Contents/MacOS/WeChat"),
+                false
+            ),
+            ScopeDecision::HardDrop
+        );
+        assert_eq!(
+            auto_policy.evaluate(Path::new("/Applications/Demo.framework"), true),
+            ScopeDecision::IndexNormally
+        );
+        assert_eq!(
+            auto_policy.evaluate(Path::new("/Applications/Notes.app"), false),
+            ScopeDecision::IndexNormally
+        );
+        assert_eq!(
+            auto_policy.evaluate(Path::new("/System/Applications/Calculator.app"), true),
+            ScopeDecision::IndexShallowContainer
+        );
+        assert_eq!(
+            auto_policy.evaluate(
                 Path::new("/System/Applications/Calculator.app/Contents/Info.plist"),
                 false
             ),
             ScopeDecision::HardDrop
+        );
+
+        // 用户主目录下的 .app 不受 index_apps 浅层影响
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            auto_policy.evaluate(&home.join("Tools/MyTool.app"), true),
+            ScopeDecision::IndexNormally
+        );
+        assert_eq!(
+            auto_policy.evaluate(&home.join("Tools/MyTool.app/Info.plist"), false),
+            ScopeDecision::IndexNormally
+        );
+
+        // 显式排除 /Applications 本身时，同深度排除优先依然 HardDrop
+        let mut excluded_apps = config.clone();
+        excluded_apps.index.exclude_paths.push("/Applications".into());
+        let excluded_policy = IndexScopePolicy::from_config_lexical(&excluded_apps);
+        assert_eq!(
+            excluded_policy.evaluate(Path::new("/Applications/WeChat.app"), true),
+            ScopeDecision::HardDrop
+        );
+
+        // 仅显式索引 /Applications/Utilities 且打开 index_apps：Utilities 按常规索引，/Applications 其余按浅层索引
+        let mut sub_cfg = AppConfig::default();
+        sub_cfg.index.index_paths = vec!["/Applications/Utilities".into()];
+        sub_cfg.index.index_apps = true;
+        let sub_policy = IndexScopePolicy::from_config_lexical(&sub_cfg);
+        assert_eq!(
+            sub_policy.evaluate(Path::new("/Applications/Safari.app"), true),
+            ScopeDecision::IndexShallowContainer
+        );
+        assert_eq!(
+            sub_policy.evaluate(Path::new("/Applications/Safari.app/Info.plist"), false),
+            ScopeDecision::HardDrop
+        );
+        assert_eq!(
+            sub_policy.evaluate(Path::new("/Applications/Utilities/Terminal.app"), true),
+            ScopeDecision::IndexNormally
+        );
+        assert_eq!(
+            sub_policy.evaluate(
+                Path::new("/Applications/Utilities/Terminal.app/Info.plist"),
+                false
+            ),
+            ScopeDecision::IndexNormally
+        );
+
+        // 索引根为 / 且默认排除 /System：/Applications 已被覆盖（不追加浅层），/System/Applications 被挡住（追加浅层）
+        let mut root_cfg = AppConfig::default();
+        root_cfg.index.index_paths = vec!["/".into()];
+        root_cfg.index.index_apps = true;
+        let shallow = root_cfg.resolve_shallow_app_roots();
+        assert!(!shallow.contains(&PathBuf::from("/Applications")));
+        assert!(shallow.contains(&PathBuf::from("/System/Applications")));
+        let root_policy = IndexScopePolicy::from_config_lexical(&root_cfg);
+        assert_eq!(
+            root_policy.evaluate(Path::new("/Applications/Safari.app"), true),
+            ScopeDecision::IndexNormally
+        );
+        assert_eq!(
+            root_policy.evaluate(Path::new("/System/Applications/Calculator.app"), true),
+            ScopeDecision::IndexShallowContainer
         );
     }
 
