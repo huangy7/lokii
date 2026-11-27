@@ -5,6 +5,20 @@ import Foundation
 // MARK: - Config Model (mirrors Rust AppConfig JSON)
 
 struct LokiiConfig: Codable {
+    enum DockIconMode: String, Codable, CaseIterable, Hashable {
+        case always
+        case whenOpen = "when_open"
+        case never
+
+        init(ffi: FfiDockIconMode) {
+            switch ffi {
+            case .always: self = .always
+            case .whenOpen: self = .whenOpen
+            case .never: self = .never
+            }
+        }
+    }
+
     var general: GeneralConfig
     var index: IndexConfig
     var window: WindowConfig
@@ -15,7 +29,7 @@ struct LokiiConfig: Codable {
         return LokiiConfig(
             general: GeneralConfig(
                 language: raw.general.language,
-                showInDock: raw.general.showInDock,
+                dockIconMode: DockIconMode(ffi: raw.general.dockIconMode),
                 terminalBundleId: raw.general.terminalBundleId,
                 hideResultsWhenEmpty: raw.general.hideResultsWhenEmpty
             ),
@@ -40,32 +54,36 @@ struct LokiiConfig: Codable {
 
     struct GeneralConfig: Codable {
         var language: String
-        var showInDock: Bool
+        var dockIconMode: DockIconMode
         var terminalBundleId: String
         var hideResultsWhenEmpty: Bool
 
         enum CodingKeys: String, CodingKey {
             case language
-            case showInDock = "show_in_dock"
+            case dockIconMode = "dock_icon_mode"
             case terminalBundleId = "terminal_bundle_id"
             case hideResultsWhenEmpty = "hide_results_when_empty"
         }
 
+        private enum LegacyCodingKeys: String, CodingKey {
+            case showInDock = "show_in_dock"
+        }
+
         init(
             language: String? = nil,
-            showInDock: Bool? = nil,
+            dockIconMode: DockIconMode? = nil,
             terminalBundleId: String? = nil,
             hideResultsWhenEmpty: Bool? = nil
         ) {
-            if let language, let showInDock, let terminalBundleId, let hideResultsWhenEmpty {
+            if let language, let dockIconMode, let terminalBundleId, let hideResultsWhenEmpty {
                 self.language = language
-                self.showInDock = showInDock
+                self.dockIconMode = dockIconMode
                 self.terminalBundleId = terminalBundleId
                 self.hideResultsWhenEmpty = hideResultsWhenEmpty
             } else {
                 let defaults = LokiiConfig.defaultConfig.general
                 self.language = language ?? defaults.language
-                self.showInDock = showInDock ?? defaults.showInDock
+                self.dockIconMode = dockIconMode ?? defaults.dockIconMode
                 self.terminalBundleId = terminalBundleId ?? defaults.terminalBundleId
                 self.hideResultsWhenEmpty = hideResultsWhenEmpty ?? defaults.hideResultsWhenEmpty
             }
@@ -73,9 +91,16 @@ struct LokiiConfig: Codable {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
+            let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
             let defaults = LokiiConfig.defaultConfig.general
             self.language = try container.decodeIfPresent(String.self, forKey: .language) ?? defaults.language
-            self.showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock) ?? defaults.showInDock
+            if let explicitMode = try container.decodeIfPresent(DockIconMode.self, forKey: .dockIconMode) {
+                self.dockIconMode = explicitMode
+            } else if let legacyShowInDock = try legacyContainer.decodeIfPresent(Bool.self, forKey: .showInDock) {
+                self.dockIconMode = legacyShowInDock ? .always : .never
+            } else {
+                self.dockIconMode = defaults.dockIconMode
+            }
             self.terminalBundleId = try container.decodeIfPresent(String.self, forKey: .terminalBundleId) ?? defaults.terminalBundleId
             self.hideResultsWhenEmpty = try container.decodeIfPresent(Bool.self, forKey: .hideResultsWhenEmpty) ?? defaults.hideResultsWhenEmpty
         }

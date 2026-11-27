@@ -63,6 +63,12 @@ final class SearchWindow: NSWindowController {
     // MARK: - Pin State & Window Level
     private(set) var isPinned: Bool = false
     private let pinButton = NSButton()
+    /// 窗口即将显示前的钩子（用于同步升格应用激活策略）；返回 true 表示本次刚从 `.accessory` 切至 `.regular`。
+    var onWillShow: (() -> Bool)?
+    /// 窗口完成 `orderOut` 收起后的通知钩子，用于驱动动态程序坞图标策略重算。
+    var onDidHide: (() -> Void)?
+    /// 淡出隐藏动画世代令牌：快速重新唤起时递增，取消尚未落地的旧淡出回调防止误收起。
+    private var hideAnimationToken: UInt64 = 0
 
     @objc func togglePin() {
         isPinned.toggle()
@@ -289,6 +295,14 @@ final class SearchWindow: NSWindowController {
     override func showWindow(_ sender: Any?) {
         guard let window = window else { return }
 
+        hideAnimationToken &+= 1
+        let showToken = hideAnimationToken
+        let upgradedToRegular = onWillShow?() ?? false
+
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+
         // 若窗口当前可见但停留在其他桌面空间（Space），先静默移出再于当前活跃空间就地呈现；
         // 避免常驻 .moveToActiveSpace 在「显示器具有单独的空间」模式下于跨屏交界处干扰拖拽。
         if window.isVisible && !window.isOnActiveSpace {
@@ -328,6 +342,18 @@ final class SearchWindow: NSWindowController {
         if let editor = searchField.currentEditor() {
             editor.selectAll(nil)
         }
+
+        // 从 `.accessory` 升格到 `.regular` 时，若系统异步完成进程类型变换导致首帧未夺回焦点，
+        // 在下一轮主线程 tick 做一次受令牌保护的补激活，避免搜索框无法直接键入。
+        if upgradedToRegular {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.hideAnimationToken == showToken,
+                      let window = self.window, window.isVisible, !NSApp.isActive else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(self.searchField)
+            }
+        }
         
         if isFirstAppear {
             // Quick fade in
@@ -362,10 +388,14 @@ final class SearchWindow: NSWindowController {
         }
         guard let window = window, window.isVisible else { return }
 
+        hideAnimationToken &+= 1
+        let hideToken = hideAnimationToken
+
         guard animated else {
             window.orderOut(nil)
             window.alphaValue = 1.0
             window.contentView?.layer?.transform = CATransform3DIdentity
+            onDidHide?()
             return
         }
 
@@ -375,9 +405,11 @@ final class SearchWindow: NSWindowController {
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().alphaValue = 0.0
         }, completionHandler: { [weak self] in
-            self?.window?.orderOut(nil)
-            self?.window?.alphaValue = 1.0
-            self?.window?.contentView?.layer?.transform = CATransform3DIdentity
+            guard let self, self.hideAnimationToken == hideToken else { return }
+            self.window?.orderOut(nil)
+            self.window?.alphaValue = 1.0
+            self.window?.contentView?.layer?.transform = CATransform3DIdentity
+            self.onDidHide?()
         })
     }
 

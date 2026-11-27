@@ -12,11 +12,22 @@ struct PreferencesGeneralPane: View {
         Form {
             // Section 1: 行为
             Section(L("prefs.section.behavior")) {
-                SettingsToggleRow(
-                    L("prefs.showInDock"),
-                    description: L("prefs.showInDock.description"),
-                    isOn: $viewModel.showInDock
-                )
+                HStack(alignment: .center, spacing: 14) {
+                    SettingsRowLabel(
+                        L("prefs.dockIconMode"),
+                        description: viewModel.dockIconModeDescription
+                    )
+                    Spacer(minLength: 12)
+                    Picker("", selection: $viewModel.dockIconMode) {
+                        Text(L("prefs.dockIconMode.always")).tag(LokiiConfig.DockIconMode.always)
+                        Text(L("prefs.dockIconMode.whenOpen")).tag(LokiiConfig.DockIconMode.whenOpen)
+                        Text(L("prefs.dockIconMode.never")).tag(LokiiConfig.DockIconMode.never)
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                .padding(.vertical, 2)
                 SettingsToggleRow(
                     L("prefs.hideOnBlur"),
                     description: L("prefs.hideOnBlur.description"),

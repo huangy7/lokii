@@ -164,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private lazy var engine = SearchEngine()
     private var preferencesController: PreferencesWindowController?
+    private var dockCoordinator: DockVisibilityCoordinator?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let config = engine.getConfig()
@@ -174,8 +175,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 应用存储的外观主题
         ThemeManager.shared.applyCurrentTheme()
 
-        // 根据配置设置应用激活策略（是否常驻 Dock）
-        NSApp.setActivationPolicy((config?.general.showInDock ?? true) ? .regular : .accessory)
+        // 初始化程序坞显示策略协调器并同步初始状态
+        let dockIconMode = config?.general.dockIconMode ?? .whenOpen
+        let coordinator = DockVisibilityCoordinator(initialMode: dockIconMode)
+        dockCoordinator = coordinator
+        coordinator.syncPolicyNow()
+
+        FDAGuideWindowController.onWillShow = { [weak self] in
+            self?.dockCoordinator?.prepareForWindowPresentation()
+        }
 
         // 注册应用支持向系统“服务（Services）”导出的数据类型
         NSApp.registerServicesMenuSendTypes(Array(ServicesPasteboard.allTypes), returnTypes: [])
@@ -184,9 +192,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(onLanguageChanged),
                                                name: L10n.languageChangedNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(onConfigReloaded),
+                                               name: SearchEngine.configReloadedNotification, object: nil)
         registerGlobalShortcut()
 
         mainWindow = SearchWindow(engine: engine)
+        mainWindow?.onWillShow = { [weak self] in
+            self?.dockCoordinator?.prepareForWindowPresentation() ?? false
+        }
+        mainWindow?.onDidHide = { [weak self] in
+            self?.dockCoordinator?.schedulePolicySync()
+        }
         mainWindow?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         engine.initialize()
@@ -200,8 +216,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        dockCoordinator?.beginTermination()
         // 存下索引与回放检查点，下次启动只需回放此后的变更（数百万条约数百毫秒）。
         engine.persistIndex()
+    }
+
+    @objc private func onConfigReloaded() {
+        let latestMode = engine.getConfig()?.general.dockIconMode ?? .whenOpen
+        dockCoordinator?.updateMode(latestMode)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -403,6 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showAboutPanel() {
+        dockCoordinator?.prepareForWindowPresentation()
         NSApp.activate(ignoringOtherApps: true)
         let options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationIcon: NSApp.applicationIconImage as Any,
@@ -436,6 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPreferences(tab: String? = nil) {
+        dockCoordinator?.prepareForWindowPresentation()
         if preferencesController == nil {
             preferencesController = PreferencesWindowController(engine: engine)
         }
@@ -449,6 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     @objc private func checkForUpdates() {
+        dockCoordinator?.prepareForWindowPresentation()
         NSApp.activate(ignoringOtherApps: true)
         AppUpdater.shared.checkForUpdates(isUserInitiated: true)
     }

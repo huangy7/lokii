@@ -90,11 +90,29 @@ pub struct FfiQueryPreview {
     pub has_regex_sugar: bool,
 }
 
+/// macOS Dock icon visibility policy exposed via UniFFI.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiDockIconMode {
+    Always,
+    WhenOpen,
+    Never,
+}
+
+impl From<config::DockIconMode> for FfiDockIconMode {
+    fn from(mode: config::DockIconMode) -> Self {
+        match mode {
+            config::DockIconMode::Always => Self::Always,
+            config::DockIconMode::WhenOpen => Self::WhenOpen,
+            config::DockIconMode::Never => Self::Never,
+        }
+    }
+}
+
 /// Typed general settings exposed via UniFFI for compile-time safe defaults.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FfiGeneralConfig {
     pub language: String,
-    pub show_in_dock: bool,
+    pub dock_icon_mode: FfiDockIconMode,
     pub terminal_bundle_id: String,
     pub hide_results_when_empty: bool,
 }
@@ -1478,7 +1496,7 @@ pub fn default_app_config() -> FfiAppConfig {
     FfiAppConfig {
         general: FfiGeneralConfig {
             language: cfg.general.language,
-            show_in_dock: cfg.general.show_in_dock,
+            dock_icon_mode: cfg.general.dock_icon_mode.into(),
             terminal_bundle_id: cfg.general.terminal_bundle_id,
             hide_results_when_empty: cfg.general.hide_results_when_empty,
         },
@@ -1509,9 +1527,34 @@ pub fn default_app_config() -> FfiAppConfig {
 /// default, so user-edited values vanish on the next preference toggle.
 /// Layering the patch over the current config keeps absent keys intact.
 fn merge_config_patch(base: &AppConfig, patch: &str) -> Option<AppConfig> {
-    let patch: serde_json::Value = serde_json::from_str(patch).ok()?;
+    let mut patch: serde_json::Value = serde_json::from_str(patch).ok()?;
+    normalize_legacy_general_patch(&mut patch);
     let base = serde_json::to_value(base).ok()?;
     serde_json::from_value(deep_merge(base, patch)).ok()
+}
+
+/// 将局部 JSON 补丁中仅携带遗留 `general.show_in_dock` 的场景转换为 `dock_icon_mode`，
+/// 避免 `deep_merge` 叠加基底的 `dock_icon_mode` 后使遗留补丁被静默覆盖。
+fn normalize_legacy_general_patch(patch: &mut serde_json::Value) {
+    let Some(general) = patch.get_mut("general").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    if general.contains_key("dock_icon_mode") {
+        general.remove("show_in_dock");
+        return;
+    }
+    if let Some(show_in_dock) = general.remove("show_in_dock") {
+        if let Some(flag) = show_in_dock.as_bool() {
+            let mode = if flag { "always" } else { "never" };
+            general.insert(
+                "dock_icon_mode".to_string(),
+                serde_json::Value::String(mode.to_string()),
+            );
+        } else {
+            // 非布尔值回写给反序列化阶段拒绝，确保畸形补丁仍返回 None
+            general.insert("show_in_dock".to_string(), show_in_dock);
+        }
+    }
 }
 
 /// Recursively overlay `patch` onto `base`: objects merge key by key, while
@@ -1595,7 +1638,10 @@ mod tests {
         let ffi_cfg = default_app_config();
         let expected = AppConfig::default();
         assert_eq!(ffi_cfg.general.language, expected.general.language);
-        assert_eq!(ffi_cfg.general.show_in_dock, expected.general.show_in_dock);
+        assert_eq!(
+            ffi_cfg.general.dock_icon_mode,
+            FfiDockIconMode::from(expected.general.dock_icon_mode)
+        );
         assert_eq!(ffi_cfg.general.terminal_bundle_id, expected.general.terminal_bundle_id);
         assert_eq!(ffi_cfg.general.hide_results_when_empty, expected.general.hide_results_when_empty);
         assert_eq!(ffi_cfg.index.index_paths, expected.index.index_paths);
@@ -1809,7 +1855,7 @@ mod tests {
         let merged = merge_config_patch(&base, patch).expect("patch should merge");
 
         assert_eq!(merged.general.language, "en");
-        assert!(!merged.general.show_in_dock);
+        assert_eq!(merged.general.dock_icon_mode, config::DockIconMode::Never);
         assert_eq!(merged.general.terminal_bundle_id, "com.apple.Terminal");
         assert_eq!(merged.index.max_results, 100);
         assert_eq!(merged.index.exclude, vec!["node_modules".to_string()]);
@@ -1825,6 +1871,14 @@ mod tests {
         let merged_terminal = merge_config_patch(&base, patch_terminal).expect("patch should merge");
         assert_eq!(merged_terminal.general.terminal_bundle_id, "com.googlecode.iterm2");
         assert_eq!(merged_terminal.general.language, "zh-Hans");
+        assert_eq!(merged_terminal.general.dock_icon_mode, config::DockIconMode::WhenOpen);
+
+        // 显式新字段优先于同补丁内遗留字段
+        let patch_modern = r#"{
+            "general": { "dock_icon_mode": "always", "show_in_dock": false }
+        }"#;
+        let merged_modern = merge_config_patch(&base, patch_modern).expect("modern patch should merge");
+        assert_eq!(merged_modern.general.dock_icon_mode, config::DockIconMode::Always);
     }
 
     /// 显式下发的空数组表示清空，必须能覆盖基底，不能被合并逻辑吞掉
@@ -1847,6 +1901,8 @@ mod tests {
     fn malformed_config_patch_is_rejected() {
         assert!(merge_config_patch(&AppConfig::default(), "not json").is_none());
         assert!(merge_config_patch(&AppConfig::default(), r#"{ "index": 42 }"#).is_none());
+        assert!(merge_config_patch(&AppConfig::default(), r#"{ "general": { "show_in_dock": 123 } }"#).is_none());
+        assert!(merge_config_patch(&AppConfig::default(), r#"{ "general": { "dock_icon_mode": "invalid" } }"#).is_none());
     }
 
     #[test]
@@ -2880,7 +2936,7 @@ mod tests {
         .unwrap();
         assert_eq!(in_mem, on_disk);
         assert_eq!(in_mem.general.language, "en");
-        assert!(!in_mem.general.show_in_dock);
+        assert_eq!(in_mem.general.dock_icon_mode, config::DockIconMode::Never);
         assert!(in_mem.window.remember_position);
         assert_eq!(in_mem.index.max_results, 321);
     }

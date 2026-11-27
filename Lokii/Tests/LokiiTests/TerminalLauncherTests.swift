@@ -14,16 +14,17 @@ final class TerminalLauncherTests: XCTestCase {
 
         let decodedLegacy = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: legacyGeneralJSON)
         XCTAssertEqual(decodedLegacy.language, "en")
-        XCTAssertEqual(decodedLegacy.showInDock, false)
+        XCTAssertEqual(decodedLegacy.dockIconMode, .never)
         XCTAssertEqual(decodedLegacy.terminalBundleId, "com.apple.Terminal")
 
         let modernGeneral = LokiiConfig.GeneralConfig(
             language: "zh-Hans",
-            showInDock: true,
+            dockIconMode: .always,
             terminalBundleId: "com.googlecode.iterm2"
         )
         let encodedData = try JSONEncoder().encode(modernGeneral)
         let decodedModern = try JSONDecoder().decode(LokiiConfig.GeneralConfig.self, from: encodedData)
+        XCTAssertEqual(decodedModern.dockIconMode, .always)
         XCTAssertEqual(decodedModern.terminalBundleId, "com.googlecode.iterm2")
     }
 
