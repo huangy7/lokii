@@ -504,7 +504,14 @@ class PreferencesViewModel: ObservableObject {
     }
 
     @Published var hasCustomWindowSizes: Bool = WindowFrameManager().hasCustomSizes
+    @Published var windowPresentationMode: WindowPresentationMode = WindowPresentationModeStore.shared.currentMode {
+        didSet {
+            guard !isLoading, windowPresentationMode != oldValue else { return }
+            WindowPresentationModeStore.shared.currentMode = windowPresentationMode
+        }
+    }
     private var windowSizeObserver: NSObjectProtocol?
+    private var windowPresentationModeObserver: NSObjectProtocol?
 
     func refreshWindowSizeState() {
         hasCustomWindowSizes = WindowFrameManager().hasCustomSizes
@@ -779,6 +786,17 @@ class PreferencesViewModel: ObservableObject {
         ) { [weak self] _ in
             self?.refreshWindowSizeState()
         }
+        windowPresentationModeObserver = NotificationCenter.default.addObserver(
+            forName: WindowPresentationModeStore.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let latest = WindowPresentationModeStore.shared.currentMode
+            if self.windowPresentationMode != latest {
+                self.windowPresentationMode = latest
+            }
+        }
         let wsCenter = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
             let obs = wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -802,6 +820,9 @@ class PreferencesViewModel: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = windowSizeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = windowPresentationModeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         let wsCenter = NSWorkspace.shared.notificationCenter
@@ -1439,6 +1460,7 @@ class PreferencesViewModel: ObservableObject {
         self.language = config.general.language
         self.terminalBundleId = config.general.terminalBundleId
         self.theme = ThemeManager.shared.currentTheme
+        self.windowPresentationMode = WindowPresentationModeStore.shared.currentMode
 
         self.indexPaths = config.index.indexPaths
         self.indexApps = config.index.indexApps

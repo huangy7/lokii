@@ -40,6 +40,23 @@ struct PreferencesGeneralPane: View {
                 )
                 HStack(alignment: .center, spacing: 14) {
                     SettingsRowLabel(
+                        L("prefs.windowMode"),
+                        description: viewModel.windowPresentationMode == .floatingBar
+                            ? L("prefs.windowMode.description.floatingBar")
+                            : L("prefs.windowMode.description.standard")
+                    )
+                    Spacer(minLength: 12)
+                    SettingsSegmentedControl(
+                        options: [
+                            .init(value: WindowPresentationMode.standardWindow, title: L("prefs.windowMode.standard")),
+                            .init(value: WindowPresentationMode.floatingBar, title: L("prefs.windowMode.floatingBar")),
+                        ],
+                        selection: $viewModel.windowPresentationMode
+                    )
+                }
+                .padding(.vertical, 2)
+                HStack(alignment: .center, spacing: 14) {
+                    SettingsRowLabel(
                         L("prefs.windowSize"),
                         description: L("prefs.windowSize.description")
                     )

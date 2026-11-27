@@ -175,6 +175,7 @@
 "search.empty.excluded.subtitle" = "当前搜索路径命中了索引排除规则，暂时无法搜索此位置的文件。";
 "search.empty.excluded.tag" = "排除规则";
 "search.empty.manageRules" = "管理索引规则";
+"search.error.syntax" = "搜索语法错误";
 "search.empty.indexing.title" = "正在建立索引";
 "search.empty.indexing.subtitle" = "索引尚未完成，部分文件暂时无法搜索，请稍候。";
 "search.empty.idle.title" = "搜索任何文件";
@@ -499,3 +500,31 @@
 "prefs.cloudDrive.group.description" = "云盘位于 ~/Library 下而默认排除；开启后仅增量扫描已物化目录与可见条目，不触发云端下载。";
 "prefs.cloudDrive.icloudName" = "iCloud 云盘";
 "prefs.cloudDrive.status.indexed" = "已加入索引";
+
+/* Floating Search Bar & Presentation Mode */
+"menu.switchToFloatingBar" = "切换到悬浮搜索条";
+"menu.switchToStandardWindow" = "切换到标准窗口";
+"window.switchToFloatingBar" = "切换到悬浮搜索条";
+"tray.switchToFloatingBar" = "切换到悬浮搜索条";
+"tray.switchToStandardWindow" = "切换到标准窗口";
+"prefs.windowMode" = "搜索窗口模式";
+"prefs.windowMode.standard" = "标准窗口";
+"prefs.windowMode.floatingBar" = "悬浮搜索条";
+"prefs.windowMode.description.standard" = "完整多列结果列表与目录树侧边栏，适合精细筛选与批量文件操作。";
+"prefs.windowMode.description.floatingBar" = "液态玻璃无标题栏悬浮搜索条，空输入自动收折，支持位置记忆与托盘下方弹出，用完即走。";
+"floatingBar.placeholder" = "搜索文件或文件夹…";
+"floatingBar.expandToStandard" = "在标准窗口中打开 (⌘⇧M)";
+"floatingBar.clear" = "清空搜索";
+"floatingBar.noMatches" = "没有找到匹配项";
+"floatingBar.enableFuzzy" = "尝试模糊搜索";
+"floatingBar.clearFilters" = "清除筛选条件";
+"floatingBar.noMatches.filteredHint" = "当前搜索条件没有匹配的文件，试试调整关键词或筛选条件。";
+"floatingBar.noMatches.fuzzyHint" = "当前搜索条件没有匹配的文件，试试调整关键词或启用模糊搜索。";
+"floatingBar.noMatches.genericHint" = "当前搜索条件没有匹配的文件，试试调整关键词或筛选条件。";
+"floatingBar.filter.size" = "大小";
+"floatingBar.filter.sizeAny" = "不限大小";
+"floatingBar.filter.sizeOver1MB" = "大于 1 MB";
+"floatingBar.filter.sizeOver10MB" = "大于 10 MB";
+"floatingBar.filter.sizeOver100MB" = "大于 100 MB";
+"floatingBar.filter.sizeUnder1MB" = "小于 1 MB";
+"floatingBar.ctx.openInStandard" = "在标准窗口中查看";

@@ -175,6 +175,7 @@
 "search.empty.excluded.subtitle" = "The search path matches an index exclusion rule. Files in this location can’t be searched yet.";
 "search.empty.excluded.tag" = "Exclusion Rule";
 "search.empty.manageRules" = "Manage Index Rules";
+"search.error.syntax" = "Invalid Search Syntax";
 "search.empty.indexing.title" = "Building the Index";
 "search.empty.indexing.subtitle" = "Indexing is still in progress. Some files can’t be searched yet. Please wait.";
 "search.empty.idle.title" = "Search Any File";
@@ -499,3 +500,31 @@
 "prefs.cloudDrive.group.description" = "Cloud drives under ~/Library are excluded by default. Enabling one incrementally indexes materialized folders and visible entries without downloading cloud files.";
 "prefs.cloudDrive.icloudName" = "iCloud Drive";
 "prefs.cloudDrive.status.indexed" = "Indexed";
+
+/* Floating Search Bar & Presentation Mode */
+"menu.switchToFloatingBar" = "Switch to Floating Search Bar";
+"menu.switchToStandardWindow" = "Switch to Standard Window";
+"window.switchToFloatingBar" = "Switch to Floating Search Bar";
+"tray.switchToFloatingBar" = "Switch to Floating Search Bar";
+"tray.switchToStandardWindow" = "Switch to Standard Window";
+"prefs.windowMode" = "Search window mode";
+"prefs.windowMode.standard" = "Standard";
+"prefs.windowMode.floatingBar" = "Floating Bar";
+"prefs.windowMode.description.standard" = "Full multi-column results with directory sidebar, ideal for detailed filtering and batch actions.";
+"prefs.windowMode.description.floatingBar" = "Liquid glass borderless floating search bar that collapses when empty, remembers its position or drops below the tray icon, and dismisses after use.";
+"floatingBar.placeholder" = "Search files or folders…";
+"floatingBar.expandToStandard" = "Open in Standard Window (⌘⇧M)";
+"floatingBar.clear" = "Clear search";
+"floatingBar.noMatches" = "No Matching Files";
+"floatingBar.enableFuzzy" = "Try Fuzzy Search";
+"floatingBar.clearFilters" = "Clear Filters";
+"floatingBar.noMatches.filteredHint" = "No files match the current criteria. Try adjusting keywords or filters.";
+"floatingBar.noMatches.fuzzyHint" = "No files match the current criteria. Try adjusting keywords or enabling fuzzy search.";
+"floatingBar.noMatches.genericHint" = "No files match the current criteria. Try adjusting keywords or filters.";
+"floatingBar.filter.size" = "Size";
+"floatingBar.filter.sizeAny" = "Any Size";
+"floatingBar.filter.sizeOver1MB" = "Over 1 MB";
+"floatingBar.filter.sizeOver10MB" = "Over 10 MB";
+"floatingBar.filter.sizeOver100MB" = "Over 100 MB";
+"floatingBar.filter.sizeUnder1MB" = "Under 1 MB";
+"floatingBar.ctx.openInStandard" = "View in Standard Window";

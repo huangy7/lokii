@@ -1492,6 +1492,11 @@ final class SearchResultsViewController: NSViewController {
         return formatter
     }()
 
+    /// 供主列表与紧凑悬浮搜索条共用的文件体积格式化入口，保持单位与精度一致
+    static func formatCompactFileSize(_ size: UInt64) -> String {
+        sizeFormatter.string(fromByteCount: Int64(size))
+    }
+
     init() {
         super.init(nibName: nil, bundle: nil)
     }
@@ -3405,7 +3410,7 @@ final class SearchResultsViewController: NSViewController {
     }
 
     /// 仅应用程序包与系统偏好面板具有独立自定义图标，普通文件与常规目录统一复用扩展名/类型纯内存图标
-    private static func needsCustomBundleIcon(path: String) -> Bool {
+    static func needsCustomBundleIcon(path: String) -> Bool {
         let ext = fileExtensionLowercased(of: path)
         return ext == "app" || ext == "prefpane"
     }
@@ -4251,7 +4256,7 @@ final class SearchTableView: NSTableView {
 private let homeDirectory = NSHomeDirectory()
 
 /// 家目录缩写结果：展示串与被替换前缀的 UTF-8 字节数。
-private struct AbbreviatedHomePath {
+struct AbbreviatedHomePath {
     let display: String
     /// 被替换的家目录前缀字节数；命中区间起点落在此范围内即属于被缩写部分。
     let prefixBytes: Int
@@ -4267,7 +4272,7 @@ private struct AbbreviatedHomePath {
 }
 
 /// 把路径开头的家目录前缀缩写为 '~'；无需缩写时原样返回。
-private func abbreviateHomePrefix(_ path: String) -> AbbreviatedHomePath {
+func abbreviateHomePrefix(_ path: String) -> AbbreviatedHomePath {
     // 必须精确匹配家目录或其子路径，避免误伤同名前缀的其他目录
     guard path == homeDirectory || path.hasPrefix(homeDirectory + "/") else {
         return AbbreviatedHomePath(display: path, prefixBytes: 0)
@@ -4325,8 +4330,8 @@ class SearchHighlightCellView: NSTableCellView {
     }
 
     /// 后端下发的是 UTF-8 字节偏移，需夹取后映射为 NSRange。
-    private static func nsRanges(in string: String,
-                                 byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
+    static func nsRanges(in string: String,
+                         byteRanges: [(start: Int, end: Int)]) -> [NSRange] {
         guard !byteRanges.isEmpty else { return [] }
         let utf8 = string.utf8
         return byteRanges.compactMap { range in

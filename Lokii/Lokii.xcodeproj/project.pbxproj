@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		03C2AA4693B5C868CC54C847 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 4DA89C31BAA12806D874CFA3 /* AppIcon.icon */; };
+		062AADA99A70E696AFD94D90 /* FloatingSearchPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56441CB88CD0C42B4CE058D0 /* FloatingSearchPanel.swift */; };
 		0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFAD6916CAB8EDC0C1974B6F /* Key.swift */; };
 		15AAEC0CDA3C27720C7F2E18 /* KeyboardShortcuts in Frameworks */ = {isa = PBXBuildFile; productRef = 484225E67DB191B3777194BF /* KeyboardShortcuts */; };
 		1B4BCC5BF4FE72D28BAEF0A4 /* Name.swift in Sources */ = {isa = PBXBuildFile; fileRef = 927DA1B3D54D6EE81E6EE89C /* Name.swift */; };
@@ -18,6 +19,9 @@
 		3076673EC3CFD490E8285A50 /* KeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */; };
 		322DC1AF3FB9D3ECEC310A29 /* LocalizedMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0778F2C459FD032A0F94ABB /* LocalizedMenu.swift */; };
 		368436915AC064B1A3606C73 /* PreferencesWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A44F7A0C971BF5863D6CC401 /* PreferencesWindowController.swift */; };
+		3FF540C1E0F3079DB3FDB67B /* FloatingSearchWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDD1D828F3CC3D86BE3F0551 /* FloatingSearchWindowController.swift */; };
+		3FFE97DC014AD55974231E5D /* FloatingBarInlineViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCC84AF51831976D49D00F4D /* FloatingBarInlineViews.swift */; };
+		41434A3F76F6A1BA421715C1 /* FloatingSearchResultCellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC4FC1B0534308C716A1FE03 /* FloatingSearchResultCellView.swift */; };
 		43E1EA3946E3F6FDE146A8EB /* ThemeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04B808522771C196E501D47E /* ThemeManager.swift */; };
 		4C5C8F57CA90E399F78A9D0C /* NSMenuItem++.swift in Sources */ = {isa = PBXBuildFile; fileRef = 947ED46B1DBFFE195C82F1B6 /* NSMenuItem++.swift */; };
 		5361A50B42CFD165A023AC82 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85D0C52D4999B73E12F4EBD0 /* AppUpdater.swift */; };
@@ -28,6 +32,7 @@
 		6B5B50FC9B03A912526CECD0 /* RecorderCocoa.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76AE17B289006D96A51F7B4B /* RecorderCocoa.swift */; };
 		6C65440D3707233BEDDD2F59 /* FDAGuideView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBF42044E61241F1D42161BC /* FDAGuideView.swift */; };
 		72AA0A7A1F0334891902B63B /* SearchEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 379816002C0A5D5D8096C54B /* SearchEngine.swift */; };
+		72D63D79FE08A397E00EDBC5 /* WindowPresentationMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE8AC94420FEADFAB3572C41 /* WindowPresentationMode.swift */; };
 		76F036A0CA671FE174936DA4 /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A96470450AEE87C889A593F5 /* Recorder.swift */; };
 		7C0237F13F88BCC09F5A3AD2 /* TerminalLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10066A78C3F4FB2CFA1C9BB3 /* TerminalLauncher.swift */; };
 		857357554A566F644A6F6348 /* CarbonKeyboardShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */; };
@@ -78,6 +83,7 @@
 		4945594BBD178DAC175979A5 /* L10n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = L10n.swift; sourceTree = "<group>"; };
 		4DA89C31BAA12806D874CFA3 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		53AD1BB516C47939C54B91E0 /* KeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardShortcuts.swift; sourceTree = "<group>"; };
+		56441CB88CD0C42B4CE058D0 /* FloatingSearchPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingSearchPanel.swift; sourceTree = "<group>"; };
 		65BA160DCBC72B8377D8BDE6 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
 		6FE9AC728B031D49DDADE917 /* LokiiWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LokiiWindow.swift; sourceTree = "<group>"; };
 		71E72A2DABCA6C6F23E1053A /* Shortcut.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shortcut.swift; sourceTree = "<group>"; };
@@ -99,11 +105,15 @@
 		B02A9D1952A2A5322D70F9B4 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		B32FC7DD2AD33DB9A5618344 /* Lokii.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Lokii.icns; sourceTree = "<group>"; };
 		BA4E830255B313BE115EA5D1 /* SettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsComponents.swift; sourceTree = "<group>"; };
+		BC4FC1B0534308C716A1FE03 /* FloatingSearchResultCellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingSearchResultCellView.swift; sourceTree = "<group>"; };
+		BE8AC94420FEADFAB3572C41 /* WindowPresentationMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPresentationMode.swift; sourceTree = "<group>"; };
 		C9607143F4601B2F15F2A0F4 /* FDAGuideWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FDAGuideWindowController.swift; sourceTree = "<group>"; };
 		CA6E77FAC6CB6E4540217991 /* CarbonKeyboardShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CarbonKeyboardShortcuts.swift; sourceTree = "<group>"; };
 		CBF42044E61241F1D42161BC /* FDAGuideView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FDAGuideView.swift; sourceTree = "<group>"; };
+		CCC84AF51831976D49D00F4D /* FloatingBarInlineViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingBarInlineViews.swift; sourceTree = "<group>"; };
 		CD253FF760C302BEBDAD521E /* PreferencesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesView.swift; sourceTree = "<group>"; };
 		CD267E77C749892BFB3B6BFA /* SearchWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchWindow.swift; sourceTree = "<group>"; };
+		CDD1D828F3CC3D86BE3F0551 /* FloatingSearchWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingSearchWindowController.swift; sourceTree = "<group>"; };
 		CEBA9ADC3CA4D68CD6D60DA5 /* DockVisibilityCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DockVisibilityCoordinator.swift; sourceTree = "<group>"; };
 		D9E872F523B17EC320CBF98C /* InlinePillButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlinePillButton.swift; sourceTree = "<group>"; };
 		DF3BDDE0879B0D36C60D3442 /* PreferencesPrivacyAndAboutPanes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesPrivacyAndAboutPanes.swift; sourceTree = "<group>"; };
@@ -139,6 +149,10 @@
 				813464940F363EDC00821512 /* FilterPopoverController.swift */,
 				8F2785E445C9283940228F3D /* FilterPopoverView.swift */,
 				3373E36AED0BB84FF41FBE05 /* FilterQuerySyncCoordinator.swift */,
+				CCC84AF51831976D49D00F4D /* FloatingBarInlineViews.swift */,
+				56441CB88CD0C42B4CE058D0 /* FloatingSearchPanel.swift */,
+				BC4FC1B0534308C716A1FE03 /* FloatingSearchResultCellView.swift */,
+				CDD1D828F3CC3D86BE3F0551 /* FloatingSearchWindowController.swift */,
 				00E1647C6F31C0CE13528EDC /* FuzzyModeButton.swift */,
 				8B947458DDBFC6998183062C /* Info.plist */,
 				D9E872F523B17EC320CBF98C /* InlinePillButton.swift */,
@@ -160,6 +174,7 @@
 				10066A78C3F4FB2CFA1C9BB3 /* TerminalLauncher.swift */,
 				04B808522771C196E501D47E /* ThemeManager.swift */,
 				79F639042CB7B54E804B6F44 /* WindowFrameManager.swift */,
+				BE8AC94420FEADFAB3572C41 /* WindowPresentationMode.swift */,
 				260F6214BF9ED6B99CC06647 /* KeyboardShortcuts */,
 				FC2A4E303189BD8555BB8DD2 /* Preferences */,
 				AC5F4C27F9F94A645F5F7458 /* Resources */,
@@ -343,6 +358,10 @@
 				ECE64A8C9247F97E4B382BBD /* FilterPopoverController.swift in Sources */,
 				CFC1A9DD189A03E00F8F2FF3 /* FilterPopoverView.swift in Sources */,
 				CCFEB9A2297EF1A1BA18AA6B /* FilterQuerySyncCoordinator.swift in Sources */,
+				3FFE97DC014AD55974231E5D /* FloatingBarInlineViews.swift in Sources */,
+				062AADA99A70E696AFD94D90 /* FloatingSearchPanel.swift in Sources */,
+				41434A3F76F6A1BA421715C1 /* FloatingSearchResultCellView.swift in Sources */,
+				3FF540C1E0F3079DB3FDB67B /* FloatingSearchWindowController.swift in Sources */,
 				8DFC5FD99747B881291B18F5 /* FuzzyModeButton.swift in Sources */,
 				ED945BBDE80A0B891DDD90E6 /* InlinePillButton.swift in Sources */,
 				0D3501BDE61DEEAF99A7BD7A /* Key.swift in Sources */,
@@ -374,6 +393,7 @@
 				CF3D818345F30FFA7B298AB0 /* Utilities.swift in Sources */,
 				E6D7AD3D488518D375B2C1F8 /* ViewModifiers.swift in Sources */,
 				586EECB8FD279A36A813700C /* WindowFrameManager.swift in Sources */,
+				72D63D79FE08A397E00EDBC5 /* WindowPresentationMode.swift in Sources */,
 				220E4427CE25A98CD96F9AA1 /* lokii_core.swift in Sources */,
 				ABC424586F7680016C9197AA /* main.swift in Sources */,
 			);

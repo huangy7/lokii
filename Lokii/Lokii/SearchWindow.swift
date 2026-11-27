@@ -67,6 +67,8 @@ final class SearchWindow: NSWindowController {
     var onWillShow: (() -> Bool)?
     /// 窗口完成 `orderOut` 收起后的通知钩子，用于驱动动态程序坞图标策略重算。
     var onDidHide: (() -> Void)?
+    /// 请求切换至悬浮搜索条形态时回调，并携带当前查询上下文。
+    var onRequestSwitchToFloatingBar: ((SearchHandoffState) -> Void)?
     /// 淡出隐藏动画世代令牌：快速重新唤起时递增，取消尚未落地的旧淡出回调防止误收起。
     private var hideAnimationToken: UInt64 = 0
 
@@ -165,6 +167,9 @@ final class SearchWindow: NSWindowController {
         }
         window.onCommandP = { [weak self] in
             self?.togglePin()
+        }
+        window.onCommandShiftM = { [weak self] in
+            self?.requestSwitchToFloatingBar()
         }
 
         setupUI()
@@ -274,6 +279,37 @@ final class SearchWindow: NSWindowController {
         let targetScreen = window.screen ?? NSScreen.main ?? NSScreen.screens.first
         let targetFrame = Self.calculateDefaultWindowFrame(on: targetScreen)
         applyProgrammaticFrame(targetFrame, display: true, animate: true)
+    }
+
+    func currentHandoffState() -> SearchHandoffState {
+        SearchHandoffState(
+            query: searchField?.stringValue ?? "",
+            mode: currentMode,
+            caseSensitivity: currentCaseSensitivity
+        )
+    }
+
+    func applyHandoffState(_ state: SearchHandoffState) {
+        currentMode = state.mode
+        currentCaseSensitivity = state.caseSensitivity
+        searchField.stringValue = state.query
+        lastQuery = state.query
+        updateCaseSensitivityButtonState()
+        updateFuzzyModeButtonState()
+        updateRegexModeButtonState()
+        updateFilterButtonState(forQuery: state.query)
+        applyQuerySyntaxHighlighting()
+        updateEmptyState()
+
+        if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            loadDefaultResults()
+        } else {
+            performSearch(query: state.query)
+        }
+    }
+
+    @objc private func requestSwitchToFloatingBar() {
+        onRequestSwitchToFloatingBar?(currentHandoffState())
     }
 
     @available(*, unavailable)
@@ -2023,6 +2059,15 @@ extension SearchWindow: NSMenuItemValidation {
         resetWindowItem.keyEquivalentModifierMask = [.command, .option]
         resetWindowItem.target = self
         menu.addItem(resetWindowItem)
+
+        let floatingBarItem = NSMenuItem(
+            title: L("window.switchToFloatingBar"),
+            action: #selector(requestSwitchToFloatingBar),
+            keyEquivalent: "m"
+        )
+        floatingBarItem.keyEquivalentModifierMask = [.command, .shift]
+        floatingBarItem.target = self
+        menu.addItem(floatingBarItem)
 
         menu.addItem(NSMenuItem.separator())
 
