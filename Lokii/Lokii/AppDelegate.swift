@@ -236,6 +236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidResignActive(_ notification: Notification) {
+        if dockCoordinator?.isPreservingActiveWindow == true {
+            return
+        }
         if FDAGuideWindowController.isPresenting {
             return
         }
@@ -473,9 +476,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     @objc private func checkForUpdates() {
-        dockCoordinator?.prepareForWindowPresentation()
-        NSApp.activate(ignoringOtherApps: true)
-        AppUpdater.shared.checkForUpdates(isUserInitiated: true)
+        AppUpdater.shared.checkForUpdates(isUserInitiated: true) { [weak self] in
+            self?.dockCoordinator?.prepareForWindowPresentation()
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     @objc private func quitApp() {

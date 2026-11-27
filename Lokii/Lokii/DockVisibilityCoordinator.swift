@@ -67,8 +67,12 @@ struct DockWindowSnapshot: Equatable {
 /// 不运行轮询定时器，且在目标策略与当前一致时直接短路，避免多余的系统调用。
 final class DockVisibilityCoordinator {
     private(set) var mode: LokiiConfig.DockIconMode
+    /// 正在执行 `.regular -> .accessory` 切换并保活前台窗口期间为 `true`，供 `applicationDidResignActive` 屏蔽失焦隐藏抖动。
+    private(set) var isPreservingActiveWindow = false
     private var isTerminating = false
     private var syncScheduled = false
+    private var syncGeneration: UInt64 = 0
+    private var preserveWindowGeneration: UInt64 = 0
     private var pendingExcludedWindowIds: Set<ObjectIdentifier> = []
 
     private let policyReader: () -> NSApplication.ActivationPolicy
@@ -148,6 +152,10 @@ final class DockVisibilityCoordinator {
     @discardableResult
     func prepareForWindowPresentation() -> Bool {
         guard !isTerminating else { return false }
+        // 即将呈现或复用窗口时，作废此前关窗排队的旧异步回落任务并清空待排除集合，避免误隐藏程序坞图标。
+        syncGeneration &+= 1
+        pendingExcludedWindowIds.removeAll()
+        syncScheduled = false
         let desired = Self.targetPolicy(for: mode, hasOpenUserWindow: true)
         let changed = applyPolicyIfNeeded(desired, preserveActiveWindow: false)
         return changed && desired == .regular
@@ -156,6 +164,9 @@ final class DockVisibilityCoordinator {
     /// 更新用户配置的程序坞图标模式并立即生效（无需重启）。
     func updateMode(_ newMode: LokiiConfig.DockIconMode) {
         guard !isTerminating else { return }
+        syncGeneration &+= 1
+        pendingExcludedWindowIds.removeAll()
+        syncScheduled = false
         mode = newMode
         syncPolicyNow(preserveActiveWindowIfDroppingToAccessory: true)
     }
@@ -168,8 +179,9 @@ final class DockVisibilityCoordinator {
         }
         guard !syncScheduled else { return }
         syncScheduled = true
+        let scheduledGeneration = syncGeneration
         asyncScheduler { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isTerminating, self.syncGeneration == scheduledGeneration else { return }
             let excluded = self.pendingExcludedWindowIds
             self.pendingExcludedWindowIds.removeAll()
             self.syncScheduled = false
@@ -197,6 +209,9 @@ final class DockVisibilityCoordinator {
     /// 应用进入退出流程时调用，阻止销毁窗口阶段再触发无意义的程序坞图标回落动画。
     func beginTermination() {
         isTerminating = true
+        syncGeneration &+= 1
+        preserveWindowGeneration &+= 1
+        isPreservingActiveWindow = false
         pendingExcludedWindowIds.removeAll()
         syncScheduled = false
     }
@@ -210,9 +225,23 @@ final class DockVisibilityCoordinator {
         guard current != target else { return false }
         // 在切换策略之前先捕获前台窗口状态，避免 `setActivationPolicy(.accessory)` 同步清掉 `NSApp.isActive`
         let restoreFrontWindow = preserveActiveWindow ? activeWindowRestorerBuilder() : nil
+        let shouldSuppressBlur = restoreFrontWindow != nil
+        var preserveToken: UInt64 = 0
+        if shouldSuppressBlur {
+            preserveWindowGeneration &+= 1
+            preserveToken = preserveWindowGeneration
+            isPreservingActiveWindow = true
+        }
         let applied = policySetter(target)
-        if applied {
-            restoreFrontWindow?()
+        if applied, let restoreFrontWindow {
+            restoreFrontWindow()
+            // 延后一轮主线程调度解除失焦隐藏抑制，覆盖系统在切换激活策略后异步派发的 `didResignActiveNotification`。
+            asyncScheduler { [weak self] in
+                guard let self, self.preserveWindowGeneration == preserveToken else { return }
+                self.isPreservingActiveWindow = false
+            }
+        } else if shouldSuppressBlur, preserveWindowGeneration == preserveToken {
+            isPreservingActiveWindow = false
         }
         return applied
     }
@@ -235,6 +264,7 @@ final class DockVisibilityCoordinator {
             guard let self, !self.isTerminating else { return }
             guard let window = notification.object as? NSWindow else { return }
             guard DockWindowSnapshot(window: window).countsAsOpenUserWindow else { return }
+            self.pendingExcludedWindowIds.remove(ObjectIdentifier(window))
             self.syncPolicyNow()
         }
 

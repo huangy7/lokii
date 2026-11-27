@@ -374,6 +374,15 @@ final class SearchWindow: NSWindowController {
                 layer.transform = CATransform3DIdentity
                 layer.add(spring, forKey: "springScale")
             }
+        } else {
+            // 窗口可能正处于淡出收起动画中途（isVisible 仍为 true）；用零时长动画覆盖在途的透明度衰减，
+            // 防止旧淡出回调被令牌取消后窗口停留在全透明状态。
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0
+                window.animator().alphaValue = 1.0
+            }
+            window.alphaValue = 1.0
+            window.contentView?.layer?.transform = CATransform3DIdentity
         }
     }
 
@@ -392,6 +401,10 @@ final class SearchWindow: NSWindowController {
         let hideToken = hideAnimationToken
 
         guard animated else {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0
+                window.animator().alphaValue = 1.0
+            }
             window.orderOut(nil)
             window.alphaValue = 1.0
             window.contentView?.layer?.transform = CATransform3DIdentity
