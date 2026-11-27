@@ -161,6 +161,9 @@ final class SingleInstanceGuard {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindow: SearchWindow?
+    private var floatingSearchWindow: FloatingSearchWindowController?
+    private let presentationModeStore = WindowPresentationModeStore.shared
+    private var isSwitchingPresentationMode = false
     private var statusItem: NSStatusItem?
     private lazy var engine = SearchEngine()
     private var preferencesController: PreferencesWindowController?
@@ -194,6 +197,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                name: L10n.languageChangedNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(onConfigReloaded),
                                                name: SearchEngine.configReloadedNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(onPresentationModeChanged),
+                                               name: WindowPresentationModeStore.didChangeNotification, object: nil)
         registerGlobalShortcut()
 
         mainWindow = SearchWindow(engine: engine)
@@ -203,7 +208,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow?.onDidHide = { [weak self] in
             self?.dockCoordinator?.schedulePolicySync()
         }
-        mainWindow?.showWindow(nil)
+        mainWindow?.onRequestSwitchToFloatingBar = { [weak self] state in
+            self?.switchToFloatingBar(handoff: state)
+        }
+
+        floatingSearchWindow = FloatingSearchWindowController(engine: engine)
+        floatingSearchWindow?.onRequestSwitchToStandardWindow = { [weak self] state in
+            self?.switchToStandardWindow(handoff: state)
+        }
+        floatingSearchWindow?.onOpenIndexPreferences = { [weak self] pathHint in
+            self?.openIndexPreferences(diagnosticPath: pathHint)
+        }
+
+        if presentationModeStore.currentMode == .floatingBar {
+            floatingSearchWindow?.showWindow(nil)
+        } else {
+            mainWindow?.showWindow(nil)
+        }
         NSApp.activate(ignoringOtherApps: true)
         engine.initialize()
 
@@ -227,7 +248,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        mainWindow?.showWindow(nil)
+        if presentationModeStore.currentMode == .floatingBar {
+            floatingSearchWindow?.showWindow(nil)
+        } else {
+            mainWindow?.showWindow(nil)
+        }
         return true
     }
 
@@ -241,6 +266,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if FDAGuideWindowController.isPresenting {
             return
+        }
+        if floatingSearchWindow?.window?.isVisible == true,
+           floatingSearchWindow?.isDraggingOut != true {
+            floatingSearchWindow?.hideWindow(animated: false)
         }
         if mainWindow?.isPinned == true {
             return
@@ -279,7 +308,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem?.menu = menu
             statusItem?.button?.performClick(nil)
         } else {
-            toggleWindow()
+            let trayAnchorRect: NSRect? = statusItem?.button.flatMap { button in
+                guard let buttonWindow = button.window else { return nil }
+                return buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            }
+            toggleWindow(anchorRect: trayAnchorRect)
         }
     }
 
@@ -297,6 +330,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return item
         }
+
+        let isFloating = presentationModeStore.currentMode == .floatingBar
+        let modeKey = isFloating ? "tray.switchToStandardWindow" : "tray.switchToFloatingBar"
+        let modeSymbol = isFloating ? "macwindow" : "rectangle.topthird.inset.filled"
+        menu.addItem(makeItem(key: modeKey, symbol: modeSymbol, action: #selector(togglePresentationMode)))
+
+        menu.addItem(NSMenuItem.separator())
 
         menu.addItem(makeItem(key: "tray.preferences", symbol: "gearshape", action: #selector(openPreferences)))
 
@@ -406,6 +446,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenu.addLocalizedItem("menu.close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         windowMenu.addLocalizedItem("menu.minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(NSMenuItem.separator())
+        let modeTitleKey = presentationModeStore.currentMode == .floatingBar
+            ? "menu.switchToStandardWindow"
+            : "menu.switchToFloatingBar"
+        let toggleModeItem = NSMenuItem(localizedKey: modeTitleKey, action: #selector(togglePresentationMode), keyEquivalent: "m")
+        toggleModeItem.keyEquivalentModifierMask = [.command, .shift]
+        toggleModeItem.target = self
+        windowMenu.addItem(toggleModeItem)
         let resetSizeItem = NSMenuItem(localizedKey: "menu.resetWindowSize", action: #selector(resetWindowSize), keyEquivalent: "")
         resetSizeItem.target = self
         windowMenu.addItem(resetSizeItem)
@@ -418,12 +465,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     @objc private func toggleWindow() {
+        toggleWindow(anchorRect: nil)
+    }
+
+    private func toggleWindow(anchorRect: NSRect?) {
         // 以窗口是否实际可见判定收起：点击状态栏图标不会激活应用，依赖 NSApp.isActive 会在失焦后误判为显示
         if let window = mainWindow?.window, window.isVisible, window.occlusionState.contains(.visible) {
             mainWindow?.hideWindow(animated: false)
+        } else if let panel = floatingSearchWindow?.window, panel.isVisible, panel.occlusionState.contains(.visible) {
+            floatingSearchWindow?.hideWindow(animated: false)
         } else {
-            mainWindow?.showWindow(nil)
+            if presentationModeStore.currentMode == .floatingBar {
+                floatingSearchWindow?.showWindow(anchorRect: anchorRect)
+            } else {
+                mainWindow?.showWindow(nil)
+            }
             NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    @objc private func togglePresentationMode() {
+        if presentationModeStore.currentMode == .floatingBar {
+            let handoff = floatingSearchWindow?.currentHandoffState()
+                ?? SearchHandoffState(query: "", mode: .auto, caseSensitivity: .auto)
+            switchToStandardWindow(handoff: handoff)
+        } else {
+            let handoff = mainWindow?.currentHandoffState()
+                ?? SearchHandoffState(query: "", mode: .auto, caseSensitivity: .auto)
+            switchToFloatingBar(handoff: handoff)
+        }
+    }
+
+    private func switchToFloatingBar(handoff: SearchHandoffState) {
+        isSwitchingPresentationMode = true
+        presentationModeStore.currentMode = .floatingBar
+        isSwitchingPresentationMode = false
+        mainWindow?.hideWindow(animated: false)
+        floatingSearchWindow?.applyHandoffState(handoff)
+        floatingSearchWindow?.showWindow(nil)
+    }
+
+    private func switchToStandardWindow(handoff: SearchHandoffState) {
+        isSwitchingPresentationMode = true
+        presentationModeStore.currentMode = .standardWindow
+        isSwitchingPresentationMode = false
+        floatingSearchWindow?.hideWindow(animated: false)
+        mainWindow?.applyHandoffState(handoff)
+        mainWindow?.showWindow(nil)
+    }
+
+    @objc private func onPresentationModeChanged() {
+        guard !isSwitchingPresentationMode else { return }
+        if presentationModeStore.currentMode == .floatingBar {
+            if mainWindow?.window?.isVisible == true {
+                let handoff = mainWindow?.currentHandoffState()
+                    ?? SearchHandoffState(query: "", mode: .auto, caseSensitivity: .auto)
+                mainWindow?.hideWindow(animated: false)
+                floatingSearchWindow?.applyHandoffState(handoff)
+                floatingSearchWindow?.showWindow(nil)
+            }
+        } else if floatingSearchWindow?.window?.isVisible == true {
+            let handoff = floatingSearchWindow?.currentHandoffState()
+                ?? SearchHandoffState(query: "", mode: .auto, caseSensitivity: .auto)
+            floatingSearchWindow?.hideWindow(animated: false)
+            mainWindow?.applyHandoffState(handoff)
+            mainWindow?.showWindow(nil)
         }
     }
 
@@ -454,6 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func resetWindowSize() {
         mainWindow?.resetToDefaultWindowFrame()
+        floatingSearchWindow?.resetSavedPosition()
     }
 
     /// 从搜索结果空态直达索引页，可选带入需排查的路径
@@ -494,6 +601,14 @@ extension AppDelegate: NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(rebuildIndex) {
             return mainWindow?.canTriggerRebuild ?? false
+        }
+        if menuItem.action == #selector(togglePresentationMode) {
+            let key = presentationModeStore.currentMode == .floatingBar
+                ? "menu.switchToStandardWindow"
+                : "menu.switchToFloatingBar"
+            menuItem.title = L(key)
+            menuItem.representedObject = key
+            return true
         }
         return true
     }

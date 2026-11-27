@@ -9,6 +9,7 @@ final class LokiiWindow: NSWindow {
     var onCommandF: (() -> Void)?
     var onOptionF: (() -> Void)?
     var onCommandP: (() -> Void)?
+    var onCommandShiftM: (() -> Void)?
 
     override func cancelOperation(_ sender: Any?) {
         if let onEscape = onEscape {
@@ -20,6 +21,12 @@ final class LokiiWindow: NSWindow {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if flags == [.command, .shift] && event.charactersIgnoringModifiers?.lowercased() == "m" {
+            if let onCommandShiftM = onCommandShiftM {
+                onCommandShiftM()
+                return true
+            }
+        }
         if flags == .command && event.charactersIgnoringModifiers?.lowercased() == "p" {
             if let onCommandP = onCommandP {
                 onCommandP()
@@ -43,6 +50,11 @@ final class LokiiWindow: NSWindow {
             onReturn?()
         default:
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if flags == [.command, .shift],
+               event.charactersIgnoringModifiers?.lowercased() == "m" {
+                onCommandShiftM?()
+                return
+            }
             if flags == .command,
                event.charactersIgnoringModifiers?.lowercased() == "p" {
                 onCommandP?()
