@@ -944,4 +944,74 @@ final class SearchResultsViewControllerTests: XCTestCase {
         let projectYmlSource = try TestFixture.readRepoFile("Lokii/project.yml")
         XCTAssertTrue(projectYmlSource.contains("com.apple.security.automation.apple-events: true"))
     }
+
+    func testPackageBundleDetectionAndAdaptiveCloudBadges() {
+        XCTAssertTrue(SearchResultsViewController.isPackageBundle(path: "/Users/dev/Documents/Q4.pages"))
+        XCTAssertTrue(SearchResultsViewController.isPackageBundle(path: "/Users/dev/Documents/Deck.KEY"))
+        XCTAssertTrue(SearchResultsViewController.isPackageBundle(path: "/Users/dev/Pictures/Photos.photoslibrary"))
+        XCTAssertFalse(SearchResultsViewController.isPackageBundle(path: "/Users/dev/Documents/PlainFolder"))
+        XCTAssertFalse(SearchResultsViewController.isPackageBundle(path: "/Users/dev/Documents/report.pdf"))
+
+        XCTAssertEqual(
+            SearchResultsViewController.cloudBadgeKind(for: "/Users/dev/Library/Mobile Documents/com~apple~CloudDocs/Notes.pages"),
+            .icloud
+        )
+        XCTAssertEqual(
+            SearchResultsViewController.cloudBadgeKind(for: "/Users/dev/library/cloudstorage/SynologyDrive-NAS/2026/Spec.pdf"),
+            .cloudStorage
+        )
+        XCTAssertNil(SearchResultsViewController.cloudBadgeKind(for: "/Users/dev/Documents/Local.pages"))
+
+        let photosUT = SearchResultsViewController.resolvedUTType(forExtension: "photoslibrary", isBundleDir: true)
+        XCTAssertEqual(photosUT.identifier, "com.apple.photos.library")
+        XCTAssertFalse(photosUT.isDynamic)
+
+        let rtfdUT = SearchResultsViewController.resolvedUTType(forExtension: "rtfd", isBundleDir: true)
+        XCTAssertEqual(rtfdUT.identifier, "com.apple.rtfd")
+        XCTAssertFalse(rtfdUT.isDynamic)
+
+        let pagesUT = SearchResultsViewController.resolvedUTType(forExtension: "pages", isBundleDir: true)
+        XCTAssertFalse(pagesUT.isDynamic)
+        XCTAssertTrue(pagesUT.conforms(to: .package))
+
+        let prefpaneUT = SearchResultsViewController.resolvedUTType(forExtension: "prefpane", isBundleDir: true)
+        XCTAssertFalse(prefpaneUT.isDynamic)
+        XCTAssertTrue(prefpaneUT.conforms(to: .package))
+
+        let controller = SearchResultsViewController()
+        let folderIcon = controller.iconForFile(at: "/Users/dev/Documents/RegularFolder", isDir: true)
+        let genericDataIcon = controller.iconForFile(at: "/Users/dev/Documents/NoExtensionFile", isDir: false, fileExtension: "")
+        let photosBundleIcon = controller.iconForFile(at: "/Users/dev/Pictures/Photos Library.photoslibrary", isDir: true, fileExtension: "")
+        XCTAssertFalse(photosBundleIcon === folderIcon, "照片图库包不应回退为普通文件夹图标")
+        XCTAssertFalse(photosBundleIcon === genericDataIcon, "照片图库包不应退化为通用空白文档图标")
+
+        let keyBundleIcon = controller.iconForFile(at: "/Users/dev/Documents/Deck.key", isDir: true, fileExtension: "")
+        let plainKeyFileIcon = controller.iconForFile(at: "/Users/dev/Documents/server.key", isDir: false, fileExtension: "key")
+        XCTAssertFalse(keyBundleIcon === plainKeyFileIcon, "目录包与同名普通扩展名文件应使用独立图标缓存键")
+
+        let pagesBundleIcon = controller.iconForFile(at: "/Users/dev/Documents/Q4.pages", isDir: true, fileExtension: "")
+        XCTAssertFalse(
+            pagesBundleIcon === folderIcon,
+            "文档包目录应使用扩展名对应的原生图标而非普通文件夹图标"
+        )
+
+        let cloudPagesIcon = controller.iconForFile(
+            at: "/Users/dev/Library/Mobile Documents/com~apple~CloudDocs/Q4.pages",
+            isDir: true,
+            fileExtension: ""
+        )
+        XCTAssertFalse(cloudPagesIcon === pagesBundleIcon, "云盘路径应叠加云朵角标")
+
+        let synologyPdfIcon = controller.iconForFile(
+            at: "/Users/dev/Library/CloudStorage/SynologyDrive-NAS/Spec.pdf",
+            isDir: false,
+            fileExtension: "pdf"
+        )
+        let localPdfIcon = controller.iconForFile(
+            at: "/Users/dev/Documents/Spec.pdf",
+            isDir: false,
+            fileExtension: "pdf"
+        )
+        XCTAssertFalse(synologyPdfIcon === localPdfIcon, "CloudStorage 路径应叠加云朵角标")
+    }
 }

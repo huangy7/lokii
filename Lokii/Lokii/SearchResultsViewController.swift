@@ -2681,7 +2681,7 @@ final class SearchResultsViewController: NSViewController {
                 let item = NSPathControlItem()
                 item.title = component
                 if itemIsDir {
-                    item.image = (isLast && Self.needsCustomBundleIcon(path: current))
+                    item.image = (isLast && (Self.needsCustomBundleIcon(path: current) || Self.isPackageBundle(path: current)))
                         ? nonBlockingTypeIcon(for: current, isDir: true, fileExtension: fileExtension)
                         : folderIcon
                 } else {
@@ -3399,10 +3399,67 @@ final class SearchResultsViewController: NSViewController {
         return path[extStart...].lowercased()
     }
 
+    enum CloudBadgeKind: String {
+        case icloud
+        case cloudStorage
+    }
+
     /// 仅应用程序包与系统偏好面板具有独立自定义图标，普通文件与常规目录统一复用扩展名/类型纯内存图标
     private static func needsCustomBundleIcon(path: String) -> Bool {
         let ext = fileExtensionLowercased(of: path)
         return ext == "app" || ext == "prefpane"
+    }
+
+    /// 在访达中表现为单个文件的文档与媒体目录包，直接按包扩展名取原生应用图标
+    static func isPackageBundle(path: String) -> Bool {
+        let ext = fileExtensionLowercased(of: path)
+        switch ext {
+        case "key", "numbers", "pages", "rtfd", "photoslibrary", "fcpbundle", "logicx", "band", "garageband":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 识别位于 iCloud 或 File Provider 云盘目录下的路径，用于叠加自适应云朵角标
+    static func cloudBadgeKind(for path: String) -> CloudBadgeKind? {
+        let lower = path.lowercased()
+        if lower.contains("/library/mobile documents/") || lower.hasSuffix("/library/mobile documents") {
+            return .icloud
+        }
+        if lower.contains("/library/cloudstorage/") || lower.hasSuffix("/library/cloudstorage") {
+            return .cloudStorage
+        }
+        return nil
+    }
+
+    /// 在基础类型图标右下角叠加适配浅/深色外观的云盘状态角标，纯内存按外观动态绘制，零磁盘 I/O
+    private func cloudBadgedIcon(base: NSImage, baseKey: String, kind: CloudBadgeKind) -> NSImage {
+        let badgedKey = "\(baseKey)__cloud_\(kind.rawValue)"
+        if let cached = typeIconCache[badgedKey] { return cached }
+        let size = NSSize(width: 18, height: 18)
+        let symbolName = kind == .icloud ? "icloud.fill" : "cloud.fill"
+        let composed = NSImage(size: size, flipped: false) { rect in
+            base.draw(in: rect)
+            let pillRect = NSRect(x: 7.5, y: 0.0, width: 10.5, height: 8.0)
+            let isDark = NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let pillBg = isDark ? NSColor(calibratedWhite: 0.16, alpha: 0.94) : NSColor.white.withAlphaComponent(0.94)
+            let pillBorder = isDark ? NSColor.white.withAlphaComponent(0.14) : NSColor.black.withAlphaComponent(0.08)
+            let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 3.5, yRadius: 3.5)
+            pillBg.setFill()
+            pillPath.fill()
+            pillBorder.setStroke()
+            pillPath.lineWidth = 0.75
+            pillPath.stroke()
+            if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+                let cfg = NSImage.SymbolConfiguration(paletteColors: [.systemBlue])
+                let styled = symbol.withSymbolConfiguration(cfg) ?? symbol
+                styled.draw(in: pillRect.insetBy(dx: 1.0, dy: 0.8))
+            }
+            return true
+        }
+        typeIconCache[badgedKey] = composed
+        return composed
     }
 
     private func nonBlockingVolumeIcon() -> NSImage {
@@ -3413,21 +3470,52 @@ final class SearchResultsViewController: NSViewController {
         return icon
     }
 
+    /// 按扩展名与目录包属性解析系统 UTType；目录包显式约束 `.package`，避免默认 `public.data` 约束导致 `.photoslibrary`/`.rtfd`/`.prefpane` 退化为 `dyn.*` 空白文档图标
+    static func resolvedUTType(forExtension ext: String, isBundleDir: Bool) -> UTType {
+        guard !ext.isEmpty else {
+            return isBundleDir ? .package : .data
+        }
+        if isBundleDir {
+            let pkgType = UTType(filenameExtension: ext, conformingTo: .package)
+            if let pkgType, !pkgType.isDynamic {
+                return pkgType
+            }
+            let dataType = UTType(filenameExtension: ext)
+            if let dataType, !dataType.isDynamic {
+                return dataType
+            }
+            return pkgType ?? dataType ?? .package
+        }
+        return UTType(filenameExtension: ext) ?? .data
+    }
+
     private func nonBlockingTypeIcon(for path: String, isDir: Bool, fileExtension: String? = nil) -> NSImage {
-        if isDir && !Self.needsCustomBundleIcon(path: path) {
+        let badgeKind = Self.cloudBadgeKind(for: path)
+        let isBundleDir = isDir && (Self.needsCustomBundleIcon(path: path) || Self.isPackageBundle(path: path))
+        if isDir && !isBundleDir {
             let key = "__type_icon_dir__"
-            if let cached = typeIconCache[key] { return cached }
-            let icon = NSWorkspace.shared.icon(for: .folder)
-            typeIconCache[key] = icon
-            return icon
+            let base: NSImage
+            if let cached = typeIconCache[key] {
+                base = cached
+            } else {
+                let icon = NSWorkspace.shared.icon(for: .folder)
+                typeIconCache[key] = icon
+                base = icon
+            }
+            return badgeKind.map { cloudBadgedIcon(base: base, baseKey: key, kind: $0) } ?? base
         }
         let ext = (fileExtension?.isEmpty == false ? fileExtension!.lowercased() : Self.fileExtensionLowercased(of: path))
-        let key = "__type_icon_ext_\(ext)"
-        if let cached = typeIconCache[key] { return cached }
-        let utType = ext.isEmpty ? UTType.data : (UTType(filenameExtension: ext) ?? .data)
-        let icon = NSWorkspace.shared.icon(for: utType)
-        typeIconCache[key] = icon
-        return icon
+        let key = isBundleDir ? "__type_icon_pkg_\(ext)" : "__type_icon_ext_\(ext)"
+        let base: NSImage
+        if let cached = typeIconCache[key] {
+            base = cached
+        } else {
+            let utType = Self.resolvedUTType(forExtension: ext, isBundleDir: isBundleDir)
+            let icon = NSWorkspace.shared.icon(for: utType)
+            typeIconCache[key] = icon
+            base = icon
+        }
+        return badgeKind.map { cloudBadgedIcon(base: base, baseKey: key, kind: $0) } ?? base
     }
 
     func iconForFile(at path: String, isDir: Bool = false, isOffline: Bool = false, fileExtension: String? = nil) -> NSImage {
@@ -3456,13 +3544,17 @@ final class SearchResultsViewController: NSViewController {
             return
         }
         let provider = workspaceIconProvider
+        let badgeKind = Self.cloudBadgeKind(for: path)
         iconLoadQueue.async { [weak self, weak cell] in
             let loaded = provider(path)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.iconCache.setObject(loaded, forKey: path as NSString)
+                let finalIcon = badgeKind.map {
+                    self.cloudBadgedIcon(base: loaded, baseKey: "__custom_bundle__\(path)", kind: $0)
+                } ?? loaded
+                self.iconCache.setObject(finalIcon, forKey: path as NSString)
                 if let cell, cell.representedPath == path {
-                    cell.imageView?.image = loaded
+                    cell.imageView?.image = finalIcon
                 }
             }
         }

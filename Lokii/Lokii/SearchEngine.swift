@@ -718,6 +718,13 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
         return try? core.previewPrimaryScopeAction(draftConfigJson: json)
     }
 
+    /// Diagnose why a path is or is not indexed under the provided draft configuration.
+    func diagnosePath(_ path: String, draftConfig: LokiiConfig) -> FfiPathDiagnosis? {
+        guard let data = try? JSONEncoder().encode(draftConfig),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return try? core.diagnosePath(path: path, draftConfigJson: json)
+    }
+
     /// Save the index with its replay checkpoint (blocking; call on quit).
     func persistIndex() {
         core.persistIndex()

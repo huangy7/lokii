@@ -456,12 +456,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow?.resetToDefaultWindowFrame()
     }
 
-    /// 从搜索结果空态直达索引页
-    func openIndexPreferences() {
-        showPreferences(tab: "index")
+    /// 从搜索结果空态直达索引页，可选带入需排查的路径
+    func openIndexPreferences(diagnosticPath: String? = nil) {
+        showPreferences(tab: "index", diagnosticPath: diagnosticPath)
     }
 
-    private func showPreferences(tab: String? = nil) {
+    private func showPreferences(tab: String? = nil, diagnosticPath: String? = nil) {
         dockCoordinator?.prepareForWindowPresentation()
         if preferencesController == nil {
             preferencesController = PreferencesWindowController(engine: engine)
@@ -470,6 +470,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             preferencesController?.selectTab(tab)
         }
         preferencesController?.showWindow(nil)
+        if let diagnosticPath, !diagnosticPath.isEmpty {
+            preferencesController?.prefillDiagnosticPath(diagnosticPath)
+        }
         preferencesController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

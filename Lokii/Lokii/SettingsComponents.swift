@@ -420,20 +420,37 @@ struct FlowLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var currentX = bounds.minX
-        var currentY = bounds.minY
-        var lineHeight: CGFloat = 0
+        var rows: [[(subview: LayoutSubview, size: CGSize)]] = []
+        var currentRow: [(subview: LayoutSubview, size: CGSize)] = []
+        var currentWidth: CGFloat = 0
 
         for subview in subviews {
             let size = subview.sizeThatFits(.unspecified)
-            if currentX + size.width > bounds.maxX && currentX > bounds.minX {
-                currentX = bounds.minX
-                currentY += lineHeight + spacing
-                lineHeight = 0
+            if currentWidth + size.width > bounds.width && !currentRow.isEmpty {
+                rows.append(currentRow)
+                currentRow = []
+                currentWidth = 0
             }
-            subview.place(at: CGPoint(x: currentX, y: currentY), proposal: ProposedViewSize(size))
-            lineHeight = max(lineHeight, size.height)
-            currentX += size.width + spacing
+            currentRow.append((subview, size))
+            currentWidth += size.width + spacing
+        }
+        if !currentRow.isEmpty {
+            rows.append(currentRow)
+        }
+
+        var currentY = bounds.minY
+        for row in rows {
+            let rowHeight = row.map(\.size.height).max() ?? 0
+            var currentX = bounds.minX
+            for item in row {
+                let yOffset = (rowHeight - item.size.height) / 2
+                item.subview.place(
+                    at: CGPoint(x: currentX, y: currentY + yOffset),
+                    proposal: ProposedViewSize(item.size)
+                )
+                currentX += item.size.width + spacing
+            }
+            currentY += rowHeight + spacing
         }
     }
 }
@@ -441,6 +458,7 @@ struct FlowLayout: Layout {
 // MARK: - Tag Chip View
 struct PillTagView: View {
     let title: String
+    var isHighlighted: Bool = false
     let onRemove: () -> Void
 
     @State private var isHovered = false
@@ -449,6 +467,7 @@ struct PillTagView: View {
         HStack(spacing: 4) {
             Text(title)
                 .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(isHighlighted ? Color.accentColor : Color.primary)
                 .lineLimit(1)
             
             Button(action: onRemove) {
@@ -461,11 +480,20 @@ struct PillTagView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Color.primary.opacity(isHovered ? 0.08 : 0.04))
+        .background(
+            isHighlighted
+                ? Color.accentColor.opacity(0.14)
+                : Color.primary.opacity(isHovered ? 0.08 : 0.04)
+        )
         .clipShape(Capsule())
         .overlay(
             Capsule()
-                .strokeBorder(isHovered ? Color.primary.opacity(0.18) : Color.primary.opacity(0.08), lineWidth: 1)
+                .strokeBorder(
+                    isHighlighted
+                        ? Color.accentColor.opacity(0.65)
+                        : (isHovered ? Color.primary.opacity(0.18) : Color.primary.opacity(0.08)),
+                    lineWidth: isHighlighted ? 1.25 : 1
+                )
         )
         .onHover { hovering in
             isHovered = hovering

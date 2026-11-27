@@ -71,6 +71,11 @@ final class PreferencesWindowController: NSWindowController, NSWindowDelegate {
         viewModel?.selectedTab = tab
     }
 
+    /// 预填索引诊断路径（需在 showWindow 完成 loadConfig 后调用，避免被重载覆盖）
+    func prefillDiagnosticPath(_ path: String) {
+        viewModel?.diagnosticInput = path
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if allowCloseAfterUnsavedPrompt {
             allowCloseAfterUnsavedPrompt = false
