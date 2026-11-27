@@ -392,6 +392,11 @@ uint32_t uniffi_lokii_core_fn_method_lokiicore_confirm_all_pending_volume_scans(
 int8_t uniffi_lokii_core_fn_method_lokiicore_confirm_volume_scan(void*_Nonnull ptr, RustBuffer path_or_id, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_DIAGNOSE_PATH
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_DIAGNOSE_PATH
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_diagnose_path(void*_Nonnull ptr, RustBuffer path, RustBuffer draft_config_json, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_GET_CONFIG_JSON
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_get_config_json(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -873,6 +878,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_confirm_all_pending_volume_
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CONFIRM_VOLUME_SCAN
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_CONFIRM_VOLUME_SCAN
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_confirm_volume_scan(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_DIAGNOSE_PATH
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_DIAGNOSE_PATH
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_diagnose_path(void
     
 );
 #endif

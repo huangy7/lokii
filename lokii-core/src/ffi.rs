@@ -202,6 +202,34 @@ pub enum FfiPrimaryScopeAction {
 }
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiPathDiagnosisStatus {
+    Indexed,
+    OutsideIndexRoots,
+    ExcludedByPathPrefix,
+    ExcludedByName,
+    ExcludedByHidden,
+    ExcludedBySensitive,
+    ExcludedByShallowApp,
+    ExcludedByPackageBundle,
+    ProtectedByFda,
+    SymlinkNotFollowed,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiPathDiagnosis {
+    pub normalized_path: String,
+    pub status: FfiPathDiagnosisStatus,
+    pub matched_root: Option<String>,
+    pub matched_rule: Option<String>,
+    pub is_preset_rule: bool,
+    pub pierced_exclude_path: Option<String>,
+    pub symlink_target: Option<String>,
+    pub suggested_index_path: Option<String>,
+    pub also_requires_fda: bool,
+    pub exists_on_disk: Option<bool>,
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfiVolumeState {
     Online,
     Syncing,
@@ -283,6 +311,42 @@ impl From<PrimaryScopeAction> for FfiPrimaryScopeAction {
                 FfiPrimaryScopeAction::IncrementalUpdate
             }
             PrimaryScopeAction::FullRebuild => FfiPrimaryScopeAction::FullRebuild,
+        }
+    }
+}
+
+impl From<crate::filter::PathDiagnosisStatus> for FfiPathDiagnosisStatus {
+    fn from(status: crate::filter::PathDiagnosisStatus) -> Self {
+        match status {
+            crate::filter::PathDiagnosisStatus::Indexed => Self::Indexed,
+            crate::filter::PathDiagnosisStatus::OutsideIndexRoots => Self::OutsideIndexRoots,
+            crate::filter::PathDiagnosisStatus::ExcludedByPathPrefix => Self::ExcludedByPathPrefix,
+            crate::filter::PathDiagnosisStatus::ExcludedByName => Self::ExcludedByName,
+            crate::filter::PathDiagnosisStatus::ExcludedByHidden => Self::ExcludedByHidden,
+            crate::filter::PathDiagnosisStatus::ExcludedBySensitive => Self::ExcludedBySensitive,
+            crate::filter::PathDiagnosisStatus::ExcludedByShallowApp => Self::ExcludedByShallowApp,
+            crate::filter::PathDiagnosisStatus::ExcludedByPackageBundle => {
+                Self::ExcludedByPackageBundle
+            }
+            crate::filter::PathDiagnosisStatus::ProtectedByFda => Self::ProtectedByFda,
+            crate::filter::PathDiagnosisStatus::SymlinkNotFollowed => Self::SymlinkNotFollowed,
+        }
+    }
+}
+
+impl From<crate::filter::PathDiagnosis> for FfiPathDiagnosis {
+    fn from(diag: crate::filter::PathDiagnosis) -> Self {
+        Self {
+            normalized_path: diag.normalized_path,
+            status: diag.status.into(),
+            matched_root: diag.matched_root,
+            matched_rule: diag.matched_rule,
+            is_preset_rule: diag.is_preset_rule,
+            pierced_exclude_path: diag.pierced_exclude_path,
+            symlink_target: diag.symlink_target,
+            suggested_index_path: diag.suggested_index_path,
+            also_requires_fda: diag.also_requires_fda,
+            exists_on_disk: diag.exists_on_disk,
         }
     }
 }
@@ -1312,6 +1376,36 @@ impl LokiiCore {
             .unwrap_or_else(|| self.build_primary_snapshot_fast(&current, has_fda));
         let new_snapshot = self.build_primary_snapshot_fast(&draft, has_fda);
         Ok(diff_primary_scope_lexical(&old_snapshot, &new_snapshot).into())
+    }
+
+    /// Diagnose why `path` is or is not indexed under `draft_config_json` without touching offline volumes.
+    pub fn diagnose_path(
+        &self,
+        path: String,
+        draft_config_json: String,
+    ) -> Result<FfiPathDiagnosis, FfiError> {
+        let current = self.config_store.read().clone();
+        let draft = merge_config_patch(&current, &draft_config_json).ok_or_else(|| {
+            FfiError::IoError {
+                message: "Invalid draft config JSON".to_string(),
+            }
+        })?;
+        let has_fda = permissions::has_full_disk_access();
+        let statuses = self.volumes.statuses();
+        let live_mounts = self.volumes.mounted_volumes_fast();
+        let is_offline_volume = |candidate: &Path| -> bool {
+            if let Some(status) = find_matching_slot(candidate, &statuses) {
+                return matches!(status.state, VolumeState::Offline | VolumeState::Missing);
+            }
+            if let Some((first_entry, _)) = volumes_first_component(candidate) {
+                if !matches_live_non_system_mount(candidate, &live_mounts) {
+                    let top_entry = Path::new("/Volumes").join(first_entry);
+                    return read_volumes_boot_symlink(&top_entry, &live_mounts).is_none();
+                }
+            }
+            false
+        };
+        Ok(crate::filter::diagnose_path_runtime(&path, &draft, has_fda, is_offline_volume).into())
     }
 
     /// Save the primary index checkpoint and all dirty volume shard caches/manifest.
@@ -3323,6 +3417,50 @@ mod tests {
             .len(),
             1,
             "rapid [A,B]->[A]->[A,B] save must never permanently lose B"
+        );
+    }
+
+    #[test]
+    fn diagnose_path_evaluates_draft_and_piercing() {
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let core = LokiiCore::for_test(
+            cache_dir.path().to_path_buf(),
+            AppConfig::default(),
+            Arc::new(Vec::new),
+        );
+
+        let cloud_file = "~/Library/CloudStorage/SynologyDrive-Office/Specs/plan.pdf".to_string();
+        let default_diag = core
+            .diagnose_path(cloud_file.clone(), "{}".to_string())
+            .expect("diagnose_path with empty patch should succeed");
+        assert_eq!(
+            default_diag.status,
+            FfiPathDiagnosisStatus::ExcludedByPathPrefix
+        );
+        assert_eq!(default_diag.matched_rule.as_deref(), Some("~/Library"));
+        assert!(default_diag.is_preset_rule);
+        assert_eq!(
+            default_diag.suggested_index_path.as_deref(),
+            Some("~/Library/CloudStorage/SynologyDrive-Office")
+        );
+
+        let draft_patch = serde_json::json!({
+            "index": {
+                "index_paths": ["~", "~/Library/CloudStorage/SynologyDrive-Office"]
+            }
+        })
+        .to_string();
+        let pierced_diag = core
+            .diagnose_path(cloud_file, draft_patch)
+            .expect("diagnose_path with draft piercing root should succeed");
+        assert_eq!(pierced_diag.status, FfiPathDiagnosisStatus::Indexed);
+        assert_eq!(
+            pierced_diag.matched_root.as_deref(),
+            Some("~/Library/CloudStorage/SynologyDrive-Office")
+        );
+        assert_eq!(
+            pierced_diag.pierced_exclude_path.as_deref(),
+            Some("~/Library")
         );
     }
 }

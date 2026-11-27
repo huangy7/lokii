@@ -177,8 +177,14 @@ final class SearchWindow: NSWindowController {
         onLanguageChanged()
         updateEmptyState()
 
-        searchResultsViewController.onManageIndexRules = {
-            (NSApp.delegate as? AppDelegate)?.openIndexPreferences()
+        searchResultsViewController.onManageIndexRules = { [weak self] in
+            let pathHint: String?
+            if let self, self.lastExclusionHint != nil {
+                pathHint = Self.extractDiagnosticPathCandidate(from: self.searchField?.stringValue ?? "")
+            } else {
+                pathHint = nil
+            }
+            (NSApp.delegate as? AppDelegate)?.openIndexPreferences(diagnosticPath: pathHint)
         }
         searchResultsViewController.onVolumeBannerConfirmAll = { [weak engine] in
             engine?.confirmAllPendingVolumeScans()
@@ -1588,6 +1594,33 @@ final class SearchWindow: NSWindowController {
 
     /// 最近一次空结果检索命中的排除规则；索引状态变化后重算空态时沿用它，避免退回普通无结果
     private var lastExclusionHint: String?
+
+    /// 从搜索框文本中提取首个包含 `/` 的路径词元（兼容 `in:` 前缀与带引号的含空格路径）
+    static func extractDiagnosticPathCandidate(from query: String) -> String? {
+        var tokens: [String] = []
+        var current = ""
+        var inQuotes = false
+        for ch in query {
+            if ch == "\"" {
+                inQuotes.toggle()
+                continue
+            }
+            if ch.isWhitespace && !inQuotes {
+                if !current.isEmpty {
+                    tokens.append(current)
+                    current = ""
+                }
+            } else {
+                current.append(ch)
+            }
+        }
+        if !current.isEmpty {
+            tokens.append(current)
+        }
+        return tokens
+            .map { $0.hasPrefix("in:") ? String($0.dropFirst(3)) : $0 }
+            .first { $0.contains("/") }
+    }
 
     private func updateEmptyState() {
         searchResultsViewController.updateEmptyContext(

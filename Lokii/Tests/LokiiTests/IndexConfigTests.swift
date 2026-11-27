@@ -1036,4 +1036,217 @@ final class IndexConfigTests: XCTestCase {
         XCTAssertTrue(confirmMsg.contains("2 external volumes including \"Disk1\""), "unexpected: \(confirmMsg)")
         XCTAssertFalse(confirmMsg.contains("and 2 external volumes"))
     }
+
+    func testCloudDriveDiscoveryAndPiercedExcludeResolution() throws {
+        let fm = FileManager.default
+        let fakeHome = fm.temporaryDirectory.appendingPathComponent("lokii-cloud-home-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: fakeHome, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: fakeHome) }
+
+        let cloudStorage = fakeHome.appendingPathComponent("Library/CloudStorage", isDirectory: true)
+        let synology = cloudStorage.appendingPathComponent("SynologyDrive-NAS", isDirectory: true)
+        let icloud = fakeHome.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
+        try fm.createDirectory(at: synology, withIntermediateDirectories: true)
+        try fm.createDirectory(at: icloud, withIntermediateDirectories: true)
+        // CloudStorage 内的普通文件或隐藏目录不应被当作云盘根
+        try Data("x".utf8).write(to: cloudStorage.appendingPathComponent("readme.txt"))
+        try fm.createDirectory(at: cloudStorage.appendingPathComponent(".hidden"), withIntermediateDirectories: true)
+
+        // 空 iCloud 目录应被忽略，仅返回 SynologyDrive-NAS
+        let firstPass = CloudDriveDiscovery.discover(
+            homeDirectory: fakeHome.path,
+            fileManager: fm,
+            icloudDisplayName: "iCloud Drive"
+        )
+        XCTAssertEqual(firstPass.map(\.path), ["~/Library/CloudStorage/SynologyDrive-NAS"])
+        XCTAssertEqual(firstPass.first?.providerHint, "cloud_storage")
+
+        // iCloud 出现可见条目后纳入发现清单
+        try Data("doc".utf8).write(to: icloud.appendingPathComponent("Notes.txt"))
+        let secondPass = CloudDriveDiscovery.discover(
+            homeDirectory: fakeHome.path,
+            fileManager: fm,
+            icloudDisplayName: "iCloud Drive"
+        )
+        XCTAssertEqual(Set(secondPass.map(\.path)), [
+            "~/Library/CloudStorage/SynologyDrive-NAS",
+            "~/Library/Mobile Documents/com~apple~CloudDocs",
+        ])
+
+        // 根路径与深层子目录区分
+        XCTAssertTrue(CloudDriveDiscovery.isCloudDriveRootPath("~/Library/CloudStorage/SynologyDrive-NAS", homeDirectory: fakeHome.path))
+        XCTAssertTrue(CloudDriveDiscovery.isCloudDriveRootPath(synology.path + "/", homeDirectory: fakeHome.path))
+        XCTAssertTrue(CloudDriveDiscovery.isCloudDriveRootPath("~/Library/Mobile Documents/com~apple~CloudDocs", homeDirectory: fakeHome.path))
+        XCTAssertFalse(CloudDriveDiscovery.isCloudDriveRootPath("~/Library/CloudStorage/SynologyDrive-NAS/Sub", homeDirectory: fakeHome.path))
+        XCTAssertFalse(CloudDriveDiscovery.isCloudDriveRootPath("~/Library/CloudStorage", homeDirectory: fakeHome.path))
+
+        // 穿透检测纯函数
+        let excludes = ["~/Library", "~/Library/CloudStorage", "/opt"]
+        XCTAssertEqual(
+            SettingsPathStatusResolver.piercedExcludePath(
+                for: "~/Library/CloudStorage/SynologyDrive-NAS",
+                excludePaths: excludes
+            ),
+            "~/Library/CloudStorage"
+        )
+        XCTAssertNil(SettingsPathStatusResolver.piercedExcludePath(for: "~/Library", excludePaths: excludes))
+        XCTAssertNil(SettingsPathStatusResolver.piercedExcludePath(for: "~/LibraryX/Docs", excludePaths: excludes))
+    }
+
+    func testDiagnosticInputCloudDriveToggleAndFfiDiagnosis() throws {
+        // 1. 输入分类与搜索词路径提取
+        XCTAssertEqual(PreferencesViewModel.classifyDiagnosticInput("   "), .empty)
+        XCTAssertEqual(PreferencesViewModel.classifyDiagnosticInput("synology"), .keyword("synology"))
+        XCTAssertEqual(PreferencesViewModel.classifyDiagnosticInput("~/Library/CloudStorage/SynologyDrive"), .path("~/Library/CloudStorage/SynologyDrive"))
+        XCTAssertEqual(
+            PreferencesViewModel.classifyDiagnosticInput("\"file:///Users/demo/My%20Drive/doc.pdf\""),
+            .path("/Users/demo/My Drive/doc.pdf")
+        )
+        XCTAssertEqual(
+            PreferencesViewModel.classifyDiagnosticInput(#"~/Library/Mobile\ Documents/com~apple~CloudDocs"#),
+            .path("~/Library/Mobile Documents/com~apple~CloudDocs")
+        )
+        XCTAssertEqual(
+            SearchWindow.extractDiagnosticPathCandidate(from: "in:\"~/Library/CloudStorage/My Drive\" report"),
+            "~/Library/CloudStorage/My Drive"
+        )
+        XCTAssertNil(SearchWindow.extractDiagnosticPathCandidate(from: "report.pdf"))
+
+        // 2. 云盘去重、增量穿透、恢复默认与 FFI 诊断联动
+        let engine = SearchEngine()
+        let vm = PreferencesViewModel(engine: engine)
+        let saved = try XCTUnwrap(engine.getConfig())
+        let realCloudName = "LokiiTestDrive-\(UUID().uuidString)"
+        let cloudStorageParent = (NSHomeDirectory() as NSString).appendingPathComponent("Library/CloudStorage")
+        let parentExisted = FileManager.default.fileExists(atPath: cloudStorageParent)
+        let realCloudDir = (cloudStorageParent as NSString).appendingPathComponent(realCloudName)
+        try FileManager.default.createDirectory(atPath: realCloudDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: realCloudDir)
+            if !parentExisted {
+                try? FileManager.default.removeItem(atPath: cloudStorageParent)
+            }
+        }
+        let testCloudPath = "~/Library/CloudStorage/\(realCloudName)"
+
+        vm.discoveredCloudDrives = [
+            CloudDriveEntry(
+                path: testCloudPath,
+                displayName: realCloudName,
+                providerHint: "cloud_storage",
+                existsOnDisk: true
+            )
+        ]
+
+        let targetDrive = try XCTUnwrap(vm.managedCloudDrives.first { $0.path == testCloudPath })
+        XCTAssertFalse(targetDrive.isIndexed)
+        XCTAssertFalse(vm.regularIndexPaths.contains(testCloudPath))
+
+        let beforeDiag = try XCTUnwrap(
+            engine.diagnosePath(testCloudPath + "/doc.pdf", draftConfig: vm.draftIndexConfig(base: saved))
+        )
+        XCTAssertEqual(beforeDiag.status, .excludedByPathPrefix)
+        XCTAssertEqual(beforeDiag.matchedRule, "~/Library")
+        XCTAssertEqual(beforeDiag.suggestedIndexPath, testCloudPath)
+
+        // 打开本机云盘开关 -> 仅纳入 indexPaths 且走增量更新（不触发全量重建）
+        vm.setCloudDriveIndexed(targetDrive, enabled: true)
+        XCTAssertTrue(vm.managedCloudDrives.first { $0.path == testCloudPath }?.isIndexed == true)
+        XCTAssertFalse(vm.regularIndexPaths.contains(testCloudPath))
+        XCTAssertEqual(engine.previewPrimaryScopeAction(vm.draftIndexConfig(base: saved)), .incrementalUpdate)
+        XCTAssertFalse(vm.pendingSaveRequiresRebuild)
+
+        let afterDiag = try XCTUnwrap(
+            engine.diagnosePath(testCloudPath + "/doc.pdf", draftConfig: vm.draftIndexConfig(base: saved))
+        )
+        XCTAssertEqual(afterDiag.status, .indexed)
+        XCTAssertEqual(afterDiag.piercedExcludePath, "~/Library")
+
+        let pkgInnerDiag = try XCTUnwrap(
+            engine.diagnosePath("~/Documents/Deck.pages/Index/Document.iwa", draftConfig: vm.draftIndexConfig(base: saved))
+        )
+        XCTAssertEqual(pkgInnerDiag.status, .excludedByPackageBundle)
+        XCTAssertEqual(pkgInnerDiag.matchedRule, "~/Documents/Deck.pages")
+        XCTAssertNil(pkgInnerDiag.suggestedIndexPath)
+
+        // 恢复默认后自动关闭
+        vm.restoreIndexDefaults()
+        XCTAssertFalse(vm.managedCloudDrives.first { $0.path == testCloudPath }?.isIndexed ?? true)
+
+        // 3. 双语本地化 key 完整对齐校验
+        let zhURL = TestFixture.repoFileURL("Lokii/Lokii/Resources/zh-Hans.lproj/Localizable.strings")
+        let enURL = TestFixture.repoFileURL("Lokii/Lokii/Resources/en.lproj/Localizable.strings")
+        let zhDict = try XCTUnwrap(NSDictionary(contentsOf: zhURL) as? [String: String])
+        let enDict = try XCTUnwrap(NSDictionary(contentsOf: enURL) as? [String: String])
+        let newKeys = [
+            "prefs.diagnostic.sectionTitle",
+            "prefs.diagnostic.sectionDescription",
+            "prefs.diagnostic.placeholder",
+            "prefs.diagnostic.clear",
+            "prefs.diagnostic.chooseButton",
+            "prefs.diagnostic.chooseHelp",
+            "prefs.diagnostic.dropHint",
+            "prefs.diagnostic.presetBadge",
+            "prefs.diagnostic.presetShort",
+            "prefs.diagnostic.customShort",
+            "prefs.diagnostic.locateRule",
+            "prefs.diagnostic.symlinkTargetNote",
+            "prefs.diagnostic.alsoRequiresFda",
+            "prefs.diagnostic.notFoundOnDisk",
+            "prefs.diagnostic.status.indexedTitle",
+            "prefs.diagnostic.status.indexedSubtitle",
+            "prefs.diagnostic.status.indexedPiercedSubtitle",
+            "prefs.diagnostic.status.pendingSaveTitle",
+            "prefs.diagnostic.status.pendingSaveSubtitle",
+            "prefs.diagnostic.status.outsideTitle",
+            "prefs.diagnostic.status.outsideSubtitle",
+            "prefs.diagnostic.status.excludedPathTitle",
+            "prefs.diagnostic.status.excludedPathSubtitle",
+            "prefs.diagnostic.status.excludedNameTitle",
+            "prefs.diagnostic.status.excludedNameSubtitle",
+            "prefs.diagnostic.status.excludedHiddenTitle",
+            "prefs.diagnostic.status.excludedHiddenSubtitle",
+            "prefs.diagnostic.status.excludedSensitiveTitle",
+            "prefs.diagnostic.status.excludedSensitiveSubtitle",
+            "prefs.diagnostic.status.excludedAppTitle",
+            "prefs.diagnostic.status.excludedAppSubtitle",
+            "prefs.diagnostic.status.excludedPackageTitle",
+            "prefs.diagnostic.status.excludedPackageSubtitle",
+            "prefs.diagnostic.status.protectedFdaTitle",
+            "prefs.diagnostic.status.protectedFdaSubtitle",
+            "prefs.diagnostic.status.symlinkTitle",
+            "prefs.diagnostic.status.symlinkSubtitle",
+            "prefs.diagnostic.fix.piercePath",
+            "prefs.diagnostic.fix.pierceNote",
+            "prefs.diagnostic.fix.addSymlinkTarget",
+            "prefs.diagnostic.fix.addIndexPath",
+            "prefs.diagnostic.fix.removeRule",
+            "prefs.diagnostic.fix.removeExcludePath",
+            "prefs.diagnostic.fix.enableHidden",
+            "prefs.diagnostic.fix.openPrivacy",
+            "prefs.diagnostic.keyword.noMatches",
+            "prefs.diagnostic.keyword.cloudDrives",
+            "prefs.diagnostic.keyword.excludePaths",
+            "prefs.diagnostic.keyword.excludePatterns",
+            "prefs.diagnostic.keyword.indexPaths",
+            "prefs.index.piercedExclude.badge",
+            "prefs.index.piercedExclude.help",
+            "prefs.cloudDrive.group.title",
+            "prefs.cloudDrive.group.description",
+            "prefs.cloudDrive.icloudName",
+            "prefs.cloudDrive.status.indexed",
+        ]
+        for key in newKeys {
+            XCTAssertNotNil(zhDict[key], "zh-Hans 缺少本地化 key: \(key)")
+            XCTAssertNotNil(enDict[key], "en 缺少本地化 key: \(key)")
+        }
+
+        // 4. 诊断输入框必须显式隐藏标签并使用 prompt，避免 macOS 分组表单左侧渲染占位标签
+        let indexPaneSource = try TestFixture.readRepoFile("Lokii/Lokii/Preferences/PreferencesIndexPane.swift")
+        let diagStart = try XCTUnwrap(indexPaneSource.range(of: "private struct IndexPathDiagnosticSection: View {"))
+        let diagEnd = try XCTUnwrap(indexPaneSource.range(of: "// MARK: - Index Preferences Pane"))
+        let diagBody = String(indexPaneSource[diagStart.lowerBound..<diagEnd.lowerBound])
+        XCTAssertTrue(diagBody.contains(".labelsHidden()"), "分组表单中的诊断 TextField 必须调用 .labelsHidden()")
+        XCTAssertTrue(diagBody.contains("prompt: Text(L(\"prefs.diagnostic.placeholder\"))"))
+    }
 }

@@ -130,6 +130,30 @@ fn is_app_bundle_name(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 是否为 macOS 常见文档/媒体目录包（如 iWork、照片图库等）。
+/// 这些目录在访达中表现为单个文件，仅收录包自身而不展开内部资源，以免碎片文件污染索引或触发未下载云盘包的拉取。
+pub(crate) fn is_package_bundle_name(name: &str) -> bool {
+    const PACKAGE_BUNDLE_EXTS: [&str; 9] = [
+        "key",
+        "numbers",
+        "pages",
+        "rtfd",
+        "photoslibrary",
+        "fcpbundle",
+        "logicx",
+        "band",
+        "garageband",
+    ];
+    name.rsplit_once('.')
+        .map(|(stem, ext)| {
+            !stem.is_empty()
+                && PACKAGE_BUNDLE_EXTS
+                    .iter()
+                    .any(|pkg| ext.eq_ignore_ascii_case(pkg))
+        })
+        .unwrap_or(false)
+}
+
 /// 判定给定路径的末端文件名是否命中系统噪声。
 pub(crate) fn is_system_noise_path(path: &Path) -> bool {
     path.file_name()
@@ -466,9 +490,9 @@ impl IndexScopePolicy {
             {
                 return ScopeDecision::HardDrop;
             }
-            if shallow_apps && is_app_bundle_name(&name) {
+            if (shallow_apps && is_app_bundle_name(&name)) || is_package_bundle_name(&name) {
                 return if comps.peek().is_some() {
-                    // 包内部：仅对浅层应用根生效，只收录应用包自身
+                    // 包内部：只收录容器包目录自身，阻断向包内递归
                     ScopeDecision::HardDrop
                 } else if is_dir {
                     ScopeDecision::IndexShallowContainer
@@ -543,7 +567,9 @@ impl IndexScopePolicy {
         {
             return ScopeDecision::HardDrop;
         }
-        if ctx.shallow_apps && is_app_bundle_name(child_name) {
+        if (ctx.shallow_apps && is_app_bundle_name(child_name))
+            || is_package_bundle_name(child_name)
+        {
             return if is_dir {
                 ScopeDecision::IndexShallowContainer
             } else {
@@ -576,6 +602,573 @@ pub fn exclusion_hint(query: &str, config: &AppConfig) -> Option<String> {
         let in_depth = deepest_matching_depth(&filter.include_roots, &path).unwrap_or(0);
         filter.exclusion_reason(&path, in_depth).map(Cow::into_owned)
     })
+}
+
+/// 路径索引诊断结论，用于设置页「为什么搜不到？」排查面板精确归因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathDiagnosisStatus {
+    /// 路径在当前草稿配置下会被正常索引（或已穿透父级排除）。
+    Indexed,
+    /// 未命中任何已配置的索引根路径。
+    OutsideIndexRoots,
+    /// 命中了 `exclude_paths` 路径前缀排除规则（如 `~/Library`）。
+    ExcludedByPathPrefix,
+    /// 路径中的某个组件命中了 `exclude` 目录/文件名规则（如 `out`、`.git`）。
+    ExcludedByName,
+    /// 路径中存在以 `.` 开头的隐藏段且当前未开启隐藏文件索引。
+    ExcludedByHidden,
+    /// 路径命中了 `exclude_sensitive` 凭据保护名单（如 `.ssh`、`.aws`）。
+    ExcludedBySensitive,
+    /// 位于自动追加的浅层 `.app` 应用根内部，且当前路径进入包内子项。
+    ExcludedByShallowApp,
+    /// 位于 macOS 文档/媒体目录包（如 `.pages`、`.key`、`.photoslibrary`）内部，包自身已按单个容器收录。
+    ExcludedByPackageBundle,
+    /// 命中系统受保护目录且当前尚未授予完全磁盘访问权限（FDA）。
+    ProtectedByFda,
+    /// 沿途存在目录级符号链接，而扫描器非根目录启用 `O_NOFOLLOW` 不会跟随进入，且目标真实路径未被收录。
+    SymlinkNotFollowed,
+}
+
+/// 单条路径的完整诊断结果（含命中规则、穿透状态、符号链接真实目标与安全修复建议）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathDiagnosis {
+    pub normalized_path: String,
+    pub status: PathDiagnosisStatus,
+    pub matched_root: Option<String>,
+    pub matched_rule: Option<String>,
+    pub is_preset_rule: bool,
+    pub pierced_exclude_path: Option<String>,
+    pub symlink_target: Option<String>,
+    pub suggested_index_path: Option<String>,
+    pub also_requires_fda: bool,
+    pub exists_on_disk: Option<bool>,
+}
+
+/// 纯词法规范化路径，处理 `.`、`..` 与冗余斜杠，绝不触碰磁盘。
+fn normalize_lexical_pathbuf_resolved(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir) | Some(Component::ParentDir)
+                ) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// 若 `path` 位于用户主目录 `home` 之下或等于 `home`，折叠为 `~` / `~/...` 便于界面展示与配置持久化。
+pub(crate) fn collapse_home_tilde_with(path: &Path, home: Option<&Path>) -> String {
+    let normalized = normalize_lexical_pathbuf_resolved(path);
+    if let Some(home_dir) = home {
+        let norm_home = normalize_lexical_pathbuf_resolved(home_dir);
+        if paths_equal_ci(&normalized, &norm_home) {
+            return "~".to_string();
+        }
+        if path_starts_with_ci(&normalized, &norm_home) {
+            let home_depth = norm_home.components().count();
+            let mut rel = PathBuf::new();
+            for comp in normalized.components().skip(home_depth) {
+                rel.push(comp.as_os_str());
+            }
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rel.to_string_lossy());
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
+fn decode_percent_bytes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 清洗诊断输入：去除首尾空白、成对引号、shell 转义空格 `\ `，并将 `file://` URL 解码为本地路径。
+pub fn clean_diagnostic_path_input(raw: &str) -> String {
+    let mut s = raw.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = s[1..s.len() - 1].trim();
+    }
+    if let Some(rest) = s
+        .strip_prefix("file://")
+        .or_else(|| s.strip_prefix("FILE://"))
+    {
+        let without_host = if let Some(after_localhost) = rest.strip_prefix("localhost/") {
+            format!("/{after_localhost}")
+        } else if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        };
+        return decode_percent_bytes(&without_host);
+    }
+    s.replace("\\ ", " ")
+}
+
+/// 在满足穿透深度（严格大于 `min_depth_exclusive`）且未被显式排除在自身或更深前缀的前提下，
+/// 优先归一化为云盘根目录（`~/Library/CloudStorage/<Provider>` 或 iCloud Drive），否则回退目标目录。
+fn compute_piercing_suggestion(
+    target: &Path,
+    is_dir: bool,
+    home: Option<&Path>,
+    excluded_prefixes: &[NormalizedPrefix],
+    min_depth_exclusive: usize,
+) -> Option<String> {
+    let base_dir = if is_dir {
+        target
+    } else {
+        target.parent().unwrap_or(target)
+    };
+    let norm_base = normalize_lexical_pathbuf_resolved(base_dir);
+    let base_depth = norm_base.components().count();
+
+    let can_pierce = |candidate: &Path| -> bool {
+        let depth = candidate.components().count();
+        if depth <= min_depth_exclusive {
+            return false;
+        }
+        let cand_str = candidate.to_string_lossy();
+        deepest_matching_depth(excluded_prefixes, &cand_str)
+            .is_none_or(|ex_depth| ex_depth < depth)
+    };
+
+    if let Some(home_dir) = home {
+        let norm_home = normalize_lexical_pathbuf_resolved(home_dir);
+        let home_depth = norm_home.components().count();
+
+        let cloud_storage_root = norm_home.join("Library").join("CloudStorage");
+        if path_starts_with_ci(&norm_base, &cloud_storage_root) && base_depth >= home_depth + 3 {
+            if let Some(Component::Normal(provider)) = norm_base.components().nth(home_depth + 2) {
+                let provider_root = cloud_storage_root.join(provider);
+                if can_pierce(&provider_root) {
+                    return Some(collapse_home_tilde_with(&provider_root, home));
+                }
+            }
+        }
+
+        let icloud_root = norm_home
+            .join("Library")
+            .join("Mobile Documents")
+            .join("com~apple~CloudDocs");
+        if path_starts_with_ci(&norm_base, &icloud_root) && can_pierce(&icloud_root) {
+            return Some(collapse_home_tilde_with(&icloud_root, home));
+        }
+    }
+
+    if can_pierce(&norm_base) {
+        Some(collapse_home_tilde_with(&norm_base, home))
+    } else {
+        None
+    }
+}
+
+/// 纯词法诊断给定路径在指定配置与 FDA 状态下的索引归因，零磁盘 I/O。
+pub fn diagnose_path_lexical(
+    path: &Path,
+    is_dir: bool,
+    config: &AppConfig,
+    has_fda: bool,
+) -> PathDiagnosis {
+    let protected = if has_fda {
+        Vec::new()
+    } else {
+        crate::scanner::protected_paths()
+    };
+    let home = dirs::home_dir();
+    diagnose_path_lexical_with(path, is_dir, config, has_fda, &protected, home.as_deref())
+}
+
+/// 可注入受保护目录列表与主目录路径的纯词法诊断实现，便于确定性单元测试。
+pub(crate) fn diagnose_path_lexical_with(
+    path: &Path,
+    is_dir: bool,
+    config: &AppConfig,
+    has_fda: bool,
+    protected: &[PathBuf],
+    home: Option<&Path>,
+) -> PathDiagnosis {
+    let normalized = normalize_lexical_pathbuf_resolved(path);
+    let normalized_display = collapse_home_tilde_with(&normalized, home);
+    let path_str = normalized.to_string_lossy().into_owned();
+
+    let matched_protected = if has_fda {
+        None
+    } else {
+        protected
+            .iter()
+            .find(|p| paths_equal_ci(&normalized, p) || path_starts_with_ci(&normalized, p))
+    };
+    let also_requires_fda = matched_protected.is_some();
+
+    let policy = IndexScopePolicy::from_config_lexical(config);
+    let defaults = AppConfig::default();
+    let default_exclude_paths: Vec<PathBuf> = defaults.resolve_exclude_paths();
+
+    let matched_root_prefix = if policy.has_empty_include_roots() {
+        None
+    } else {
+        deepest_matching_prefix(&policy.include_roots, &path_str)
+    };
+
+    let Some(matched_root_prefix) = matched_root_prefix else {
+        return PathDiagnosis {
+            normalized_path: normalized_display,
+            status: PathDiagnosisStatus::OutsideIndexRoots,
+            matched_root: None,
+            matched_rule: None,
+            is_preset_rule: false,
+            pierced_exclude_path: None,
+            symlink_target: None,
+            suggested_index_path: compute_piercing_suggestion(
+                &normalized,
+                is_dir,
+                home,
+                &policy.excluded_prefixes,
+                0,
+            ),
+            also_requires_fda,
+            exists_on_disk: None,
+        };
+    };
+
+    let in_depth = matched_root_prefix.depth;
+    let shallow_apps = matched_root_prefix.shallow_apps;
+    let matched_root_display = collapse_home_tilde_with(&matched_root_prefix.raw, home);
+
+    let pierced_exclude_path = policy
+        .excluded_prefixes
+        .iter()
+        .filter(|p| p.depth < in_depth && p.matches_str(&path_str))
+        .max_by_key(|p| p.depth)
+        .map(|p| collapse_home_tilde_with(&p.raw, home));
+
+    if let Some(ex) = deepest_matching_prefix(&policy.excluded_prefixes, &path_str) {
+        if ex.depth >= in_depth {
+            let is_preset = default_exclude_paths
+                .iter()
+                .any(|def| paths_equal_ci(def, &ex.raw));
+            return PathDiagnosis {
+                normalized_path: normalized_display,
+                status: PathDiagnosisStatus::ExcludedByPathPrefix,
+                matched_root: Some(matched_root_display),
+                matched_rule: Some(collapse_home_tilde_with(&ex.raw, home)),
+                is_preset_rule: is_preset,
+                pierced_exclude_path,
+                symlink_target: None,
+                suggested_index_path: compute_piercing_suggestion(
+                    &normalized,
+                    is_dir,
+                    home,
+                    &policy.excluded_prefixes,
+                    ex.depth,
+                ),
+                also_requires_fda,
+                exists_on_disk: None,
+            };
+        }
+    }
+
+    // 逐段检查相对路径组件；将显式目录名与凭据保护置前，避免 `.git`/`.ssh` 误导用户打开隐藏文件开关
+    let all_comps: Vec<Component<'_>> = normalized.components().collect();
+    let mut comp_path = PathBuf::new();
+    for comp in &all_comps[..in_depth.min(all_comps.len())] {
+        comp_path.push(comp.as_os_str());
+    }
+
+    for idx in in_depth..all_comps.len() {
+        let comp = all_comps[idx];
+        comp_path.push(comp.as_os_str());
+        let Component::Normal(os_name) = comp else {
+            continue;
+        };
+        let name = os_name.to_string_lossy().into_owned();
+        let has_next = idx + 1 < all_comps.len();
+        let comp_is_dir = has_next || is_dir;
+
+        if policy.excluded_names.contains(&name) {
+            let is_preset = defaults.index.exclude.iter().any(|e| e == &name);
+            let suggestion = if comp_is_dir {
+                compute_piercing_suggestion(&comp_path, true, home, &policy.excluded_prefixes, 0)
+            } else {
+                None
+            };
+            return PathDiagnosis {
+                normalized_path: normalized_display,
+                status: PathDiagnosisStatus::ExcludedByName,
+                matched_root: Some(matched_root_display),
+                matched_rule: Some(name),
+                is_preset_rule: is_preset,
+                pierced_exclude_path,
+                symlink_target: None,
+                suggested_index_path: suggestion,
+                also_requires_fda,
+                exists_on_disk: None,
+            };
+        }
+
+        if policy.exclude_sensitive
+            && policy
+                .sensitive_names
+                .iter()
+                .any(|sensitive| sensitive.eq_ignore_ascii_case(&name))
+        {
+            let is_preset = defaults
+                .index
+                .sensitive_names
+                .iter()
+                .any(|sensitive| sensitive.eq_ignore_ascii_case(&name));
+            let suggestion = if comp_is_dir {
+                compute_piercing_suggestion(&comp_path, true, home, &policy.excluded_prefixes, 0)
+            } else {
+                None
+            };
+            return PathDiagnosis {
+                normalized_path: normalized_display,
+                status: PathDiagnosisStatus::ExcludedBySensitive,
+                matched_root: Some(matched_root_display),
+                matched_rule: Some(name),
+                is_preset_rule: is_preset,
+                pierced_exclude_path,
+                symlink_target: None,
+                suggested_index_path: suggestion,
+                also_requires_fda,
+                exists_on_disk: None,
+            };
+        }
+
+        if !policy.include_hidden && name.starts_with('.') {
+            let remaining_has_dot = all_comps[(idx + 1)..].iter().any(|c| match c {
+                Component::Normal(seg) => seg.to_string_lossy().starts_with('.'),
+                _ => false,
+            });
+            let suggestion = if comp_is_dir && !remaining_has_dot {
+                compute_piercing_suggestion(&comp_path, true, home, &policy.excluded_prefixes, 0)
+            } else {
+                None
+            };
+            return PathDiagnosis {
+                normalized_path: normalized_display,
+                status: PathDiagnosisStatus::ExcludedByHidden,
+                matched_root: Some(matched_root_display),
+                matched_rule: Some(name),
+                is_preset_rule: false,
+                pierced_exclude_path,
+                symlink_target: None,
+                suggested_index_path: suggestion,
+                also_requires_fda,
+                exists_on_disk: None,
+            };
+        }
+
+        if shallow_apps && is_app_bundle_name(&name) {
+            if has_next {
+                let bundle_display = collapse_home_tilde_with(&comp_path, home);
+                return PathDiagnosis {
+                    normalized_path: normalized_display,
+                    status: PathDiagnosisStatus::ExcludedByShallowApp,
+                    matched_root: Some(matched_root_display),
+                    matched_rule: Some(bundle_display.clone()),
+                    is_preset_rule: false,
+                    pierced_exclude_path,
+                    symlink_target: None,
+                    suggested_index_path: Some(bundle_display),
+                    also_requires_fda,
+                    exists_on_disk: None,
+                };
+            }
+            break;
+        }
+
+        if is_package_bundle_name(&name) {
+            if has_next {
+                let bundle_display = collapse_home_tilde_with(&comp_path, home);
+                return PathDiagnosis {
+                    normalized_path: normalized_display,
+                    status: PathDiagnosisStatus::ExcludedByPackageBundle,
+                    matched_root: Some(matched_root_display),
+                    matched_rule: Some(bundle_display),
+                    is_preset_rule: false,
+                    pierced_exclude_path,
+                    symlink_target: None,
+                    suggested_index_path: None,
+                    also_requires_fda,
+                    exists_on_disk: None,
+                };
+            }
+            break;
+        }
+    }
+
+    if let Some(protected_dir) = matched_protected {
+        return PathDiagnosis {
+            normalized_path: normalized_display,
+            status: PathDiagnosisStatus::ProtectedByFda,
+            matched_root: Some(matched_root_display),
+            matched_rule: Some(collapse_home_tilde_with(protected_dir, home)),
+            is_preset_rule: false,
+            pierced_exclude_path,
+            symlink_target: None,
+            suggested_index_path: None,
+            also_requires_fda: false,
+            exists_on_disk: None,
+        };
+    }
+
+    PathDiagnosis {
+        normalized_path: normalized_display,
+        status: PathDiagnosisStatus::Indexed,
+        matched_root: Some(matched_root_display),
+        matched_rule: None,
+        is_preset_rule: false,
+        pierced_exclude_path,
+        symlink_target: None,
+        suggested_index_path: None,
+        also_requires_fda: false,
+        exists_on_disk: None,
+    }
+}
+
+/// 运行期路径诊断：先避开失联外部卷做安全存在性与符号链接检测，再委托纯词法诊断引擎归因。
+pub fn diagnose_path_runtime(
+    raw_path: &str,
+    config: &AppConfig,
+    has_fda: bool,
+    is_offline_volume: impl Fn(&Path) -> bool,
+) -> PathDiagnosis {
+    let cleaned = clean_diagnostic_path_input(raw_path);
+    let expanded = expand_tilde(&cleaned);
+    let normalized = normalize_lexical_pathbuf_resolved(&expanded);
+    let home = dirs::home_dir();
+
+    if is_offline_volume(&normalized) {
+        let is_dir = normalized.extension().is_none();
+        return diagnose_path_lexical(&normalized, is_dir, config, has_fda);
+    }
+
+    let protected_skip = !has_fda
+        && crate::scanner::is_protected_or_descendant(&normalized, &crate::scanner::protected_paths());
+    let (exists_on_disk, is_dir) = if protected_skip {
+        (None, normalized.extension().is_none())
+    } else {
+        match std::fs::metadata(&normalized) {
+            Ok(meta) => (Some(true), meta.is_dir()),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                (None, normalized.extension().is_none())
+            }
+            Err(_) => (Some(false), normalized.extension().is_none()),
+        }
+    };
+
+    let mut diag = diagnose_path_lexical(&normalized, is_dir, config, has_fda);
+    diag.exists_on_disk = exists_on_disk;
+
+    if diag.status == PathDiagnosisStatus::Indexed && exists_on_disk == Some(true) {
+        let policy = IndexScopePolicy::from_config_lexical(config);
+        let path_str = normalized.to_string_lossy();
+        if let Some(matched_root) = deepest_matching_prefix(&policy.include_roots, &path_str) {
+            let in_depth = matched_root.depth;
+            let all_comps: Vec<Component<'_>> = normalized.components().collect();
+            let mut prefix_path = PathBuf::new();
+            for comp in &all_comps[..in_depth.min(all_comps.len())] {
+                prefix_path.push(comp.as_os_str());
+            }
+
+            // 扫描器对非根目录启用 O_NOFOLLOW，仅在匹配根之后出现目录级符号链接时进行穿透复检
+            for idx in in_depth..all_comps.len() {
+                prefix_path.push(all_comps[idx].as_os_str());
+                let is_symlink = std::fs::symlink_metadata(&prefix_path)
+                    .is_ok_and(|m| m.file_type().is_symlink());
+                if !is_symlink {
+                    continue;
+                }
+                let has_next = idx + 1 < all_comps.len();
+                let points_to_dir =
+                    std::fs::metadata(&prefix_path).is_ok_and(|m| m.is_dir());
+                if !has_next && !points_to_dir {
+                    break;
+                }
+
+                let target_raw = std::fs::read_link(&prefix_path)
+                    .map(|link_target| {
+                        let joined = if link_target.is_absolute() {
+                            link_target
+                        } else {
+                            prefix_path
+                                .parent()
+                                .unwrap_or_else(|| Path::new("/"))
+                                .join(link_target)
+                        };
+                        normalize_lexical_pathbuf_resolved(&joined)
+                    })
+                    .unwrap_or_else(|_| {
+                        std::fs::canonicalize(&prefix_path)
+                            .unwrap_or_else(|_| prefix_path.clone())
+                    });
+
+                let mut resolved_full = target_raw.clone();
+                for suffix_comp in &all_comps[(idx + 1)..] {
+                    resolved_full.push(suffix_comp.as_os_str());
+                }
+                resolved_full = normalize_lexical_pathbuf_resolved(&resolved_full);
+
+                let target_diag =
+                    diagnose_path_lexical(&resolved_full, is_dir, config, has_fda);
+                let target_display = collapse_home_tilde_with(&target_raw, home.as_deref());
+                if target_diag.status == PathDiagnosisStatus::Indexed {
+                    diag.symlink_target = Some(target_display);
+                } else {
+                    diag.status = PathDiagnosisStatus::SymlinkNotFollowed;
+                    diag.matched_rule =
+                        Some(collapse_home_tilde_with(&prefix_path, home.as_deref()));
+                    diag.symlink_target = Some(target_display);
+                    diag.suggested_index_path = compute_piercing_suggestion(
+                        &resolved_full,
+                        is_dir,
+                        home.as_deref(),
+                        &policy.excluded_prefixes,
+                        0,
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    diag
 }
 
 #[cfg(test)]
@@ -1291,5 +1884,301 @@ mod tests {
             empty_roots_policy.evaluate_child(&ctx, &child, "file.js", false),
             empty_roots_policy.evaluate_with_hidden(&child, false, true)
         );
+    }
+
+    #[test]
+    fn test_diagnose_path_lexical_covers_cloud_storage_piercing_and_rules() {
+        let home = dirs::home_dir().unwrap();
+        let config = AppConfig::default();
+
+        // 1. Synology Drive under ~/Library/CloudStorage -> ExcludedByPathPrefix("~/Library") + cloud root suggestion
+        let synology_file = home.join("Library/CloudStorage/SynologyDrive-NAS/2026/合同.pdf");
+        let diag = diagnose_path_lexical_with(
+            &synology_file,
+            false,
+            &config,
+            true,
+            &[],
+            Some(&home),
+        );
+        assert_eq!(diag.status, PathDiagnosisStatus::ExcludedByPathPrefix);
+        assert_eq!(diag.matched_rule.as_deref(), Some("~/Library"));
+        assert!(diag.is_preset_rule);
+        assert_eq!(
+            diag.suggested_index_path.as_deref(),
+            Some("~/Library/CloudStorage/SynologyDrive-NAS")
+        );
+
+        // 2. iCloud Drive -> normalizes suggestion to iCloud root
+        let icloud_doc = home.join("Library/Mobile Documents/com~apple~CloudDocs/Work/Doc.pages");
+        let diag_icloud = diagnose_path_lexical_with(
+            &icloud_doc,
+            false,
+            &config,
+            true,
+            &[],
+            Some(&home),
+        );
+        assert_eq!(diag_icloud.status, PathDiagnosisStatus::ExcludedByPathPrefix);
+        assert_eq!(
+            diag_icloud.suggested_index_path.as_deref(),
+            Some("~/Library/Mobile Documents/com~apple~CloudDocs")
+        );
+
+        // 3. ~/Library itself -> cannot pierce same-depth exclude
+        let lib_dir = home.join("Library");
+        let diag_lib = diagnose_path_lexical_with(&lib_dir, true, &config, true, &[], Some(&home));
+        assert_eq!(diag_lib.status, PathDiagnosisStatus::ExcludedByPathPrefix);
+        assert_eq!(diag_lib.suggested_index_path, None);
+
+        // 4. Adding Synology Drive root pierces ~/Library
+        let mut pierced_cfg = config.clone();
+        pierced_cfg
+            .index
+            .index_paths
+            .push("~/Library/CloudStorage/SynologyDrive-NAS".to_string());
+        let diag_pierced = diagnose_path_lexical_with(
+            &synology_file,
+            false,
+            &pierced_cfg,
+            true,
+            &[],
+            Some(&home),
+        );
+        assert_eq!(diag_pierced.status, PathDiagnosisStatus::Indexed);
+        assert_eq!(
+            diag_pierced.matched_root.as_deref(),
+            Some("~/Library/CloudStorage/SynologyDrive-NAS")
+        );
+        assert_eq!(diag_pierced.pierced_exclude_path.as_deref(), Some("~/Library"));
+
+        // 5. Explicit exclude on cloud provider root falls back to deeper subpath suggestion
+        let mut explicit_ex_cfg = config.clone();
+        explicit_ex_cfg
+            .index
+            .exclude_paths
+            .push("~/Library/CloudStorage/SynologyDrive-NAS".to_string());
+        let diag_fallback = diagnose_path_lexical_with(
+            &synology_file,
+            false,
+            &explicit_ex_cfg,
+            true,
+            &[],
+            Some(&home),
+        );
+        assert_eq!(diag_fallback.status, PathDiagnosisStatus::ExcludedByPathPrefix);
+        assert_eq!(
+            diag_fallback.matched_rule.as_deref(),
+            Some("~/Library/CloudStorage/SynologyDrive-NAS")
+        );
+        assert_eq!(
+            diag_fallback.suggested_index_path.as_deref(),
+            Some("~/Library/CloudStorage/SynologyDrive-NAS/2026")
+        );
+
+        // 6. Excluded directory name "out"
+        let out_file = home.join("Work/out/report.pdf");
+        let diag_out = diagnose_path_lexical_with(&out_file, false, &config, true, &[], Some(&home));
+        assert_eq!(diag_out.status, PathDiagnosisStatus::ExcludedByName);
+        assert_eq!(diag_out.matched_rule.as_deref(), Some("out"));
+        assert!(diag_out.is_preset_rule);
+        assert_eq!(diag_out.suggested_index_path.as_deref(), Some("~/Work/out"));
+
+        // 7. .git with include_hidden=false reports ExcludedByName (not ExcludedByHidden)
+        let git_cfg = home.join("proj/.git/config");
+        let diag_git = diagnose_path_lexical_with(&git_cfg, false, &config, true, &[], Some(&home));
+        assert_eq!(diag_git.status, PathDiagnosisStatus::ExcludedByName);
+        assert_eq!(diag_git.matched_rule.as_deref(), Some(".git"));
+        assert!(diag_git.is_preset_rule);
+
+        // 8. .ssh with include_hidden=false reports ExcludedBySensitive
+        let ssh_key = home.join(".ssh/id_rsa");
+        let diag_ssh = diagnose_path_lexical_with(&ssh_key, false, &config, true, &[], Some(&home));
+        assert_eq!(diag_ssh.status, PathDiagnosisStatus::ExcludedBySensitive);
+        assert_eq!(diag_ssh.matched_rule.as_deref(), Some(".ssh"));
+        assert!(diag_ssh.is_preset_rule);
+
+        // 9. Hidden dir vs hidden file
+        let nvim_cfg = home.join(".config/nvim/init.lua");
+        let diag_hidden_dir =
+            diagnose_path_lexical_with(&nvim_cfg, false, &config, true, &[], Some(&home));
+        assert_eq!(diag_hidden_dir.status, PathDiagnosisStatus::ExcludedByHidden);
+        assert_eq!(diag_hidden_dir.matched_rule.as_deref(), Some(".config"));
+        assert_eq!(
+            diag_hidden_dir.suggested_index_path.as_deref(),
+            Some("~/.config")
+        );
+
+        let zshrc = home.join(".zshrc");
+        let diag_hidden_file =
+            diagnose_path_lexical_with(&zshrc, false, &config, true, &[], Some(&home));
+        assert_eq!(diag_hidden_file.status, PathDiagnosisStatus::ExcludedByHidden);
+        assert_eq!(diag_hidden_file.matched_rule.as_deref(), Some(".zshrc"));
+        assert_eq!(diag_hidden_file.suggested_index_path, None);
+
+        // 10. FDA protected path vs also_requires_fda
+        let protected = vec![home.join("Documents"), home.join("Library/Containers")];
+        let doc_file = home.join("Documents/a.pdf");
+        let diag_fda = diagnose_path_lexical_with(
+            &doc_file,
+            false,
+            &config,
+            false,
+            &protected,
+            Some(&home),
+        );
+        assert_eq!(diag_fda.status, PathDiagnosisStatus::ProtectedByFda);
+        assert_eq!(diag_fda.matched_rule.as_deref(), Some("~/Documents"));
+        assert!(!diag_fda.also_requires_fda);
+
+        let container_file = home.join("Library/Containers/WeWork/a.pdf");
+        let diag_container = diagnose_path_lexical_with(
+            &container_file,
+            false,
+            &config,
+            false,
+            &protected,
+            Some(&home),
+        );
+        assert_eq!(diag_container.status, PathDiagnosisStatus::ExcludedByPathPrefix);
+        assert!(diag_container.also_requires_fda);
+
+        // 11. Empty index_paths -> OutsideIndexRoots
+        let mut empty_cfg = config.clone();
+        empty_cfg.index.index_paths.clear();
+        let diag_outside = diagnose_path_lexical_with(
+            &home.join("Work/notes.md"),
+            false,
+            &empty_cfg,
+            true,
+            &[],
+            Some(&home),
+        );
+        assert_eq!(diag_outside.status, PathDiagnosisStatus::OutsideIndexRoots);
+        assert_eq!(diag_outside.suggested_index_path.as_deref(), Some("~/Work"));
+    }
+
+    #[test]
+    fn test_diagnose_path_runtime_detects_symlink_and_cleans_input() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let blocked = tmp.path().join("blocked");
+        let blocked_sub = blocked.join("sub");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&blocked_sub).unwrap();
+        let target_file = blocked_sub.join("note.txt");
+        fs::write(&target_file, "hello").unwrap();
+
+        let link_path = root.join("link");
+        std::os::unix::fs::symlink(&blocked_sub, &link_path).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.index.index_paths = vec![root.to_string_lossy().into_owned()];
+        cfg.index.exclude_paths = vec![blocked.to_string_lossy().into_owned()];
+
+        let via_link = link_path.join("note.txt");
+        let quoted_file_url = format!(
+            "\"file://{}\"",
+            via_link.to_string_lossy().replace(' ', "%20")
+        );
+        let diag = diagnose_path_runtime(&quoted_file_url, &cfg, true, |_| false);
+        assert_eq!(diag.status, PathDiagnosisStatus::SymlinkNotFollowed);
+        assert_eq!(diag.exists_on_disk, Some(true));
+        assert_eq!(
+            diag.matched_rule.as_deref(),
+            Some(link_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            diag.symlink_target.as_deref(),
+            Some(blocked_sub.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            diag.suggested_index_path.as_deref(),
+            Some(blocked_sub.to_string_lossy().as_ref())
+        );
+
+        // Adding the real target directory resolves SymlinkNotFollowed to Indexed
+        cfg.index
+            .index_paths
+            .push(blocked_sub.to_string_lossy().into_owned());
+        let diag_ok = diagnose_path_runtime(&via_link.to_string_lossy(), &cfg, true, |_| false);
+        assert_eq!(diag_ok.status, PathDiagnosisStatus::Indexed);
+        assert_eq!(
+            diag_ok.symlink_target.as_deref(),
+            Some(blocked_sub.to_string_lossy().as_ref())
+        );
+
+        // Offline volume path does not touch disk
+        let diag_offline = diagnose_path_runtime("/Volumes/OfflineNAS/a.txt", &cfg, true, |_| true);
+        assert_eq!(diag_offline.exists_on_disk, None);
+
+        // Shell-escaped spaces are unescaped for manual input/paste
+        assert_eq!(
+            clean_diagnostic_path_input(r"~/Library/Mobile\ Documents/com~apple~CloudDocs"),
+            "~/Library/Mobile Documents/com~apple~CloudDocs"
+        );
+    }
+
+    #[test]
+    fn test_package_bundles_are_shallow_containers_while_plain_key_files_index_normally() {
+        let home = dirs::home_dir().unwrap();
+        let config = AppConfig::default();
+        let policy = IndexScopePolicy::from_config_lexical(&config);
+
+        for bundle_name in [
+            "Deck.key",
+            "Budget.numbers",
+            "Report.pages",
+            "Notes.rtfd",
+            "Photos.photoslibrary",
+            "Movie.fcpbundle",
+            "Song.logicx",
+            "Track.band",
+            "Demo.garageband",
+        ] {
+            let dir_path = home.join("Documents").join(bundle_name);
+            let ctx = policy.dir_child_context(&home.join("Documents"), false);
+            assert_eq!(
+                policy.evaluate(&dir_path, true),
+                ScopeDecision::IndexShallowContainer,
+                "bundle dir {bundle_name} must be IndexShallowContainer"
+            );
+            assert_eq!(
+                policy.evaluate_child(&ctx, &dir_path, bundle_name, true),
+                ScopeDecision::IndexShallowContainer
+            );
+            assert_eq!(
+                policy.evaluate(&dir_path.join("Index/Document.iwa"), false),
+                ScopeDecision::HardDrop,
+                "internal files inside {bundle_name} must be HardDrop"
+            );
+        }
+
+        // Plain `.key` files (e.g. private key files) are not directories and must index normally
+        let plain_key = home.join("Documents/id_ed25519.key");
+        let ctx = policy.dir_child_context(&home.join("Documents"), false);
+        assert_eq!(
+            policy.evaluate(&plain_key, false),
+            ScopeDecision::IndexNormally
+        );
+        assert_eq!(
+            policy.evaluate_child(&ctx, &plain_key, "id_ed25519.key", false),
+            ScopeDecision::IndexNormally
+        );
+
+        let bundle_self = home.join("Documents/Q4.pages");
+        let diag_self =
+            diagnose_path_lexical_with(&bundle_self, true, &config, true, &[], Some(&home));
+        assert_eq!(diag_self.status, PathDiagnosisStatus::Indexed);
+
+        let bundle_inner = bundle_self.join("Index/Document.iwa");
+        let diag_inner =
+            diagnose_path_lexical_with(&bundle_inner, false, &config, true, &[], Some(&home));
+        assert_eq!(
+            diag_inner.status,
+            PathDiagnosisStatus::ExcludedByPackageBundle
+        );
+        assert_eq!(diag_inner.matched_rule.as_deref(), Some("~/Documents/Q4.pages"));
+        assert_eq!(diag_inner.suggested_index_path, None);
     }
 }

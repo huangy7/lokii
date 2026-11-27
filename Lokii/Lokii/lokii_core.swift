@@ -891,6 +891,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func confirmVolumeScan(pathOrId: String) throws  -> Bool
     
     /**
+     * Diagnose why `path` is or is not indexed under `draft_config_json` without touching offline volumes.
+     */
+    func diagnosePath(path: String, draftConfigJson: String) throws  -> FfiPathDiagnosis
+    
+    /**
      * Get the current configuration as a JSON string.
      */
     func getConfigJson()  -> String
@@ -1131,6 +1136,18 @@ open func confirmVolumeScan(pathOrId: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_lokii_core_fn_method_lokiicore_confirm_volume_scan(self.uniffiClonePointer(),
         FfiConverterString.lower(pathOrId),$0
+    )
+})
+}
+    
+    /**
+     * Diagnose why `path` is or is not indexed under `draft_config_json` without touching offline volumes.
+     */
+open func diagnosePath(path: String, draftConfigJson: String)throws  -> FfiPathDiagnosis  {
+    return try  FfiConverterTypeFfiPathDiagnosis_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_lokii_core_fn_method_lokiicore_diagnose_path(self.uniffiClonePointer(),
+        FfiConverterString.lower(path),
+        FfiConverterString.lower(draftConfigJson),$0
     )
 })
 }
@@ -1903,6 +1920,140 @@ public func FfiConverterTypeFfiMatchRange_lift(_ buf: RustBuffer) throws -> FfiM
 #endif
 public func FfiConverterTypeFfiMatchRange_lower(_ value: FfiMatchRange) -> RustBuffer {
     return FfiConverterTypeFfiMatchRange.lower(value)
+}
+
+
+public struct FfiPathDiagnosis {
+    public var normalizedPath: String
+    public var status: FfiPathDiagnosisStatus
+    public var matchedRoot: String?
+    public var matchedRule: String?
+    public var isPresetRule: Bool
+    public var piercedExcludePath: String?
+    public var symlinkTarget: String?
+    public var suggestedIndexPath: String?
+    public var alsoRequiresFda: Bool
+    public var existsOnDisk: Bool?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(normalizedPath: String, status: FfiPathDiagnosisStatus, matchedRoot: String?, matchedRule: String?, isPresetRule: Bool, piercedExcludePath: String?, symlinkTarget: String?, suggestedIndexPath: String?, alsoRequiresFda: Bool, existsOnDisk: Bool?) {
+        self.normalizedPath = normalizedPath
+        self.status = status
+        self.matchedRoot = matchedRoot
+        self.matchedRule = matchedRule
+        self.isPresetRule = isPresetRule
+        self.piercedExcludePath = piercedExcludePath
+        self.symlinkTarget = symlinkTarget
+        self.suggestedIndexPath = suggestedIndexPath
+        self.alsoRequiresFda = alsoRequiresFda
+        self.existsOnDisk = existsOnDisk
+    }
+}
+
+#if compiler(>=6)
+extension FfiPathDiagnosis: Sendable {}
+#endif
+
+
+extension FfiPathDiagnosis: Equatable, Hashable {
+    public static func ==(lhs: FfiPathDiagnosis, rhs: FfiPathDiagnosis) -> Bool {
+        if lhs.normalizedPath != rhs.normalizedPath {
+            return false
+        }
+        if lhs.status != rhs.status {
+            return false
+        }
+        if lhs.matchedRoot != rhs.matchedRoot {
+            return false
+        }
+        if lhs.matchedRule != rhs.matchedRule {
+            return false
+        }
+        if lhs.isPresetRule != rhs.isPresetRule {
+            return false
+        }
+        if lhs.piercedExcludePath != rhs.piercedExcludePath {
+            return false
+        }
+        if lhs.symlinkTarget != rhs.symlinkTarget {
+            return false
+        }
+        if lhs.suggestedIndexPath != rhs.suggestedIndexPath {
+            return false
+        }
+        if lhs.alsoRequiresFda != rhs.alsoRequiresFda {
+            return false
+        }
+        if lhs.existsOnDisk != rhs.existsOnDisk {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(normalizedPath)
+        hasher.combine(status)
+        hasher.combine(matchedRoot)
+        hasher.combine(matchedRule)
+        hasher.combine(isPresetRule)
+        hasher.combine(piercedExcludePath)
+        hasher.combine(symlinkTarget)
+        hasher.combine(suggestedIndexPath)
+        hasher.combine(alsoRequiresFda)
+        hasher.combine(existsOnDisk)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPathDiagnosis: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPathDiagnosis {
+        return
+            try FfiPathDiagnosis(
+                normalizedPath: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypeFfiPathDiagnosisStatus.read(from: &buf), 
+                matchedRoot: FfiConverterOptionString.read(from: &buf), 
+                matchedRule: FfiConverterOptionString.read(from: &buf), 
+                isPresetRule: FfiConverterBool.read(from: &buf), 
+                piercedExcludePath: FfiConverterOptionString.read(from: &buf), 
+                symlinkTarget: FfiConverterOptionString.read(from: &buf), 
+                suggestedIndexPath: FfiConverterOptionString.read(from: &buf), 
+                alsoRequiresFda: FfiConverterBool.read(from: &buf), 
+                existsOnDisk: FfiConverterOptionBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiPathDiagnosis, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.normalizedPath, into: &buf)
+        FfiConverterTypeFfiPathDiagnosisStatus.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.matchedRoot, into: &buf)
+        FfiConverterOptionString.write(value.matchedRule, into: &buf)
+        FfiConverterBool.write(value.isPresetRule, into: &buf)
+        FfiConverterOptionString.write(value.piercedExcludePath, into: &buf)
+        FfiConverterOptionString.write(value.symlinkTarget, into: &buf)
+        FfiConverterOptionString.write(value.suggestedIndexPath, into: &buf)
+        FfiConverterBool.write(value.alsoRequiresFda, into: &buf)
+        FfiConverterOptionBool.write(value.existsOnDisk, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPathDiagnosis_lift(_ buf: RustBuffer) throws -> FfiPathDiagnosis {
+    return try FfiConverterTypeFfiPathDiagnosis.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPathDiagnosis_lower(_ value: FfiPathDiagnosis) -> RustBuffer {
+    return FfiConverterTypeFfiPathDiagnosis.lower(value)
 }
 
 
@@ -2820,6 +2971,132 @@ extension FfiFileType: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiPathDiagnosisStatus {
+    
+    case indexed
+    case outsideIndexRoots
+    case excludedByPathPrefix
+    case excludedByName
+    case excludedByHidden
+    case excludedBySensitive
+    case excludedByShallowApp
+    case excludedByPackageBundle
+    case protectedByFda
+    case symlinkNotFollowed
+}
+
+
+#if compiler(>=6)
+extension FfiPathDiagnosisStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPathDiagnosisStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiPathDiagnosisStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPathDiagnosisStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .indexed
+        
+        case 2: return .outsideIndexRoots
+        
+        case 3: return .excludedByPathPrefix
+        
+        case 4: return .excludedByName
+        
+        case 5: return .excludedByHidden
+        
+        case 6: return .excludedBySensitive
+        
+        case 7: return .excludedByShallowApp
+        
+        case 8: return .excludedByPackageBundle
+        
+        case 9: return .protectedByFda
+        
+        case 10: return .symlinkNotFollowed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiPathDiagnosisStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .indexed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .outsideIndexRoots:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .excludedByPathPrefix:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .excludedByName:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .excludedByHidden:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .excludedBySensitive:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .excludedByShallowApp:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .excludedByPackageBundle:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .protectedByFda:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .symlinkNotFollowed:
+            writeInt(&buf, Int32(10))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPathDiagnosisStatus_lift(_ buf: RustBuffer) throws -> FfiPathDiagnosisStatus {
+    return try FfiConverterTypeFfiPathDiagnosisStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPathDiagnosisStatus_lower(_ value: FfiPathDiagnosisStatus) -> RustBuffer {
+    return FfiConverterTypeFfiPathDiagnosisStatus.lower(value)
+}
+
+
+extension FfiPathDiagnosisStatus: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiPrimaryScopeAction {
     
     case noOp
@@ -3280,6 +3557,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
+    typealias SwiftType = Bool?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterBool.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterBool.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -3498,6 +3799,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_confirm_volume_scan() != 32680) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_diagnose_path() != 39463) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_get_config_json() != 54941) {

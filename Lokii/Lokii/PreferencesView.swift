@@ -58,10 +58,12 @@ struct PreferencesView: View {
             viewModel.updateFDAStatus()
             viewModel.refreshLaunchAtLoginStatus()
             viewModel.refreshCliStatus()
+            viewModel.refreshCloudDrives()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             viewModel.updateFDAStatus()
             viewModel.refreshCliStatus()
+            viewModel.refreshCloudDrives()
         }
     }
 

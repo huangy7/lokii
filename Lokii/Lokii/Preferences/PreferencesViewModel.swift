@@ -223,6 +223,27 @@ enum SettingsPathStatusResolver {
             && !components[2].isEmpty
     }
 
+    /// 若 `path` 严格位于某条排除路径前缀之下（不含同路径冲突），返回最深被穿透的排除路径原串。
+    static func piercedExcludePath(for path: String, excludePaths: [String]) -> String? {
+        if containsSamePath(excludePaths, path) {
+            return nil
+        }
+        let normalizedTarget = normalizePath(path)
+        var bestMatch: (length: Int, raw: String)?
+        for rawEx in excludePaths {
+            let normalizedEx = normalizePath(rawEx)
+            guard !normalizedEx.isEmpty,
+                  normalizedTarget.caseInsensitiveCompare(normalizedEx) != .orderedSame,
+                  isPath(normalizedTarget, insideOrEqual: normalizedEx) else {
+                continue
+            }
+            if bestMatch == nil || normalizedEx.count > bestMatch!.length {
+                bestMatch = (normalizedEx.count, rawEx)
+            }
+        }
+        return bestMatch?.raw
+    }
+
     /// 根据内核 IOKit 驱动祖先链与 DiskArbitration 设备元数据，精确判定挂载卷是否为磁盘映像（DMG / ISO / SparseImage）。
     ///
     /// 判定优先级：
@@ -299,6 +320,154 @@ struct ManagedVolumeItem: Identifiable, Equatable {
     let isSavedIndexed: Bool
     let isMounted: Bool
     let status: FfiVolumeStatus?
+}
+
+/// 后台发现的本机云盘根目录（`~/Library/CloudStorage/*` 与非空 iCloud Drive）
+struct CloudDriveEntry: Equatable, Identifiable {
+    var id: String { path.lowercased() }
+    let path: String
+    let displayName: String
+    let providerHint: String
+    let existsOnDisk: Bool
+}
+
+/// 设置页「本机云盘」分组的统一展示条目
+struct ManagedCloudDriveItem: Identifiable, Equatable {
+    let id: String
+    let path: String
+    let displayName: String
+    let providerHint: String
+    let isIndexed: Bool
+    let isSavedIndexed: Bool
+    let isAvailableOnDisk: Bool
+    let volumeStatus: FfiVolumeStatus?
+}
+
+/// 本机云盘探测与根路径归类纯函数集（仅一级目录浅层枚举，绝不触发云端文件下载）
+enum CloudDriveDiscovery {
+    static func expandPath(_ path: String, homeDirectory: String) -> String {
+        var normHome = homeDirectory
+        while normHome.count > 1 && normHome.hasSuffix("/") {
+            normHome.removeLast()
+        }
+        let expanded: String
+        if path == "~" {
+            expanded = normHome
+        } else if path.hasPrefix("~/") {
+            expanded = normHome + "/" + path.dropFirst(2)
+        } else {
+            expanded = path
+        }
+        var trimmed = expanded
+        while trimmed.count > 1 && trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        return trimmed
+    }
+
+    static func isCloudDriveRootPath(_ path: String, homeDirectory: String = NSHomeDirectory()) -> Bool {
+        let normalized = expandPath(path, homeDirectory: homeDirectory)
+        let normHome = expandPath("~", homeDirectory: homeDirectory)
+        let cloudStorageRoot = normHome + "/Library/CloudStorage"
+        let cloudPrefixLower = cloudStorageRoot.lowercased() + "/"
+        if normalized.lowercased().hasPrefix(cloudPrefixLower) {
+            let remainder = String(normalized.dropFirst(cloudPrefixLower.count))
+            return !remainder.isEmpty && !remainder.contains("/") && !remainder.hasPrefix(".")
+        }
+        let icloudRoot = normHome + "/Library/Mobile Documents/com~apple~CloudDocs"
+        return normalized.caseInsensitiveCompare(icloudRoot) == .orderedSame
+    }
+
+    static func discover(
+        homeDirectory: String = NSHomeDirectory(),
+        fileManager: FileManager = .default,
+        icloudDisplayName: String = L("prefs.cloudDrive.icloudName")
+    ) -> [CloudDriveEntry] {
+        let normHome = expandPath("~", homeDirectory: homeDirectory)
+        var entries: [CloudDriveEntry] = []
+
+        let cloudStorageURL = URL(fileURLWithPath: normHome, isDirectory: true)
+            .appendingPathComponent("Library/CloudStorage", isDirectory: true)
+        if let children = try? fileManager.contentsOfDirectory(
+            at: cloudStorageURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .localizedNameKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for child in children {
+                let name = child.lastPathComponent
+                guard !name.isEmpty, !name.hasPrefix(".") else { continue }
+                let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .localizedNameKey])
+                guard values?.isDirectory == true else { continue }
+                let localized = values?.localizedName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayName = (localized?.isEmpty == false) ? localized! : name
+                entries.append(CloudDriveEntry(
+                    path: "~/Library/CloudStorage/\(name)",
+                    displayName: displayName,
+                    providerHint: "cloud_storage",
+                    existsOnDisk: true
+                ))
+            }
+        }
+
+        let icloudURL = URL(fileURLWithPath: normHome, isDirectory: true)
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
+        var icloudIsDir: ObjCBool = false
+        if fileManager.fileExists(atPath: icloudURL.path, isDirectory: &icloudIsDir), icloudIsDir.boolValue {
+            if let children = try? fileManager.contentsOfDirectory(
+                at: icloudURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ), children.contains(where: { !$0.lastPathComponent.hasPrefix(".") }) {
+                entries.append(CloudDriveEntry(
+                    path: "~/Library/Mobile Documents/com~apple~CloudDocs",
+                    displayName: icloudDisplayName,
+                    providerHint: "icloud",
+                    existsOnDisk: true
+                ))
+            }
+        }
+
+        return entries.sorted {
+            $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+        }
+    }
+}
+
+/// 路径诊断输入分类
+enum DiagnosticInputKind: Equatable {
+    case empty
+    case path(String)
+    case keyword(String)
+}
+
+/// 关键词反查命中的规则项
+struct MatchedExcludeRule: Equatable, Identifiable {
+    let value: String
+    let isPreset: Bool
+    var id: String { value }
+}
+
+/// 非路径关键词匹配结果
+struct KeywordRuleMatchResult: Equatable {
+    let query: String
+    let matchedCloudDrives: [ManagedCloudDriveItem]
+    let matchedExcludePaths: [MatchedExcludeRule]
+    let matchedExcludePatterns: [MatchedExcludeRule]
+    let matchedIndexPaths: [String]
+
+    var isEmpty: Bool {
+        matchedCloudDrives.isEmpty
+            && matchedExcludePaths.isEmpty
+            && matchedExcludePatterns.isEmpty
+            && matchedIndexPaths.isEmpty
+    }
+}
+
+/// 设置页顶部诊断条的统一输出状态
+enum IndexDiagnosticResult: Equatable {
+    case empty
+    case path(draft: FfiPathDiagnosis, saved: FfiPathDiagnosis?)
+    case keyword(KeywordRuleMatchResult)
 }
 
 // MARK: - Preferences ViewModel
@@ -418,18 +587,21 @@ class PreferencesViewModel: ObservableObject {
             guard !isLoading else { return }
             refreshLocalPathChecks()
             recomputePendingSaveRequiresRebuild()
+            refreshDiagnosticIfNeeded()
         }
     }
     @Published var indexApps: Bool = false {
         didSet {
             guard !isLoading else { return }
             recomputePendingSaveRequiresRebuild()
+            refreshDiagnosticIfNeeded()
         }
     }
     @Published var excludePatterns: [String] = LokiiConfig.IndexConfig.defaultExclude {
         didSet {
             guard !isLoading else { return }
             recomputePendingSaveRequiresRebuild()
+            refreshDiagnosticIfNeeded()
         }
     }
     @Published var excludePaths: [String] = LokiiConfig.IndexConfig.defaultExcludePaths {
@@ -437,18 +609,21 @@ class PreferencesViewModel: ObservableObject {
             guard !isLoading else { return }
             refreshLocalPathChecks()
             recomputePendingSaveRequiresRebuild()
+            refreshDiagnosticIfNeeded()
         }
     }
     @Published var includeHidden: Bool = false {
         didSet {
             guard !isLoading else { return }
             recomputePendingSaveRequiresRebuild()
+            refreshDiagnosticIfNeeded()
         }
     }
     @Published var excludeSensitive: Bool = true {
         didSet {
             guard !isLoading else { return }
             recomputePendingSaveRequiresRebuild()
+            refreshDiagnosticIfNeeded()
         }
     }
     @Published var networkRescanEnabled: Bool = LokiiConfig.IndexConfig.defaultNetworkRescanEnabled {
@@ -468,6 +643,19 @@ class PreferencesViewModel: ObservableObject {
     @Published var volumeStatuses: [FfiVolumeStatus] = []
     /// 后台探测到的本机当前已挂载外部卷/网络卷列表
     @Published var mountedVolumes: [MountedVolumeEntry] = []
+    /// 后台探测到的本机云盘根目录列表
+    @Published var discoveredCloudDrives: [CloudDriveEntry] = []
+    /// 路径诊断与规则反查输入文本
+    @Published var diagnosticInput: String = "" {
+        didSet {
+            guard !isLoading else { return }
+            refreshDiagnostic()
+        }
+    }
+    /// 路径诊断或关键词匹配结果
+    @Published private(set) var diagnosticResult: IndexDiagnosticResult = .empty
+    /// 规则定位后临时高亮的排除规则文本
+    @Published var highlightedRule: String? = nil
     /// 搜索结果是否包含已断开外部卷/网络卷的离线缓存条目（即时生效，独立于索引草稿）
     @Published var includeOfflineResults: Bool = true {
         didSet {
@@ -497,6 +685,8 @@ class PreferencesViewModel: ObservableObject {
     private let mountedVolumeProbeQueue = DispatchQueue(label: "com.lokii.prefs.mountedVolumes", qos: .utility)
     private var localProbeGeneration: UInt64 = 0
     private var cliProbeGeneration: UInt64 = 0
+    private var diagnosticGeneration: UInt64 = 0
+    private var highlightClearWorkItem: DispatchWorkItem?
 
     // 已持久化的索引配置，用于脏状态比对与放弃更改恢复
     @Published var savedIndexPaths: [String] = LokiiConfig.IndexConfig.defaultIndexPaths
@@ -623,6 +813,88 @@ class PreferencesViewModel: ObservableObject {
     /// 供「索引路径」分组展示的目录列表：过滤掉已由「外置磁盘与网络卷」分组统一托管的整卷根路径，避免重复展示
     var nonVolumeIndexPaths: [String] {
         indexPaths.filter { !SettingsPathStatusResolver.isVolumeRootPath($0) }
+    }
+
+    /// 供「索引路径」分组展示的常规目录列表：同时过滤掉已由「本机云盘」分组托管的云盘根路径
+    var regularIndexPaths: [String] {
+        nonVolumeIndexPaths.filter { !CloudDriveDiscovery.isCloudDriveRootPath($0) }
+    }
+
+    /// 供「本机云盘」分组展示的统一云盘清单（合并后台发现云盘与已配置云盘根路径）
+    var managedCloudDrives: [ManagedCloudDriveItem] {
+        let indexedSet = Set(indexPaths.map { SettingsPathStatusResolver.normalizePath($0).lowercased() })
+        let savedIndexedSet = Set(savedIndexPaths.map { SettingsPathStatusResolver.normalizePath($0).lowercased() })
+        var seenKeys: Set<String> = []
+        var items: [ManagedCloudDriveItem] = []
+
+        for entry in discoveredCloudDrives {
+            let key = SettingsPathStatusResolver.normalizePath(entry.path).lowercased()
+            guard seenKeys.insert(key).inserted else { continue }
+            items.append(ManagedCloudDriveItem(
+                id: key,
+                path: entry.path,
+                displayName: entry.displayName,
+                providerHint: entry.providerHint,
+                isIndexed: indexedSet.contains(key),
+                isSavedIndexed: savedIndexedSet.contains(key),
+                isAvailableOnDisk: entry.existsOnDisk,
+                volumeStatus: SettingsPathStatusResolver.matchVolumeStatus(forPath: entry.path, in: volumeStatuses)
+            ))
+        }
+
+        for rawPath in (indexPaths + savedIndexPaths) where CloudDriveDiscovery.isCloudDriveRootPath(rawPath) {
+            let normPath = SettingsPathStatusResolver.normalizePath(rawPath)
+            let key = normPath.lowercased()
+            guard seenKeys.insert(key).inserted else { continue }
+            let isIcloud = normPath.lowercased().hasSuffix("/com~apple~clouddocs")
+            let displayName = isIcloud ? L("prefs.cloudDrive.icloudName") : (normPath as NSString).lastPathComponent
+            items.append(ManagedCloudDriveItem(
+                id: key,
+                path: rawPath,
+                displayName: displayName,
+                providerHint: isIcloud ? "icloud" : "cloud_storage",
+                isIndexed: indexedSet.contains(key),
+                isSavedIndexed: savedIndexedSet.contains(key),
+                isAvailableOnDisk: localPathAvailability[normPath] ?? false,
+                volumeStatus: SettingsPathStatusResolver.matchVolumeStatus(forPath: rawPath, in: volumeStatuses)
+            ))
+        }
+
+        return items.sorted { lhs, rhs in
+            if lhs.isIndexed != rhs.isIndexed {
+                return lhs.isIndexed && !rhs.isIndexed
+            }
+            if lhs.isAvailableOnDisk != rhs.isAvailableOnDisk {
+                return lhs.isAvailableOnDisk && !rhs.isAvailableOnDisk
+            }
+            return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    func setCloudDriveIndexed(_ item: ManagedCloudDriveItem, enabled: Bool) {
+        let targetKey = SettingsPathStatusResolver.normalizePath(item.path).lowercased()
+        if enabled {
+            if !indexPaths.contains(where: { SettingsPathStatusResolver.normalizePath($0).lowercased() == targetKey }) {
+                indexPaths.append(item.path)
+            }
+        } else {
+            indexPaths.removeAll { SettingsPathStatusResolver.normalizePath($0).lowercased() == targetKey }
+        }
+    }
+
+    func refreshCloudDrives() {
+        mountedVolumeProbeQueue.async { [weak self] in
+            let entries = CloudDriveDiscovery.discover()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.discoveredCloudDrives != entries {
+                    self.discoveredCloudDrives = entries
+                    if !self.diagnosticInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.refreshDiagnostic()
+                    }
+                }
+            }
+        }
     }
 
     /// 供「外置磁盘与网络卷」分组展示的统一卷清单（合并本机已挂载卷、后端追踪卷与草稿中的整卷路径）
@@ -952,6 +1224,7 @@ class PreferencesViewModel: ObservableObject {
     func updateFDAStatus() {
         self.hasFullDiskAccess = engine.hasFullDiskAccess
         recomputePendingSaveRequiresRebuild()
+        refreshDiagnosticIfNeeded()
     }
 
     func refreshAvailableTerminals() {
@@ -1194,6 +1467,8 @@ class PreferencesViewModel: ObservableObject {
         engine.scheduleVolumeStatusesRefresh()
         refreshLocalPathChecks()
         refreshMountedVolumes()
+        refreshCloudDrives()
+        refreshDiagnosticIfNeeded()
     }
 
     private func saveGeneralConfig() {
@@ -1338,6 +1613,7 @@ class PreferencesViewModel: ObservableObject {
                 isRebuildingIndex = true
                 rebuildScannedCount = 0
             }
+            refreshDiagnosticIfNeeded()
         } else {
             indexSaveErrorMessage = L("prefs.index.saveFailed")
         }
@@ -1358,6 +1634,7 @@ class PreferencesViewModel: ObservableObject {
         isLoading = wasLoading
         refreshLocalPathChecks()
         recomputePendingSaveRequiresRebuild()
+        refreshDiagnosticIfNeeded()
     }
 
     func restoreIndexDefaults() {
@@ -1375,6 +1652,165 @@ class PreferencesViewModel: ObservableObject {
         isLoading = wasLoading
         refreshLocalPathChecks()
         recomputePendingSaveRequiresRebuild()
+        refreshDiagnosticIfNeeded()
+    }
+
+    // MARK: - Path Diagnosis & Rule Lookup
+
+    var isDiagnosticInputPath: Bool {
+        if case .path = Self.classifyDiagnosticInput(diagnosticInput) {
+            return true
+        }
+        return false
+    }
+
+    static func classifyDiagnosticInput(_ raw: String) -> DiagnosticInputKind {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+        if trimmed.count >= 2,
+           ((trimmed.hasPrefix("\"") && trimmed.hasSuffix("\""))
+            || (trimmed.hasPrefix("'") && trimmed.hasSuffix("'"))) {
+            trimmed = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !trimmed.isEmpty else { return .empty }
+
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("file://") {
+            if let url = URL(string: trimmed), url.isFileURL {
+                return .path(url.path)
+            }
+            var rest = String(trimmed.dropFirst("file://".count))
+            if rest.lowercased().hasPrefix("localhost/") {
+                rest = "/" + rest.dropFirst("localhost/".count)
+            } else if !rest.hasPrefix("/") {
+                rest = "/" + rest
+            }
+            return .path(rest.removingPercentEncoding ?? rest)
+        }
+
+        let unescaped = trimmed.replacingOccurrences(of: "\\ ", with: " ")
+        if unescaped.contains("/") || unescaped == "~" || unescaped.hasPrefix("~/") {
+            return .path(unescaped)
+        }
+        return .keyword(unescaped)
+    }
+
+    func refreshDiagnosticIfNeeded() {
+        guard !diagnosticInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            if diagnosticResult != .empty {
+                diagnosticResult = .empty
+            }
+            return
+        }
+        refreshDiagnostic()
+    }
+
+    func refreshDiagnostic() {
+        diagnosticGeneration &+= 1
+        let generation = diagnosticGeneration
+        let kind = Self.classifyDiagnosticInput(diagnosticInput)
+
+        switch kind {
+        case .empty:
+            diagnosticResult = .empty
+        case let .keyword(query):
+            let lower = query.lowercased()
+            let presetExPaths = Set(Self.defaultExcludePaths.map { $0.lowercased() })
+            let presetExPatterns = Set(Self.defaultExcludePatterns)
+            let cloudMatches = managedCloudDrives.filter {
+                $0.displayName.lowercased().contains(lower) || $0.path.lowercased().contains(lower)
+            }
+            let excludePathMatches = excludePaths
+                .filter { $0.lowercased().contains(lower) }
+                .map { MatchedExcludeRule(value: $0, isPreset: presetExPaths.contains($0.lowercased())) }
+            let excludePatternMatches = excludePatterns
+                .filter { $0.lowercased().contains(lower) }
+                .map { MatchedExcludeRule(value: $0, isPreset: presetExPatterns.contains($0)) }
+            let indexPathMatches = indexPaths.filter { $0.lowercased().contains(lower) }
+            diagnosticResult = .keyword(KeywordRuleMatchResult(
+                query: query,
+                matchedCloudDrives: cloudMatches,
+                matchedExcludePaths: excludePathMatches,
+                matchedExcludePatterns: excludePatternMatches,
+                matchedIndexPaths: indexPathMatches
+            ))
+        case let .path(path):
+            let draftConfig = draftIndexConfig()
+            let shouldCheckSaved = isIndexDirty
+            let savedConfig = shouldCheckSaved ? savedIndexConfigSnapshot() : nil
+
+            pathProbeQueue.async { [weak self] in
+                guard let self else { return }
+                guard let draftDiag = self.engine.diagnosePath(path, draftConfig: draftConfig) else {
+                    return
+                }
+                let savedDiag = savedConfig.flatMap { self.engine.diagnosePath(path, draftConfig: $0) }
+                DispatchQueue.main.async {
+                    guard self.diagnosticGeneration == generation else { return }
+                    self.diagnosticResult = .path(draft: draftDiag, saved: savedDiag)
+                }
+            }
+        }
+    }
+
+    private func savedIndexConfigSnapshot() -> LokiiConfig {
+        LokiiConfig(
+            general: .init(
+                language: language,
+                dockIconMode: dockIconMode,
+                terminalBundleId: terminalBundleId,
+                hideResultsWhenEmpty: hideResultsWhenEmpty
+            ),
+            index: .init(
+                indexPaths: savedIndexPaths,
+                indexApps: savedIndexApps,
+                exclude: savedExcludePatterns,
+                excludePaths: savedExcludePaths,
+                includeHidden: savedIncludeHidden,
+                excludeSensitive: savedExcludeSensitive,
+                sensitiveNames: sensitiveNames,
+                maxResults: maxResults,
+                networkRescanEnabled: savedNetworkRescanEnabled,
+                networkRescanMinutes: savedNetworkRescanMinutes,
+                serialScanPaths: serialScanPaths
+            ),
+            window: .init(
+                hideOnBlur: hideOnBlur,
+                rememberPosition: rememberPosition
+            )
+        )
+    }
+
+    func addIndexPathIfMissing(_ rawPath: String) {
+        let key = SettingsPathStatusResolver.normalizePath(rawPath).lowercased()
+        guard !key.isEmpty else { return }
+        if !indexPaths.contains(where: { SettingsPathStatusResolver.normalizePath($0).lowercased() == key }) {
+            indexPaths.append(rawPath)
+        }
+    }
+
+    func removeExcludePattern(_ pattern: String) {
+        excludePatterns.removeAll { $0 == pattern }
+    }
+
+    func removeExcludePath(_ path: String) {
+        let targetKey = SettingsPathStatusResolver.normalizePath(path).lowercased()
+        excludePaths.removeAll { SettingsPathStatusResolver.normalizePath($0).lowercased() == targetKey }
+    }
+
+    func openPrivacyTab() {
+        selectedTab = "privacy"
+    }
+
+    func highlightRuleTemporarily(_ rule: String) {
+        highlightClearWorkItem?.cancel()
+        highlightedRule = rule
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.highlightedRule == rule else { return }
+            self.highlightedRule = nil
+        }
+        highlightClearWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: item)
     }
 
     /// 开关打开时内核追加的系统应用索引根；此处仅用于提示与排除规则的冲突。

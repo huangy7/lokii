@@ -97,6 +97,44 @@ pub(crate) fn contains_protected_descendant(path: &Path, protected: &[PathBuf]) 
     protected.iter().any(|p| path_starts_with_ci(p, path))
 }
 
+/// macOS `<sys/stat.h>` `SF_DATALESS`：云端未物化占位条目，避免 `open()` 触发云端下载或阻塞。
+#[cfg(target_os = "macos")]
+const SF_DATALESS: u32 = 0x4000_0000;
+
+/// 通过 `stat(2)` 检测目录自身是否带有 `SF_DATALESS` 标记（用于显式索引根与实时回扫根入口）。
+#[cfg(target_os = "macos")]
+fn is_dataless_path_stat(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::stat(c_path.as_ptr(), &mut st) };
+    ret == 0 && (st.st_flags & SF_DATALESS) != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_dataless_path_stat(_path: &Path) -> bool {
+    false
+}
+
+/// 通过 `lstat(2)` 检测条目自身是否带有 `SF_DATALESS` 标记（用于目录遍历降级路径）。
+#[cfg(target_os = "macos")]
+fn is_dataless_path_lstat(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::lstat(c_path.as_ptr(), &mut st) };
+    ret == 0 && (st.st_flags & SF_DATALESS) != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_dataless_path_lstat(_path: &Path) -> bool {
+    false
+}
+
 /// 并行扫描目录并在遍历期实时应用排除过滤器，避免进入已排除子树。
 ///
 /// 在 macOS 上采用多线程目录队列 + `getattrlistbulk(2)` 批量拉取属性，将原本逐文件的 `lstat`
@@ -375,7 +413,7 @@ fn scan_borrowed_with_sink(
         )?;
         progress.fetch_add(1, Ordering::Relaxed);
 
-        if should_descend {
+        if should_descend && !is_dataless_path_stat(root) {
             initial_dirs.push(root.clone());
         }
     }
@@ -463,7 +501,8 @@ fn scan_borrowed_with_sink(
                                             is_dir: bool,
                                             size: u64,
                                             modified: u64,
-                                            created_at: u64|
+                                            created_at: u64,
+                                            is_dataless: bool|
                      -> Result<(), VolumeScanError> {
                         path_buf.truncate(prefix_len);
                         path_buf.push_str(name);
@@ -482,7 +521,8 @@ fn scan_borrowed_with_sink(
                             crate::filter::ScopeDecision::HardDrop => return Ok(()),
                             crate::filter::ScopeDecision::IndexShallowContainer => {}
                             crate::filter::ScopeDecision::IndexNormally => {
-                                if is_dir {
+                                // 未物化的云端目录仅收录目录自身，防止后台扫描触发云端下载
+                                if is_dir && !is_dataless {
                                     // 用原始 OsStr 拼接子目录路径，避免非 UTF-8 目录名经 lossy 解码后 open 返回 ENOENT 丢子树
                                     subdirs.push(dir.join(raw_name));
                                 }
@@ -710,6 +750,7 @@ mod macos_bulk {
     const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
     const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
     const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+    const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
     const ATTR_CMN_ERROR: u32 = 0x2000_0000;
     const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
     const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
@@ -776,7 +817,7 @@ mod macos_bulk {
         buf: &mut [u64],
         cancel: &AtomicBool,
         is_mounted: &dyn Fn() -> bool,
-        mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64) -> Result<(), VolumeScanError>,
+        mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64, bool) -> Result<(), VolumeScanError>,
     ) -> Result<BulkOutcome, VolumeScanError> {
         let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
             return Ok(BulkOutcome::Unsupported);
@@ -806,7 +847,8 @@ mod macos_bulk {
             | ATTR_CMN_NAME
             | ATTR_CMN_OBJTYPE
             | ATTR_CMN_CRTIME
-            | ATTR_CMN_MODTIME;
+            | ATTR_CMN_MODTIME
+            | ATTR_CMN_FLAGS;
         attrlist.fileattr = ATTR_FILE_DATALENGTH;
 
         let buf_bytes = buf.len() * std::mem::size_of::<u64>();
@@ -959,6 +1001,19 @@ mod macos_bulk {
                     modified = ts.tv_sec.max(0) as u64;
                 }
 
+                let mut is_dataless = false;
+                if (returned.commonattr & ATTR_CMN_FLAGS) != 0 {
+                    if cursor + 4 > entry_end {
+                        pos = entry_end;
+                        continue;
+                    }
+                    let flags = unsafe {
+                        std::ptr::read_unaligned(raw.as_ptr().add(cursor) as *const u32)
+                    };
+                    cursor += 4;
+                    is_dataless = (flags & super::SF_DATALESS) != 0;
+                }
+
                 let mut size = 0u64;
                 if (returned.fileattr & ATTR_FILE_DATALENGTH) != 0 {
                     if cursor + 8 <= entry_end {
@@ -976,11 +1031,11 @@ mod macos_bulk {
                         let raw_os = std::ffi::OsStr::from_bytes(bytes);
                         match std::str::from_utf8(bytes) {
                             Ok(name) => {
-                                on_entry(raw_os, name, is_dir, size, modified, created_at)?;
+                                on_entry(raw_os, name, is_dir, size, modified, created_at, is_dataless)?;
                             }
                             Err(_) => {
                                 let owned = String::from_utf8_lossy(bytes);
-                                on_entry(raw_os, &owned, is_dir, size, modified, created_at)?;
+                                on_entry(raw_os, &owned, is_dir, size, modified, created_at, is_dataless)?;
                             }
                         }
                     }
@@ -998,7 +1053,7 @@ fn enumerate_dir_fallback(
     abort_on_disconnect: bool,
     cancel: &std::sync::atomic::AtomicBool,
     is_mounted: &dyn Fn() -> bool,
-    mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64) -> Result<(), VolumeScanError>,
+    mut on_entry: impl FnMut(&std::ffi::OsStr, &str, bool, u64, u64, u64, bool) -> Result<(), VolumeScanError>,
 ) -> Result<(), VolumeScanError> {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -1041,7 +1096,8 @@ fn enumerate_dir_fallback(
         let size = if is_dir { 0 } else { meta.len() };
         let modified = system_time_to_unix_secs(meta.modified());
         let created_at = system_time_to_unix_secs(meta.created());
-        on_entry(&name, &name_str, is_dir, size, modified, created_at)?;
+        let is_dataless = is_dataless_path_lstat(&entry.path());
+        on_entry(&name, &name_str, is_dir, size, modified, created_at, is_dataless)?;
     }
     Ok(())
 }
@@ -1119,6 +1175,10 @@ pub fn scan_volume_compact_atomic(
     let mut progress_count = 1u64;
     on_progress(progress_count);
 
+    if is_dataless_path_stat(root) {
+        return Ok(index);
+    }
+
     let mut dirs = std::collections::VecDeque::new();
     dirs.push_back(root.to_path_buf());
     let mut is_first_dir = true;
@@ -1147,7 +1207,8 @@ pub fn scan_volume_compact_atomic(
                                 is_dir: bool,
                                 size: u64,
                                 modified: u64,
-                                created_at: u64|
+                                created_at: u64,
+                                is_dataless: bool|
          -> Result<(), VolumeScanError> {
             path_buf.truncate(prefix_len);
             path_buf.push_str(name);
@@ -1156,7 +1217,7 @@ pub fn scan_volume_compact_atomic(
                 crate::filter::ScopeDecision::HardDrop => return Ok(()),
                 crate::filter::ScopeDecision::IndexShallowContainer => {}
                 crate::filter::ScopeDecision::IndexNormally => {
-                    if is_dir {
+                    if is_dir && !is_dataless {
                         dirs.push_back(dir.join(raw_name));
                     }
                 }
@@ -1279,6 +1340,10 @@ pub fn scan_volume_compact_atomic_parallel(
     let mut progress_count = 1u64;
     on_progress(progress_count);
 
+    if is_dataless_path_stat(root) {
+        return Ok(index);
+    }
+
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4);
@@ -1346,7 +1411,8 @@ pub fn scan_volume_compact_atomic_parallel(
                                             is_dir: bool,
                                             size: u64,
                                             modified: u64,
-                                            created_at: u64|
+                                            created_at: u64,
+                                            is_dataless: bool|
                      -> Result<(), VolumeScanError> {
                         if local_abort_ref.load(Ordering::Relaxed) {
                             return Err(VolumeScanError::Cancelled);
@@ -1359,7 +1425,7 @@ pub fn scan_volume_compact_atomic_parallel(
                             crate::filter::ScopeDecision::HardDrop => return Ok(()),
                             crate::filter::ScopeDecision::IndexShallowContainer => {}
                             crate::filter::ScopeDecision::IndexNormally => {
-                                if is_dir {
+                                if is_dir && !is_dataless {
                                     subdirs.push(dir.join(raw_name));
                                 }
                             }
@@ -2302,5 +2368,55 @@ mod tests {
         assert!(matches!(disconnected, Err(VolumeScanError::Disconnected(_))));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scan_treats_document_and_media_package_bundles_as_shallow_and_preserves_attr_flags_parsing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let pages_dir = root.join("Q4.pages");
+        let pages_inner = pages_dir.join("Index");
+        let photos_dir = root.join("Album.photoslibrary");
+        let photos_inner = photos_dir.join("originals");
+        let normal_dir = root.join("Docs");
+        fs::create_dir_all(&pages_inner).unwrap();
+        fs::create_dir_all(&photos_inner).unwrap();
+        fs::create_dir_all(&normal_dir).unwrap();
+
+        fs::write(pages_inner.join("Document.iwa"), b"iwa-bytes").unwrap();
+        fs::write(photos_inner.join("photo.jpg"), b"jpg").unwrap();
+        fs::write(normal_dir.join("notes.md"), b"hello world!").unwrap();
+        fs::write(root.join("id_ed25519.key"), b"secret-key").unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.index.index_paths = vec![root.to_string_lossy().into_owned()];
+        config.index.exclude_paths = vec![];
+        config.index.exclude = vec![];
+        config.index.include_hidden = true;
+        let filter = Arc::new(crate::filter::CompiledFilter::from_config(&config));
+        let entries = scan_directories(
+            &[root.to_path_buf()],
+            filter,
+            true,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let paths: std::collections::HashMap<String, (bool, u64)> = entries
+            .iter()
+            .map(|e| (e.path.clone(), (e.is_dir, e.size)))
+            .collect();
+
+        assert_eq!(paths.get(&pages_dir.to_string_lossy().into_owned()), Some(&(true, 0)));
+        assert_eq!(paths.get(&photos_dir.to_string_lossy().into_owned()), Some(&(true, 0)));
+        assert_eq!(
+            paths.get(&normal_dir.join("notes.md").to_string_lossy().into_owned()),
+            Some(&(false, 12))
+        );
+        assert_eq!(
+            paths.get(&root.join("id_ed25519.key").to_string_lossy().into_owned()),
+            Some(&(false, 10))
+        );
+        assert!(!paths.contains_key(&pages_inner.join("Document.iwa").to_string_lossy().into_owned()));
+        assert!(!paths.contains_key(&photos_inner.join("photo.jpg").to_string_lossy().into_owned()));
     }
 }
