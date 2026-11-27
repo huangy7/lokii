@@ -47,18 +47,28 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
         }
     }
 
-    func checkForUpdates(isUserInitiated: Bool = false) {
-        guard isUserInitiated || automaticallyChecksForUpdates else { return }
+    /// 发起更新检查；仅在确认能够实际触发检查时才执行 `beforePresenting` 回调并返回 `true`，
+    /// 避免后台已有检查或更新器未就绪时提前升格应用激活策略导致程序坞图标空悬。
+    @discardableResult
+    func checkForUpdates(isUserInitiated: Bool = false, beforePresenting: (() -> Void)? = nil) -> Bool {
+        guard isUserInitiated || automaticallyChecksForUpdates else { return false }
         start()
-        guard let updater = controller?.updater, updater.canCheckForUpdates else { return }
+        guard let updater = controller?.updater, updater.canCheckForUpdates else { return false }
+        if !isUserInitiated && updater.sessionInProgress {
+            return false
+        }
+        if isUserInitiated {
+            beforePresenting?()
+        }
         userInitiated = isUserInitiated
         errorMessage = nil
         isChecking = true
         if isUserInitiated {
             updater.checkForUpdates()
-        } else if !updater.sessionInProgress {
+        } else {
             updater.checkForUpdatesInBackground()
         }
+        return true
     }
 
     func updaterShouldPromptForPermissionToCheck(forUpdates updater: SPUUpdater) -> Bool {

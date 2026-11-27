@@ -306,4 +306,145 @@ final class DockVisibilityCoordinatorTests: XCTestCase {
         XCTAssertTrue(encoded.contains("\"dock_icon_mode\":\"when_open\""))
         XCTAssertFalse(encoded.contains("show_in_dock"))
     }
+
+    func testUpdateModeNeverSuppressesBlurHideDuringPolicyTransition() {
+        var currentPolicy: NSApplication.ActivationPolicy = .regular
+        var preservingDuringSetter = false
+        var scheduledBlocks: [() -> Void] = []
+
+        var coordinator: DockVisibilityCoordinator!
+        coordinator = DockVisibilityCoordinator(
+            initialMode: .whenOpen,
+            observeWindowNotifications: false,
+            policyReader: { currentPolicy },
+            policySetter: { next in
+                preservingDuringSetter = coordinator.isPreservingActiveWindow
+                currentPolicy = next
+                return true
+            },
+            windowSnapshotProvider: {
+                [DockWindowSnapshot(className: "PreferencesWindow", level: .normal, isVisible: true)]
+            },
+            activeWindowRestorerBuilder: {
+                { }
+            },
+            asyncScheduler: { block in
+                scheduledBlocks.append(block)
+            }
+        )
+
+        XCTAssertFalse(coordinator.isPreservingActiveWindow)
+        coordinator.updateMode(.never)
+        XCTAssertTrue(preservingDuringSetter, "切换至 .accessory 同步期间必须抑制失焦隐藏")
+        XCTAssertTrue(coordinator.isPreservingActiveWindow, "下一轮主线程复焦完成前应继续抑制失焦隐藏")
+        XCTAssertEqual(scheduledBlocks.count, 1)
+
+        scheduledBlocks.removeFirst()()
+        XCTAssertFalse(coordinator.isPreservingActiveWindow)
+
+        // 若系统拒绝切换策略，不得遗留常驻抑制标记
+        currentPolicy = .regular
+        let failingCoordinator = DockVisibilityCoordinator(
+            initialMode: .whenOpen,
+            observeWindowNotifications: false,
+            policyReader: { currentPolicy },
+            policySetter: { _ in false },
+            windowSnapshotProvider: {
+                [DockWindowSnapshot(className: "PreferencesWindow", level: .normal, isVisible: true)]
+            },
+            activeWindowRestorerBuilder: { { } },
+            asyncScheduler: { block in
+                scheduledBlocks.append(block)
+            }
+        )
+        failingCoordinator.updateMode(.never)
+        XCTAssertFalse(failingCoordinator.isPreservingActiveWindow)
+    }
+
+    func testPrepareForWindowPresentationInvalidatesStaleWillCloseSync() {
+        let center = NotificationCenter()
+        let reusedWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 120),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: true
+        )
+        let reusedId = ObjectIdentifier(reusedWindow)
+
+        var currentPolicy: NSApplication.ActivationPolicy = .regular
+        var snapshots: [DockWindowSnapshot] = [
+            DockWindowSnapshot(identifier: reusedId, className: "PreferencesWindow", level: .normal, isVisible: true),
+        ]
+        var scheduledBlocks: [() -> Void] = []
+
+        let coordinator = DockVisibilityCoordinator(
+            initialMode: .whenOpen,
+            notificationCenter: center,
+            observeWindowNotifications: true,
+            policyReader: { currentPolicy },
+            policySetter: { next in
+                currentPolicy = next
+                return true
+            },
+            windowSnapshotProvider: { snapshots },
+            activeWindowRestorerBuilder: { nil },
+            asyncScheduler: { block in
+                scheduledBlocks.append(block)
+            }
+        )
+
+        // 1. 复用窗口触发关闭，排入旧异步回落任务（排除 reusedId）
+        center.post(name: NSWindow.willCloseNotification, object: reusedWindow)
+        XCTAssertEqual(scheduledBlocks.count, 1)
+
+        // 2. 旧任务尚未落地前立刻重新呈现窗口：应作废旧异步同步并清空排除集
+        _ = coordinator.prepareForWindowPresentation()
+
+        // 3. 旧异步回调执行后，不得把刚重开的窗口排除掉并误降级为 .accessory
+        scheduledBlocks.removeFirst()()
+        XCTAssertEqual(currentPolicy, .regular)
+
+        // 4. 随后真正关闭全部窗口并重新排入同步，仍应正常回落为 .accessory
+        snapshots = []
+        coordinator.schedulePolicySync()
+        XCTAssertEqual(scheduledBlocks.count, 1)
+        scheduledBlocks.removeFirst()()
+        XCTAssertEqual(currentPolicy, .accessory)
+    }
+
+    func testSearchWindowReopenDuringFadeOutRestoresOpacity() throws {
+        _ = NSApplication.shared
+        let searchWindow = SearchWindow(engine: SearchEngine())
+        let window = try XCTUnwrap(searchWindow.window)
+        defer { window.orderOut(nil) }
+
+        var didHideCount = 0
+        searchWindow.onDidHide = {
+            didHideCount += 1
+        }
+
+        searchWindow.showWindow(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertTrue(window.isVisible)
+
+        // 触发 0.15s 淡出动画后立刻重新唤起，验证旧收起回调被取消且窗口透明度恢复为 1.0
+        searchWindow.hideWindow(animated: true)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        searchWindow.showWindow(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+
+        XCTAssertTrue(window.isVisible)
+        XCTAssertEqual(window.alphaValue, 1.0, accuracy: 0.01)
+        XCTAssertEqual(didHideCount, 0)
+    }
+
+    @MainActor
+    func testCheckForUpdatesSkipsBeforePresentingWhenUpdaterCannotCheck() {
+        var beforePresentingCalled = false
+        let started = AppUpdater.shared.checkForUpdates(isUserInitiated: true) {
+            beforePresentingCalled = true
+        }
+        XCTAssertFalse(started)
+        XCTAssertFalse(beforePresentingCalled)
+    }
 }
