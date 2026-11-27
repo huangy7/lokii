@@ -95,7 +95,7 @@ impl Default for GeneralConfig {
 
 /// Index-related configuration: which directories to scan, what to exclude.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "IndexConfigWire")]
 pub struct IndexConfig {
     /// Directories to index (supports "~" for home directory).
     pub index_paths: Vec<String>,
@@ -113,11 +113,82 @@ pub struct IndexConfig {
     pub sensitive_names: Vec<String>,
     /// Maximum number of search results to return.
     pub max_results: usize,
-    /// 非本地卷（网络共享等）上的索引根每隔多少分钟整棵重扫一次；FSEvents 看不到远端改动。0 表示不重扫。
+    /// 是否按设定间隔自动重扫在线网络卷；默认关闭以避免周期唤醒休眠中的 NAS 硬盘。
+    pub network_rescan_enabled: bool,
+    /// 开启自动重扫后，非本地卷（网络共享等）上的索引根每隔多少分钟整棵重扫一次；FSEvents 看不到远端改动。
     pub network_rescan_minutes: u64,
     /// 强制使用单线程顺序友好批量扫描的卷路径列表（当外置机械盘桥接芯片不上报 IOKit 旋转介质属性时手动覆盖）。
-    #[serde(default)]
     pub serial_scan_paths: Vec<String>,
+}
+
+/// 兼容历史配置中仅以 `network_rescan_minutes = 0` 表示关闭的过渡反序列化视图：
+/// 缺失 `network_rescan_enabled` 时默认关闭；当 `network_rescan_minutes == 0` 时统一规约为关闭并回填默认间隔，
+/// 确保开关重新开启时不会出现 0 分钟无效周期。
+#[derive(Deserialize)]
+#[serde(default)]
+struct IndexConfigWire {
+    index_paths: Vec<String>,
+    index_apps: bool,
+    exclude: Vec<String>,
+    exclude_paths: Vec<String>,
+    include_hidden: bool,
+    exclude_sensitive: bool,
+    sensitive_names: Vec<String>,
+    max_results: usize,
+    network_rescan_enabled: Option<bool>,
+    network_rescan_minutes: Option<u64>,
+    serial_scan_paths: Vec<String>,
+}
+
+impl Default for IndexConfigWire {
+    fn default() -> Self {
+        let defaults = IndexConfig::default();
+        Self {
+            index_paths: defaults.index_paths,
+            index_apps: defaults.index_apps,
+            exclude: defaults.exclude,
+            exclude_paths: defaults.exclude_paths,
+            include_hidden: defaults.include_hidden,
+            exclude_sensitive: defaults.exclude_sensitive,
+            sensitive_names: defaults.sensitive_names,
+            max_results: defaults.max_results,
+            network_rescan_enabled: None,
+            network_rescan_minutes: None,
+            serial_scan_paths: defaults.serial_scan_paths,
+        }
+    }
+}
+
+impl From<IndexConfigWire> for IndexConfig {
+    fn from(wire: IndexConfigWire) -> Self {
+        let defaults = IndexConfig::default();
+        let (network_rescan_enabled, network_rescan_minutes) = match wire.network_rescan_minutes {
+            Some(0) => (false, defaults.network_rescan_minutes),
+            Some(minutes) => (
+                wire.network_rescan_enabled
+                    .unwrap_or(defaults.network_rescan_enabled),
+                minutes,
+            ),
+            None => (
+                wire.network_rescan_enabled
+                    .unwrap_or(defaults.network_rescan_enabled),
+                defaults.network_rescan_minutes,
+            ),
+        };
+        Self {
+            index_paths: wire.index_paths,
+            index_apps: wire.index_apps,
+            exclude: wire.exclude,
+            exclude_paths: wire.exclude_paths,
+            include_hidden: wire.include_hidden,
+            exclude_sensitive: wire.exclude_sensitive,
+            sensitive_names: wire.sensitive_names,
+            max_results: wire.max_results,
+            network_rescan_enabled,
+            network_rescan_minutes,
+            serial_scan_paths: wire.serial_scan_paths,
+        }
+    }
 }
 
 impl Default for IndexConfig {
@@ -206,7 +277,8 @@ impl Default for IndexConfig {
                 ".msmtprc".to_string(),
             ],
             max_results: 500,
-            network_rescan_minutes: 30,
+            network_rescan_enabled: false,
+            network_rescan_minutes: 1440,
             serial_scan_paths: Vec::new(),
         }
     }
@@ -464,8 +536,11 @@ sensitive_names = [".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-stor
 # 搜索结果最大返回数量
 max_results = 500
 
-# 网络共享等非本地卷上的索引目录，每隔多少分钟整体重扫一次（0 表示不重扫）
-network_rescan_minutes = 30
+# 是否按设定间隔自动重扫在线网络卷（网络共享无法实时感知远端改动；默认关闭以避免唤醒休眠中的 NAS 硬盘）
+network_rescan_enabled = false
+
+# 开启自动重扫后，在线网络卷的重扫间隔（分钟，默认 1440 即 24 小时）
+network_rescan_minutes = 1440
 
 [window]
 # 窗口失去焦点时是否自动隐藏
@@ -950,6 +1025,8 @@ toggle_window = "Cmd+Alt+F"
         assert!(config.exclude_sensitive);
         assert!(config.sensitive_names.contains(&".ssh".to_string()));
         assert_eq!(config.max_results, 500);
+        assert!(!config.network_rescan_enabled);
+        assert_eq!(config.network_rescan_minutes, 1440);
 
         let parsed_default = AppConfig::from_toml(DEFAULT_CONFIG_TOML).expect("DEFAULT_CONFIG_TOML valid");
         assert!(!parsed_default.index.include_hidden);
@@ -957,6 +1034,55 @@ toggle_window = "Cmd+Alt+F"
         assert!(parsed_default.index.exclude.contains(&".DS_Store".to_string()));
         assert!(parsed_default.index.sensitive_names.contains(&".ssh".to_string()));
         assert!(!parsed_default.index.exclude.contains(&".nox".to_string()));
+        assert!(!parsed_default.index.network_rescan_enabled);
+        assert_eq!(parsed_default.index.network_rescan_minutes, 1440);
+    }
+
+    #[test]
+    fn test_network_rescan_config_backward_compatibility() {
+        // 缺失新旧字段时回退默认：关闭且默认间隔 24 小时
+        let empty: IndexConfig = toml::from_str("").expect("parse empty index");
+        assert!(!empty.network_rescan_enabled);
+        assert_eq!(empty.network_rescan_minutes, 1440);
+
+        // 遗留配置以 0 表示关闭：映射为关闭并回填 1440，避免再次开启时出现 0 分钟无效间隔
+        let legacy_off: IndexConfig =
+            toml::from_str("network_rescan_minutes = 0\n").expect("parse legacy off");
+        assert!(!legacy_off.network_rescan_enabled);
+        assert_eq!(legacy_off.network_rescan_minutes, 1440);
+
+        // 遗留配置无开关字段且含旧间隔：升级后保持默认关闭，同时保留历史间隔便于用户开启后沿用
+        let legacy_minutes: IndexConfig =
+            toml::from_str("network_rescan_minutes = 30\n").expect("parse legacy minutes");
+        assert!(!legacy_minutes.network_rescan_enabled);
+        assert_eq!(legacy_minutes.network_rescan_minutes, 30);
+
+        // 仅打开开关而未写间隔时使用 24 小时默认间隔
+        let enabled_only: IndexConfig =
+            serde_json::from_str(r#"{"network_rescan_enabled":true}"#).expect("parse enabled only");
+        assert!(enabled_only.network_rescan_enabled);
+        assert_eq!(enabled_only.network_rescan_minutes, 1440);
+
+        // 开关开启但手工写入 0 分钟：强制防呆关闭并回填默认间隔，杜绝零间隔死循环
+        let zero_guard: IndexConfig = serde_json::from_str(
+            r#"{"network_rescan_enabled":true,"network_rescan_minutes":0}"#,
+        )
+        .expect("parse zero guard");
+        assert!(!zero_guard.network_rescan_enabled);
+        assert_eq!(zero_guard.network_rescan_minutes, 1440);
+
+        // 关闭开关时保留用户自定义间隔，TOML/JSON 往返无损
+        let custom_off: IndexConfig = serde_json::from_str(
+            r#"{"network_rescan_enabled":false,"network_rescan_minutes":360}"#,
+        )
+        .expect("parse custom off");
+        assert!(!custom_off.network_rescan_enabled);
+        assert_eq!(custom_off.network_rescan_minutes, 360);
+        let toml_out = toml::to_string(&custom_off).expect("serialize toml");
+        assert!(toml_out.contains("network_rescan_enabled = false"));
+        assert!(toml_out.contains("network_rescan_minutes = 360"));
+        let roundtrip: IndexConfig = toml::from_str(&toml_out).expect("roundtrip toml");
+        assert_eq!(roundtrip, custom_off);
     }
 
     #[test]
@@ -1078,6 +1204,8 @@ max_results = 200
         assert!(DEFAULT_CONFIG_TOML.contains("hide_on_blur = true"));
         assert!(DEFAULT_CONFIG_TOML.contains("remember_position = false"));
         assert!(DEFAULT_CONFIG_TOML.contains("max_results = 500"));
+        assert!(DEFAULT_CONFIG_TOML.contains("network_rescan_enabled = false"));
+        assert!(DEFAULT_CONFIG_TOML.contains("network_rescan_minutes = 1440"));
     }
 
     // --- Existing tests updated for sectioned struct ---

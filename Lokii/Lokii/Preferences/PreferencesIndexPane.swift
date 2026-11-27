@@ -495,6 +495,172 @@ private struct PreferencesTextInputSheet: View {
     }
 }
 
+// MARK: - Custom Network Rescan Interval Sheet
+enum NetworkRescanIntervalUnit: String, CaseIterable, Identifiable {
+    case minutes
+    case hours
+    case days
+
+    var id: String { rawValue }
+
+    /// 最长限制为 365 天（525,600 分钟），避免误输超大数字导致事实上的永不触发。
+    static let maxTotalMinutes = 365 * 1440
+
+    var minutesMultiplier: Int {
+        switch self {
+        case .minutes: return 1
+        case .hours: return 60
+        case .days: return 1440
+        }
+    }
+
+    var maxValue: Int {
+        Self.maxTotalMinutes / minutesMultiplier
+    }
+
+    var label: String {
+        switch self {
+        case .minutes: return L("prefs.networkRescan.customSheet.unit.minutes")
+        case .hours: return L("prefs.networkRescan.customSheet.unit.hours")
+        case .days: return L("prefs.networkRescan.customSheet.unit.days")
+        }
+    }
+
+    static func decompose(minutes: Int) -> (amount: Int, unit: NetworkRescanIntervalUnit) {
+        let clamped = max(1, minutes)
+        if clamped >= 1440 && clamped % 1440 == 0 {
+            return (clamped / 1440, .days)
+        }
+        if clamped >= 60 && clamped % 60 == 0 {
+            return (clamped / 60, .hours)
+        }
+        return (clamped, .minutes)
+    }
+
+    static func parseTotalMinutes(text: String, unit: NetworkRescanIntervalUnit) -> Int? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let value = Int(trimmed), value >= 1, value <= unit.maxValue else {
+            return nil
+        }
+        return value * unit.minutesMultiplier
+    }
+}
+
+private struct CustomNetworkRescanSheet: View {
+    let initialMinutes: Int
+    let onCommit: (Int) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var amountText: String
+    @State private var unit: NetworkRescanIntervalUnit
+    @FocusState private var isFieldFocused: Bool
+
+    init(initialMinutes: Int, onCommit: @escaping (Int) -> Void) {
+        self.initialMinutes = initialMinutes
+        self.onCommit = onCommit
+        let decomposed = NetworkRescanIntervalUnit.decompose(minutes: initialMinutes)
+        _amountText = State(initialValue: String(decomposed.amount))
+        _unit = State(initialValue: decomposed.unit)
+    }
+
+    private var parsedTotalMinutes: Int? {
+        NetworkRescanIntervalUnit.parseTotalMinutes(text: amountText, unit: unit)
+    }
+
+    private var showValidationHint: Bool {
+        !amountText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && parsedTotalMinutes == nil
+    }
+
+    private func stepAmount(by delta: Int) {
+        let trimmed = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next: Int
+        if let current = Int(trimmed) {
+            if current < 1 {
+                next = 1
+            } else if current > unit.maxValue {
+                next = unit.maxValue
+            } else {
+                next = min(max(current + delta, 1), unit.maxValue)
+            }
+        } else {
+            next = 1
+        }
+        amountText = String(next)
+    }
+
+    private func handleSubmit() {
+        guard let totalMinutes = parsedTotalMinutes else { return }
+        onCommit(totalMinutes)
+        dismiss()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L("prefs.networkRescan.customSheet.title"))
+                    .font(.headline)
+                Text(L("prefs.networkRescan.customSheet.message"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
+                TextField("", text: $amountText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13).monospacedDigit())
+                    .focused($isFieldFocused)
+                    .onSubmit {
+                        handleSubmit()
+                    }
+
+                Stepper("", onIncrement: {
+                    stepAmount(by: 1)
+                }, onDecrement: {
+                    stepAmount(by: -1)
+                })
+                .labelsHidden()
+                .fixedSize()
+
+                Picker("", selection: $unit) {
+                    ForEach(NetworkRescanIntervalUnit.allCases) { item in
+                        Text(item.label).tag(item)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(width: 96)
+            }
+
+            if showValidationHint {
+                Text(String(format: L("prefs.networkRescan.customSheet.invalidRange"), unit.maxValue))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+            }
+
+            HStack {
+                Spacer()
+                Button(L("prefs.excludePatterns.editor.cancel")) {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button(L("prefs.networkRescan.customSheet.apply")) {
+                    handleSubmit()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(parsedTotalMinutes == nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 340)
+        .onAppear {
+            isFieldFocused = true
+        }
+    }
+}
+
 // MARK: - Managed Volume Row
 private struct ManagedVolumeRow: View {
     let item: ManagedVolumeItem
@@ -705,10 +871,40 @@ private struct ManagedVolumeRow: View {
 
 // MARK: - Index Preferences Pane
 struct PreferencesIndexPane: View {
+    private static let customNetworkRescanTag = -1
+    static let networkRescanPresetMinutes: [Int] = [30, 60, 180, 360, 720, 1440, 4320, 10080, 43200]
+
+    static func networkRescanIntervalLabel(minutes: Int) -> String {
+        if minutes == 1440 {
+            return L("prefs.networkRescan.daySingular")
+        }
+        if minutes > 1440 && minutes % 1440 == 0 {
+            return String(format: L("prefs.networkRescan.days"), minutes / 1440)
+        }
+        if minutes == 60 {
+            return L("prefs.networkRescan.hourSingular")
+        }
+        if minutes >= 60 && minutes % 60 == 0 {
+            return String(format: L("prefs.networkRescan.hours"), minutes / 60)
+        }
+        return String(format: L("prefs.networkRescan.minutes"), minutes)
+    }
+
+    static func networkRescanCustomIntervalLabel(minutes: Int) -> String {
+        if minutes >= 1440 && minutes % 1440 == 0 {
+            return String(format: L("prefs.networkRescan.customDays"), minutes / 1440)
+        }
+        if minutes >= 60 && minutes % 60 == 0 {
+            return String(format: L("prefs.networkRescan.customHours"), minutes / 60)
+        }
+        return String(format: L("prefs.networkRescan.customMinutes"), minutes)
+    }
+
     @ObservedObject var viewModel: PreferencesViewModel
     @State private var isPresetsExpanded = false
     @State private var isPatternPresetsExpanded = false
     @State private var activeInputSheet: IndexInputSheetMode?
+    @State private var isCustomRescanSheetPresented = false
     @State private var pendingClearCachePath: String? = nil
 
     var body: some View {
@@ -841,21 +1037,47 @@ struct PreferencesIndexPane: View {
                         isOn: $viewModel.includeOfflineResults
                     )
 
-                    HStack(alignment: .center, spacing: 14) {
-                        SettingsRowLabel(
-                            L("prefs.networkRescan"),
-                            description: L("prefs.networkRescan.description")
-                        )
-                        Spacer(minLength: 12)
-                        SettingsNumberStepper(
-                            value: $viewModel.networkRescanMinutes,
-                            range: 0...120,
-                            step: 1,
-                            width: 82,
-                            unit: viewModel.networkRescanMinutes == 0
-                                ? L("prefs.networkRescan.off")
-                                : L("prefs.networkRescan.unit")
-                        )
+                    SettingsToggleRow(
+                        L("prefs.networkRescan"),
+                        description: L("prefs.networkRescan.description"),
+                        isOn: $viewModel.networkRescanEnabled.animation(.easeInOut(duration: 0.15))
+                    )
+
+                    if viewModel.networkRescanEnabled {
+                        HStack(alignment: .center, spacing: 14) {
+                            SettingsRowLabel(
+                                L("prefs.networkRescan.interval"),
+                                description: L("prefs.networkRescan.interval.description")
+                            )
+                            Spacer(minLength: 12)
+                            Picker("", selection: Binding(
+                                get: { viewModel.networkRescanMinutes },
+                                set: { newValue in
+                                    if newValue == Self.customNetworkRescanTag {
+                                        isCustomRescanSheetPresented = true
+                                    } else {
+                                        viewModel.networkRescanMinutes = newValue
+                                    }
+                                }
+                            )) {
+                                ForEach(Self.networkRescanPresetMinutes, id: \.self) { minutes in
+                                    Text(Self.networkRescanIntervalLabel(minutes: minutes))
+                                        .tag(minutes)
+                                }
+                                Divider()
+                                if !Self.networkRescanPresetMinutes.contains(viewModel.networkRescanMinutes) {
+                                    Text(Self.networkRescanCustomIntervalLabel(minutes: viewModel.networkRescanMinutes))
+                                        .tag(viewModel.networkRescanMinutes)
+                                }
+                                Text(L("prefs.networkRescan.customAction"))
+                                    .tag(Self.customNetworkRescanTag)
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .fixedSize()
+                        }
+                        .padding(.leading, 16)
+                        .padding(.vertical, 2)
                     }
                 } header: {
                     SettingsSectionHeader(
@@ -1035,6 +1257,11 @@ struct PreferencesIndexPane: View {
                 }
             }
             .formStyle(.grouped)
+            .sheet(isPresented: $isCustomRescanSheetPresented) {
+                CustomNetworkRescanSheet(initialMinutes: viewModel.networkRescanMinutes) { totalMinutes in
+                    viewModel.networkRescanMinutes = totalMinutes
+                }
+            }
 
             indexActionBar
         }

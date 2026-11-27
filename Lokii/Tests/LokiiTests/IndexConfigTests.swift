@@ -16,6 +16,7 @@ final class IndexConfigTests: XCTestCase {
             "include_hidden": false,
             "sensitive_names": [".ssh", ".vault"],
             "max_results": 200,
+            "network_rescan_enabled": true,
             "network_rescan_minutes": 15,
             "serial_scan_paths": ["/Volumes/ArchiveHDD"]
         }
@@ -28,6 +29,7 @@ final class IndexConfigTests: XCTestCase {
         XCTAssertEqual(config1.excludePaths, ["~/Library", "/System"])
         XCTAssertEqual(config1.sensitiveNames, [".ssh", ".vault"])
         XCTAssertEqual(config1.maxResults, 200)
+        XCTAssertTrue(config1.networkRescanEnabled)
         XCTAssertEqual(config1.networkRescanMinutes, 15)
         XCTAssertEqual(config1.serialScanPaths, ["/Volumes/ArchiveHDD"])
 
@@ -48,14 +50,45 @@ final class IndexConfigTests: XCTestCase {
         XCTAssertTrue(config2.includeHidden)
         XCTAssertTrue(config2.excludeSensitive)
         XCTAssertEqual(config2.sensitiveNames, LokiiConfig.IndexConfig.defaultSensitiveNames)
-        XCTAssertEqual(config2.networkRescanMinutes, 30)
+        XCTAssertFalse(config2.networkRescanEnabled)
+        XCTAssertEqual(config2.networkRescanMinutes, 1440)
 
         let encodedData = try JSONEncoder().encode(config1)
         let encodedJSON = String(data: encodedData, encoding: .utf8)!
         XCTAssertTrue(encodedJSON.contains("\"exclude_paths\":"))
+        XCTAssertTrue(encodedJSON.contains("\"network_rescan_enabled\":true"))
         XCTAssertTrue(encodedJSON.contains("\"network_rescan_minutes\":15"))
         XCTAssertTrue(encodedJSON.contains("\"serial_scan_paths\":"))
         XCTAssertEqual(config2.serialScanPaths, [])
+
+        // 遗留与边界兼容：0 分钟视为关闭并回填默认 24 小时；旧配置缺省开关时保持默认关闭并保留历史间隔
+        let legacyZero = try decoder.decode(
+            LokiiConfig.IndexConfig.self,
+            from: "{\"network_rescan_minutes\": 0}".data(using: .utf8)!
+        )
+        XCTAssertFalse(legacyZero.networkRescanEnabled)
+        XCTAssertEqual(legacyZero.networkRescanMinutes, 1440)
+
+        let legacyIntervalOnly = try decoder.decode(
+            LokiiConfig.IndexConfig.self,
+            from: "{\"network_rescan_minutes\": 30}".data(using: .utf8)!
+        )
+        XCTAssertFalse(legacyIntervalOnly.networkRescanEnabled)
+        XCTAssertEqual(legacyIntervalOnly.networkRescanMinutes, 30)
+
+        let enabledWithZero = try decoder.decode(
+            LokiiConfig.IndexConfig.self,
+            from: "{\"network_rescan_enabled\": true, \"network_rescan_minutes\": 0}".data(using: .utf8)!
+        )
+        XCTAssertFalse(enabledWithZero.networkRescanEnabled)
+        XCTAssertEqual(enabledWithZero.networkRescanMinutes, 1440)
+
+        let disabledCustom = try decoder.decode(
+            LokiiConfig.IndexConfig.self,
+            from: "{\"network_rescan_enabled\": false, \"network_rescan_minutes\": 360}".data(using: .utf8)!
+        )
+        XCTAssertFalse(disabledCustom.networkRescanEnabled)
+        XCTAssertEqual(disabledCustom.networkRescanMinutes, 360)
 
         let emptyData = "{}".data(using: .utf8)!
         let decodedIndex = try decoder.decode(LokiiConfig.IndexConfig.self, from: emptyData)
@@ -73,11 +106,46 @@ final class IndexConfigTests: XCTestCase {
         XCTAssertEqual(decodedIndex.maxResults, 500)
         XCTAssertEqual(defaultIndex.maxResults, 500)
         XCTAssertTrue(decodedIndex.excludeSensitive)
-        XCTAssertEqual(decodedIndex.networkRescanMinutes, 30)
+        XCTAssertFalse(decodedIndex.networkRescanEnabled)
+        XCTAssertFalse(defaultIndex.networkRescanEnabled)
+        XCTAssertEqual(decodedIndex.networkRescanMinutes, 1440)
+        XCTAssertEqual(defaultIndex.networkRescanMinutes, 1440)
         XCTAssertEqual(PreferencesViewModel.defaultIndexPaths, LokiiConfig.IndexConfig.defaultIndexPaths)
         XCTAssertEqual(PreferencesViewModel.defaultExcludePatterns, LokiiConfig.IndexConfig.defaultExclude)
         XCTAssertEqual(PreferencesViewModel.defaultExcludePaths, LokiiConfig.IndexConfig.defaultExcludePaths)
+        XCTAssertEqual(PreferencesViewModel.defaultNetworkRescanEnabled, LokiiConfig.IndexConfig.defaultNetworkRescanEnabled)
         XCTAssertEqual(PreferencesViewModel.defaultNetworkRescanMinutes, LokiiConfig.IndexConfig.defaultNetworkRescanMinutes)
+        XCTAssertTrue(PreferencesIndexPane.networkRescanPresetMinutes.contains(1440))
+        XCTAssertTrue(PreferencesIndexPane.networkRescanPresetMinutes.contains(4320))
+        XCTAssertTrue(PreferencesIndexPane.networkRescanPresetMinutes.contains(10080))
+        XCTAssertTrue(PreferencesIndexPane.networkRescanPresetMinutes.contains(43200))
+        XCTAssertFalse(PreferencesIndexPane.networkRescanIntervalLabel(minutes: 60).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanIntervalLabel(minutes: 1440).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanIntervalLabel(minutes: 4320).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanIntervalLabel(minutes: 10080).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanIntervalLabel(minutes: 43200).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanCustomIntervalLabel(minutes: 45).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanCustomIntervalLabel(minutes: 120).isEmpty)
+        XCTAssertFalse(PreferencesIndexPane.networkRescanCustomIntervalLabel(minutes: 2880).isEmpty)
+
+        // 自定义重扫间隔拆分与边界校验（1 分钟 ~ 365 天）
+        let d45 = NetworkRescanIntervalUnit.decompose(minutes: 45)
+        XCTAssertEqual(d45.amount, 45)
+        XCTAssertEqual(d45.unit, .minutes)
+        let d120 = NetworkRescanIntervalUnit.decompose(minutes: 120)
+        XCTAssertEqual(d120.amount, 2)
+        XCTAssertEqual(d120.unit, .hours)
+        let d4320 = NetworkRescanIntervalUnit.decompose(minutes: 4320)
+        XCTAssertEqual(d4320.amount, 3)
+        XCTAssertEqual(d4320.unit, .days)
+
+        XCTAssertEqual(NetworkRescanIntervalUnit.parseTotalMinutes(text: "45", unit: .minutes), 45)
+        XCTAssertEqual(NetworkRescanIntervalUnit.parseTotalMinutes(text: " 12 ", unit: .hours), 720)
+        XCTAssertEqual(NetworkRescanIntervalUnit.parseTotalMinutes(text: "365", unit: .days), 525_600)
+        XCTAssertNil(NetworkRescanIntervalUnit.parseTotalMinutes(text: "0", unit: .minutes))
+        XCTAssertNil(NetworkRescanIntervalUnit.parseTotalMinutes(text: "-5", unit: .hours))
+        XCTAssertNil(NetworkRescanIntervalUnit.parseTotalMinutes(text: "366", unit: .days))
+        XCTAssertNil(NetworkRescanIntervalUnit.parseTotalMinutes(text: "abc", unit: .days))
 
         let decodedWindow = try decoder.decode(LokiiConfig.WindowConfig.self, from: emptyData)
         let defaultWindow = LokiiConfig.WindowConfig()
@@ -295,6 +363,23 @@ final class IndexConfigTests: XCTestCase {
 
         // 1. 未修改时无需重建
         XCTAssertFalse(viewModel.pendingSaveRequiresRebuild)
+
+        // 1b. 切换网络卷定时重扫开关/间隔：标脏且不触发主索引重建，放弃更改可恢复
+        let initialEnabled = viewModel.networkRescanEnabled
+        let initialMinutes = viewModel.networkRescanMinutes
+        viewModel.networkRescanEnabled = !initialEnabled
+        viewModel.networkRescanMinutes = initialMinutes == 360 ? 720 : 360
+        XCTAssertTrue(viewModel.isIndexDirty)
+        XCTAssertFalse(viewModel.pendingSaveRequiresRebuild)
+        XCTAssertEqual(viewModel.draftIndexConfig(base: saved).index.networkRescanEnabled, !initialEnabled)
+        XCTAssertEqual(
+            viewModel.draftIndexConfig(base: saved).index.networkRescanMinutes,
+            initialMinutes == 360 ? 720 : 360
+        )
+        viewModel.discardIndexChanges()
+        XCTAssertFalse(viewModel.isIndexDirty)
+        XCTAssertEqual(viewModel.networkRescanEnabled, initialEnabled)
+        XCTAssertEqual(viewModel.networkRescanMinutes, initialMinutes)
 
         // 2. 纯收窄（新增排除路径）-> Rust 返回 PruneOnly -> pendingSaveRequiresRebuild == false
         viewModel.excludePaths.append("/tmp/__lokii_swift_test_narrow__")
