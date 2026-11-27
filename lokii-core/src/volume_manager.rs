@@ -904,19 +904,20 @@ impl VolumeCoordinator {
                         }
                     }
 
-                    let (cfg_changed, rescan_minutes, cfg_opt) = {
+                    let (cfg_changed, rescan_enabled, rescan_minutes, cfg_opt) = {
                         let guard = config_store.read();
+                        let rescan_enabled = guard.index.network_rescan_enabled;
                         let rescan_mins = guard.index.network_rescan_minutes;
                         if last_index_cfg.as_ref() == Some(&guard.index) {
-                            (false, rescan_mins, None)
+                            (false, rescan_enabled, rescan_mins, None)
                         } else {
                             let inner_guard = inner.read();
                             if inner_guard.config.index == guard.index {
                                 // 已由前序 on_config_updated 完成对账，仅同步本地游标避免重复全量对账
                                 last_index_cfg = Some(guard.index.clone());
-                                (false, rescan_mins, None)
+                                (false, rescan_enabled, rescan_mins, None)
                             } else {
-                                (true, rescan_mins, Some(guard.clone()))
+                                (true, rescan_enabled, rescan_mins, Some(guard.clone()))
                             }
                         }
                     };
@@ -982,9 +983,10 @@ impl VolumeCoordinator {
                         }
                     }
 
-                    // Periodic rescan for online network volumes when configured.
-                    if rescan_minutes > 0 {
-                        let base_interval = Duration::from_secs(rescan_minutes * 60);
+                    // Periodic rescan for online network volumes when explicitly enabled.
+                    if let Some(base_interval) =
+                        effective_network_rescan_interval(rescan_enabled, rescan_minutes)
+                    {
                         let now_unix = current_unix_secs();
                         let any_due = {
                             let guard = inner.read();
@@ -4454,6 +4456,14 @@ fn is_under_hidden_dir(root: &Path, path: &Path) -> bool {
     })
 }
 
+/// 将用户配置的开关与分钟数换算为周期重扫基础间隔；关闭或非正值返回 `None`，并使用饱和乘法防止极端手工配置溢出。
+fn effective_network_rescan_interval(enabled: bool, minutes: u64) -> Option<Duration> {
+    if !enabled || minutes == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(minutes.saturating_mul(60)))
+}
+
 /// 判断在线网络卷是否到达周期重扫时机：仅允许干净 `Online` 且无待确认原因的网络卷触发，
 /// 在用户配置间隔基础上引入上次扫描耗时 5 倍的自适应冷却（上限 6 小时）。
 fn network_slot_rescan_due(slot: &VolumeSlot, base_interval: Duration, now_unix: u64) -> bool {
@@ -6389,6 +6399,18 @@ mod tests {
         assert!(!network_slot_rescan_due(&slot, Duration::from_secs(60), now_unix));
         slot.state = VolumeState::NeedsConfirmation;
         assert!(!network_slot_rescan_due(&slot, Duration::from_secs(60), now_unix));
+
+        // 开关关闭或间隔为 0 时一律不调度周期重扫；超大分钟数使用饱和乘法避免溢出
+        assert_eq!(effective_network_rescan_interval(false, 1440), None);
+        assert_eq!(effective_network_rescan_interval(true, 0), None);
+        assert_eq!(
+            effective_network_rescan_interval(true, 1440),
+            Some(Duration::from_secs(24 * 3600))
+        );
+        assert_eq!(
+            effective_network_rescan_interval(true, u64::MAX),
+            Some(Duration::from_secs(u64::MAX))
+        );
     }
 
     #[test]

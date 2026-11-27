@@ -1627,12 +1627,13 @@ public struct FfiIndexConfig {
     public var excludeSensitive: Bool
     public var sensitiveNames: [String]
     public var maxResults: UInt64
+    public var networkRescanEnabled: Bool
     public var networkRescanMinutes: UInt64
     public var serialScanPaths: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(indexPaths: [String], indexApps: Bool, exclude: [String], excludePaths: [String], includeHidden: Bool, excludeSensitive: Bool, sensitiveNames: [String], maxResults: UInt64, networkRescanMinutes: UInt64, serialScanPaths: [String]) {
+    public init(indexPaths: [String], indexApps: Bool, exclude: [String], excludePaths: [String], includeHidden: Bool, excludeSensitive: Bool, sensitiveNames: [String], maxResults: UInt64, networkRescanEnabled: Bool, networkRescanMinutes: UInt64, serialScanPaths: [String]) {
         self.indexPaths = indexPaths
         self.indexApps = indexApps
         self.exclude = exclude
@@ -1641,6 +1642,7 @@ public struct FfiIndexConfig {
         self.excludeSensitive = excludeSensitive
         self.sensitiveNames = sensitiveNames
         self.maxResults = maxResults
+        self.networkRescanEnabled = networkRescanEnabled
         self.networkRescanMinutes = networkRescanMinutes
         self.serialScanPaths = serialScanPaths
     }
@@ -1677,6 +1679,9 @@ extension FfiIndexConfig: Equatable, Hashable {
         if lhs.maxResults != rhs.maxResults {
             return false
         }
+        if lhs.networkRescanEnabled != rhs.networkRescanEnabled {
+            return false
+        }
         if lhs.networkRescanMinutes != rhs.networkRescanMinutes {
             return false
         }
@@ -1695,6 +1700,7 @@ extension FfiIndexConfig: Equatable, Hashable {
         hasher.combine(excludeSensitive)
         hasher.combine(sensitiveNames)
         hasher.combine(maxResults)
+        hasher.combine(networkRescanEnabled)
         hasher.combine(networkRescanMinutes)
         hasher.combine(serialScanPaths)
     }
@@ -1717,6 +1723,7 @@ public struct FfiConverterTypeFfiIndexConfig: FfiConverterRustBuffer {
                 excludeSensitive: FfiConverterBool.read(from: &buf), 
                 sensitiveNames: FfiConverterSequenceString.read(from: &buf), 
                 maxResults: FfiConverterUInt64.read(from: &buf), 
+                networkRescanEnabled: FfiConverterBool.read(from: &buf), 
                 networkRescanMinutes: FfiConverterUInt64.read(from: &buf), 
                 serialScanPaths: FfiConverterSequenceString.read(from: &buf)
         )
@@ -1731,6 +1738,7 @@ public struct FfiConverterTypeFfiIndexConfig: FfiConverterRustBuffer {
         FfiConverterBool.write(value.excludeSensitive, into: &buf)
         FfiConverterSequenceString.write(value.sensitiveNames, into: &buf)
         FfiConverterUInt64.write(value.maxResults, into: &buf)
+        FfiConverterBool.write(value.networkRescanEnabled, into: &buf)
         FfiConverterUInt64.write(value.networkRescanMinutes, into: &buf)
         FfiConverterSequenceString.write(value.serialScanPaths, into: &buf)
     }

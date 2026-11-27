@@ -42,6 +42,7 @@ struct LokiiConfig: Codable {
                 excludeSensitive: raw.index.excludeSensitive,
                 sensitiveNames: raw.index.sensitiveNames,
                 maxResults: Int(raw.index.maxResults),
+                networkRescanEnabled: raw.index.networkRescanEnabled,
                 networkRescanMinutes: Int(raw.index.networkRescanMinutes),
                 serialScanPaths: raw.index.serialScanPaths
             ),
@@ -115,6 +116,7 @@ struct LokiiConfig: Codable {
         var excludeSensitive: Bool
         var sensitiveNames: [String]
         var maxResults: Int
+        var networkRescanEnabled: Bool
         var networkRescanMinutes: Int
         var serialScanPaths: [String]
 
@@ -127,6 +129,7 @@ struct LokiiConfig: Codable {
             case excludeSensitive = "exclude_sensitive"
             case sensitiveNames = "sensitive_names"
             case maxResults = "max_results"
+            case networkRescanEnabled = "network_rescan_enabled"
             case networkRescanMinutes = "network_rescan_minutes"
             case serialScanPaths = "serial_scan_paths"
         }
@@ -136,6 +139,7 @@ struct LokiiConfig: Codable {
         static var defaultExcludePaths: [String] { LokiiConfig.defaultConfig.index.excludePaths }
         static var defaultSensitiveNames: [String] { LokiiConfig.defaultConfig.index.sensitiveNames }
         static var defaultMaxResults: Int { LokiiConfig.defaultConfig.index.maxResults }
+        static var defaultNetworkRescanEnabled: Bool { LokiiConfig.defaultConfig.index.networkRescanEnabled }
         static var defaultNetworkRescanMinutes: Int { LokiiConfig.defaultConfig.index.networkRescanMinutes }
         static var defaultSerialScanPaths: [String] { LokiiConfig.defaultConfig.index.serialScanPaths }
 
@@ -148,12 +152,13 @@ struct LokiiConfig: Codable {
             excludeSensitive: Bool? = nil,
             sensitiveNames: [String]? = nil,
             maxResults: Int? = nil,
+            networkRescanEnabled: Bool? = nil,
             networkRescanMinutes: Int? = nil,
             serialScanPaths: [String]? = nil
         ) {
             if let indexPaths, let indexApps, let exclude, let excludePaths,
                let includeHidden, let excludeSensitive, let sensitiveNames,
-               let maxResults, let networkRescanMinutes, let serialScanPaths {
+               let maxResults, let networkRescanEnabled, let networkRescanMinutes, let serialScanPaths {
                 self.indexPaths = indexPaths
                 self.indexApps = indexApps
                 self.exclude = exclude
@@ -162,6 +167,7 @@ struct LokiiConfig: Codable {
                 self.excludeSensitive = excludeSensitive
                 self.sensitiveNames = sensitiveNames
                 self.maxResults = maxResults
+                self.networkRescanEnabled = networkRescanEnabled
                 self.networkRescanMinutes = networkRescanMinutes
                 self.serialScanPaths = serialScanPaths
             } else {
@@ -174,6 +180,7 @@ struct LokiiConfig: Codable {
                 self.excludeSensitive = excludeSensitive ?? defaults.excludeSensitive
                 self.sensitiveNames = sensitiveNames ?? defaults.sensitiveNames
                 self.maxResults = maxResults ?? defaults.maxResults
+                self.networkRescanEnabled = networkRescanEnabled ?? defaults.networkRescanEnabled
                 self.networkRescanMinutes = networkRescanMinutes ?? defaults.networkRescanMinutes
                 self.serialScanPaths = serialScanPaths ?? defaults.serialScanPaths
             }
@@ -190,7 +197,15 @@ struct LokiiConfig: Codable {
             self.excludeSensitive = try container.decodeIfPresent(Bool.self, forKey: .excludeSensitive) ?? defaults.excludeSensitive
             self.sensitiveNames = try container.decodeIfPresent([String].self, forKey: .sensitiveNames) ?? defaults.sensitiveNames
             self.maxResults = try container.decodeIfPresent(Int.self, forKey: .maxResults) ?? defaults.maxResults
-            self.networkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes) ?? defaults.networkRescanMinutes
+            let rawNetworkRescanEnabled = try container.decodeIfPresent(Bool.self, forKey: .networkRescanEnabled)
+            let rawNetworkRescanMinutes = try container.decodeIfPresent(Int.self, forKey: .networkRescanMinutes)
+            if let rawNetworkRescanMinutes, rawNetworkRescanMinutes <= 0 {
+                self.networkRescanEnabled = false
+                self.networkRescanMinutes = defaults.networkRescanMinutes
+            } else {
+                self.networkRescanEnabled = rawNetworkRescanEnabled ?? defaults.networkRescanEnabled
+                self.networkRescanMinutes = rawNetworkRescanMinutes ?? defaults.networkRescanMinutes
+            }
             self.serialScanPaths = try container.decodeIfPresent([String].self, forKey: .serialScanPaths) ?? defaults.serialScanPaths
         }
     }

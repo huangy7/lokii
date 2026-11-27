@@ -128,6 +128,7 @@ pub struct FfiIndexConfig {
     pub exclude_sensitive: bool,
     pub sensitive_names: Vec<String>,
     pub max_results: u64,
+    pub network_rescan_enabled: bool,
     pub network_rescan_minutes: u64,
     pub serial_scan_paths: Vec<String>,
 }
@@ -1509,6 +1510,7 @@ pub fn default_app_config() -> FfiAppConfig {
             exclude_sensitive: cfg.index.exclude_sensitive,
             sensitive_names: cfg.index.sensitive_names,
             max_results: cfg.index.max_results as u64,
+            network_rescan_enabled: cfg.index.network_rescan_enabled,
             network_rescan_minutes: cfg.index.network_rescan_minutes,
             serial_scan_paths: cfg.index.serial_scan_paths,
         },
@@ -1652,6 +1654,10 @@ mod tests {
         assert_eq!(ffi_cfg.index.exclude_sensitive, expected.index.exclude_sensitive);
         assert_eq!(ffi_cfg.index.sensitive_names, expected.index.sensitive_names);
         assert_eq!(ffi_cfg.index.max_results, expected.index.max_results as u64);
+        assert_eq!(
+            ffi_cfg.index.network_rescan_enabled,
+            expected.index.network_rescan_enabled
+        );
         assert_eq!(ffi_cfg.index.network_rescan_minutes, expected.index.network_rescan_minutes);
         assert_eq!(ffi_cfg.index.serial_scan_paths, expected.index.serial_scan_paths);
         assert_eq!(ffi_cfg.window.hide_on_blur, expected.window.hide_on_blur);
@@ -1894,6 +1900,25 @@ mod tests {
             !merged.index.exclude_paths.is_empty(),
             "同一节里未被提及的字段不受影响"
         );
+    }
+
+    #[test]
+    fn config_patch_preserves_and_normalizes_network_rescan_fields() {
+        let mut base = AppConfig::default();
+        base.index.network_rescan_enabled = true;
+        base.index.network_rescan_minutes = 360;
+
+        // 仅关闭开关时保留原有间隔
+        let disabled = merge_config_patch(&base, r#"{ "index": { "network_rescan_enabled": false } }"#)
+            .expect("disable patch should merge");
+        assert!(!disabled.index.network_rescan_enabled);
+        assert_eq!(disabled.index.network_rescan_minutes, 360);
+
+        // 遗留补丁以 0 分钟表示关闭：统一关闭并回填默认 24 小时
+        let legacy_zero = merge_config_patch(&base, r#"{ "index": { "network_rescan_minutes": 0 } }"#)
+            .expect("legacy zero patch should merge");
+        assert!(!legacy_zero.index.network_rescan_enabled);
+        assert_eq!(legacy_zero.index.network_rescan_minutes, 1440);
     }
 
     /// 非法补丁必须被拒绝，而不是回退成一份默认配置覆盖用户设置

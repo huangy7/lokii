@@ -596,7 +596,8 @@ mod tests {
             exclude_sensitive: true,
             sensitive_names: AppConfig::default().index.sensitive_names,
             max_results: 500,
-            network_rescan_minutes: 5,
+            network_rescan_enabled: false,
+            network_rescan_minutes: 1440,
             serial_scan_paths: vec![],
         };
         CompiledFilter::from_config(&config)
@@ -996,7 +997,8 @@ mod tests {
                 exclude_sensitive,
                 sensitive_names: AppConfig::default().index.sensitive_names,
                 max_results: 500,
-                network_rescan_minutes: 5,
+                network_rescan_enabled: false,
+                network_rescan_minutes: 1440,
                 serial_scan_paths: vec![],
             };
             CompiledFilter::from_config(&config)

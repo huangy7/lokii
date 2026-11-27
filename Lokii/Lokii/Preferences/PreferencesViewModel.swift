@@ -451,7 +451,13 @@ class PreferencesViewModel: ObservableObject {
             recomputePendingSaveRequiresRebuild()
         }
     }
-    @Published var networkRescanMinutes: Int = 30 {
+    @Published var networkRescanEnabled: Bool = LokiiConfig.IndexConfig.defaultNetworkRescanEnabled {
+        didSet {
+            guard !isLoading else { return }
+            recomputePendingSaveRequiresRebuild()
+        }
+    }
+    @Published var networkRescanMinutes: Int = LokiiConfig.IndexConfig.defaultNetworkRescanMinutes {
         didSet {
             guard !isLoading else { return }
             recomputePendingSaveRequiresRebuild()
@@ -501,7 +507,8 @@ class PreferencesViewModel: ObservableObject {
     @Published var savedExcludeSensitive: Bool = true
     private var sensitiveNames: [String] = LokiiConfig.IndexConfig.defaultSensitiveNames
     private var serialScanPaths: [String] = LokiiConfig.IndexConfig.defaultSerialScanPaths
-    @Published var savedNetworkRescanMinutes: Int = 30
+    @Published var savedNetworkRescanEnabled: Bool = LokiiConfig.IndexConfig.defaultNetworkRescanEnabled
+    @Published var savedNetworkRescanMinutes: Int = LokiiConfig.IndexConfig.defaultNetworkRescanMinutes
 
     @Published var hasFullDiskAccess: Bool = false
     @Published var selectedTab: String = "general"
@@ -1166,6 +1173,7 @@ class PreferencesViewModel: ObservableObject {
         self.excludePaths = config.index.excludePaths
         self.includeHidden = config.index.includeHidden
         self.excludeSensitive = config.index.excludeSensitive
+        self.networkRescanEnabled = config.index.networkRescanEnabled
         self.networkRescanMinutes = config.index.networkRescanMinutes
 
         self.savedIndexPaths = config.index.indexPaths
@@ -1176,6 +1184,7 @@ class PreferencesViewModel: ObservableObject {
         self.savedExcludeSensitive = config.index.excludeSensitive
         self.sensitiveNames = config.index.sensitiveNames
         self.serialScanPaths = config.index.serialScanPaths
+        self.savedNetworkRescanEnabled = config.index.networkRescanEnabled
         self.savedNetworkRescanMinutes = config.index.networkRescanMinutes
         self.includeOfflineResults = engine.includeOfflineResults
         isLoading = false
@@ -1205,6 +1214,7 @@ class PreferencesViewModel: ObservableObject {
                 excludeSensitive: savedExcludeSensitive,
                 sensitiveNames: sensitiveNames,
                 maxResults: maxResults,
+                networkRescanEnabled: savedNetworkRescanEnabled,
                 networkRescanMinutes: savedNetworkRescanMinutes,
                 serialScanPaths: serialScanPaths
             ),
@@ -1233,6 +1243,7 @@ class PreferencesViewModel: ObservableObject {
                 excludeSensitive: excludeSensitive,
                 sensitiveNames: sensitiveNames,
                 maxResults: maxResults,
+                networkRescanEnabled: networkRescanEnabled,
                 networkRescanMinutes: networkRescanMinutes,
                 serialScanPaths: serialScanPaths
             ),
@@ -1247,6 +1258,7 @@ class PreferencesViewModel: ObservableObject {
         config.index.excludePaths = excludePaths
         config.index.includeHidden = includeHidden
         config.index.excludeSensitive = excludeSensitive
+        config.index.networkRescanEnabled = networkRescanEnabled
         config.index.networkRescanMinutes = networkRescanMinutes
         return config
     }
@@ -1258,6 +1270,7 @@ class PreferencesViewModel: ObservableObject {
         excludePaths != savedExcludePaths ||
         includeHidden != savedIncludeHidden ||
         excludeSensitive != savedExcludeSensitive ||
+        networkRescanEnabled != savedNetworkRescanEnabled ||
         networkRescanMinutes != savedNetworkRescanMinutes
     }
 
@@ -1318,6 +1331,7 @@ class PreferencesViewModel: ObservableObject {
             savedExcludePaths = excludePaths
             savedIncludeHidden = includeHidden
             savedExcludeSensitive = excludeSensitive
+            savedNetworkRescanEnabled = networkRescanEnabled
             savedNetworkRescanMinutes = networkRescanMinutes
             recomputePendingSaveRequiresRebuild()
             if needsRebuild {
@@ -1339,6 +1353,7 @@ class PreferencesViewModel: ObservableObject {
         excludePaths = savedExcludePaths
         includeHidden = savedIncludeHidden
         excludeSensitive = savedExcludeSensitive
+        networkRescanEnabled = savedNetworkRescanEnabled
         networkRescanMinutes = savedNetworkRescanMinutes
         isLoading = wasLoading
         refreshLocalPathChecks()
@@ -1355,6 +1370,7 @@ class PreferencesViewModel: ObservableObject {
         excludePaths = defaults.excludePaths
         includeHidden = defaults.includeHidden
         excludeSensitive = defaults.excludeSensitive
+        networkRescanEnabled = defaults.networkRescanEnabled
         networkRescanMinutes = defaults.networkRescanMinutes
         isLoading = wasLoading
         refreshLocalPathChecks()
@@ -1379,6 +1395,7 @@ class PreferencesViewModel: ObservableObject {
 
     /// 索引配置的出厂默认值，直接透传自 Rust `AppConfig::default()` 单一来源。
     static var defaultIndexPaths: [String] { LokiiConfig.IndexConfig.defaultIndexPaths }
+    static var defaultNetworkRescanEnabled: Bool { LokiiConfig.IndexConfig.defaultNetworkRescanEnabled }
     static var defaultNetworkRescanMinutes: Int { LokiiConfig.IndexConfig.defaultNetworkRescanMinutes }
     static var defaultExcludePatterns: [String] { LokiiConfig.IndexConfig.defaultExclude }
     static var defaultExcludePaths: [String] { LokiiConfig.IndexConfig.defaultExcludePaths }
@@ -1407,6 +1424,7 @@ class PreferencesViewModel: ObservableObject {
             excludePaths == defaults.excludePaths &&
             includeHidden == defaults.includeHidden &&
             excludeSensitive == defaults.excludeSensitive &&
+            networkRescanEnabled == defaults.networkRescanEnabled &&
             networkRescanMinutes == defaults.networkRescanMinutes
     }
 }
