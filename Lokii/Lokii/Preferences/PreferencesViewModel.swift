@@ -305,9 +305,20 @@ struct ManagedVolumeItem: Identifiable, Equatable {
 class PreferencesViewModel: ObservableObject {
     let engine: SearchEngine
 
-    @Published var showInDock: Bool = true {
+    @Published var dockIconMode: LokiiConfig.DockIconMode = .whenOpen {
         didSet {
             saveGeneralConfig()
+        }
+    }
+
+    var dockIconModeDescription: String {
+        switch dockIconMode {
+        case .always:
+            return L("prefs.dockIconMode.description.always")
+        case .whenOpen:
+            return L("prefs.dockIconMode.description.whenOpen")
+        case .never:
+            return L("prefs.dockIconMode.description.never")
         }
     }
 
@@ -1142,7 +1153,7 @@ class PreferencesViewModel: ObservableObject {
         isLoading = true
         self.hideOnBlur = config.window.hideOnBlur
         self.rememberPosition = config.window.rememberPosition
-        self.showInDock = config.general.showInDock
+        self.dockIconMode = config.general.dockIconMode
         self.hideResultsWhenEmpty = config.general.hideResultsWhenEmpty
         self.maxResults = config.index.maxResults
         self.language = config.general.language
@@ -1181,7 +1192,7 @@ class PreferencesViewModel: ObservableObject {
         _ = engine.updateConfig(LokiiConfig(
             general: .init(
                 language: language,
-                showInDock: showInDock,
+                dockIconMode: dockIconMode,
                 terminalBundleId: terminalBundleId,
                 hideResultsWhenEmpty: hideResultsWhenEmpty
             ),
@@ -1209,7 +1220,7 @@ class PreferencesViewModel: ObservableObject {
         var config = base ?? LokiiConfig(
             general: .init(
                 language: language,
-                showInDock: showInDock,
+                dockIconMode: dockIconMode,
                 terminalBundleId: terminalBundleId,
                 hideResultsWhenEmpty: hideResultsWhenEmpty
             ),

@@ -13,14 +13,27 @@ pub(crate) const APP_INDEX_ROOTS: [&str; 3] = [
     "/System/Cryptexes/App/System/Applications",
 ];
 
+/// macOS 程序坞（Dock）图标显示策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockIconMode {
+    /// 始终在程序坞常驻图标。
+    Always,
+    /// 仅在存在可见或最小化窗口时显示图标，所有窗口隐藏或关闭后自动切入菜单栏常驻。
+    #[default]
+    WhenOpen,
+    /// 从不在程序坞显示图标，纯菜单栏与全局快捷键常驻。
+    Never,
+}
+
 /// General application settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "GeneralConfigWire")]
 pub struct GeneralConfig {
     /// UI language: "zh-Hans" (default) or "en".
     pub language: String,
-    /// Whether to show the application icon in the macOS Dock.
-    pub show_in_dock: bool,
+    /// macOS Dock icon visibility policy.
+    pub dock_icon_mode: DockIconMode,
     /// Preferred terminal application bundle identifier (e.g. "com.googlecode.iterm2")
     /// or absolute application bundle path. Defaults to "com.apple.Terminal".
     pub terminal_bundle_id: String,
@@ -28,11 +41,52 @@ pub struct GeneralConfig {
     pub hide_results_when_empty: bool,
 }
 
+/// 兼容遗留 `show_in_dock` 布尔键的过渡反序列化视图：
+/// 序列化时仅输出规范字段 `dock_icon_mode`，避免配置文件残留冲突双键。
+#[derive(Deserialize)]
+#[serde(default)]
+struct GeneralConfigWire {
+    language: String,
+    dock_icon_mode: Option<DockIconMode>,
+    show_in_dock: Option<bool>,
+    terminal_bundle_id: String,
+    hide_results_when_empty: bool,
+}
+
+impl Default for GeneralConfigWire {
+    fn default() -> Self {
+        let defaults = GeneralConfig::default();
+        Self {
+            language: defaults.language,
+            dock_icon_mode: None,
+            show_in_dock: None,
+            terminal_bundle_id: defaults.terminal_bundle_id,
+            hide_results_when_empty: defaults.hide_results_when_empty,
+        }
+    }
+}
+
+impl From<GeneralConfigWire> for GeneralConfig {
+    fn from(wire: GeneralConfigWire) -> Self {
+        let dock_icon_mode = wire.dock_icon_mode.unwrap_or_else(|| match wire.show_in_dock {
+            Some(true) => DockIconMode::Always,
+            Some(false) => DockIconMode::Never,
+            None => DockIconMode::default(),
+        });
+        Self {
+            language: wire.language,
+            dock_icon_mode,
+            terminal_bundle_id: wire.terminal_bundle_id,
+            hide_results_when_empty: wire.hide_results_when_empty,
+        }
+    }
+}
+
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             language: "zh-Hans".to_string(),
-            show_in_dock: true,
+            dock_icon_mode: DockIconMode::WhenOpen,
             terminal_bundle_id: "com.apple.Terminal".to_string(),
             hide_results_when_empty: true,
         }
@@ -379,8 +433,8 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Lokii 配置文件
 # 界面语言: "zh-Hans", "en"
 language = "zh-Hans"
 
-# 是否在程序坞中显示图标
-show_in_dock = true
+# 程序坞图标显示策略: "always"（始终）, "when_open"（仅窗口打开时）, "never"（从不）
+dock_icon_mode = "when_open"
 
 # 未输入搜索词时是否隐藏默认文件列表
 hide_results_when_empty = true
@@ -826,7 +880,7 @@ toggle_window = "Cmd+Alt+F"
 "#;
         let config = AppConfig::from_toml(toml_str).expect("parse failed");
         assert_eq!(config.general.language, "en");
-        assert!(!config.general.show_in_dock);
+        assert_eq!(config.general.dock_icon_mode, DockIconMode::Never);
         assert_eq!(
             config.index.index_paths,
             vec!["/Users/test", "~/Documents"]
@@ -845,22 +899,38 @@ toggle_window = "Cmd+Alt+F"
     fn test_general_config_defaults() {
         let config = GeneralConfig::default();
         assert_eq!(config.language, "zh-Hans");
-        assert!(config.show_in_dock);
+        assert_eq!(config.dock_icon_mode, DockIconMode::WhenOpen);
         assert_eq!(config.terminal_bundle_id, "com.apple.Terminal");
     }
 
     #[test]
     fn test_general_config_backward_compatibility() {
-        // 边界守卫与向后兼容：验证缺失 terminal_bundle_id 键的历史配置能优雅回退至默认系统终端
+        // 边界守卫与向后兼容：验证遗留 show_in_dock 布尔键能无损迁移至三态 dock_icon_mode，
+        // 且缺失 terminal_bundle_id 时优雅回退至默认系统终端
         let json_legacy = r#"{"language":"en","show_in_dock":false}"#;
         let config_json: GeneralConfig = serde_json::from_str(json_legacy).expect("反序列化遗留 JSON 失败");
         assert_eq!(config_json.language, "en");
-        assert!(!config_json.show_in_dock);
+        assert_eq!(config_json.dock_icon_mode, DockIconMode::Never);
         assert_eq!(config_json.terminal_bundle_id, "com.apple.Terminal");
 
         let toml_legacy = "language = \"zh-Hans\"\nshow_in_dock = true\n";
         let config_toml: GeneralConfig = toml::from_str(toml_legacy).expect("反序列化遗留 TOML 失败");
+        assert_eq!(config_toml.dock_icon_mode, DockIconMode::Always);
         assert_eq!(config_toml.terminal_bundle_id, "com.apple.Terminal");
+
+        // 新旧字段并存时以显式 dock_icon_mode 为准
+        let toml_dual = "dock_icon_mode = \"when_open\"\nshow_in_dock = false\n";
+        let config_dual: GeneralConfig = toml::from_str(toml_dual).expect("反序列化双键 TOML 失败");
+        assert_eq!(config_dual.dock_icon_mode, DockIconMode::WhenOpen);
+
+        // 序列化仅写出规范字段 dock_icon_mode，不再输出遗留 show_in_dock
+        let serialized_toml = toml::to_string(&config_dual).expect("序列化 TOML 失败");
+        assert!(serialized_toml.contains("dock_icon_mode = \"when_open\""));
+        assert!(!serialized_toml.contains("show_in_dock"));
+
+        let serialized_json = serde_json::to_string(&config_dual).expect("序列化 JSON 失败");
+        assert!(serialized_json.contains("\"dock_icon_mode\":\"when_open\""));
+        assert!(!serialized_json.contains("show_in_dock"));
     }
 
     #[test]
@@ -1000,7 +1070,8 @@ max_results = 200
         assert!(DEFAULT_CONFIG_TOML.contains("[window]"));
         assert!(DEFAULT_CONFIG_TOML.contains("[shortcut]"));
         assert!(DEFAULT_CONFIG_TOML.contains("[general]"));
-        assert!(DEFAULT_CONFIG_TOML.contains("show_in_dock = true"));
+        assert!(DEFAULT_CONFIG_TOML.contains(r#"dock_icon_mode = "when_open""#));
+        assert!(!DEFAULT_CONFIG_TOML.contains("show_in_dock"));
         assert!(DEFAULT_CONFIG_TOML.contains("Cmd+Shift+Space"));
         assert!(DEFAULT_CONFIG_TOML.contains(r#"index_paths = ["~"]"#));
         assert!(DEFAULT_CONFIG_TOML.contains("index_apps = false"));
@@ -1065,7 +1136,7 @@ max_results = 200
         let json = serde_json::to_string_pretty(&original).expect("serialize");
         let restored: AppConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.general.language, original.general.language);
-        assert_eq!(restored.general.show_in_dock, original.general.show_in_dock);
+        assert_eq!(restored.general.dock_icon_mode, original.general.dock_icon_mode);
         assert_eq!(restored.index.max_results, original.index.max_results);
         assert_eq!(restored.index.index_paths, original.index.index_paths);
         assert_eq!(restored.index.include_hidden, original.index.include_hidden);
@@ -1079,7 +1150,7 @@ max_results = 200
     #[test]
     fn test_config_json_custom_values_round_trip() {
         let mut config = AppConfig::default();
-        config.general.show_in_dock = false;
+        config.general.dock_icon_mode = DockIconMode::Never;
         config.index.max_results = 1000;
         config.index.include_hidden = false;
         config.window.hide_on_blur = false;
@@ -1088,7 +1159,7 @@ max_results = 200
         assert_eq!(restored.index.max_results, 1000);
         assert!(!restored.index.include_hidden);
         assert!(!restored.window.hide_on_blur);
-        assert!(!restored.general.show_in_dock);
+        assert_eq!(restored.general.dock_icon_mode, DockIconMode::Never);
     }
 
     #[test]
@@ -1141,6 +1212,7 @@ show_in_dock = true
 "#;
         let legacy = AppConfig::from_toml(legacy_toml).expect("legacy toml must parse");
         assert!(legacy.general.hide_results_when_empty);
+        assert_eq!(legacy.general.dock_icon_mode, DockIconMode::Always);
 
         let disabled_toml = r#"
 [general]

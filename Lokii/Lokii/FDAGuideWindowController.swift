@@ -3,6 +3,8 @@ import SwiftUI
 
 final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
     static var current: FDAGuideWindowController?
+    /// 权限引导窗口呈现前的回调钩子，用于在需要时提前升格应用激活策略。
+    static var onWillShow: (() -> Void)?
 
     /// “不再提示”标记的持久化键；引导窗、视图与应用代理共用同一份定义，避免字面量拼写漂移
     static let promptDismissedKey = "FDAPromptDismissed"
@@ -23,6 +25,7 @@ final class FDAGuideWindowController: NSWindowController, NSWindowDelegate {
     }
 
     static func show() {
+        onWillShow?()
         if let existing = current, existing.window?.isVisible == true {
             existing.window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)

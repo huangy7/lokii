@@ -87,19 +87,24 @@ final class IndexConfigTests: XCTestCase {
         XCTAssertFalse(defaultWindow.rememberPosition)
 
         XCTAssertTrue(LokiiConfig.GeneralConfig().hideResultsWhenEmpty)
+        XCTAssertEqual(LokiiConfig.GeneralConfig().dockIconMode, .whenOpen)
         let legacyGeneralData = """
         {"language": "zh-Hans", "show_in_dock": true}
         """.data(using: .utf8)!
         let decodedLegacyGeneral = try decoder.decode(LokiiConfig.GeneralConfig.self, from: legacyGeneralData)
         XCTAssertTrue(decodedLegacyGeneral.hideResultsWhenEmpty)
+        XCTAssertEqual(decodedLegacyGeneral.dockIconMode, .always)
 
         let disabledGeneralData = """
-        {"language": "en", "show_in_dock": true, "hide_results_when_empty": false}
+        {"language": "en", "dock_icon_mode": "when_open", "hide_results_when_empty": false}
         """.data(using: .utf8)!
         let decodedDisabledGeneral = try decoder.decode(LokiiConfig.GeneralConfig.self, from: disabledGeneralData)
         XCTAssertFalse(decodedDisabledGeneral.hideResultsWhenEmpty)
+        XCTAssertEqual(decodedDisabledGeneral.dockIconMode, .whenOpen)
         let encodedGeneral = String(data: try JSONEncoder().encode(decodedDisabledGeneral), encoding: .utf8) ?? ""
         XCTAssertTrue(encodedGeneral.contains("\"hide_results_when_empty\":false"))
+        XCTAssertTrue(encodedGeneral.contains("\"dock_icon_mode\":\"when_open\""))
+        XCTAssertFalse(encodedGeneral.contains("show_in_dock"))
     }
 
     func testSettingsPathStatusResolverAndVolumeLifecycle() {

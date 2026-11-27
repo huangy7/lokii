@@ -1531,15 +1531,15 @@ public func FfiConverterTypeFfiAppConfig_lower(_ value: FfiAppConfig) -> RustBuf
  */
 public struct FfiGeneralConfig {
     public var language: String
-    public var showInDock: Bool
+    public var dockIconMode: FfiDockIconMode
     public var terminalBundleId: String
     public var hideResultsWhenEmpty: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(language: String, showInDock: Bool, terminalBundleId: String, hideResultsWhenEmpty: Bool) {
+    public init(language: String, dockIconMode: FfiDockIconMode, terminalBundleId: String, hideResultsWhenEmpty: Bool) {
         self.language = language
-        self.showInDock = showInDock
+        self.dockIconMode = dockIconMode
         self.terminalBundleId = terminalBundleId
         self.hideResultsWhenEmpty = hideResultsWhenEmpty
     }
@@ -1555,7 +1555,7 @@ extension FfiGeneralConfig: Equatable, Hashable {
         if lhs.language != rhs.language {
             return false
         }
-        if lhs.showInDock != rhs.showInDock {
+        if lhs.dockIconMode != rhs.dockIconMode {
             return false
         }
         if lhs.terminalBundleId != rhs.terminalBundleId {
@@ -1569,7 +1569,7 @@ extension FfiGeneralConfig: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(language)
-        hasher.combine(showInDock)
+        hasher.combine(dockIconMode)
         hasher.combine(terminalBundleId)
         hasher.combine(hideResultsWhenEmpty)
     }
@@ -1585,7 +1585,7 @@ public struct FfiConverterTypeFfiGeneralConfig: FfiConverterRustBuffer {
         return
             try FfiGeneralConfig(
                 language: FfiConverterString.read(from: &buf), 
-                showInDock: FfiConverterBool.read(from: &buf), 
+                dockIconMode: FfiConverterTypeFfiDockIconMode.read(from: &buf), 
                 terminalBundleId: FfiConverterString.read(from: &buf), 
                 hideResultsWhenEmpty: FfiConverterBool.read(from: &buf)
         )
@@ -1593,7 +1593,7 @@ public struct FfiConverterTypeFfiGeneralConfig: FfiConverterRustBuffer {
 
     public static func write(_ value: FfiGeneralConfig, into buf: inout [UInt8]) {
         FfiConverterString.write(value.language, into: &buf)
-        FfiConverterBool.write(value.showInDock, into: &buf)
+        FfiConverterTypeFfiDockIconMode.write(value.dockIconMode, into: &buf)
         FfiConverterString.write(value.terminalBundleId, into: &buf)
         FfiConverterBool.write(value.hideResultsWhenEmpty, into: &buf)
     }
@@ -2539,6 +2539,86 @@ public func FfiConverterTypeFfiCaseSensitivity_lower(_ value: FfiCaseSensitivity
 
 
 extension FfiCaseSensitivity: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * macOS Dock icon visibility policy exposed via UniFFI.
+ */
+
+public enum FfiDockIconMode {
+    
+    case always
+    case whenOpen
+    case never
+}
+
+
+#if compiler(>=6)
+extension FfiDockIconMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiDockIconMode: FfiConverterRustBuffer {
+    typealias SwiftType = FfiDockIconMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDockIconMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .always
+        
+        case 2: return .whenOpen
+        
+        case 3: return .never
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiDockIconMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .always:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .whenOpen:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .never:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDockIconMode_lift(_ buf: RustBuffer) throws -> FfiDockIconMode {
+    return try FfiConverterTypeFfiDockIconMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDockIconMode_lower(_ value: FfiDockIconMode) -> RustBuffer {
+    return FfiConverterTypeFfiDockIconMode.lower(value)
+}
+
+
+extension FfiDockIconMode: Equatable, Hashable {}
 
 
 
