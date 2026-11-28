@@ -159,12 +159,43 @@ final class SingleInstanceGuard {
     }
 }
 
+/// 状态栏图标点击与失焦自动收起的竞态抑制守卫：
+/// 点击状态栏图标时，系统会先激活菜单栏宿主窗口导致 `applicationDidResignActive` 隐藏当前浮窗；
+/// 若随后的 `statusItemClicked` 见窗口已不可见而再次执行显示分支，就会表现为“点不闭反而重开”。
+/// 记录最近一次因失焦触发的自动收起时间戳，并在极短窗口内消费一次以完成原本的“点击关闭”意图。
+struct StatusItemResignToggleGuard {
+    static let defaultSuppressionWindow: TimeInterval = 0.25
+
+    private let suppressionWindow: TimeInterval
+    private var lastResignAutoHideUptime: TimeInterval?
+
+    init(suppressionWindow: TimeInterval = StatusItemResignToggleGuard.defaultSuppressionWindow) {
+        self.suppressionWindow = suppressionWindow
+    }
+
+    mutating func recordResignAutoHide(at uptime: TimeInterval) {
+        lastResignAutoHideUptime = uptime
+    }
+
+    mutating func clear() {
+        lastResignAutoHideUptime = nil
+    }
+
+    mutating func consumeRecentResignHide(at uptime: TimeInterval) -> Bool {
+        guard let recorded = lastResignAutoHideUptime else { return false }
+        lastResignAutoHideUptime = nil
+        let delta = uptime - recorded
+        return delta >= 0 && delta <= suppressionWindow
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindow: SearchWindow?
     private var floatingSearchWindow: FloatingSearchWindowController?
     private let presentationModeStore = WindowPresentationModeStore.shared
     private var isSwitchingPresentationMode = false
     private var statusItem: NSStatusItem?
+    private var statusItemToggleGuard = StatusItemResignToggleGuard()
     private lazy var engine = SearchEngine()
     private var preferencesController: PreferencesWindowController?
     private var dockCoordinator: DockVisibilityCoordinator?
@@ -267,15 +298,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if FDAGuideWindowController.isPresenting {
             return
         }
+        var hiddenByResign = false
         if floatingSearchWindow?.window?.isVisible == true,
            floatingSearchWindow?.isDraggingOut != true {
             floatingSearchWindow?.hideWindow(animated: false)
+            hiddenByResign = true
         }
-        if mainWindow?.isPinned == true {
-            return
+        if mainWindow?.isPinned != true,
+           (engine.getConfig()?.window.hideOnBlur ?? true),
+           mainWindow?.window?.isVisible == true {
+            mainWindow?.hideWindow(animated: false)
+            hiddenByResign = true
         }
-        guard engine.getConfig()?.window.hideOnBlur ?? true else { return }
-        mainWindow?.hideWindow(animated: false)
+        if hiddenByResign {
+            statusItemToggleGuard.recordResignAutoHide(at: ProcessInfo.processInfo.systemUptime)
+        }
     }
 
     // MARK: - Global Shortcut
@@ -312,7 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let buttonWindow = button.window else { return nil }
                 return buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
             }
-            toggleWindow(anchorRect: trayAnchorRect)
+            toggleWindow(anchorRect: trayAnchorRect, fromStatusItem: true)
         }
     }
 
@@ -468,13 +505,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleWindow(anchorRect: nil)
     }
 
-    private func toggleWindow(anchorRect: NSRect?) {
-        // 以窗口是否实际可见判定收起：点击状态栏图标不会激活应用，依赖 NSApp.isActive 会在失焦后误判为显示
+    private func toggleWindow(anchorRect: NSRect?, fromStatusItem: Bool = false) {
+        // 以窗口是否实际可见判定收起：点击状态栏图标不会激活应用，依赖 NSApp.isActive 会在失焦后误判为显示；
+        // 对无标题栏透明浮动面板不依赖 occlusionState，直接以 isVisible && isOnActiveSpace 判定，避免误判导致点不开或关不掉。
         if let window = mainWindow?.window, window.isVisible, window.occlusionState.contains(.visible) {
+            statusItemToggleGuard.clear()
             mainWindow?.hideWindow(animated: false)
-        } else if let panel = floatingSearchWindow?.window, panel.isVisible, panel.occlusionState.contains(.visible) {
+        } else if let panel = floatingSearchWindow?.window, panel.isVisible, panel.isOnActiveSpace {
+            statusItemToggleGuard.clear()
             floatingSearchWindow?.hideWindow(animated: false)
         } else {
+            if fromStatusItem && statusItemToggleGuard.consumeRecentResignHide(at: ProcessInfo.processInfo.systemUptime) {
+                return
+            }
+            statusItemToggleGuard.clear()
             if presentationModeStore.currentMode == .floatingBar {
                 floatingSearchWindow?.showWindow(anchorRect: anchorRect)
             } else {

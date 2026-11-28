@@ -447,4 +447,104 @@ final class DockVisibilityCoordinatorTests: XCTestCase {
         XCTAssertFalse(started)
         XCTAssertFalse(beforePresentingCalled)
     }
+
+    func testRapidToggleBurstsDebounceDemotionAndPreventPolicyThrashing() {
+        var currentPolicy: NSApplication.ActivationPolicy = .accessory
+        var appliedPolicies: [NSApplication.ActivationPolicy] = []
+        var hasOpen = false
+        var now: TimeInterval = 10.0
+        var immediateTasks: [() -> Void] = []
+        var delayedTasks: [(delay: TimeInterval, block: () -> Void)] = []
+
+        let coordinator = DockVisibilityCoordinator(
+            initialMode: .whenOpen,
+            rapidToggleThreshold: 0.45,
+            demotionDelay: 0.55,
+            clock: { now },
+            observeWindowNotifications: false,
+            policyReader: { currentPolicy },
+            policySetter: { next in
+                currentPolicy = next
+                appliedPolicies.append(next)
+                return true
+            },
+            windowSnapshotProvider: {
+                hasOpen
+                    ? [DockWindowSnapshot(className: "LokiiWindow", level: .normal, isVisible: true)]
+                    : []
+            },
+            activeWindowRestorerBuilder: { nil },
+            asyncScheduler: { block in
+                immediateTasks.append(block)
+            },
+            delayedScheduler: { delay, block in
+                delayedTasks.append((delay, block))
+            }
+        )
+
+        // 1. 正常使用路径：开窗停留超过 rapidToggleThreshold (0.45s) 后关闭 -> 0ms 即时回落，不走延迟定时器
+        hasOpen = true
+        _ = coordinator.prepareForWindowPresentation()
+        now += 1.0
+        hasOpen = false
+        coordinator.schedulePolicySync()
+        XCTAssertEqual(immediateTasks.count, 1)
+        XCTAssertTrue(delayedTasks.isEmpty)
+        immediateTasks.removeFirst()()
+        XCTAssertEqual(currentPolicy, .accessory)
+        XCTAssertEqual(appliedPolicies, [.regular, .accessory])
+
+        appliedPolicies.removeAll()
+        // 越过阈值窗口后开始连续快点测试
+        now += 1.0
+
+        // 2. 高频连点路径：连续 10 次间隔 0.10s (< 0.45s) 快速开合 -> 仅第 1 次升格，期间全走 0.55s 防抖冷却
+        for _ in 0..<10 {
+            hasOpen = true
+            _ = coordinator.prepareForWindowPresentation()
+            now += 0.10
+            hasOpen = false
+            coordinator.schedulePolicySync()
+        }
+
+        XCTAssertEqual(currentPolicy, .regular)
+        XCTAssertEqual(appliedPolicies, [.regular])
+        XCTAssertTrue(immediateTasks.isEmpty)
+        XCTAssertEqual(delayedTasks.count, 10)
+        XCTAssertTrue(delayedTasks.allSatisfy { $0.delay == 0.55 })
+
+        // 前 9 个陈旧延迟任务已被后续 prepareForWindowPresentation 作废，执行时不得降格
+        for i in 0..<9 {
+            delayedTasks[i].block()
+        }
+        XCTAssertEqual(currentPolicy, .regular)
+        XCTAssertEqual(appliedPolicies, [.regular])
+
+        // 仅最后一次关窗的延迟任务生效并平稳回落为 .accessory
+        delayedTasks[9].block()
+        XCTAssertEqual(currentPolicy, .accessory)
+        XCTAssertEqual(appliedPolicies, [.regular, .accessory])
+    }
+
+    func testStatusItemResignToggleGuardSuppressesImmediateReopenAndAllowsNextClick() {
+        var guardState = StatusItemResignToggleGuard(suppressionWindow: 0.25)
+
+        // 无前置失焦隐藏记录时不拦截
+        XCTAssertFalse(guardState.consumeRecentResignHide(at: 100.0))
+
+        // 同一点击先触发失焦隐藏，随后 10ms 内触发托盘点击 -> 抑制误重开并自动消费记录
+        guardState.recordResignAutoHide(at: 100.0)
+        XCTAssertTrue(guardState.consumeRecentResignHide(at: 100.01))
+        // 已消费后，紧接着的下一击允许正常打开
+        XCTAssertFalse(guardState.consumeRecentResignHide(at: 100.02))
+
+        // 超过抑制时间窗后过期失效
+        guardState.recordResignAutoHide(at: 200.0)
+        XCTAssertFalse(guardState.consumeRecentResignHide(at: 200.30))
+
+        // clear 后立即失效
+        guardState.recordResignAutoHide(at: 300.0)
+        guardState.clear()
+        XCTAssertFalse(guardState.consumeRecentResignHide(at: 300.01))
+    }
 }
