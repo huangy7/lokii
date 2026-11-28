@@ -71,6 +71,9 @@ public final class FilterPopoverController: NSObject, NSPopoverDelegate {
             onStateChanged: { [weak self] newState in
                 guard let self = self else { return }
                 self.viewModel.state = newState
+                DispatchQueue.main.async { [weak self] in
+                    self?.updatePopoverContentSize()
+                }
                 self.onFilterStateChanged?(newState)
                 if let field = self.searchField {
                     // 若用户并非在浮层内部数值输入框中键入，确保搜索框处于编辑态以便光标推进至尾部

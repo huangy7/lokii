@@ -639,7 +639,8 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
         query: String,
         mode: FfiSearchMode = .auto,
         caseSensitivity: FfiCaseSensitivity = .auto,
-        includeOffline: Bool? = nil
+        includeOffline: Bool? = nil,
+        sort: FfiSearchSort = .relevance
     ) -> FfiSearchResponse {
         let shouldIncludeOffline: Bool
         if let includeOffline {
@@ -649,11 +650,12 @@ final class SearchEngine: ObservableObject, @unchecked Sendable {
             shouldIncludeOffline = cachedIncludeOfflineResults
             statusLock.unlock()
         }
-        return core.searchWithOptions(
+        return core.searchWithSort(
             query: query,
             mode: mode,
             caseSensitivity: caseSensitivity,
-            includeOffline: shouldIncludeOffline
+            includeOffline: shouldIncludeOffline,
+            sort: sort
         )
     }
 

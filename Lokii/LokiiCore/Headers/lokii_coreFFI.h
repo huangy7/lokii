@@ -492,6 +492,11 @@ RustBuffer uniffi_lokii_core_fn_method_lokiicore_search(void*_Nonnull ptr, RustB
 RustBuffer uniffi_lokii_core_fn_method_lokiicore_search_with_options(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustBuffer case_sensitivity, int8_t include_offline, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH_WITH_SORT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_SEARCH_WITH_SORT
+RustBuffer uniffi_lokii_core_fn_method_lokiicore_search_with_sort(void*_Nonnull ptr, RustBuffer query, RustBuffer mode, RustBuffer case_sensitivity, int8_t include_offline, RustBuffer sort, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_CONFIG_WATCHER
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_FN_METHOD_LOKIICORE_START_CONFIG_WATCHER
 void uniffi_lokii_core_fn_method_lokiicore_start_config_watcher(void*_Nonnull ptr, void*_Nonnull event_handler, RustCallStatus *_Nonnull out_status
@@ -998,6 +1003,12 @@ uint16_t uniffi_lokii_core_checksum_method_lokiicore_search(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_WITH_OPTIONS
 #define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_WITH_OPTIONS
 uint16_t uniffi_lokii_core_checksum_method_lokiicore_search_with_options(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_WITH_SORT
+#define UNIFFI_FFIDEF_UNIFFI_LOKII_CORE_CHECKSUM_METHOD_LOKIICORE_SEARCH_WITH_SORT
+uint16_t uniffi_lokii_core_checksum_method_lokiicore_search_with_sort(void
     
 );
 #endif

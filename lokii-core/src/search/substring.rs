@@ -103,6 +103,7 @@ pub fn search_index_tokens(
         case_sensitive,
         explicit_lock,
         None,
+        super::SearchSort::Relevance,
     )
     .0
 }
@@ -116,7 +117,7 @@ pub(crate) fn single_inferred_extension(tokens: &[QueryToken]) -> Option<String>
 
 /// 在纯文件名子串检索未填满 `max_results` 时，按相邻切分追加 `parent_term + filename_term` 混合召回。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn search_index_tokens_with_hybrid(
+pub(crate) fn search_index_tokens_with_hybrid_and_sort(
     read: &CompactIndex,
     positive_tokens: &[QueryToken],
     filter: &CompiledRecordFilter,
@@ -125,6 +126,7 @@ pub(crate) fn search_index_tokens_with_hybrid(
     case_sensitivity: CaseSensitivity,
     explicit_lock: bool,
     inferred_extension_exists: Option<bool>,
+    sort: super::SearchSort,
 ) -> Vec<AdvancedSearchResult> {
     let (mut results, matched_ordinals) = search_index_tokens_with_ordinals(
         read,
@@ -134,24 +136,45 @@ pub(crate) fn search_index_tokens_with_hybrid(
         case_sensitive,
         explicit_lock,
         inferred_extension_exists,
+        sort,
     );
-    let remaining = max_results.saturating_sub(results.len());
-    if remaining == 0 || positive_tokens.len() < 2 {
+    if sort == super::SearchSort::Relevance {
+        let remaining = max_results.saturating_sub(results.len());
+        if remaining == 0 || positive_tokens.len() < 2 {
+            return results;
+        }
+
+        append_hybrid_parent_name_hits(
+            read,
+            positive_tokens,
+            filter,
+            remaining,
+            case_sensitivity,
+            &matched_ordinals,
+            sort,
+            &mut results,
+        );
         return results;
     }
 
-    append_hybrid_parent_name_hits(
-        read,
-        positive_tokens,
-        filter,
-        remaining,
-        case_sensitivity,
-        &matched_ordinals,
-        &mut results,
-    );
+    if positive_tokens.len() >= 2 && max_results > 0 {
+        append_hybrid_parent_name_hits(
+            read,
+            positive_tokens,
+            filter,
+            max_results,
+            case_sensitivity,
+            &matched_ordinals,
+            sort,
+            &mut results,
+        );
+        results.sort_by(|a, b| super::cmp_advanced_by_sort(a, b, sort));
+        results.truncate(max_results);
+    }
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_index_tokens_with_ordinals(
     read: &CompactIndex,
     positive_tokens: &[QueryToken],
@@ -160,6 +183,7 @@ fn search_index_tokens_with_ordinals(
     case_sensitive: bool,
     explicit_lock: bool,
     inferred_extension_exists: Option<bool>,
+    sort: super::SearchSort,
 ) -> (Vec<AdvancedSearchResult>, Vec<usize>) {
     if max_results == 0 {
         return (Vec::new(), Vec::new());
@@ -203,72 +227,150 @@ fn search_index_tokens_with_ordinals(
     let rank_ctx = RecordRankContext::default();
     let targets_hidden = keywords_target_hidden(extension.is_some(), &keywords);
 
-    let matches = match (&extension, compiled_ext.as_ref()) {
+    let matches: Vec<(usize, f64)> = match (&extension, compiled_ext.as_ref()) {
         (Some(extension), Some(ext_matcher)) => {
             let req = extension_signature(extension);
             let ext_ascii = extension.is_ascii();
-            let mut top = super::top_k::TopK::new(max_results);
-            let query_index = read.query_index();
-            let sorted = read.sorted_names();
-            let records = read.records();
-            let passthrough = filter.is_passthrough();
-            let allow_dirs = filter.allow_dirs();
-            for &name_id in &sorted.ids {
-                if !extension.is_empty() {
-                    if let Some(sig) = read.name_signature(name_id) {
+            if sort != super::SearchSort::Relevance {
+                let mut top: super::top_k::TopK<'_, u64> = super::top_k::TopK::new(max_results);
+                let query_index = read.query_index();
+                let records = read.records();
+                let passthrough = filter.is_passthrough();
+                for name_id in 0..query_index.slot_count() as u32 {
+                    if !extension.is_empty() {
+                        let sig = query_index.signature_at(name_id);
+                        if sig == NameSignature::default() && !query_index.is_ready(name_id) {
+                            continue;
+                        }
                         if !sig.contains(req) {
                             continue;
                         }
                     }
-                }
-                let entries = read.entries_for_name(name_id);
-                if entries.is_empty() {
-                    continue;
-                }
-                let Some((name, folded)) = read.name_entry(name_id) else {
-                    continue;
-                };
-                if !extension_matches(name, folded, extension, ext_ascii) {
-                    continue;
-                }
-                let base = BaseNameScore::for_exact_fast_path(name);
-                let upper = base.upper_bound(&rank_ctx, allow_dirs, false);
-                if let Some(worst) = top.worst() {
-                    if upper < worst.score || (upper == worst.score && name > worst.name()) {
+                    let entries = query_index.entries(name_id);
+                    if entries.is_empty() {
                         continue;
                     }
-                }
-                let (head, tail) = bucket_slices(entries);
-                for &ordinal in head.iter().chain(tail.iter()) {
-                    let Some(record) = records.get(ordinal as usize) else {
+                    let Some((name, folded)) = read.name_entry(name_id) else {
                         continue;
                     };
-                    if ext_matcher.matches(record.extension) {
+                    if !extension_matches(name, folded, extension, ext_ascii) {
+                        continue;
+                    }
+                    for &ordinal in entries {
+                        let ord_usize = ordinal as usize;
+                        let Some(record) = records.get(ord_usize) else {
+                            continue;
+                        };
+                        if !ext_matcher.matches(record.extension) {
+                            continue;
+                        }
+                        let key = super::sort_key_for_record(record, sort);
+                        if let Some(worst) = top.worst() {
+                            if key < worst.score || (key == worst.score && name > worst.name()) {
+                                continue;
+                            }
+                        }
                         if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
                             continue;
                         }
-                        let (parent_depth, parent_hidden) =
-                            read.record_parent_meta(record, query_index);
-                        let score = score_record_with_meta(
-                            base,
-                            record.is_dir,
-                            parent_depth,
-                            parent_hidden,
-                            &rank_ctx,
-                            false,
-                            0,
-                        );
-                        top.offer(ordinal as usize, score, name);
+                        if let Some(view) = read.view(crate::compact_index::EntryId(ord_usize)) {
+                            top.offer_path(ord_usize, key, view);
+                        }
                     }
                 }
+                top.finish()
+                    .into_iter()
+                    .map(|c| (c.ordinal, 1.0))
+                    .collect()
+            } else {
+                let mut top = super::top_k::TopK::new(max_results);
+                let query_index = read.query_index();
+                let sorted = read.sorted_names();
+                let records = read.records();
+                let passthrough = filter.is_passthrough();
+                let allow_dirs = filter.allow_dirs();
+                for &name_id in &sorted.ids {
+                    if !extension.is_empty() {
+                        if let Some(sig) = read.name_signature(name_id) {
+                            if !sig.contains(req) {
+                                continue;
+                            }
+                        }
+                    }
+                    let entries = read.entries_for_name(name_id);
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    let Some((name, folded)) = read.name_entry(name_id) else {
+                        continue;
+                    };
+                    if !extension_matches(name, folded, extension, ext_ascii) {
+                        continue;
+                    }
+                    let base = BaseNameScore::for_exact_fast_path(name);
+                    let upper = base.upper_bound(&rank_ctx, allow_dirs, false);
+                    if let Some(worst) = top.worst() {
+                        if upper < worst.score || (upper == worst.score && name > worst.name()) {
+                            continue;
+                        }
+                    }
+                    let (head, tail) = bucket_slices(entries);
+                    for &ordinal in head.iter().chain(tail.iter()) {
+                        let Some(record) = records.get(ordinal as usize) else {
+                            continue;
+                        };
+                        if ext_matcher.matches(record.extension) {
+                            if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                                continue;
+                            }
+                            let (parent_depth, parent_hidden) =
+                                read.record_parent_meta(record, query_index);
+                            let score = score_record_with_meta(
+                                base,
+                                record.is_dir,
+                                parent_depth,
+                                parent_hidden,
+                                &rank_ctx,
+                                false,
+                                0,
+                            );
+                            top.offer(ordinal as usize, score, name);
+                        }
+                    }
+                }
+                top.finish()
+                    .into_iter()
+                    .map(|c| (c.ordinal, c.score.to_f64()))
+                    .collect()
             }
-            top.finish()
         }
         _ => {
             if keywords.is_empty() {
                 // 纯否定过滤词（如 `!test` / `!.pdf`）在无正向筛选条件与无 `type:all` 时不返回全量文件
                 if !filter.has_positive_filter() && !filter.has_explicit_type_all() {
                     Vec::new()
+                } else if sort != super::SearchSort::Relevance {
+                    let mut top: super::top_k::TopK<'_, u64> = super::top_k::TopK::new(max_results);
+                    let passthrough = filter.is_passthrough();
+                    let records = read.records();
+                    for (ordinal, record) in records.iter().enumerate() {
+                        let key = super::sort_key_for_record(record, sort);
+                        if let Some(worst) = top.worst() {
+                            if key < worst.score {
+                                continue;
+                            }
+                        }
+                        if !passthrough && !filter.matches_record_in(read, record, None) {
+                            continue;
+                        }
+                        if let Some(view) = read.view(crate::compact_index::EntryId(ordinal)) {
+                            top.offer_path(ordinal, key, view);
+                        }
+                    }
+                    top.finish()
+                        .into_iter()
+                        .map(|c| (c.ordinal, 1.0))
+                        .collect()
                 } else {
                     let mut top = super::top_k::TopK::new(max_results);
                     let query_index = read.query_index();
@@ -295,6 +397,9 @@ fn search_index_tokens_with_ordinals(
                         top.offer(id.0, score, name);
                     }
                     top.finish()
+                        .into_iter()
+                        .map(|c| (c.ordinal, c.score.to_f64()))
+                        .collect()
                 }
             } else {
                 let mut req = NameSignature::default();
@@ -302,25 +407,53 @@ fn search_index_tokens_with_ordinals(
                     req = req.union(NameSignature::from_substring_query(kw));
                 }
                 let all_ascii = keywords.iter().all(|k| k.is_ascii());
-                super::rank_unique_names(
-                    read,
-                    filter,
-                    max_results,
-                    req,
-                    targets_hidden,
-                    &rank_ctx,
-                    |name, folded| {
-                        score_name_rank(
-                            name,
-                            folded,
-                            &keywords,
-                            &raw_keywords,
-                            all_ascii,
-                            case_sensitive,
-                            explicit_lock,
-                        )
-                    },
-                )
+                if sort != super::SearchSort::Relevance {
+                    super::rank_unique_names_sorted(
+                        read,
+                        filter,
+                        max_results,
+                        req,
+                        sort,
+                        |name, folded| {
+                            score_name_rank(
+                                name,
+                                folded,
+                                &keywords,
+                                &raw_keywords,
+                                all_ascii,
+                                case_sensitive,
+                                explicit_lock,
+                            )
+                            .is_some()
+                        },
+                    )
+                    .into_iter()
+                    .map(|c| (c.ordinal, 1.0))
+                    .collect()
+                } else {
+                    super::rank_unique_names(
+                        read,
+                        filter,
+                        max_results,
+                        req,
+                        targets_hidden,
+                        &rank_ctx,
+                        |name, folded| {
+                            score_name_rank(
+                                name,
+                                folded,
+                                &keywords,
+                                &raw_keywords,
+                                all_ascii,
+                                case_sensitive,
+                                explicit_lock,
+                            )
+                        },
+                    )
+                    .into_iter()
+                    .map(|c| (c.ordinal, c.score.to_f64()))
+                    .collect()
+                }
             }
         }
     };
@@ -333,12 +466,12 @@ fn search_index_tokens_with_ordinals(
         .map(|(raw, lower)| (*raw, lower.as_str()))
         .collect();
 
-    let ordinals: Vec<usize> = matches.iter().map(|c| c.ordinal).collect();
+    let ordinals: Vec<usize> = matches.iter().map(|&(ord, _)| ord).collect();
     let results = matches
         .into_iter()
-        .map(|candidate| {
+        .map(|(ordinal, score)| {
             let view = read
-                .view(crate::compact_index::EntryId(candidate.ordinal))
+                .view(crate::compact_index::EntryId(ordinal))
                 .unwrap();
             let match_positions = if extension.is_some() || keywords.is_empty() {
                 Vec::new()
@@ -348,7 +481,7 @@ fn search_index_tokens_with_ordinals(
             };
             AdvancedSearchResult {
                 entry: view.materialize(),
-                score: candidate.score.to_f64(),
+                score,
                 match_positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Substring,
@@ -506,6 +639,7 @@ fn compute_parent_match_positions(parent: &str, parent_terms: &[String]) -> Vec<
     merge_highlight_spans(spans, parent_no_slash.len())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_hybrid_parent_name_hits(
     read: &CompactIndex,
     positive_tokens: &[QueryToken],
@@ -513,6 +647,7 @@ fn append_hybrid_parent_name_hits(
     remaining: usize,
     case_sensitivity: CaseSensitivity,
     pure_matched_ordinals: &[usize],
+    sort: super::SearchSort,
     results: &mut Vec<AdvancedSearchResult>,
 ) {
     let k = positive_tokens.len();
@@ -600,6 +735,8 @@ fn append_hybrid_parent_name_hits(
         }
 
         let mut top = super::top_k::TopK::new(remaining);
+        let mut sorted_top: super::top_k::TopK<'_, u64> = super::top_k::TopK::new(remaining);
+        let use_custom_sort = sort != super::SearchSort::Relevance;
         for name_id in 0..query_index.slot_count() as u32 {
             let sig = query_index.signature_at(name_id);
             if sig == NameSignature::default() && !query_index.is_ready(name_id) {
@@ -631,6 +768,46 @@ fn append_hybrid_parent_name_hits(
             ) else {
                 continue;
             };
+
+            if use_custom_sort {
+                for &ordinal in entries {
+                    let ord_usize = ordinal as usize;
+                    if pure_seen.contains(&ord_usize) {
+                        continue;
+                    }
+                    let Some(record) = records.get(ord_usize) else {
+                        continue;
+                    };
+                    let key = super::sort_key_for_record(record, sort);
+                    if let Some(worst) = sorted_top.worst() {
+                        if key < worst.score || (key == worst.score && name > worst.name()) {
+                            continue;
+                        }
+                    }
+                    let pmatch = if record.raw_path {
+                        evaluate_hybrid_parent_raw(
+                            read.record_parent(record),
+                            &plan.parent_terms,
+                            plan.all_parent_ascii,
+                        )
+                    } else {
+                        parent_matches
+                            .get(record.path as usize)
+                            .copied()
+                            .unwrap_or(HybridParentMatch::Miss)
+                    };
+                    if pmatch == HybridParentMatch::Miss {
+                        continue;
+                    }
+                    if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                        continue;
+                    }
+                    if let Some(view) = read.view(crate::compact_index::EntryId(ord_usize)) {
+                        sorted_top.offer_path(ord_usize, key, view);
+                    }
+                }
+                continue;
+            }
 
             let name_quality_bonus =
                 ((name_base.tier as i64) * 2_000) + ((name_base.sub_tier as i64) * 200);
@@ -689,7 +866,18 @@ fn append_hybrid_parent_name_hits(
             }
         }
 
-        let chosen = top.finish();
+        let chosen: Vec<(usize, f64)> = if use_custom_sort {
+            sorted_top
+                .finish()
+                .into_iter()
+                .map(|c| (c.ordinal, 1.0))
+                .collect()
+        } else {
+            top.finish()
+                .into_iter()
+                .map(|c| (c.ordinal, c.score.to_f64()))
+                .collect()
+        };
         if chosen.is_empty() {
             return;
         }
@@ -703,14 +891,14 @@ fn append_hybrid_parent_name_hits(
             .map(|(raw, lower)| (*raw, lower.as_str()))
             .collect();
 
-        for candidate in chosen {
+        for (ordinal, score) in chosen {
             let view = read
-                .view(crate::compact_index::EntryId(candidate.ordinal))
+                .view(crate::compact_index::EntryId(ordinal))
                 .expect("valid compact reference");
             let name_folded = crate::cjk::fold_cow(view.name);
             let match_positions = find_positions(view.name, name_folded.as_ref(), &kw_refs);
             let parent = if view.raw_path().is_some() {
-                read.record_parent(&records[candidate.ordinal])
+                read.record_parent(&records[ordinal])
             } else {
                 view.parent
             };
@@ -719,7 +907,7 @@ fn append_hybrid_parent_name_hits(
 
             results.push(AdvancedSearchResult {
                 entry: view.materialize(),
-                score: candidate.score.to_f64(),
+                score,
                 match_positions,
                 parent_match_positions,
                 search_mode: SearchMode::Substring,
@@ -729,7 +917,14 @@ fn append_hybrid_parent_name_hits(
     }
 
     // 多切分计划（3 词及以上）：每个计划预先在父目录池上完成一次零分配评估，按记录取各计划最高分
+    let use_custom_sort = sort != super::SearchSort::Relevance;
     let mut best_by_ordinal: HashMap<usize, (usize, RankScore, &str)> = HashMap::new();
+    let mut sorted_top: super::top_k::TopK<'_, u64> = super::top_k::TopK::new(remaining);
+    let mut plan_by_ordinal: HashMap<usize, usize> = if use_custom_sort {
+        HashMap::with_capacity(remaining)
+    } else {
+        HashMap::new()
+    };
 
     for (plan_idx, plan) in plans.iter().enumerate() {
         let parent_matches = read.evaluate_parents(HybridParentMatch::Miss, |parent| {
@@ -777,6 +972,55 @@ fn append_hybrid_parent_name_hits(
 
             let name_quality_bonus =
                 ((name_base.tier as i64) * 2_000) + ((name_base.sub_tier as i64) * 200);
+
+            if use_custom_sort {
+                for &ordinal in entries {
+                    let ord_usize = ordinal as usize;
+                    if pure_seen.contains(&ord_usize) {
+                        continue;
+                    }
+                    let Some(record) = records.get(ord_usize) else {
+                        continue;
+                    };
+                    let key = super::sort_key_for_record(record, sort);
+                    if let Some(worst) = sorted_top.worst() {
+                        if key < worst.score || (key == worst.score && name > worst.name()) {
+                            continue;
+                        }
+                    }
+                    if plan_by_ordinal.contains_key(&ord_usize) {
+                        continue;
+                    }
+                    let pmatch = if record.raw_path {
+                        evaluate_hybrid_parent_raw(
+                            read.record_parent(record),
+                            &plan.parent_terms,
+                            plan.all_parent_ascii,
+                        )
+                    } else {
+                        parent_matches
+                            .get(record.path as usize)
+                            .copied()
+                            .unwrap_or(HybridParentMatch::Miss)
+                    };
+                    if pmatch == HybridParentMatch::Miss {
+                        continue;
+                    }
+                    if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                        continue;
+                    }
+                    if let Some(view) = read.view(crate::compact_index::EntryId(ord_usize)) {
+                        let (inserted, evicted) = sorted_top.offer_path_tracked(ord_usize, key, view);
+                        if inserted {
+                            if let Some(evicted_ord) = evicted {
+                                plan_by_ordinal.remove(&evicted_ord);
+                            }
+                            plan_by_ordinal.insert(ord_usize, plan_idx);
+                        }
+                    }
+                }
+                continue;
+            }
 
             let (head, tail_slice) = bucket_slices(entries);
             for &ordinal in head.iter().chain(tail_slice.iter()) {
@@ -837,16 +1081,37 @@ fn append_hybrid_parent_name_hits(
         }
     }
 
-    if best_by_ordinal.is_empty() {
-        return;
-    }
+    let chosen: Vec<(usize, usize, f64)> = if use_custom_sort {
+        if plan_by_ordinal.is_empty() {
+            return;
+        }
+        sorted_top
+            .finish()
+            .into_iter()
+            .filter_map(|c| {
+                plan_by_ordinal
+                    .get(&c.ordinal)
+                    .map(|&plan_idx| (c.ordinal, plan_idx, 1.0))
+            })
+            .collect()
+    } else {
+        if best_by_ordinal.is_empty() {
+            return;
+        }
+        let mut top = super::top_k::TopK::new(remaining);
+        for (&ordinal, &(_, score, name)) in &best_by_ordinal {
+            top.offer(ordinal, score, name);
+        }
+        top.finish()
+            .into_iter()
+            .filter_map(|c| {
+                best_by_ordinal
+                    .get(&c.ordinal)
+                    .map(|&(plan_idx, _, _)| (c.ordinal, plan_idx, c.score.to_f64()))
+            })
+            .collect()
+    };
 
-    let mut top = super::top_k::TopK::new(remaining);
-    for (&ordinal, &(_, score, name)) in &best_by_ordinal {
-        top.offer(ordinal, score, name);
-    }
-
-    let chosen = top.finish();
     let prepared_kws: Vec<Vec<(&str, String)>> = plans
         .iter()
         .map(|plan| {
@@ -857,13 +1122,10 @@ fn append_hybrid_parent_name_hits(
         })
         .collect();
 
-    for candidate in chosen {
-        let Some(&(plan_idx, _, _)) = best_by_ordinal.get(&candidate.ordinal) else {
-            continue;
-        };
+    for (ordinal, plan_idx, score) in chosen {
         let plan = &plans[plan_idx];
         let view = read
-            .view(crate::compact_index::EntryId(candidate.ordinal))
+            .view(crate::compact_index::EntryId(ordinal))
             .expect("valid compact reference");
         let name_folded = crate::cjk::fold_cow(view.name);
         let kw_refs: Vec<(&str, &str)> = prepared_kws[plan_idx]
@@ -872,7 +1134,7 @@ fn append_hybrid_parent_name_hits(
             .collect();
         let match_positions = find_positions(view.name, name_folded.as_ref(), &kw_refs);
         let parent = if view.raw_path().is_some() {
-            read.record_parent(&records[candidate.ordinal])
+            read.record_parent(&records[ordinal])
         } else {
             view.parent
         };
@@ -881,7 +1143,7 @@ fn append_hybrid_parent_name_hits(
 
         results.push(AdvancedSearchResult {
             entry: view.materialize(),
-            score: candidate.score.to_f64(),
+            score,
             match_positions,
             parent_match_positions,
             search_mode: SearchMode::Substring,
@@ -933,6 +1195,26 @@ pub fn search_disjunction_with_filters(
     clause_filters: Option<&[CompiledRecordFilter]>,
     max_results: usize,
     explicit_lock: bool,
+) -> Vec<AdvancedSearchResult> {
+    search_disjunction_with_filters_and_sort(
+        read,
+        query,
+        filter,
+        clause_filters,
+        max_results,
+        explicit_lock,
+        super::SearchSort::Relevance,
+    )
+}
+
+pub(crate) fn search_disjunction_with_filters_and_sort(
+    read: &CompactIndex,
+    query: &DisjunctionQuery,
+    filter: &CompiledRecordFilter,
+    clause_filters: Option<&[CompiledRecordFilter]>,
+    max_results: usize,
+    explicit_lock: bool,
+    sort: super::SearchSort,
 ) -> Vec<AdvancedSearchResult> {
     if max_results == 0 || query.is_empty() {
         return Vec::new();
@@ -1000,9 +1282,11 @@ pub fn search_disjunction_with_filters(
         return Vec::new();
     }
 
+    let use_custom_sort = sort != super::SearchSort::Relevance;
     let query_index = read.query_index();
     let sorted = read.sorted_names();
     let mut top = super::top_k::TopK::new(max_results);
+    let mut sorted_top: super::top_k::TopK<'_, u64> = super::top_k::TopK::new(max_results);
     let rank_ctx = RecordRankContext::default();
     let records = read.records();
     let mut ascii_buf = Vec::with_capacity(128);
@@ -1073,6 +1357,43 @@ pub fn search_disjunction_with_filters(
         }
 
         if matched_clauses.is_empty() {
+            continue;
+        }
+
+        if use_custom_sort {
+            for &ordinal in entries {
+                let ord_usize = ordinal as usize;
+                let Some(record) = records.get(ord_usize) else {
+                    continue;
+                };
+                let key = super::sort_key_for_record(record, sort);
+                if let Some(worst) = sorted_top.worst() {
+                    if key < worst.score || (key == worst.score && name > worst.name()) {
+                        continue;
+                    }
+                }
+                let mut any_clause_matched = false;
+                for &(prep_idx, base_opt, ext_opt) in &matched_clauses {
+                    let c = &prepared_clauses[prep_idx];
+                    let cf = clause_filters
+                        .and_then(|fs| fs.get(c.clause_idx))
+                        .unwrap_or(filter);
+                    if !cf.is_passthrough() && !cf.matches_record_in(read, record, Some(name)) {
+                        continue;
+                    }
+                    if ext_opt.is_some_and(|m| !record.is_dir && m.matches(record.extension))
+                        || base_opt.is_some()
+                    {
+                        any_clause_matched = true;
+                        break;
+                    }
+                }
+                if any_clause_matched {
+                    if let Some(view) = read.view(crate::compact_index::EntryId(ord_usize)) {
+                        sorted_top.offer_path(ord_usize, key, view);
+                    }
+                }
+            }
             continue;
         }
 
@@ -1159,16 +1480,27 @@ pub fn search_disjunction_with_filters(
     }
 
     // 4. 高亮隔离与三态合并
-    let candidates = top.finish();
+    let candidates: Vec<(usize, f64)> = if use_custom_sort {
+        sorted_top
+            .finish()
+            .into_iter()
+            .map(|c| (c.ordinal, 1.0))
+            .collect()
+    } else {
+        top.finish()
+            .into_iter()
+            .map(|c| (c.ordinal, c.score.to_f64()))
+            .collect()
+    };
     let mut results = Vec::with_capacity(candidates.len());
 
-    for candidate in candidates {
-        let Some(view) = read.view(crate::compact_index::EntryId(candidate.ordinal)) else {
+    for (ordinal, score) in candidates {
+        let Some(view) = read.view(crate::compact_index::EntryId(ordinal)) else {
             continue;
         };
         let name = view.name;
         let name_folded = crate::cjk::fold_cow(name);
-        let record = &read.records()[candidate.ordinal];
+        let record = &read.records()[ordinal];
         let folded = read.name_entry(record.name).and_then(|(_, f)| f);
 
         let mut all_spans = Vec::new();
@@ -1255,7 +1587,7 @@ pub fn search_disjunction_with_filters(
 
         results.push(AdvancedSearchResult {
             entry: view.materialize(),
-            score: candidate.score.to_f64(),
+            score,
             match_positions,
             parent_match_positions,
             search_mode: SearchMode::Substring,

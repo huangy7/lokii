@@ -1077,8 +1077,32 @@ impl VolumeCoordinator {
         max_results: usize,
         include_offline: bool,
     ) -> (Vec<MultiSearchResult>, bool, Option<String>, SearchMode) {
+        self.search_with_filter_and_sort(
+            primary,
+            query,
+            mode,
+            filter,
+            case_sensitivity,
+            max_results,
+            include_offline,
+            search::SearchSort::Relevance,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_filter_and_sort(
+        &self,
+        primary: &IndexStore,
+        query: &str,
+        mode: SearchMode,
+        filter: QueryFilter,
+        case_sensitivity: CaseSensitivity,
+        max_results: usize,
+        include_offline: bool,
+        sort: search::SearchSort,
+    ) -> (Vec<MultiSearchResult>, bool, Option<String>, SearchMode) {
         // Snapshot slot stores under a short read lock, then release coordinator lock before reading
-        // indexes or invoking search::dispatch_multi.
+        // indexes or invoking search::dispatch_multi_with_sort.
         let snapshots: Vec<ShardSnapshot> = {
             let inner = self.inner.read();
             inner
@@ -1117,7 +1141,7 @@ impl VolumeCoordinator {
             });
         }
 
-        search::dispatch_multi(
+        search::dispatch_multi_with_sort(
             &shards,
             query,
             mode,
@@ -1125,6 +1149,7 @@ impl VolumeCoordinator {
             case_sensitivity,
             max_results,
             include_offline,
+            sort,
         )
     }
 

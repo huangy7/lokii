@@ -168,7 +168,7 @@
 "search.empty.action.tryFuzzy.subtitle" = "Allow flexible typo-tolerant hits";
 "search.empty.action.tryFuzzy.activeSubtitle" = "Fuzzy match is already active";
 "search.empty.action.checkFilters.title" = "Check filters";
-"search.empty.action.checkFilters.subtitle" = "Adjust file type or size limits";
+"search.empty.action.checkFilters.subtitle" = "Adjust file type, size, or modified date limits";
 "search.empty.action.checkScope.title" = "Verify index scope";
 "search.empty.action.checkScope.subtitle" = "Ensure target folders are indexed";
 "search.empty.excluded.title" = "This Location Isn’t Indexed";
@@ -228,8 +228,17 @@
 "search.trash.confirmMessage" = "Items moved to Trash can be restored from Finder.";
 "search.trash.confirmButton" = "Move to Trash";
 "search.trash.cancelButton" = "Cancel";
+"search.trash.dataless.singleTitle" = "This file is cloud-only. Move to Trash?";
+"search.trash.dataless.multiOneTitle" = "1 of %d selected items is cloud-only. Move to Trash?";
+"search.trash.dataless.multiTitle" = "%2$d of %1$d selected items are cloud-only. Move to Trash?";
+"search.trash.dataless.message" = "Cloud-only placeholder files are not downloaded locally. Moving them to Trash will not free local disk space and will delete them from cloud storage. You can restore them from Trash in Finder.";
+"search.trash.dataless.confirmButton" = "Move to Trash Anyway";
 "search.trash.failedTitle" = "Cannot Move to Trash";
 "search.trash.failedMessage" = "Failed to move %1$d item(s) to Trash:\n%2$@";
+"search.selection.summary" = "%1$d selected · %2$@";
+"search.selection.summaryWithFolders" = "%1$d selected · %2$@ in files";
+"search.selection.summaryWithFoldersTooltip" = "%1$d items selected (including %2$d folders). Total size excludes folder contents.";
+"search.selection.foldersOnly" = "%d folders selected";
 
 /* SearchWindow - sidebar */
 "search.sidebar.emptyHint" = "Directory distribution will appear here";
@@ -347,6 +356,14 @@
 "filter.size.under" = "Under";
 "filter.size.invalidRange" = "Minimum size exceeds maximum size";
 "filter.size.folderMetadataNote" = "Folders are filtered by directory metadata size, not recursive total size";
+"filter.modified.title" = "Modified Date";
+"filter.modified.any" = "Any";
+"filter.modified.last7Days" = "Last 7 days";
+"filter.modified.last30Days" = "Last 30 days";
+"filter.modified.olderThan90Days" = "Older than 3 months";
+"filter.modified.olderThan180Days" = "Older than 6 months";
+"filter.modified.olderThan1Year" = "Older than 1 year";
+"filter.modified.custom" = "Custom: %@";
 "filter.done" = "Done";
 "filter.button.tooltip" = "Filters (⌥F)";
 "filter.button.tooltip.active" = "Filters: %d active (⌥F)";

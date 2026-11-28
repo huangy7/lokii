@@ -87,6 +87,24 @@ pub fn search_index(
     max_results: usize,
     case_sensitive: bool,
 ) -> (Vec<AdvancedSearchResult>, Option<String>) {
+    search_index_with_sort(
+        read,
+        query,
+        filter,
+        max_results,
+        case_sensitive,
+        super::SearchSort::Relevance,
+    )
+}
+
+pub(crate) fn search_index_with_sort(
+    read: &CompactIndex,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    sort: super::SearchSort,
+) -> (Vec<AdvancedSearchResult>, Option<String>) {
     let raw_pattern = query.trim().strip_prefix("regex:").unwrap_or(query.trim());
     if raw_pattern.is_empty() {
         return (Vec::new(), None);
@@ -109,31 +127,44 @@ pub fn search_index(
     let req = required_signature_for_regex(&pattern_nfc);
     let targets_hidden = raw_pattern.starts_with(r"\.") || raw_pattern.starts_with(r"^\.");
     let rank_ctx = RecordRankContext::default();
-    let candidates = super::rank_unique_names(
-        read,
-        filter,
-        max_results,
-        req,
-        targets_hidden,
-        &rank_ctx,
-        |name, _folded| {
+    let ranked_entries: Vec<(usize, f64)> = if sort != super::SearchSort::Relevance {
+        super::rank_unique_names_sorted(read, filter, max_results, req, sort, |name, _folded| {
             let name_nfc = crate::cjk::normalize_nfc_cow(name);
-            if !regex.is_match(&name_nfc) {
-                return None;
-            }
-            let tier = match regex.find(&name_nfc) {
-                Some(m) if m.start() == 0 && m.end() == name_nfc.len() => MatchTier::FullExact,
-                Some(m) if m.start() == 0 => MatchTier::Prefix,
-                _ => MatchTier::Substring,
-            };
-            Some(BaseNameScore::for_tier_only(name, tier, 0))
-        },
-    );
-    let capture_count = regex.captures_len();
-    let results = candidates
+            regex.is_match(&name_nfc)
+        })
         .into_iter()
-        .filter_map(|candidate| {
-            let view = read.view(crate::compact_index::EntryId(candidate.ordinal))?;
+        .map(|c| (c.ordinal, 1.0))
+        .collect()
+    } else {
+        super::rank_unique_names(
+            read,
+            filter,
+            max_results,
+            req,
+            targets_hidden,
+            &rank_ctx,
+            |name, _folded| {
+                let name_nfc = crate::cjk::normalize_nfc_cow(name);
+                if !regex.is_match(&name_nfc) {
+                    return None;
+                }
+                let tier = match regex.find(&name_nfc) {
+                    Some(m) if m.start() == 0 && m.end() == name_nfc.len() => MatchTier::FullExact,
+                    Some(m) if m.start() == 0 => MatchTier::Prefix,
+                    _ => MatchTier::Substring,
+                };
+                Some(BaseNameScore::for_tier_only(name, tier, 0))
+            },
+        )
+        .into_iter()
+        .map(|c| (c.ordinal, c.score.to_f64()))
+        .collect()
+    };
+    let capture_count = regex.captures_len();
+    let results = ranked_entries
+        .into_iter()
+        .filter_map(|(ordinal, score)| {
+            let view = read.view(crate::compact_index::EntryId(ordinal))?;
             let name = view.name;
             let name_nfc = crate::cjk::normalize_nfc_cow(name);
             let name_is_ascii = name.is_ascii();
@@ -177,7 +208,7 @@ pub fn search_index(
 
             Some(AdvancedSearchResult {
                 entry: view.materialize(),
-                score: candidate.score.to_f64(),
+                score,
                 match_positions: merged_positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Regex,

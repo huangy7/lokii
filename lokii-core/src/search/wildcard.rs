@@ -194,6 +194,24 @@ pub fn search_index(
     max_results: usize,
     case_sensitive: bool,
 ) -> Vec<AdvancedSearchResult> {
+    search_index_with_sort(
+        read,
+        query,
+        filter,
+        max_results,
+        case_sensitive,
+        super::SearchSort::Relevance,
+    )
+}
+
+pub(crate) fn search_index_with_sort(
+    read: &CompactIndex,
+    query: &str,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    sort: super::SearchSort,
+) -> Vec<AdvancedSearchResult> {
     let raw_pattern = query.trim();
     if raw_pattern.is_empty() || max_results == 0 {
         return Vec::new();
@@ -211,7 +229,7 @@ pub fn search_index(
                 was_sanitized_pasted_path: false,
             })
             .collect();
-        search_index_tokens(read, &tokens, filter, max_results, case_sensitive)
+        search_index_tokens_with_sort(read, &tokens, filter, max_results, case_sensitive, sort)
     } else {
         let token = QueryToken {
             text: raw_pattern.to_string(),
@@ -221,25 +239,27 @@ pub fn search_index(
             had_escaped_meta: false,
             was_sanitized_pasted_path: false,
         };
-        search_index_tokens(
+        search_index_tokens_with_sort(
             read,
             std::slice::from_ref(&token),
             filter,
             max_results,
             case_sensitive,
+            sort,
         )
     }
 }
 
 /// 基于结构化正向词元的通配符检索实现：
-/// - `"*"` 走修改时间倒序全局 Top-K 并前置堆顶阈值短路；
+/// - `"*"` 走修改时间倒序（或指定 `sort` 维度）全局 Top-K 并前置堆顶阈值短路；
 /// - 非 `"*"` 接入 `rank_unique_names` 双层复合排序（路径深度、隐藏降权、目录与长度权重）并支持多词 AND 交集与字面片段高亮。
-pub(crate) fn search_index_tokens(
+pub(crate) fn search_index_tokens_with_sort(
     read: &CompactIndex,
     positive_tokens: &[QueryToken],
     filter: &CompiledRecordFilter,
     max_results: usize,
     case_sensitive: bool,
+    sort: super::SearchSort,
 ) -> Vec<AdvancedSearchResult> {
     if positive_tokens.is_empty() || max_results == 0 {
         return Vec::new();
@@ -253,14 +273,20 @@ pub(crate) fn search_index_tokens(
         return Vec::new();
     }
 
-    // 单个未加引号 "*"：全局遍历所有记录并按修改时间倒序保留 Top-K，前置堆顶阈值短路规避百万次视图构造
+    // 单个未加引号 "*"：全局遍历所有记录并按目标维度（默认修改时间倒序）保留 Top-K，前置堆顶阈值短路规避百万次视图构造
     if active_tokens.len() == 1 && !active_tokens[0].quoted && active_tokens[0].text.trim() == "*" {
+        let effective_star_sort = if sort == super::SearchSort::Relevance {
+            super::SearchSort::ModifiedDesc
+        } else {
+            sort
+        };
         let mut top = super::top_k::TopK::new(max_results);
         let passthrough = filter.is_passthrough();
         let records = read.records();
         for (ordinal, record) in records.iter().enumerate() {
+            let key = super::sort_key_for_record(record, effective_star_sort);
             if let Some(worst) = top.worst() {
-                if record.modified < worst.score {
+                if key < worst.score {
                     continue;
                 }
             }
@@ -268,7 +294,7 @@ pub(crate) fn search_index_tokens(
                 continue;
             }
             if let Some(view) = read.view(crate::compact_index::EntryId(ordinal)) {
-                top.offer_path(ordinal, record.modified, view);
+                top.offer_path(ordinal, key, view);
             }
         }
         return top
@@ -341,6 +367,43 @@ pub(crate) fn search_index_tokens(
     let targets_hidden = active_tokens.iter().any(|t| t.text.trim().starts_with('.'));
     let rank_ctx = RecordRankContext::default();
     let mut ascii_buf = Vec::with_capacity(128);
+
+    if sort != super::SearchSort::Relevance {
+        let candidates = super::rank_unique_names_sorted(
+            read,
+            filter,
+            max_results,
+            req,
+            sort,
+            |name, folded| {
+                matches_wildcard_terms(
+                    name,
+                    folded,
+                    &patterns,
+                    multi_and_mode,
+                    simple_suffix,
+                    case_sensitive,
+                    &mut ascii_buf,
+                )
+            },
+        );
+        return candidates
+            .into_iter()
+            .map(|candidate| {
+                let view = read
+                    .view(crate::compact_index::EntryId(candidate.ordinal))
+                    .unwrap();
+                let match_positions = find_wildcard_positions(view.name, &patterns, case_sensitive);
+                AdvancedSearchResult {
+                    entry: view.materialize(),
+                    score: 1.0,
+                    match_positions,
+                    parent_match_positions: Vec::new(),
+                    search_mode: SearchMode::Wildcard,
+                }
+            })
+            .collect();
+    }
 
     let candidates = super::rank_unique_names(
         read,

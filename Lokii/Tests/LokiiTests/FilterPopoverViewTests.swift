@@ -204,5 +204,60 @@ final class FilterPopoverViewTests: XCTestCase {
         XCTAssertTrue(enContent.contains("Clear All"))
         XCTAssertTrue(zhContent.contains("大小下限大于上限，区间互斥"))
         XCTAssertTrue(enContent.contains("Minimum size exceeds maximum size"))
+
+        let newKeys = [
+            "filter.modified.title",
+            "filter.modified.any",
+            "filter.modified.last7Days",
+            "filter.modified.last30Days",
+            "filter.modified.olderThan90Days",
+            "filter.modified.olderThan180Days",
+            "filter.modified.olderThan1Year",
+            "filter.modified.custom",
+            "search.selection.summary",
+            "search.selection.summaryWithFolders",
+            "search.selection.summaryWithFoldersTooltip",
+            "search.selection.foldersOnly",
+            "search.trash.dataless.singleTitle",
+            "search.trash.dataless.multiOneTitle",
+            "search.trash.dataless.multiTitle",
+            "search.trash.dataless.message",
+            "search.trash.dataless.confirmButton",
+        ]
+        for key in newKeys {
+            XCTAssertTrue(zhContent.contains("\"\(key)\""), "zh-Hans 必须包含 \(key)")
+            XCTAssertTrue(enContent.contains("\"\(key)\""), "en 必须包含 \(key)")
+        }
+    }
+
+    func testModifiedTimePresetSelectionToggleAndClearAll() {
+        var state = FilterState()
+        var changeCount = 0
+        let binding = Binding(get: { state }, set: { state = $0 })
+        let view = FilterPopoverView(
+            state: binding,
+            onStateChanged: { _ in changeCount += 1 }
+        )
+
+        view.selectModifiedTimePreset(.last7Days)
+        XCTAssertEqual(state.modifiedTime, .preset(.last7Days))
+        XCTAssertEqual(changeCount, 1)
+
+        // 再次点击同一预设应切换回不限
+        view.selectModifiedTimePreset(.last7Days)
+        XCTAssertNil(state.modifiedTime)
+        XCTAssertEqual(changeCount, 2)
+
+        view.selectModifiedTimePreset(.olderThan1Year)
+        XCTAssertEqual(state.modifiedTime, .preset(.olderThan1Year))
+        view.selectModifiedTimePreset(nil)
+        XCTAssertNil(state.modifiedTime)
+
+        state.modifiedTime = .custom(["mtime:2025-01-01..2025-03-31"])
+        state.selectedTypes = [.media]
+        state.minSizeBytes = 1_000_000_000
+        view.clearAll()
+        XCTAssertNil(state.modifiedTime)
+        XCTAssertTrue(state.isUnconstrained)
     }
 }

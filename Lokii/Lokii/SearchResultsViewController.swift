@@ -877,6 +877,10 @@ protocol SearchResultsViewControllerDelegate: AnyObject {
     func searchResultsDidRequestScopeFilter(path: String)
     /// 检索结果条目被用户有效消费回调（如访达定位、终端唤起、复制、预览、拖拽等），用于归档有效搜索历史
     func searchResultsDidConsumeResult()
+    /// 用户切换或清除需全量索引重排的列排序方式时回调（大小/修改日期/创建日期）
+    func searchResultsDidChangeServerSort(_ sort: FfiSearchSort)
+    /// 用户切换至仅在当前列表执行的本地列排序（名称/路径/扩展名）时回调
+    func searchResultsDidSwitchToClientSort()
 }
 
 extension SearchResultsViewControllerDelegate {
@@ -885,6 +889,8 @@ extension SearchResultsViewControllerDelegate {
     func searchResultsDidTrashItems(paths: Set<String>) {}
     func searchResultsDidRequestScopeFilter(path: String) {}
     func searchResultsDidConsumeResult() {}
+    func searchResultsDidChangeServerSort(_ sort: FfiSearchSort) {}
+    func searchResultsDidSwitchToClientSort() {}
 }
 
 // MARK: - Breadcrumb Navigation & Delegation
@@ -1057,6 +1063,7 @@ final class SearchResultsViewController: NSViewController {
     let separator = NSBox()
     let bottomBar = NSView()
     let pathBar = BreadcrumbPathControl()
+    let multiSelectionSummaryLabel = NSTextField(labelWithString: "")
     let statusLabel = NSTextField(labelWithString: "")
     let inlineProgressIndicator: NSProgressIndicator = {
         let pi = NSProgressIndicator()
@@ -1148,6 +1155,27 @@ final class SearchResultsViewController: NSViewController {
 
     /// 注入式确认弹窗闭包，默认通过主视窗弹出原生确认 Sheet，返回用户是否确认执行
     var confirmTrashHandler: ((Int, @escaping (Bool) -> Void) -> Void)?
+
+    /// 注入式仅云端占位文件检测闭包，默认使用无触发按需下载的 `lstat(2)` 只读检测
+    var datalessCheckHandler: ([FfiSearchResult]) -> Int = { items in
+        items.reduce(into: 0) { count, item in
+            if !item.isDir, SearchResultsViewController.isCloudDatalessFile(atPath: item.path) {
+                count += 1
+            }
+        }
+    }
+
+    /// 注入式云端占位文件删除确认弹窗闭包（参数：总选中数、云端占位文件数、确认回调）
+    var confirmDatalessTrashHandler: ((Int, Int, @escaping (Bool) -> Void) -> Void)?
+
+    /// 废纸篓删除前预检标记，避免连续快捷键重复触发并发弹窗
+    private var isTrashPreflightInFlight: Bool = false
+
+    /// 程序化同步表头排序标记，避免内部清理/同步触发冗余后端重查
+    private var isApplyingProgrammaticSort: Bool = false
+
+    /// 标识当前是否接入了全量索引服务端排序协作者；开启后点击服务端排序列直接等待后端 Top-K 下发，规避局部重排闪烁
+    var handlesServerSortRemotely: Bool = false
 
     /// In-memory offline path predicate supplied by SearchEngine; avoids disk checks on UI events.
     var isPathOfflineHandler: ((String) -> Bool)?
@@ -2036,6 +2064,16 @@ final class SearchResultsViewController: NSViewController {
         updateFDAButtonContent()
         bottomBar.addSubview(fdaHintButton)
 
+        multiSelectionSummaryLabel.translatesAutoresizingMaskIntoConstraints = false
+        multiSelectionSummaryLabel.font = .systemFont(ofSize: 12)
+        multiSelectionSummaryLabel.textColor = .secondaryLabelColor
+        multiSelectionSummaryLabel.lineBreakMode = .byTruncatingTail
+        multiSelectionSummaryLabel.maximumNumberOfLines = 1
+        multiSelectionSummaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        multiSelectionSummaryLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        multiSelectionSummaryLabel.isHidden = true
+        bottomBar.addSubview(multiSelectionSummaryLabel)
+
         bottomBar.addSubview(inlineProgressIndicator)
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -2077,6 +2115,10 @@ final class SearchResultsViewController: NSViewController {
             fdaHintButton.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 14),
             fdaHintButton.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
             fdaHintButton.trailingAnchor.constraint(lessThanOrEqualTo: inlineProgressIndicator.leadingAnchor, constant: -8),
+
+            multiSelectionSummaryLabel.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 14),
+            multiSelectionSummaryLabel.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
+            multiSelectionSummaryLabel.trailingAnchor.constraint(lessThanOrEqualTo: inlineProgressIndicator.leadingAnchor, constant: -8),
 
             inlineProgressIndicator.trailingAnchor.constraint(equalTo: statusLabel.leadingAnchor, constant: -4),
             inlineProgressIndicator.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
@@ -2275,20 +2317,31 @@ final class SearchResultsViewController: NSViewController {
         }
     }
 
+    private func clearSortDescriptorsProgrammatically() {
+        isApplyingProgrammaticSort = true
+        tableView.sortDescriptors = []
+        isApplyingProgrammaticSort = false
+    }
+
     /// 切换指定结果列表列的可见性，并同步持久化、清理失效排序与刷新末列对齐
     func setColumnHidden(_ hidden: Bool, for identifier: NSUserInterfaceItemIdentifier) {
         guard identifier != .columnName,
               let col = tableView.tableColumn(withIdentifier: identifier) else { return }
         col.isHidden = hidden
+        var clearedServerSort = false
         if hidden,
            let activeSortKey = tableView.sortDescriptors.first?.key,
            let colSortKey = col.sortDescriptorPrototype?.key,
            activeSortKey == colSortKey {
-            tableView.sortDescriptors = []
+            clearSortDescriptorsProgrammatically()
+            clearedServerSort = Self.serverSort(forKey: activeSortKey, ascending: true) != nil
         }
         persistHiddenColumnIdentifiers()
         updateColumnAlignments()
         tableView.reloadData()
+        if clearedServerSort {
+            delegate?.searchResultsDidChangeServerSort(.relevance)
+        }
     }
 
     /// 恢复结果列表默认列序、默认宽度与默认可见状态（显示名称/路径/修改日期/大小，隐藏创建日期/扩展名）
@@ -2305,13 +2358,18 @@ final class SearchResultsViewController: NSViewController {
                 col.isHidden = Self.defaultHiddenColumnIdentifiers.contains(def.id)
             }
         }
+        var clearedServerSort = false
         if let activeSortKey = tableView.sortDescriptors.first?.key,
            let hiddenDef = Self.canonicalColumnDefinitions.first(where: { $0.sortKey == activeSortKey }),
            Self.defaultHiddenColumnIdentifiers.contains(hiddenDef.id) {
-            tableView.sortDescriptors = []
+            clearSortDescriptorsProgrammatically()
+            clearedServerSort = Self.serverSort(forKey: activeSortKey, ascending: true) != nil
         }
         updateColumnAlignments()
         tableView.reloadData()
+        if clearedServerSort {
+            delegate?.searchResultsDidChangeServerSort(.relevance)
+        }
     }
 
     /// 动态刷新列头与单元格文本对齐方式：
@@ -2518,7 +2576,9 @@ final class SearchResultsViewController: NSViewController {
     func displayResults(
         _ results: [FfiSearchResult],
         preserveSelection: Bool,
-        autoSelectFirstRow: Bool = false
+        autoSelectFirstRow: Bool = false,
+        preserveSortDescriptors: Bool = false,
+        skipLocalSort: Bool = false
     ) {
         let previousPath = preserveSelection ? selectedResult?.path : nil
         self.results = results
@@ -2527,10 +2587,13 @@ final class SearchResultsViewController: NSViewController {
         dateTextCache.removeAll()
         sizeTextCache.removeAll()
 
-        if !preserveSelection {
-            tableView.sortDescriptors = []
+        if !preserveSelection && !preserveSortDescriptors {
+            clearSortDescriptorsProgrammatically()
         } else if let descriptor = tableView.sortDescriptors.first, let key = descriptor.key {
-            sortResults(by: key, ascending: descriptor.ascending)
+            let activeIsServerSort = Self.serverSort(forKey: key, ascending: descriptor.ascending) != nil
+            if !(skipLocalSort && activeIsServerSort) {
+                sortResults(by: key, ascending: descriptor.ascending)
+            }
         }
 
         // 高频击键刷新直接整表重绘，规避每次按键触发 150ms 离屏图层淡入合成与视觉残影
@@ -2711,13 +2774,65 @@ final class SearchResultsViewController: NSViewController {
         updateBottomBarVisibility()
     }
 
-    /// 根据当前路径选中状态与完全磁盘访问权限协同控制显隐让位
+    /// 根据当前多选状态、文件路径选中状态与完全磁盘访问权限协同控制底栏左侧区域互斥显隐
     private func updateBottomBarVisibility() {
+        let showMultiSummary = !multiSelectionSummaryLabel.stringValue.isEmpty
+        if showMultiSummary {
+            multiSelectionSummaryLabel.isHidden = false
+            pathBar.isHidden = true
+            fdaHintButton.isHidden = true
+            return
+        }
+        multiSelectionSummaryLabel.isHidden = true
         // 路径展示优先级高于权限提示：有选中路径时始终让位给路径
         let hasBreadcrumb = pathBar.url != nil || !pathBar.pathItems.isEmpty
         let showFDAHint = !hasBreadcrumb && !hasFullDiskAccess
         pathBar.isHidden = showFDAHint
         fdaHintButton.isHidden = !showFDAHint
+    }
+
+    /// 多选（>= 2 项）时在底栏左侧汇总条目数量与文件累计体积；单选或无选区时清零并让位给路径栏
+    private func updateMultiSelectionSummary() {
+        let selected = selectedResults
+        guard selected.count > 1 else {
+            multiSelectionSummaryLabel.stringValue = ""
+            multiSelectionSummaryLabel.toolTip = nil
+            updateBottomBarVisibility()
+            return
+        }
+
+        let fileCount = selected.lazy.filter { !$0.isDir }.count
+        let folderCount = selected.count - fileCount
+        let totalBytes = selected.reduce(Int64(0)) { acc, item in
+            guard !item.isDir else { return acc }
+            let clamped = item.size > UInt64(Int64.max) ? Int64.max : Int64(item.size)
+            return acc > Int64.max - clamped ? Int64.max : acc + clamped
+        }
+        let formattedSize = Self.sizeFormatter.string(fromByteCount: totalBytes)
+
+        if fileCount == 0 {
+            multiSelectionSummaryLabel.stringValue = String(format: L("search.selection.foldersOnly"), selected.count)
+            multiSelectionSummaryLabel.toolTip = nil
+        } else if folderCount > 0 {
+            multiSelectionSummaryLabel.stringValue = String(
+                format: L("search.selection.summaryWithFolders"),
+                selected.count,
+                formattedSize
+            )
+            multiSelectionSummaryLabel.toolTip = String(
+                format: L("search.selection.summaryWithFoldersTooltip"),
+                selected.count,
+                folderCount
+            )
+        } else {
+            multiSelectionSummaryLabel.stringValue = String(
+                format: L("search.selection.summary"),
+                selected.count,
+                formattedSize
+            )
+            multiSelectionSummaryLabel.toolTip = nil
+        }
+        updateBottomBarVisibility()
     }
 
     /// 更新底栏状态统计文本（权威持久状态驱动，若正在展示临时状态则仅静默暂存最新进度）
@@ -2855,6 +2970,7 @@ final class SearchResultsViewController: NSViewController {
         renderEmptyState()
         renderVolumeBanner(animated: false)
         updateFDAButtonContent()
+        updateMultiSelectionSummary()
     }
 
     // MARK: - Bottom Bar Actions & Animation
@@ -2932,6 +3048,7 @@ final class SearchResultsViewController: NSViewController {
     }
 
     private func notifySelectionChanged() {
+        updateMultiSelectionSummary()
         let current = selectedResult
         let currentPath = current?.path
         let currentOffline = current.map { isResultOffline($0) }
@@ -3230,45 +3347,67 @@ final class SearchResultsViewController: NSViewController {
     }
 
     @objc func moveToTrashSelected(_ sender: Any? = nil) {
+        guard !isTrashPreflightInFlight else { return }
         let selected = selectedResults
         guard requireAllOnline(selected) else { return }
 
-        confirmTrashIfNeeded(count: selected.count) { [weak self] confirmed in
-            guard let self = self, confirmed else { return }
+        let datalessChecker = self.datalessCheckHandler
+        isTrashPreflightInFlight = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let datalessCount = datalessChecker(selected)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.isTrashPreflightInFlight = false
+                let proceedToTrash: (Bool) -> Void = { [weak self] confirmed in
+                    guard let self = self, confirmed else { return }
+                    self.performMoveToTrash(selected)
+                }
+                if datalessCount > 0 {
+                    self.confirmDatalessTrashIfNeeded(
+                        totalCount: selected.count,
+                        datalessCount: datalessCount,
+                        completion: proceedToTrash
+                    )
+                } else {
+                    self.confirmTrashIfNeeded(count: selected.count, completion: proceedToTrash)
+                }
+            }
+        }
+    }
 
-            let handler = self.trashItemHandler
-            // 调度至后台用户交互队列执行同步阻塞式文件系统 I/O，规避大目录或外接磁盘下的主线程掉帧
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                var trashedPaths = Set<String>()
-                var errors: [(String, Error)] = []
+    private func performMoveToTrash(_ selected: [FfiSearchResult]) {
+        let handler = self.trashItemHandler
+        // 调度至后台用户交互队列执行同步阻塞式文件系统 I/O，规避大目录或外接磁盘下的主线程掉帧
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var trashedPaths = Set<String>()
+            var errors: [(String, Error)] = []
 
-                for item in selected {
-                    let url = URL(fileURLWithPath: item.path)
-                    do {
-                        _ = try handler(url)
+            for item in selected {
+                let url = URL(fileURLWithPath: item.path)
+                do {
+                    _ = try handler(url)
+                    trashedPaths.insert(item.path)
+                } catch {
+                    let nsError = error as NSError
+                    if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError {
+                        // 边界守卫与自愈容错：若目标文件在物理文件系统上已不存在（如已在终端被清理），
+                        // 表明该项目在源路径消除的业务诉求已达成，直接顺势将其作为已移除项从视图与结果集中剔除，
+                        // 规避误报弹窗打扰用户
                         trashedPaths.insert(item.path)
-                    } catch {
-                        let nsError = error as NSError
-                        if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileNoSuchFileError {
-                            // 边界守卫与自愈容错：若目标文件在物理文件系统上已不存在（如已在终端被清理），
-                            // 表明该项目在源路径消除的业务诉求已达成，直接顺势将其作为已移除项从视图与结果集中剔除，
-                            // 规避误报弹窗打扰用户
-                            trashedPaths.insert(item.path)
-                        } else {
-                            errors.append((item.name, error))
-                        }
+                    } else {
+                        errors.append((item.name, error))
                     }
                 }
+            }
 
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
-                    if !trashedPaths.isEmpty {
-                        self.applyTrashedItems(trashedPaths)
-                        self.playTrashSound()
-                    }
-                    if !errors.isEmpty {
-                        self.showTrashErrors(errors)
-                    }
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if !trashedPaths.isEmpty {
+                    self.applyTrashedItems(trashedPaths)
+                    self.playTrashSound()
+                }
+                if !errors.isEmpty {
+                    self.showTrashErrors(errors)
                 }
             }
         }
@@ -3289,6 +3428,38 @@ final class SearchResultsViewController: NSViewController {
         alert.messageText = String(format: L("search.trash.confirmTitle"), count)
         alert.informativeText = L("search.trash.confirmMessage")
         alert.addButton(withTitle: L("search.trash.confirmButton"))
+        alert.addButton(withTitle: L("search.trash.cancelButton"))
+        alert.beginSheetModal(for: window) { response in
+            completion(response == .alertFirstButtonReturn)
+        }
+    }
+
+    /// 仅云端占位文件删除警示：提醒用户移入废纸篓不会释放本地空间且会删除云端副本
+    private func confirmDatalessTrashIfNeeded(
+        totalCount: Int,
+        datalessCount: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        if let customHandler = confirmDatalessTrashHandler {
+            customHandler(totalCount, datalessCount, completion)
+            return
+        }
+        guard let window = view.window else {
+            completion(true)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if totalCount == 1 {
+            alert.messageText = L("search.trash.dataless.singleTitle")
+        } else if datalessCount == 1 {
+            alert.messageText = String(format: L("search.trash.dataless.multiOneTitle"), totalCount)
+        } else {
+            alert.messageText = String(format: L("search.trash.dataless.multiTitle"), totalCount, datalessCount)
+        }
+        alert.informativeText = L("search.trash.dataless.message")
+        let confirmButton = alert.addButton(withTitle: L("search.trash.dataless.confirmButton"))
+        confirmButton.hasDestructiveAction = true
         alert.addButton(withTitle: L("search.trash.cancelButton"))
         alert.beginSheetModal(for: window) { response in
             completion(response == .alertFirstButtonReturn)
@@ -3683,10 +3854,51 @@ extension SearchResultsViewController: NSTableViewDataSource {
         delegate?.searchResultsDidConsumeResult()
     }
 
+    /// 将列排序键映射为全量索引服务端排序枚举（仅大小、修改时间、创建时间触发跨全量索引 Top-K 重排）
+    static func serverSort(forKey key: String, ascending: Bool) -> FfiSearchSort? {
+        switch key {
+        case "size":
+            return ascending ? .sizeAsc : .sizeDesc
+        case "modified":
+            return ascending ? .modifiedAsc : .modifiedDesc
+        case "created":
+            return ascending ? .createdAsc : .createdDesc
+        default:
+            return nil
+        }
+    }
+
+    /// 通过 `lstat(2)` 只读标志位检测云端未下载占位文件（`SF_DATALESS = 0x4000_0000`），避免触发系统按需下载
+    static func isCloudDatalessFile(atPath path: String) -> Bool {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return false }
+        let isDirectory = (st.st_mode & S_IFMT) == S_IFDIR
+        guard !isDirectory else { return false }
+        let sfDataless: UInt32 = 0x4000_0000
+        return (st.st_flags & sfDataless) != 0
+    }
+
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard !isApplyingProgrammaticSort else { return }
         guard let descriptor = tableView.sortDescriptors.first,
               let key = descriptor.key else { return }
 
+        if let serverSort = Self.serverSort(forKey: key, ascending: descriptor.ascending) {
+            if handlesServerSortRemotely, let delegate = delegate {
+                tableView.deselectAll(nil)
+                notifySelectionChanged()
+                delegate.searchResultsDidChangeServerSort(serverSort)
+                return
+            }
+            sortResults(by: key, ascending: descriptor.ascending)
+            tableView.deselectAll(nil)
+            reloadWithFade()
+            notifySelectionChanged()
+            delegate?.searchResultsDidChangeServerSort(serverSort)
+            return
+        }
+
+        delegate?.searchResultsDidSwitchToClientSort()
         sortResults(by: key, ascending: descriptor.ascending)
 
         tableView.deselectAll(nil)

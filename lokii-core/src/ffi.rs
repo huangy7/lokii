@@ -194,6 +194,17 @@ pub enum FfiSearchMode {
 }
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiSearchSort {
+    Relevance,
+    SizeDesc,
+    SizeAsc,
+    ModifiedDesc,
+    ModifiedAsc,
+    CreatedDesc,
+    CreatedAsc,
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfiPrimaryScopeAction {
     NoOp,
     PruneOnly,
@@ -288,6 +299,20 @@ impl From<SearchMode> for FfiSearchMode {
             SearchMode::Wildcard => FfiSearchMode::Wildcard,
             SearchMode::Regex => FfiSearchMode::Regex,
             SearchMode::Fuzzy => FfiSearchMode::Fuzzy,
+        }
+    }
+}
+
+impl From<FfiSearchSort> for search::SearchSort {
+    fn from(sort: FfiSearchSort) -> Self {
+        match sort {
+            FfiSearchSort::Relevance => search::SearchSort::Relevance,
+            FfiSearchSort::SizeDesc => search::SearchSort::SizeDesc,
+            FfiSearchSort::SizeAsc => search::SearchSort::SizeAsc,
+            FfiSearchSort::ModifiedDesc => search::SearchSort::ModifiedDesc,
+            FfiSearchSort::ModifiedAsc => search::SearchSort::ModifiedAsc,
+            FfiSearchSort::CreatedDesc => search::SearchSort::CreatedDesc,
+            FfiSearchSort::CreatedAsc => search::SearchSort::CreatedAsc,
         }
     }
 }
@@ -1293,15 +1318,35 @@ impl LokiiCore {
         case_sensitivity: FfiCaseSensitivity,
         include_offline: bool,
     ) -> FfiSearchResponse {
+        self.search_with_sort(
+            query,
+            mode,
+            case_sensitivity,
+            include_offline,
+            FfiSearchSort::Relevance,
+        )
+    }
+
+    /// Search across primary and mounted volume shards with explicit offline cache control and server-side Top-K sort.
+    pub fn search_with_sort(
+        &self,
+        query: String,
+        mode: FfiSearchMode,
+        case_sensitivity: FfiCaseSensitivity,
+        include_offline: bool,
+        sort: FfiSearchSort,
+    ) -> FfiSearchResponse {
         let max_results = self.config_store.read().index.max_results;
         let search_mode = SearchMode::from(&mode);
-        let (results, is_case_sensitive, error, effective_mode) = self.volumes.search(
+        let (results, is_case_sensitive, error, effective_mode) = self.volumes.search_with_filter_and_sort(
             &self.store,
             &query,
             search_mode,
+            search::QueryFilter::default(),
             case_sensitivity.into(),
             max_results,
             include_offline,
+            sort.into(),
         );
 
         let hint = if results.is_empty() {

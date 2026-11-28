@@ -2,6 +2,37 @@ import Cocoa
 
 // MARK: - 过滤状态与检索语法协调数据结构
 
+/// 过滤浮层中的修改时间预设档位，对应内联 `mtime:` 语法词元。
+public enum ModifiedTimePreset: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case last7Days = "<7d"
+    case last30Days = "<30d"
+    case olderThan90Days = ">90d"
+    case olderThan180Days = ">180d"
+    case olderThan1Year = ">1y"
+
+    public var id: String { rawValue }
+
+    public var queryToken: String { "mtime:\(rawValue)" }
+
+    public var titleKey: String {
+        switch self {
+        case .last7Days: return "filter.modified.last7Days"
+        case .last30Days: return "filter.modified.last30Days"
+        case .olderThan90Days: return "filter.modified.olderThan90Days"
+        case .olderThan180Days: return "filter.modified.olderThan180Days"
+        case .olderThan1Year: return "filter.modified.olderThan1Year"
+        }
+    }
+}
+
+/// 修改时间过滤状态：预设胶囊或用户手写的自定义时间语法词元。
+public enum ModifiedTimeFilter: Equatable, Hashable, Sendable {
+    case preset(ModifiedTimePreset)
+    /// 完整保留搜索框中手写的自定义时间词元（如 `["mtime:2025-01-01..2025-12-31"]`），
+    /// 避免在浮层切换文件类型或大小时丢失原有时间表达式。
+    case custom([String])
+}
+
 /// 表示用户在过滤浮层或搜索栏中激活的多维条件约束
 public struct FilterState: Equatable, Hashable, Sendable {
     /// 选定的文件类型集合
@@ -13,6 +44,9 @@ public struct FilterState: Equatable, Hashable, Sendable {
     /// 文件大小字节上限（包含）
     public var maxSizeBytes: UInt64?
 
+    /// 修改时间过滤条件
+    public var modifiedTime: ModifiedTimeFilter?
+
     /// 具体文件类型枚举列表（排除 All）
     public static let concreteFileTypes: [FfiFileType] = [
         .code, .document, .image, .media, .archive, .folder
@@ -22,11 +56,13 @@ public struct FilterState: Equatable, Hashable, Sendable {
     public init(
         selectedTypes: Set<FfiFileType> = [],
         minSizeBytes: UInt64? = nil,
-        maxSizeBytes: UInt64? = nil
+        maxSizeBytes: UInt64? = nil,
+        modifiedTime: ModifiedTimeFilter? = nil
     ) {
         self.selectedTypes = selectedTypes
         self.minSizeBytes = minSizeBytes
         self.maxSizeBytes = maxSizeBytes
+        self.modifiedTime = modifiedTime
     }
 
     /// 判断文件类型维度是否具备实质性过滤约束
@@ -47,6 +83,9 @@ public struct FilterState: Equatable, Hashable, Sendable {
         if minSizeBytes != nil || maxSizeBytes != nil {
             count += 1
         }
+        if modifiedTime != nil {
+            count += 1
+        }
         return count
     }
 
@@ -60,6 +99,7 @@ public struct FilterState: Equatable, Hashable, Sendable {
         selectedTypes.removeAll()
         minSizeBytes = nil
         maxSizeBytes = nil
+        modifiedTime = nil
     }
 }
 
@@ -106,6 +146,21 @@ public final class FilterQuerySyncCoordinator {
             tokens.append("size:>\(formatBytes(minBytes))")
         } else if let maxBytes = state.maxSizeBytes {
             tokens.append("size:<\(formatBytes(maxBytes))")
+        }
+
+        // 3. 修改时间语法: mtime:<7d, mtime:>90d 或用户自定义表达
+        if let modifiedTime = state.modifiedTime {
+            switch modifiedTime {
+            case .preset(let preset):
+                tokens.append(preset.queryToken)
+            case .custom(let customTokens):
+                for tok in customTokens {
+                    let clean = tok.trimmingCharacters(in: .whitespaces)
+                    if !clean.isEmpty {
+                        tokens.append(clean)
+                    }
+                }
+            }
         }
 
         return tokens.joined(separator: " ")
@@ -196,6 +251,7 @@ public final class FilterQuerySyncCoordinator {
 
         var remainingTerms: [String] = []
         var state = FilterState()
+        var validModifiedTokens: [(raw: String, payload: String)] = []
 
         for token in scanSyntaxTokens(in: trimmed) {
             let term = token.raw
@@ -245,8 +301,27 @@ public final class FilterQuerySyncCoordinator {
                 continue
             }
 
+            // 3. mtime:<condition> / modified:<condition>
+            if lower.hasPrefix("mtime:") || lower.hasPrefix("modified:") {
+                let prefixLen = lower.hasPrefix("mtime:") ? 6 : 9
+                let modPayload = String(term.dropFirst(prefixLen))
+                if isValidModifiedTimePayload(modPayload) {
+                    validModifiedTokens.append((raw: term, payload: modPayload))
+                    continue
+                }
+                remainingTerms.append(term)
+                continue
+            }
+
             // 未命中任何语法的普通词项
             remainingTerms.append(term)
+        }
+
+        if validModifiedTokens.count == 1,
+           let preset = modifiedTimePreset(forPayload: validModifiedTokens[0].payload) {
+            state.modifiedTime = .preset(preset)
+        } else if !validModifiedTokens.isEmpty {
+            state.modifiedTime = .custom(validModifiedTokens.map(\.raw))
         }
 
         let keyword = remainingTerms.joined(separator: " ")
@@ -459,12 +534,141 @@ public final class FilterQuerySyncCoordinator {
         }
     }
 
+    // MARK: - 修改时间语法校验与预设映射
+
+    private static let modifiedDurationUnits: Set<String> = [
+        "min", "mins", "minute", "minutes",
+        "h", "hr", "hrs", "hour", "hours",
+        "d", "day", "days",
+        "w", "wk", "wks", "week", "weeks",
+        "m", "mo", "mos", "mon", "month", "months",
+        "y", "yr", "yrs", "year", "years",
+    ]
+
+    private static func isValidRelativeDuration(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return false }
+        guard let splitIdx = s.firstIndex(where: { !($0.isASCII && ($0.isNumber || $0 == ".")) }) else {
+            return false
+        }
+        guard splitIdx > s.startIndex else { return false }
+        let numStr = String(s[..<splitIdx])
+        let unit = String(s[splitIdx...]).trimmingCharacters(in: .whitespaces).lowercased()
+        guard modifiedDurationUnits.contains(unit) else { return false }
+        if UInt64(numStr) != nil {
+            return true
+        }
+        if let val = Double(numStr), !val.isNaN, !val.isInfinite, val >= 0 {
+            return true
+        }
+        return false
+    }
+
+    private static func isValidCalendarDate(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        let lower = s.lowercased()
+        if lower == "today" || lower == "yesterday" {
+            return true
+        }
+        let parts = s.split(separator: "-", omittingEmptySubsequences: false)
+        switch parts.count {
+        case 1:
+            guard parts[0].count == 4, let year = Int(parts[0]), (1970...9999).contains(year) else {
+                return false
+            }
+            return parts[0].allSatisfy { $0.isASCII && $0.isNumber }
+        case 2:
+            guard parts[0].count == 4, parts[1].count == 2,
+                  parts[0].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  parts[1].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let year = Int(parts[0]), (1970...9999).contains(year),
+                  let month = Int(parts[1]), (1...12).contains(month) else {
+                return false
+            }
+            return true
+        case 3:
+            guard parts[0].count == 4, parts[1].count == 2, parts[2].count == 2,
+                  parts[0].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  parts[1].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  parts[2].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let year = Int(parts[0]), (1970...9999).contains(year),
+                  let month = Int(parts[1]), (1...12).contains(month),
+                  let day = Int(parts[2]) else {
+                return false
+            }
+            let maxDay: Int
+            switch month {
+            case 1, 3, 5, 7, 8, 10, 12: maxDay = 31
+            case 4, 6, 9, 11: maxDay = 30
+            case 2:
+                let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+                maxDay = leap ? 29 : 28
+            default:
+                return false
+            }
+            return (1...maxDay).contains(day)
+        default:
+            return false
+        }
+    }
+
+    public static func isValidModifiedTimePayload(_ payload: String) -> Bool {
+        let trimmed = payload.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+
+        if let dotRange = trimmed.range(of: "..") {
+            let left = String(trimmed[..<dotRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let right = String(trimmed[dotRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+            guard !left.isEmpty || !right.isEmpty else { return false }
+            let leftRel = left.isEmpty || isValidRelativeDuration(left)
+            let rightRel = right.isEmpty || isValidRelativeDuration(right)
+            if leftRel && rightRel {
+                return true
+            }
+            let leftCal = left.isEmpty || isValidCalendarDate(left)
+            let rightCal = right.isEmpty || isValidCalendarDate(right)
+            return leftCal && rightCal
+        }
+
+        if trimmed.hasPrefix(">=") || trimmed.hasPrefix("<=") {
+            let rest = String(trimmed.dropFirst(2))
+            return isValidRelativeDuration(rest) || isValidCalendarDate(rest)
+        }
+        if trimmed.hasPrefix(">") || trimmed.hasPrefix("<") {
+            let rest = String(trimmed.dropFirst(1))
+            return isValidRelativeDuration(rest) || isValidCalendarDate(rest)
+        }
+        if trimmed.hasPrefix("=") {
+            let rest = String(trimmed.dropFirst(1))
+            return isValidCalendarDate(rest)
+        }
+        return isValidRelativeDuration(trimmed) || isValidCalendarDate(trimmed)
+    }
+
+    public static func modifiedTimePreset(forPayload payload: String) -> ModifiedTimePreset? {
+        let lower = payload.trimmingCharacters(in: .whitespaces).lowercased()
+        switch lower {
+        case "<7d", "<=7d", "7d", "<7day", "<7days", "<1w", "<=1w", "1w", "<1wk", "<1week":
+            return .last7Days
+        case "<30d", "<=30d", "30d", "<30day", "<30days", "<1m", "<=1m", "1m", "<1mo", "<1month":
+            return .last30Days
+        case ">90d", ">=90d", ">90day", ">90days", ">3m", ">=3m", ">3mo", ">3mos", ">3month", ">3months":
+            return .olderThan90Days
+        case ">180d", ">=180d", ">180day", ">180days", ">6m", ">=6m", ">6mo", ">6mos", ">6month", ">6months":
+            return .olderThan180Days
+        case ">1y", ">=1y", ">1yr", ">1yrs", ">1year", ">1years", ">365d", ">=365d", ">12m", ">=12m", ">12mo", ">12month", ">12months":
+            return .olderThan1Year
+        default:
+            return nil
+        }
+    }
+
     // MARK: - 语法高亮与限定词胶囊格式化
 
-    /// 限定词语法：(type|size|ext):(\S*)；高亮格式化与「是否需要触碰 textStorage」的判定共用一份，避免模式漂移
-    private static let filterSyntaxRegex = try? NSRegularExpression(pattern: "(?i)\\b(type|size|ext):([^\\s]*)")
+    /// 限定词语法：(type|size|ext|mtime|modified):(\S*)；高亮格式化与「是否需要触碰 textStorage」的判定共用一份，避免模式漂移
+    private static let filterSyntaxRegex = try? NSRegularExpression(pattern: "(?i)\\b(type|size|ext|mtime|modified):([^\\s]*)")
 
-    /// 判断给定的检索表达式中是否包含限定词语法（type: / size: / ext:）
+    /// 判断给定的检索表达式中是否包含限定词语法（type: / size: / ext: / mtime: / modified:）
     public static func containsFilterSyntax(_ query: String) -> Bool {
         let fullRange = NSRange(location: 0, length: (query as NSString).length)
         return filterSyntaxRegex?.firstMatch(in: query, range: fullRange) != nil
@@ -522,6 +726,10 @@ public final class FilterQuerySyncCoordinator {
                     }
                 } else if keyLower == "size" {
                     guard parseSizeToken(valPayload) != nil else {
+                        continue
+                    }
+                } else if keyLower == "mtime" || keyLower == "modified" {
+                    guard isValidModifiedTimePayload(valPayload) else {
                         continue
                     }
                 }

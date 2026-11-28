@@ -69,6 +69,7 @@ fn main() {
         limit,
         case_sensitivity: None,
         include_offline: online_only.then_some(false),
+        sort: None,
     };
     let response = query(&request).unwrap_or_else(|e| {
         fail(
