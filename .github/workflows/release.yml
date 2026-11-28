@@ -18,9 +18,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 不可启用 fetch-tags: true：actions/checkout 会将 commit SHA 写入 refs/tags/<tag>，
+      # 与附注标签自动跟随写入同一 ref 冲突；附注标签对象由下方显式 git fetch 精准拉取。
       - uses: actions/checkout@v5
-        with:
-          fetch-tags: true
 
       - name: verify tag matches crate version
         shell: bash
@@ -54,7 +54,7 @@ jobs:
             exit 0
           fi
           # actions/checkout 默认按 commit SHA 写入轻量本地 ref，需强制拉取远端 tag 对象以还原附注说明
-          git fetch --force --depth=1 origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git fetch --no-tags --force --depth=1 origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           TAG_OBJECT_TYPE="$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null || echo unknown)"
           echo "[INFO] tag ${GITHUB_REF_NAME} 对象类型：${TAG_OBJECT_TYPE}"
 
