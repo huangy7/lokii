@@ -253,4 +253,56 @@ final class FilterQuerySyncCoordinatorTests: XCTestCase {
             XCTAssertEqual(attrs[.foregroundColor] as? NSColor, NSColor.labelColor)
         }
     }
+
+    func testModifiedTimeFilterRoundtripCustomPreservationAndSyntaxPill() {
+        for preset in ModifiedTimePreset.allCases {
+            var state = FilterState()
+            state.modifiedTime = .preset(preset)
+            XCTAssertEqual(state.activeCount, 1)
+
+            let serialized = FilterQuerySyncCoordinator.serialize(keyword: "archive", state: state)
+            XCTAssertTrue(serialized.contains("mtime:\(preset.rawValue)"))
+
+            let (keyword, parsed) = FilterQuerySyncCoordinator.deserialize(query: serialized)
+            XCTAssertEqual(keyword, "archive")
+            XCTAssertEqual(parsed.modifiedTime, .preset(preset))
+            XCTAssertEqual(parsed.activeCount, 1)
+        }
+
+        let (_, aliasParsed) = FilterQuerySyncCoordinator.deserialize(query: "modified:>180d dump")
+        XCTAssertEqual(aliasParsed.modifiedTime, .preset(.olderThan180Days))
+
+        let customQuery = "video mtime:2025-01-01..2025-06-30"
+        var (customKw, customState) = FilterQuerySyncCoordinator.deserialize(query: customQuery)
+        XCTAssertEqual(customKw, "video")
+        XCTAssertEqual(customState.modifiedTime, .custom(["mtime:2025-01-01..2025-06-30"]))
+        XCTAssertEqual(customState.activeCount, 1)
+
+        customState.selectedTypes = [.media]
+        let reserialized = FilterQuerySyncCoordinator.serialize(keyword: customKw, state: customState)
+        XCTAssertEqual(reserialized, "video type:media mtime:2025-01-01..2025-06-30")
+
+        customState.clearAll()
+        XCTAssertNil(customState.modifiedTime)
+        XCTAssertTrue(customState.isUnconstrained)
+
+        let quoted = "\"mtime:<7d\""
+        let (quotedKw, quotedState) = FilterQuerySyncCoordinator.deserialize(query: quoted)
+        XCTAssertEqual(quotedKw, quoted)
+        XCTAssertTrue(quotedState.isUnconstrained)
+
+        let syntaxQuery = "movie mtime:<7d modified:2025-01-01"
+        let attrStr = FilterQuerySyncCoordinator.formatQuerySyntax(syntaxQuery)
+        let nsSyntax = syntaxQuery as NSString
+        for key in ["mtime:", "modified:"] {
+            let keyRange = nsSyntax.range(of: key)
+            XCTAssertEqual(attrStr.attributes(at: keyRange.location, effectiveRange: nil)[.foregroundColor] as? NSColor, NSColor.secondaryLabelColor)
+        }
+        for payload in ["<7d", "2025-01-01"] {
+            let valRange = nsSyntax.range(of: payload)
+            let attrs = attrStr.attributes(at: valRange.location, effectiveRange: nil)
+            XCTAssertEqual(attrs[.foregroundColor] as? NSColor, NSColor.controlAccentColor)
+            XCTAssertNotNil(attrs[.backgroundColor])
+        }
+    }
 }

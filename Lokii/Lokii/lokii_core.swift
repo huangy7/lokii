@@ -999,6 +999,11 @@ public protocol LokiiCoreProtocol: AnyObject, Sendable {
     func searchWithOptions(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity, includeOffline: Bool)  -> FfiSearchResponse
     
     /**
+     * Search across primary and mounted volume shards with explicit offline cache control and server-side Top-K sort.
+     */
+    func searchWithSort(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity, includeOffline: Bool, sort: FfiSearchSort)  -> FfiSearchResponse
+    
+    /**
      * Start the config file watcher for hot-reload.
      */
     func startConfigWatcher(eventHandler: EventHandler) 
@@ -1359,6 +1364,21 @@ open func searchWithOptions(query: String, mode: FfiSearchMode, caseSensitivity:
         FfiConverterTypeFfiSearchMode_lower(mode),
         FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),
         FfiConverterBool.lower(includeOffline),$0
+    )
+})
+}
+    
+    /**
+     * Search across primary and mounted volume shards with explicit offline cache control and server-side Top-K sort.
+     */
+open func searchWithSort(query: String, mode: FfiSearchMode, caseSensitivity: FfiCaseSensitivity, includeOffline: Bool, sort: FfiSearchSort) -> FfiSearchResponse  {
+    return try!  FfiConverterTypeFfiSearchResponse_lift(try! rustCall() {
+    uniffi_lokii_core_fn_method_lokiicore_search_with_sort(self.uniffiClonePointer(),
+        FfiConverterString.lower(query),
+        FfiConverterTypeFfiSearchMode_lower(mode),
+        FfiConverterTypeFfiCaseSensitivity_lower(caseSensitivity),
+        FfiConverterBool.lower(includeOffline),
+        FfiConverterTypeFfiSearchSort_lower(sort),$0
     )
 })
 }
@@ -3272,6 +3292,111 @@ extension FfiSearchMode: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiSearchSort {
+    
+    case relevance
+    case sizeDesc
+    case sizeAsc
+    case modifiedDesc
+    case modifiedAsc
+    case createdDesc
+    case createdAsc
+}
+
+
+#if compiler(>=6)
+extension FfiSearchSort: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSearchSort: FfiConverterRustBuffer {
+    typealias SwiftType = FfiSearchSort
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSearchSort {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .relevance
+        
+        case 2: return .sizeDesc
+        
+        case 3: return .sizeAsc
+        
+        case 4: return .modifiedDesc
+        
+        case 5: return .modifiedAsc
+        
+        case 6: return .createdDesc
+        
+        case 7: return .createdAsc
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiSearchSort, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .relevance:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .sizeDesc:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .sizeAsc:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .modifiedDesc:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .modifiedAsc:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .createdDesc:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .createdAsc:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSearchSort_lift(_ buf: RustBuffer) throws -> FfiSearchSort {
+    return try FfiConverterTypeFfiSearchSort.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSearchSort_lower(_ value: FfiSearchSort) -> RustBuffer {
+    return FfiConverterTypeFfiSearchSort.lower(value)
+}
+
+
+extension FfiSearchSort: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiStartupMode {
     
     case hotStart(cachedCount: UInt64
@@ -3859,6 +3984,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_search_with_options() != 35406) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lokii_core_checksum_method_lokiicore_search_with_sort() != 49413) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lokii_core_checksum_method_lokiicore_start_config_watcher() != 32031) {

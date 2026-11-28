@@ -69,29 +69,47 @@ impl<'a, K: Ord> TopK<'a, K> {
         score: K,
         view: crate::compact_index::EntryView<'a>,
     ) {
+        let _ = self.offer_path_tracked(ordinal, score, view);
+    }
+
+    pub(crate) fn offer_path_tracked(
+        &mut self,
+        ordinal: usize,
+        score: K,
+        view: crate::compact_index::EntryView<'a>,
+    ) -> (bool, Option<usize>) {
         let path = view
             .raw_path()
             .map_or((view.parent, view.name), |path| (path, ""));
-        self.offer_candidate(Candidate {
+        self.offer_candidate_tracked(Candidate {
             ordinal,
             score,
             name: view.name,
             path: Some(path),
-        });
+        })
     }
 
     fn offer_candidate(&mut self, candidate: Candidate<'a, K>) {
+        let _ = self.offer_candidate_tracked(candidate);
+    }
+
+    fn offer_candidate_tracked(&mut self, candidate: Candidate<'a, K>) -> (bool, Option<usize>) {
         if self.limit == 0 {
-            return;
+            return (false, None);
         }
         if self.candidates.len() < self.limit {
             self.candidates.push(candidate);
-        } else if self
-            .candidates
-            .peek()
-            .is_some_and(|worst| candidate < *worst)
-        {
-            *self.candidates.peek_mut().unwrap() = candidate;
+            (true, None)
+        } else if let Some(mut worst) = self.candidates.peek_mut() {
+            if candidate < *worst {
+                let evicted = worst.ordinal;
+                *worst = candidate;
+                (true, Some(evicted))
+            } else {
+                (false, None)
+            }
+        } else {
+            (false, None)
         }
     }
 

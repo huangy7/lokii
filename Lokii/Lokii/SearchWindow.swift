@@ -101,6 +101,7 @@ final class SearchWindow: NSWindowController {
     static let maxHistoryDisplayLength = 36
     private var currentMode: FfiSearchMode = .auto
     private var currentCaseSensitivity: FfiCaseSensitivity = .auto
+    private var currentSort: FfiSearchSort = .relevance
     private var statusText: LocalizedText = .key("search.indexing") {
         didSet { updateStatusLabel() }
     }
@@ -292,6 +293,7 @@ final class SearchWindow: NSWindowController {
     func applyHandoffState(_ state: SearchHandoffState) {
         currentMode = state.mode
         currentCaseSensitivity = state.caseSensitivity
+        currentSort = .relevance
         searchField.stringValue = state.query
         lastQuery = state.query
         updateCaseSensitivityButtonState()
@@ -572,6 +574,7 @@ final class SearchWindow: NSWindowController {
             searchField: searchField,
             onSearch: { [weak self] query in
                 guard let self = self else { return }
+                self.currentSort = .relevance
                 self.lastQuery = query
                 if query.isEmpty {
                     self.searchResultsViewController.updateBottomPath(for: nil)
@@ -634,6 +637,8 @@ final class SearchWindow: NSWindowController {
 
     @objc private func recentSearchSelected(_ sender: NSMenuItem) {
         guard let query = sender.representedObject as? String else { return }
+        currentSort = .relevance
+        lastQuery = query
         searchField.stringValue = query
         applyQuerySyntaxHighlighting()
         updateCaseSensitivityButtonState()
@@ -1265,6 +1270,7 @@ final class SearchWindow: NSWindowController {
         }
         guard query != lastQuery else { return }
         lastQuery = query
+        currentSort = .relevance
         searchWorkItem?.cancel()
 
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1345,18 +1351,24 @@ final class SearchWindow: NSWindowController {
         }
         let generation = nextSearchGeneration()
         let shouldBuildTree = splitViewController.needsDirectoryTree
+        let sort = currentSort
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let response = self.engine.search(query: "*", mode: .wildcard)
+            let response = self.engine.search(query: "*", mode: .wildcard, sort: sort)
             guard self.isCurrentSearchGeneration(generation) else { return }
 
-            // 默认未检索状态下按修改时间倒序排列（最近活跃优先），时间相同时按文件名自然字母顺序排列
-            let sorted = response.results.sorted {
-                if $0.modified != $1.modified {
-                    return $0.modified > $1.modified
+            let sorted: [FfiSearchResult]
+            if sort == .relevance {
+                // 默认未检索状态下按修改时间倒序排列（最近活跃优先），时间相同时按文件名自然字母顺序排列
+                sorted = response.results.sorted {
+                    if $0.modified != $1.modified {
+                        return $0.modified > $1.modified
+                    }
+                    return $0.name.localizedStandardCompare($1.name) == .orderedAscending
                 }
-                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            } else {
+                sorted = response.results
             }
             guard self.isCurrentSearchGeneration(generation) else { return }
 
@@ -1405,7 +1417,9 @@ final class SearchWindow: NSWindowController {
                     rawResults: items,
                     tree: tree,
                     deferTreeBuild: !shouldBuildTree,
-                    autoSelectFirstRow: false
+                    autoSelectFirstRow: false,
+                    preserveSortDescriptors: sort != .relevance,
+                    skipLocalSort: sort != .relevance
                 )
                 if self.sidebarTreeViewController.selectedPath == nil {
                     self.searchMatchText = nil
@@ -1415,16 +1429,17 @@ final class SearchWindow: NSWindowController {
         }
     }
 
-    private func performSearch(query: String) {
+    private func performSearch(query: String, autoSelectFirstRow: Bool = true) {
         guard indexingState != .failed else { return }
         let generation = nextSearchGeneration()
         let mode = currentMode
         let caseSensitivity = currentCaseSensitivity
+        let sort = currentSort
         let shouldBuildTree = splitViewController.needsDirectoryTree
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let response = self.engine.search(query: query, mode: mode, caseSensitivity: caseSensitivity)
+            let response = self.engine.search(query: query, mode: mode, caseSensitivity: caseSensitivity, sort: sort)
             guard self.isCurrentSearchGeneration(generation) else { return }
 
             let tree: ResultDirectoryTree? = (shouldBuildTree && !response.results.isEmpty)
@@ -1441,7 +1456,9 @@ final class SearchWindow: NSWindowController {
                     rawResults: response.results,
                     tree: tree,
                     deferTreeBuild: !shouldBuildTree,
-                    autoSelectFirstRow: true
+                    autoSelectFirstRow: autoSelectFirstRow,
+                    preserveSortDescriptors: sort != .relevance,
+                    skipLocalSort: sort != .relevance
                 )
                 self.updateFilterButtonState(forQuery: self.searchField.stringValue)
                 self.updateCaseSensitivityButtonState(responseCaseSensitive: response.isCaseSensitive)
@@ -1808,6 +1825,21 @@ extension SearchWindow: SearchMainSplitViewControllerDelegate {
             searchMatchText = nil
         }
     }
+
+    func searchMainSplitViewDidChangeServerSort(_ sort: FfiSearchSort) {
+        guard indexingState != .failed else { return }
+        currentSort = sort
+        let query = searchField.stringValue
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            loadDefaultResults()
+        } else {
+            performSearch(query: query, autoSelectFirstRow: false)
+        }
+    }
+
+    func searchMainSplitViewDidSwitchToClientSort() {
+        currentSort = .relevance
+    }
 }
 
 // MARK: - NSWindowDelegate
@@ -1872,6 +1904,8 @@ extension SearchWindow: NSSearchFieldDelegate {
         if commandSelector == #selector(NSResponder.moveUp(_:)) {
             let length = (textView.string as NSString).length
             if length == 0, let lastQuery = recentSearches.first {
+                currentSort = .relevance
+                self.lastQuery = lastQuery
                 searchField.stringValue = lastQuery
                 focusSearchField()
                 performSearch(query: lastQuery)

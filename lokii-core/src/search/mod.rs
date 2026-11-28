@@ -16,7 +16,7 @@ pub use disjunction::{
 };
 pub use filter::{
     is_dotfile_query, parse_query_filter, parse_query_structured, CompiledRecordFilter, FileType,
-    ParsedQuery, QueryFilter, QueryToken, SizeFilter,
+    ModifiedFilter, ParsedQuery, QueryFilter, QueryToken, SizeFilter,
 };
 pub use regex_sugar::{is_regex_metachar, parse_regex_sugar, RegexSugar};
 pub use substring::search_disjunction;
@@ -248,6 +248,164 @@ pub(crate) fn rank_unique_names<'a>(
         }
     }
     top.finish()
+}
+
+/// 按记录字段（体积、修改时间、创建时间）执行全索引 Top-K 筛选与排序：
+/// 禁用 `BaseNameScore::upper_bound` 剪枝与重名桶截断，改用 `TopK<u64>` 堆顶阈值前置短路。
+pub(crate) fn rank_unique_names_sorted<'a>(
+    index: &'a CompactIndex,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    required_sig: NameSignature,
+    sort: SearchSort,
+    mut match_name: impl FnMut(&'a str, Option<&'a str>) -> bool,
+) -> Vec<Candidate<'a, u64>> {
+    let mut top = TopK::new(max_results);
+    if max_results == 0 {
+        return Vec::new();
+    }
+    let query_index = index.query_index();
+    let passthrough = filter.is_passthrough();
+    let records = index.records();
+    for name_id in 0..query_index.slot_count() as u32 {
+        let sig = query_index.signature_at(name_id);
+        if sig == crate::string_pool::NameSignature::default() && !query_index.is_ready(name_id) {
+            continue;
+        }
+        if !sig.contains(required_sig) {
+            continue;
+        }
+        let entries = query_index.entries(name_id);
+        if entries.is_empty() {
+            continue;
+        }
+        let Some(name) = index.name_text(name_id) else {
+            continue;
+        };
+        let folded = if name.is_ascii() {
+            None
+        } else {
+            query_index.folded(name_id)
+        };
+        if !match_name(name, folded) {
+            continue;
+        }
+        for &ordinal in entries {
+            let ord_usize = ordinal as usize;
+            let Some(record) = records.get(ord_usize) else {
+                continue;
+            };
+            let key = sort_key_for_record(record, sort);
+            if let Some(worst) = top.worst() {
+                if key < worst.score || (key == worst.score && name > worst.name()) {
+                    continue;
+                }
+            }
+            if !passthrough && !filter.matches_record_in(index, record, Some(name)) {
+                continue;
+            }
+            if let Some(view) = index.view(crate::compact_index::EntryId(ord_usize)) {
+                top.offer_path(ord_usize, key, view);
+            }
+        }
+    }
+    top.finish()
+}
+
+/// 检索结果服务端全量排序策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    #[default]
+    Relevance,
+    SizeDesc,
+    SizeAsc,
+    ModifiedDesc,
+    ModifiedAsc,
+    CreatedDesc,
+    CreatedAsc,
+}
+
+#[inline]
+pub(crate) fn sort_key_for_record(record: &crate::compact_index::CompactRecord, sort: SearchSort) -> u64 {
+    match sort {
+        SearchSort::SizeDesc => record.size,
+        SearchSort::SizeAsc => u64::MAX - record.size,
+        SearchSort::ModifiedDesc => record.modified,
+        SearchSort::ModifiedAsc => u64::MAX - record.modified,
+        SearchSort::CreatedDesc => record.created_at,
+        SearchSort::CreatedAsc => u64::MAX - record.created_at,
+        SearchSort::Relevance => 0,
+    }
+}
+
+#[inline]
+pub(crate) fn sort_key_for_entry(entry: &FileEntry, sort: SearchSort) -> u64 {
+    match sort {
+        SearchSort::SizeDesc => entry.size,
+        SearchSort::SizeAsc => u64::MAX - entry.size,
+        SearchSort::ModifiedDesc => entry.modified,
+        SearchSort::ModifiedAsc => u64::MAX - entry.modified,
+        SearchSort::CreatedDesc => entry.created_at,
+        SearchSort::CreatedAsc => u64::MAX - entry.created_at,
+        SearchSort::Relevance => 0,
+    }
+}
+
+pub(crate) fn cmp_advanced_by_sort(
+    a: &AdvancedSearchResult,
+    b: &AdvancedSearchResult,
+    sort: SearchSort,
+) -> std::cmp::Ordering {
+    if sort == SearchSort::Relevance {
+        return b
+            .score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.entry.name.cmp(&b.entry.name))
+            .then_with(|| a.entry.path.cmp(&b.entry.path));
+    }
+    let ka = sort_key_for_entry(&a.entry, sort);
+    let kb = sort_key_for_entry(&b.entry, sort);
+    kb.cmp(&ka)
+        .then_with(|| a.entry.name.cmp(&b.entry.name))
+        .then_with(|| a.entry.path.cmp(&b.entry.path))
+}
+
+pub(crate) fn cmp_multi_by_sort(
+    a: &MultiSearchResult,
+    b: &MultiSearchResult,
+    sort: SearchSort,
+) -> std::cmp::Ordering {
+    if sort == SearchSort::Relevance {
+        return cmp_score_desc(a, b);
+    }
+    let ka = sort_key_for_entry(&a.result.entry, sort);
+    let kb = sort_key_for_entry(&b.result.entry, sort);
+    kb.cmp(&ka)
+}
+
+pub(crate) fn resolve_effective_sort(
+    requested: SearchSort,
+    has_content_terms: bool,
+    is_star_wildcard: bool,
+    filter: &QueryFilter,
+) -> SearchSort {
+    if requested != SearchSort::Relevance {
+        return requested;
+    }
+    if is_star_wildcard {
+        return SearchSort::ModifiedDesc;
+    }
+    if !has_content_terms {
+        if !filter.size_filter.is_unconstrained() {
+            return SearchSort::SizeDesc;
+        }
+        if !filter.modified_filter.is_unconstrained() {
+            return SearchSort::ModifiedDesc;
+        }
+    }
+    SearchSort::Relevance
 }
 
 /// Search mode per D-01, D-02, D-04.
@@ -649,6 +807,7 @@ fn try_posix_colon_fallback(
     explicit_lock: bool,
     effective_mode: SearchMode,
     max_results: usize,
+    sort: SearchSort,
 ) -> Option<(Vec<AdvancedSearchResult>, bool)> {
     if effective_mode == SearchMode::Regex
         || path_query.scope_prefix.is_some()
@@ -693,18 +852,22 @@ fn try_posix_colon_fallback(
         &recompiled
     };
 
-    let results = substring::search_index_tokens(
+    let results = substring::search_index_tokens_with_hybrid_and_sort(
         read,
         &colon_tokens,
         filter_ref,
         max_results,
         fallback_cs,
+        case_sensitivity,
         explicit_lock,
+        None,
+        sort,
     );
     (!results.is_empty()).then_some((results, fallback_cs))
 }
 
 /// 未索引绝对路径目录的单层实时兜底列举（`std::fs::read_dir`），仅用于补齐系统目录或外挂卷等尚未建库路径。
+#[allow(clippy::too_many_arguments)]
 fn fallback_read_dir(
     path_query: &path_query::PathQuery,
     compiled_filter: &CompiledRecordFilter,
@@ -712,6 +875,7 @@ fn fallback_read_dir(
     is_case_sensitive: bool,
     explicit_lock: bool,
     effective_mode: SearchMode,
+    sort: SearchSort,
 ) -> Vec<AdvancedSearchResult> {
     if max_results == 0
         || effective_mode == SearchMode::Regex
@@ -876,7 +1040,11 @@ fn fallback_read_dir(
         ));
     }
 
-    matched.sort_by(|(sa, ra), (sb, rb)| sb.cmp(sa).then_with(|| ra.entry.name.cmp(&rb.entry.name)));
+    if sort != SearchSort::Relevance {
+        matched.sort_by(|(_, ra), (_, rb)| cmp_advanced_by_sort(ra, rb, sort));
+    } else {
+        matched.sort_by(|(sa, ra), (sb, rb)| sb.cmp(sa).then_with(|| ra.entry.name.cmp(&rb.entry.name)));
+    }
     matched.truncate(limit);
     matched.into_iter().map(|(_, res)| res).collect()
 }
@@ -895,10 +1063,31 @@ pub fn dispatch_with_filter(
     case_sensitivity: CaseSensitivity,
     max_results: usize,
 ) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
+    dispatch_with_filter_and_sort(
+        store,
+        query,
+        mode,
+        filter,
+        case_sensitivity,
+        max_results,
+        SearchSort::Relevance,
+    )
+}
+
+pub fn dispatch_with_filter_and_sort(
+    store: &IndexStore,
+    query: &str,
+    mode: SearchMode,
+    filter: QueryFilter,
+    case_sensitivity: CaseSensitivity,
+    max_results: usize,
+    sort: SearchSort,
+) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
     let read = store.read();
     let prepared = prepare_search(query, mode, case_sensitivity, false, |ext| {
         read.extension_id(ext).is_some()
     });
+    let effective_sort = resolve_prepared_sort(&prepared, mode, &filter, sort);
     dispatch_with_filter_inner(
         &read,
         &prepared,
@@ -908,7 +1097,49 @@ pub fn dispatch_with_filter(
         max_results,
         None,
         FuzzyPass::Both,
+        effective_sort,
     )
+}
+
+fn has_content_terms_for_sort(parsed: &ParsedQuery, mode: SearchMode) -> bool {
+    if mode == SearchMode::Regex {
+        return !extract_content_terms_from_tokens(&parsed.positive_tokens, SearchMode::Regex)
+            .is_empty();
+    }
+    parsed.positive_tokens.iter().any(|t| {
+        if t.negated || t.text.is_empty() {
+            return false;
+        }
+        if t.quoted {
+            return true;
+        }
+        let text = t.text.as_str();
+        if text.starts_with("in:") {
+            return false;
+        }
+        !(text.contains('/') && text.ends_with('/'))
+    })
+}
+
+fn resolve_prepared_sort(
+    prepared: &PreparedSearch,
+    mode: SearchMode,
+    caller_filter: &QueryFilter,
+    requested_sort: SearchSort,
+) -> SearchSort {
+    if requested_sort != SearchSort::Relevance {
+        return requested_sort;
+    }
+    if prepared.disjunction.is_some() {
+        return SearchSort::Relevance;
+    }
+    let effective_filter = prepared.parsed.filter.merged_with(caller_filter);
+    let is_star_wildcard = prepared.parsed.clean_query.trim() == "*"
+        && (mode == SearchMode::Wildcard
+            || (mode == SearchMode::Auto
+                && detect_mode_from_tokens(&prepared.parsed.positive_tokens) == SearchMode::Wildcard));
+    let has_content_terms = has_content_terms_for_sort(&prepared.parsed, mode);
+    resolve_effective_sort(requested_sort, has_content_terms, is_star_wildcard, &effective_filter)
 }
 
 struct PreparedSearch {
@@ -991,6 +1222,7 @@ fn dispatch_with_filter_inner(
     max_results: usize,
     shard_context: Option<(&SearchShard<'_>, &[SearchShard<'_>])>,
     fuzzy_pass: FuzzyPass<'_>,
+    effective_sort: SearchSort,
 ) -> (Vec<AdvancedSearchResult>, bool, Option<String>, SearchMode) {
     let explicit_lock = case_sensitivity == CaseSensitivity::Sensitive;
     if let Some(disjunction_query) = &prepared.disjunction {
@@ -1035,13 +1267,14 @@ fn dispatch_with_filter_inner(
             .collect();
         let fallback_filter =
             CompiledRecordFilter::compile_with_case(read, filter, is_case_sensitive);
-        let results = substring::search_disjunction_with_filters(
+        let results = substring::search_disjunction_with_filters_and_sort(
             read,
             disjunction_query,
             &fallback_filter,
             Some(&clause_compiled_filters),
             max_results,
             explicit_lock,
+            effective_sort,
         );
         return (results, is_case_sensitive, None, SearchMode::Auto);
     }
@@ -1152,13 +1385,14 @@ fn dispatch_with_filter_inner(
                     path_query = path_query.rewrite_drift_alias(configured, active);
                 }
             }
-            let results = path_search::search_index(
+            let results = path_search::search_index_with_sort(
                 read,
                 &path_query,
                 &compiled_filter,
                 max_results,
                 is_case_sensitive,
                 explicit_lock,
+                effective_sort,
             );
             if !results.is_empty() || max_results == 0 {
                 return (results, is_case_sensitive, None, effective_mode);
@@ -1175,6 +1409,7 @@ fn dispatch_with_filter_inner(
                 explicit_lock,
                 effective_mode,
                 max_results,
+                effective_sort,
             ) {
                 return (colon_results, fallback_cs, None, effective_mode);
             }
@@ -1191,6 +1426,7 @@ fn dispatch_with_filter_inner(
                 is_case_sensitive,
                 explicit_lock,
                 effective_mode,
+                effective_sort,
             );
             return (read_dir_results, is_case_sensitive, None, effective_mode);
         }
@@ -1200,7 +1436,7 @@ fn dispatch_with_filter_inner(
     // 保持高确定性与精准度：普通文本输入严格按连续子串匹配，搜不到即返回空列表，避免无脑降级为模糊跳字匹配。
     let (mut results, error) = match effective_mode {
         SearchMode::Auto | SearchMode::Substring => {
-            let results = substring::search_index_tokens_with_hybrid(
+            let results = substring::search_index_tokens_with_hybrid_and_sort(
                 read,
                 &parsed.positive_tokens,
                 &compiled_filter,
@@ -1209,27 +1445,30 @@ fn dispatch_with_filter_inner(
                 case_sensitivity,
                 explicit_lock,
                 prepared.single_extension_exists,
+                effective_sort,
             );
             (results, None)
         }
         SearchMode::Wildcard => {
-            let results = wildcard::search_index_tokens(
+            let results = wildcard::search_index_tokens_with_sort(
                 read,
                 &parsed.positive_tokens,
                 &compiled_filter,
                 max_results,
                 is_case_sensitive,
+                effective_sort,
             );
             (results, None)
         }
         SearchMode::Regex => {
             let pattern = pattern_to_run.as_deref().unwrap_or(&parsed.clean_query);
-            regex_search::search_index(
+            regex_search::search_index_with_sort(
                 read,
                 pattern,
                 &compiled_filter,
                 max_results,
                 is_case_sensitive,
+                effective_sort,
             )
         }
         SearchMode::Fuzzy => {
@@ -1249,13 +1488,14 @@ fn dispatch_with_filter_inner(
                 if prepared.single_extension_exists == Some(true) {
                     return (Vec::new(), is_case_sensitive, None, effective_mode);
                 }
-                let mut raw = fuzzy::search_index_tokens_raw(
+                let mut raw = fuzzy::search_index_tokens_raw_with_sort(
                     read,
                     fuzzy_tokens,
                     &compiled_filter,
                     max_results,
                     is_case_sensitive,
                     seen,
+                    effective_sort,
                 );
                 if !filter_scope_candidates.is_empty() {
                     for (item, _) in &mut raw {
@@ -1270,8 +1510,9 @@ fn dispatch_with_filter_inner(
                 *output = raw;
                 return (Vec::new(), is_case_sensitive, None, effective_mode);
             }
-            // 模糊模式是 Auto 的放宽：子串/混合/拼音命中在前，跳字命中去重后补足剩余名额
-            let mut results = substring::search_index_tokens_with_hybrid(
+            // 模糊模式是 Auto 的放宽：子串/混合/拼音命中在前，跳字命中去重后补足剩余名额；
+            // 指定非相关性全局排序时，精确命中与跳字命中各自取 Top-K 后按目标排序字段统一归并截断。
+            let mut results = substring::search_index_tokens_with_hybrid_and_sort(
                 read,
                 fuzzy_tokens,
                 &compiled_filter,
@@ -1280,8 +1521,13 @@ fn dispatch_with_filter_inner(
                 case_sensitivity,
                 explicit_lock,
                 prepared.single_extension_exists,
+                effective_sort,
             );
-            let remaining = max_results.saturating_sub(results.len());
+            let remaining = if effective_sort != SearchSort::Relevance {
+                max_results
+            } else {
+                max_results.saturating_sub(results.len())
+            };
             if remaining == 0 || matches!(fuzzy_pass, FuzzyPass::Precise) {
                 if !filter_scope_candidates.is_empty() {
                     for item in &mut results {
@@ -1301,17 +1547,22 @@ fn dispatch_with_filter_inner(
             let seen: std::collections::HashSet<String> =
                 results.iter().map(|r| r.entry.path.clone()).collect();
             results.extend(
-                fuzzy::search_index_tokens(
+                fuzzy::search_index_tokens_with_sort(
                     read,
                     fuzzy_tokens,
                     &compiled_filter,
                     max_results,
                     is_case_sensitive,
+                    effective_sort,
                 )
                 .into_iter()
                 .filter(|r| !seen.contains(&r.entry.path))
                 .take(remaining),
             );
+            if effective_sort != SearchSort::Relevance {
+                results.sort_by(|a, b| cmp_advanced_by_sort(a, b, effective_sort));
+                results.truncate(max_results);
+            }
             (results, None)
         }
     };
@@ -1471,10 +1722,6 @@ fn cmp_score_desc(a: &MultiSearchResult, b: &MultiSearchResult) -> std::cmp::Ord
         .unwrap_or(std::cmp::Ordering::Equal)
 }
 
-fn cmp_modified_desc(a: &MultiSearchResult, b: &MultiSearchResult) -> std::cmp::Ordering {
-    b.result.entry.modified.cmp(&a.result.entry.modified)
-}
-
 fn shard_allows_live_fallback(
     shard: &SearchShard<'_>,
     shards: &[SearchShard<'_>],
@@ -1514,6 +1761,29 @@ pub fn dispatch_multi(
     max_results: usize,
     include_offline: bool,
 ) -> (Vec<MultiSearchResult>, bool, Option<String>, SearchMode) {
+    dispatch_multi_with_sort(
+        shards,
+        query,
+        mode,
+        filter,
+        case_sensitivity,
+        max_results,
+        include_offline,
+        SearchSort::Relevance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_multi_with_sort(
+    shards: &[SearchShard<'_>],
+    query: &str,
+    mode: SearchMode,
+    filter: QueryFilter,
+    case_sensitivity: CaseSensitivity,
+    max_results: usize,
+    include_offline: bool,
+    sort: SearchSort,
+) -> (Vec<MultiSearchResult>, bool, Option<String>, SearchMode) {
     let active_shards: Vec<_> = shards
         .iter()
         .filter(|s| include_offline || !s.is_offline)
@@ -1523,6 +1793,7 @@ pub fn dispatch_multi(
             .iter()
             .any(|shard| shard.index.extension_id(ext).is_some())
     });
+    let effective_sort = resolve_prepared_sort(&prepared, mode, &filter, sort);
     if active_shards.is_empty() || max_results == 0 {
         let empty = CompactIndex::default();
         let (_, is_case_sensitive, _, effective_mode) = dispatch_with_filter_inner(
@@ -1534,6 +1805,7 @@ pub fn dispatch_multi(
             0,
             None,
             FuzzyPass::Precise,
+            effective_sort,
         );
         return (Vec::new(), is_case_sensitive, None, effective_mode);
     }
@@ -1548,6 +1820,7 @@ pub fn dispatch_multi(
             max_results,
             Some((shard, shards)),
             FuzzyPass::Precise,
+            effective_sort,
         );
         (
             wrap_shard_results(results, shard),
@@ -1564,15 +1837,15 @@ pub fn dispatch_multi(
         error = error.or(shard_error);
         shard_results.push(results);
     }
-    let cmp = if effective_mode == SearchMode::Wildcard && prepared.parsed.clean_query.trim() == "*"
-    {
-        cmp_modified_desc
-    } else {
-        cmp_score_desc
-    };
-    let mut merged = merge_shard_results_by(shard_results, max_results, cmp);
+    let mut merged = merge_shard_results_by(shard_results, max_results, |a, b| {
+        cmp_multi_by_sort(a, b, effective_sort)
+    });
 
-    let remaining = max_results - merged.len();
+    let remaining = if effective_sort != SearchSort::Relevance {
+        max_results
+    } else {
+        max_results - merged.len()
+    };
     if effective_mode == SearchMode::Fuzzy && remaining > 0 {
         let mut seen: std::collections::HashSet<String> = merged
             .iter()
@@ -1592,6 +1865,7 @@ pub fn dispatch_multi(
                     seen: &seen,
                     output: &mut raw,
                 },
+                effective_sort,
             );
             raw.into_iter()
                 .map(|(result, score)| {
@@ -1609,19 +1883,34 @@ pub fn dispatch_multi(
         .into_iter()
         .flatten()
         .collect();
-        candidates.sort_by(|(left, left_score), (right, right_score)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| left.result.entry.name.cmp(&right.result.entry.name))
-                .then_with(|| left.result.entry.path.cmp(&right.result.entry.path))
-        });
-        merged.extend(
-            candidates
-                .into_iter()
-                .map(|(res, _)| res)
-                .filter(|res| seen.insert(res.result.entry.path.clone()))
-                .take(remaining),
-        );
+        if effective_sort != SearchSort::Relevance {
+            merged.extend(
+                candidates
+                    .into_iter()
+                    .map(|(res, _)| res)
+                    .filter(|res| seen.insert(res.result.entry.path.clone())),
+            );
+            merged.sort_by(|a, b| {
+                cmp_multi_by_sort(a, b, effective_sort)
+                    .then_with(|| a.result.entry.name.cmp(&b.result.entry.name))
+                    .then_with(|| a.result.entry.path.cmp(&b.result.entry.path))
+            });
+            merged.truncate(max_results);
+        } else {
+            candidates.sort_by(|(left, left_score), (right, right_score)| {
+                right_score
+                    .cmp(left_score)
+                    .then_with(|| left.result.entry.name.cmp(&right.result.entry.name))
+                    .then_with(|| left.result.entry.path.cmp(&right.result.entry.path))
+            });
+            merged.extend(
+                candidates
+                    .into_iter()
+                    .map(|(res, _)| res)
+                    .filter(|res| seen.insert(res.result.entry.path.clone()))
+                    .take(remaining),
+            );
+        }
     }
     (merged, is_case_sensitive, error, effective_mode)
 }
@@ -2525,5 +2814,273 @@ mod tests {
         assert!(!root_paths.contains(&"/test/sub.rs"));
         assert!(root_paths.contains(&"/proj/src/test"));
         assert!(root_paths.contains(&"/proj/other/test"));
+    }
+
+    #[test]
+    fn test_pure_size_query_top_k_eliminates_depth_truncation() {
+        let store = IndexStore::new();
+        let mut entries = Vec::with_capacity(600);
+        for i in 0..599u64 {
+            entries.push(FileEntry {
+                name: format!("shallow_{i}.bin"),
+                path: format!("/root/shallow_{i}.bin"),
+                is_dir: false,
+                size: 1_000 + i,
+                modified: 1_000 + i,
+                created_at: 1_000 + i,
+                extension: "bin".to_string(),
+            });
+        }
+        entries.push(FileEntry {
+            name: "giant_movie.mkv".to_string(),
+            path: "/a/b/c/d/e/f/g/giant_movie.mkv".to_string(),
+            is_dir: false,
+            size: 9_000_000_000,
+            modified: 500,
+            created_at: 500,
+            extension: "mkv".to_string(),
+        });
+        store.replace(entries);
+
+        let (res, _, _, _) = dispatch_with_filter_and_sort(
+            &store,
+            "size:>100",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            50,
+            SearchSort::Relevance,
+        );
+        assert_eq!(res.len(), 50);
+        assert_eq!(res[0].entry.path, "/a/b/c/d/e/f/g/giant_movie.mkv");
+        assert!(res.windows(2).all(|w| w[0].entry.size >= w[1].entry.size));
+    }
+
+    #[test]
+    fn test_server_sort_top_k_across_engines_and_multi_shard() {
+        let make = |name: &str, path: &str, size: u64, modified: u64, created_at: u64, ext: &str| FileEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir: false,
+            size,
+            modified,
+            created_at,
+            extension: ext.to_string(),
+        };
+
+        let store = IndexStore::new();
+        store.replace(vec![
+            make("alpha_1.mp4", "/proj/sub/alpha_1.mp4", 100, 9_000, 4_000, "mp4"),
+            make("alpha_2.mp4", "/proj/sub/deep/alpha_2.mp4", 5_000, 1_000, 500, "mp4"),
+            make("alpha_3.mp4", "/other/alpha_3.mp4", 3_000, 5_000, 2_000, "mp4"),
+            make("beta_alpha_4.mp4", "/proj/sub/beta_alpha_4.mp4", 2_000, 7_000, 1_000, "mp4"),
+            make("beta_5.mkv", "/proj/sub/beta_5.mkv", 8_000, 3_000, 3_000, "mkv"),
+        ]);
+
+        let cases = [
+            ("alpha", SearchMode::Auto),
+            (".mp4", SearchMode::Auto),
+            ("*.mp4", SearchMode::Auto),
+            ("proj/alpha", SearchMode::Auto),
+            ("*", SearchMode::Wildcard),
+            ("*alpha*", SearchMode::Wildcard),
+            ("alpha_[0-9]+", SearchMode::Regex),
+            ("alph", SearchMode::Fuzzy),
+            ("in:/proj/sub", SearchMode::Auto),
+            ("/proj/sub/alpha", SearchMode::Auto),
+            ("alpha | beta", SearchMode::Auto),
+        ];
+
+        for (query, mode) in cases {
+            for sort in [
+                SearchSort::SizeDesc,
+                SearchSort::SizeAsc,
+                SearchSort::ModifiedDesc,
+                SearchSort::ModifiedAsc,
+                SearchSort::CreatedDesc,
+                SearchSort::CreatedAsc,
+            ] {
+                let (full, _, err, _) = dispatch_with_filter_and_sort(
+                    &store,
+                    query,
+                    mode,
+                    QueryFilter::default(),
+                    CaseSensitivity::Auto,
+                    10,
+                    sort,
+                );
+                assert!(err.is_none(), "unexpected error for {query}: {err:?}");
+                assert!(full.len() >= 3, "expected >= 3 hits for {query}");
+
+                let (top2, _, _, _) = dispatch_with_filter_and_sort(
+                    &store,
+                    query,
+                    mode,
+                    QueryFilter::default(),
+                    CaseSensitivity::Auto,
+                    2,
+                    sort,
+                );
+                assert_eq!(top2.len(), 2, "expected top 2 hits for {query}");
+                let top2_paths: Vec<_> = top2.iter().map(|r| r.entry.path.as_str()).collect();
+                let full_prefix: Vec<_> = full.iter().take(2).map(|r| r.entry.path.as_str()).collect();
+                assert_eq!(top2_paths, full_prefix, "Top-2 mismatch for query={query}, sort={sort:?}");
+            }
+        }
+
+        // 多分片全局归并 Top-K
+        let idx1 = CompactIndex::from_entries(vec![
+            make("clip_a.mov", "/s1/clip_a.mov", 1_200, 500, 900, "mov"),
+            make("clip_b.mov", "/s1/clip_b.mov", 9_500, 100, 200, "mov"),
+        ])
+        .unwrap();
+        let idx2 = CompactIndex::from_entries(vec![
+            make("clip_c.mov", "/s2/clip_c.mov", 4_800, 800, 100, "mov"),
+            make("clip_d.mov", "/s2/clip_d.mov", 7_200, 300, 600, "mov"),
+        ])
+        .unwrap();
+        let shards = [
+            SearchShard {
+                index: &idx1,
+                configured_path: Some("/s1"),
+                active_path: Some("/s1"),
+                volume_name: None,
+                is_offline: false,
+            },
+            SearchShard {
+                index: &idx2,
+                configured_path: Some("/s2"),
+                active_path: Some("/s2"),
+                volume_name: None,
+                is_offline: false,
+            },
+        ];
+
+        let (multi_size_desc, _, _, _) = dispatch_multi_with_sort(
+            &shards,
+            "clip",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            3,
+            true,
+            SearchSort::SizeDesc,
+        );
+        assert_eq!(
+            multi_size_desc.iter().map(|r| r.result.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["clip_b.mov", "clip_d.mov", "clip_c.mov"]
+        );
+
+        let (multi_created_asc, _, _, _) = dispatch_multi_with_sort(
+            &shards,
+            "clip",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            3,
+            true,
+            SearchSort::CreatedAsc,
+        );
+        assert_eq!(
+            multi_created_asc.iter().map(|r| r.result.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["clip_c.mov", "clip_b.mov", "clip_d.mov"]
+        );
+
+        // Relevance 自动推断排序策略：纯 mtime 按修改时间降序；size 与 mtime/in: 组合优先按 size 降序
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let store_auto = IndexStore::new();
+        store_auto.replace(vec![
+            make(
+                "older_huge.bin",
+                "/proj/older_huge.bin",
+                50_000,
+                now_secs.saturating_sub(300 * 86_400),
+                100,
+                "bin",
+            ),
+            make(
+                "newer_small.bin",
+                "/proj/newer_small.bin",
+                500,
+                now_secs.saturating_sub(200 * 86_400),
+                200,
+                "bin",
+            ),
+            make(
+                "outside.bin",
+                "/other/outside.bin",
+                90_000,
+                now_secs.saturating_sub(250 * 86_400),
+                300,
+                "bin",
+            ),
+        ]);
+
+        let (mtime_only, _, _, _) = dispatch_with_filter_and_sort(
+            &store_auto,
+            "mtime:>180d",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            10,
+            SearchSort::Relevance,
+        );
+        assert_eq!(
+            mtime_only.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["newer_small.bin", "outside.bin", "older_huge.bin"]
+        );
+
+        let (size_and_mtime, _, _, _) = dispatch_with_filter_and_sort(
+            &store_auto,
+            "size:>100 mtime:>180d",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            10,
+            SearchSort::Relevance,
+        );
+        assert_eq!(
+            size_and_mtime.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["outside.bin", "older_huge.bin", "newer_small.bin"]
+        );
+
+        let (size_and_in, _, _, _) = dispatch_with_filter_and_sort(
+            &store_auto,
+            "size:>100 in:/proj",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            10,
+            SearchSort::Relevance,
+        );
+        assert_eq!(
+            size_and_in.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["older_huge.bin", "newer_small.bin"]
+        );
+
+        // 3 词及以上混合多计划查询在自定义排序下跨计划去重与 Top-K 淘汰正确性
+        let multi_plan_store = IndexStore::new();
+        multi_plan_store.replace(vec![
+            make("alpha_gamma.bin", "/alpha/beta/alpha_gamma.bin", 1_000, 100, 100, "bin"),
+            make("beta_gamma.bin", "/alpha/beta/beta_gamma.bin", 9_000, 200, 200, "bin"),
+            make("gamma.bin", "/alpha/beta/gamma.bin", 5_000, 300, 300, "bin"),
+            make("delta.bin", "/alpha/beta/delta.bin", 20_000, 400, 400, "bin"),
+        ]);
+        let (hybrid3, _, _, _) = dispatch_with_filter_and_sort(
+            &multi_plan_store,
+            "alpha beta gamma",
+            SearchMode::Auto,
+            QueryFilter::default(),
+            CaseSensitivity::Auto,
+            2,
+            SearchSort::SizeDesc,
+        );
+        assert_eq!(
+            hybrid3.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta_gamma.bin", "gamma.bin"]
+        );
     }
 }

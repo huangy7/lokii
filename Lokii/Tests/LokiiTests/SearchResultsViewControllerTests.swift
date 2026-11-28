@@ -14,6 +14,8 @@ final class SearchResultsViewControllerTests: XCTestCase {
         var focusSearchFieldCallCount = 0
         var trashedPaths: Set<String> = []
         var trashCallCount = 0
+        var serverSortCalls: [FfiSearchSort] = []
+        var clientSortSwitchCount = 0
 
         func searchResultsDidSelect(result: FfiSearchResult?) {
             selectedResult = result
@@ -36,6 +38,14 @@ final class SearchResultsViewControllerTests: XCTestCase {
         func searchResultsDidTrashItems(paths: Set<String>) {
             trashedPaths = paths
             trashCallCount += 1
+        }
+
+        func searchResultsDidChangeServerSort(_ sort: FfiSearchSort) {
+            serverSortCalls.append(sort)
+        }
+
+        func searchResultsDidSwitchToClientSort() {
+            clientSortSwitchCount += 1
         }
     }
 
@@ -1013,5 +1023,171 @@ final class SearchResultsViewControllerTests: XCTestCase {
             fileExtension: "pdf"
         )
         XCTAssertFalse(synologyPdfIcon === localPdfIcon, "CloudStorage 路径应叠加云朵角标")
+    }
+
+    func testMultiSelectionBottomBarSummaryAndDatalessTrashWarning() throws {
+        let controller = SearchResultsViewController()
+        let mockDelegate = MockDelegate()
+        controller.delegate = mockDelegate
+        _ = controller.view
+
+        let bigA = TestFixture.searchResult(name: "movie_a.mov", path: "/tmp/movie_a.mov", extension: "mov", size: 2_000_000_000, created: 100, modified: 200)
+        let bigB = TestFixture.searchResult(name: "movie_b.mkv", path: "/tmp/movie_b.mkv", extension: "mkv", size: 1_000_000_000, created: 100, modified: 200)
+        let folderC = TestFixture.searchResult(name: "archive_dir", path: "/tmp/archive_dir", extension: "", isDir: true, size: 999_999_999, created: 100, modified: 200)
+        let folderD = TestFixture.searchResult(name: "backup_dir", path: "/tmp/backup_dir", extension: "", isDir: true, size: 500_000_000, created: 100, modified: 200)
+
+        controller.updateFDAStatus(hasFDA: false)
+        controller.displayResults([bigA, bigB, folderC], preserveSelection: false)
+        XCTAssertTrue(controller.multiSelectionSummaryLabel.isHidden)
+        XCTAssertFalse(controller.fdaHintButton.isHidden)
+
+        // 单选显示路径栏，不显示多选汇总
+        controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        controller.updateBottomPath(with: bigA.path)
+        XCTAssertTrue(controller.multiSelectionSummaryLabel.isHidden)
+        XCTAssertFalse(controller.pathBar.isHidden)
+
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+
+        // 多选纯文件（>= 2 项）显示累计大小并隐藏路径栏与 FDA 提示
+        controller.tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+        let expected3GB = formatter.string(fromByteCount: 3_000_000_000)
+        XCTAssertFalse(controller.multiSelectionSummaryLabel.isHidden)
+        XCTAssertEqual(controller.multiSelectionSummaryLabel.stringValue, String(format: L("search.selection.summary"), 2, expected3GB))
+        XCTAssertNil(controller.multiSelectionSummaryLabel.toolTip)
+        XCTAssertTrue(controller.pathBar.isHidden)
+        XCTAssertTrue(controller.fdaHintButton.isHidden)
+
+        // 混合文件与文件夹（文件夹体积不计入累加）
+        controller.tableView.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
+        let expected2GB = formatter.string(fromByteCount: 2_000_000_000)
+        XCTAssertEqual(controller.multiSelectionSummaryLabel.stringValue, String(format: L("search.selection.summaryWithFolders"), 2, expected2GB))
+        XCTAssertEqual(controller.multiSelectionSummaryLabel.toolTip, String(format: L("search.selection.summaryWithFoldersTooltip"), 2, 1))
+
+        // 退回单选恢复路径栏
+        controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        controller.updateBottomPath(with: bigA.path)
+        XCTAssertTrue(controller.multiSelectionSummaryLabel.isHidden)
+        XCTAssertFalse(controller.pathBar.isHidden)
+
+        // 仅选中文件夹
+        controller.displayResults([folderC, folderD], preserveSelection: false)
+        controller.tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+        XCTAssertEqual(controller.multiSelectionSummaryLabel.stringValue, String(format: L("search.selection.foldersOnly"), 2))
+
+        // 云端占位文件预检拦截与取消/确认路径
+        controller.displayResults([bigA, bigB], preserveSelection: false)
+        controller.tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+
+        var trashedPaths: [String] = []
+        var normalConfirmCalls = 0
+        var datalessAlerts: [(Int, Int)] = []
+        var shouldConfirmDataless = false
+
+        controller.trashItemHandler = { url in
+            trashedPaths.append(url.path)
+            return url
+        }
+        controller.confirmTrashHandler = { _, completion in
+            normalConfirmCalls += 1
+            completion(true)
+        }
+        controller.datalessCheckHandler = { items in
+            items.count == 2 ? 1 : 0
+        }
+        controller.confirmDatalessTrashHandler = { total, dataless, completion in
+            datalessAlerts.append((total, dataless))
+            completion(shouldConfirmDataless)
+        }
+
+        controller.moveToTrashSelected()
+        waitMainUntil { datalessAlerts.count == 1 }
+        XCTAssertEqual(datalessAlerts.first?.0, 2)
+        XCTAssertEqual(datalessAlerts.first?.1, 1)
+        XCTAssertEqual(normalConfirmCalls, 0)
+        XCTAssertTrue(trashedPaths.isEmpty)
+
+        shouldConfirmDataless = true
+        controller.moveToTrashSelected()
+        waitMainUntil { mockDelegate.trashCallCount == 1 }
+        XCTAssertEqual(trashedPaths.count, 2)
+        XCTAssertEqual(normalConfirmCalls, 0)
+
+        // 无云端占位文件时走常规确认路径
+        controller.displayResults([bigA], preserveSelection: false)
+        controller.selectFirstRow()
+        controller.datalessCheckHandler = { _ in 0 }
+        controller.moveToTrashSelected()
+        waitMainUntil { mockDelegate.trashCallCount == 2 }
+        XCTAssertEqual(normalConfirmCalls, 1)
+
+        // lstat(2) 云端占位检测只读安全边界：本地普通文件、目录与不存在路径均安全返回 false
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lokii-dataless-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let localFile = tempDir.appendingPathComponent("local.bin")
+        try Data("ok".utf8).write(to: localFile)
+        XCTAssertFalse(SearchResultsViewController.isCloudDatalessFile(atPath: localFile.path))
+        XCTAssertFalse(SearchResultsViewController.isCloudDatalessFile(atPath: tempDir.path))
+        XCTAssertFalse(SearchResultsViewController.isCloudDatalessFile(atPath: tempDir.appendingPathComponent("missing.bin").path))
+    }
+
+    func testServerSortDelegateRoutingAndColumnHideReset() throws {
+        let controller = SearchResultsViewController()
+        let mockDelegate = MockDelegate()
+        controller.delegate = mockDelegate
+        _ = controller.view
+
+        let small = TestFixture.searchResult(name: "small.txt", path: "/tmp/small.txt", extension: "txt", size: 100, created: 300, modified: 200)
+        let large = TestFixture.searchResult(name: "large.bin", path: "/tmp/large.bin", extension: "bin", size: 2_000_000, created: 100, modified: 500)
+        controller.displayResults([small, large], preserveSelection: false)
+
+        let expectedPairs: [(String, Bool, FfiSearchSort)] = [
+            ("size", true, .sizeAsc),
+            ("size", false, .sizeDesc),
+            ("modified", true, .modifiedAsc),
+            ("modified", false, .modifiedDesc),
+            ("created", true, .createdAsc),
+            ("created", false, .createdDesc),
+        ]
+        for (key, asc, expectedSort) in expectedPairs {
+            let countBefore = mockDelegate.serverSortCalls.count
+            // 赋值给 NSTableView.sortDescriptors 时 AppKit 会自动派发 sortDescriptorsDidChange
+            controller.tableView.sortDescriptors = [NSSortDescriptor(key: key, ascending: asc)]
+            XCTAssertEqual(mockDelegate.serverSortCalls.count, countBefore + 1)
+            XCTAssertEqual(mockDelegate.serverSortCalls.last, expectedSort)
+        }
+
+        let countBeforeClientOnly = mockDelegate.serverSortCalls.count
+        let switchBeforeClientOnly = mockDelegate.clientSortSwitchCount
+        for localKey in ["name", "path", "extension"] {
+            controller.tableView.sortDescriptors = [NSSortDescriptor(key: localKey, ascending: true)]
+        }
+        XCTAssertEqual(mockDelegate.serverSortCalls.count, countBeforeClientOnly)
+        XCTAssertEqual(mockDelegate.clientSortSwitchCount, switchBeforeClientOnly + 3)
+
+        // 开启远端协同排序时，点击服务端排序列不抢跑本地重排
+        controller.handlesServerSortRemotely = true
+        controller.displayResults([small, large], preserveSelection: false)
+        controller.tableView.sortDescriptors = [NSSortDescriptor(key: "size", ascending: false)]
+        XCTAssertEqual(controller.results.map(\.name), ["small.txt", "large.bin"])
+
+        // 后端排序结果下发时保留排序指示器且不触发客户端二次重排
+        controller.displayResults(
+            [small, large],
+            preserveSelection: false,
+            preserveSortDescriptors: true,
+            skipLocalSort: true
+        )
+        XCTAssertEqual(controller.tableView.sortDescriptors.first?.key, "size")
+        XCTAssertEqual(controller.results.map(\.name), ["small.txt", "large.bin"])
+
+        // 隐藏当前正在服务端排序的列应清理排序并通知回到默认相关性排序
+        let callsBeforeHide = mockDelegate.serverSortCalls.count
+        controller.setColumnHidden(true, for: .columnSize)
+        XCTAssertTrue(controller.tableView.sortDescriptors.isEmpty)
+        XCTAssertEqual(mockDelegate.serverSortCalls.count, callsBeforeHide + 1)
+        XCTAssertEqual(mockDelegate.serverSortCalls.last, .relevance)
     }
 }

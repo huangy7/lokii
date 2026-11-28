@@ -123,6 +123,24 @@ pub fn search_index_tokens(
     max_results: usize,
     case_sensitive: bool,
 ) -> Vec<AdvancedSearchResult> {
+    search_index_tokens_with_sort(
+        read,
+        positive_tokens,
+        filter,
+        max_results,
+        case_sensitive,
+        super::SearchSort::Relevance,
+    )
+}
+
+pub(crate) fn search_index_tokens_with_sort(
+    read: &CompactIndex,
+    positive_tokens: &[super::filter::QueryToken],
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    sort: super::SearchSort,
+) -> Vec<AdvancedSearchResult> {
     search_index_tokens_inner(
         read,
         positive_tokens,
@@ -130,19 +148,21 @@ pub fn search_index_tokens(
         max_results,
         case_sensitive,
         None,
+        sort,
     )
     .into_iter()
     .map(|(result, _)| result)
     .collect()
 }
 
-pub(crate) fn search_index_tokens_raw(
+pub(crate) fn search_index_tokens_raw_with_sort(
     read: &CompactIndex,
     positive_tokens: &[super::filter::QueryToken],
     filter: &CompiledRecordFilter,
     max_results: usize,
     case_sensitive: bool,
     seen: &std::collections::HashSet<String>,
+    sort: super::SearchSort,
 ) -> Vec<(AdvancedSearchResult, u32)> {
     search_index_tokens_inner(
         read,
@@ -151,6 +171,7 @@ pub(crate) fn search_index_tokens_raw(
         max_results,
         case_sensitive,
         Some(seen),
+        sort,
     )
 }
 
@@ -161,6 +182,7 @@ fn search_index_tokens_inner(
     max_results: usize,
     case_sensitive: bool,
     raw_order_excluding: Option<&std::collections::HashSet<String>>,
+    sort: super::SearchSort,
 ) -> Vec<(AdvancedSearchResult, u32)> {
     if positive_tokens.is_empty() || max_results == 0 {
         return Vec::new();
@@ -212,7 +234,70 @@ fn search_index_tokens_inner(
         let haystack = Utf32Str::new(&name_target, &mut buffer);
         pattern.score(haystack, &mut matcher)
     };
-    let matches: Vec<_> = if let Some(seen) = raw_order_excluding {
+    let matches: Vec<_> = if sort != super::SearchSort::Relevance {
+        let mut top = super::top_k::TopK::new(max_results);
+        let mut path = String::new();
+        let query_index = read.query_index();
+        let records = read.records();
+        let passthrough = filter.is_passthrough();
+        for name_id in 0..query_index.slot_count() as u32 {
+            let sig = query_index.signature_at(name_id);
+            if sig == crate::string_pool::NameSignature::default() && !query_index.is_ready(name_id)
+            {
+                continue;
+            }
+            if !sig.contains(req) {
+                continue;
+            }
+            let entries = query_index.entries(name_id);
+            if entries.is_empty() {
+                continue;
+            }
+            let Some(name) = read.name_text(name_id) else {
+                continue;
+            };
+            let folded = if name.is_ascii() {
+                None
+            } else {
+                query_index.folded(name_id)
+            };
+            let Some(raw_score) = score_name(name, folded) else {
+                continue;
+            };
+            let _ = raw_score;
+            for &ordinal in entries {
+                let ord_usize = ordinal as usize;
+                let Some(record) = records.get(ord_usize) else {
+                    continue;
+                };
+                let key = super::sort_key_for_record(record, sort);
+                if let Some(worst) = top.worst() {
+                    if key < worst.score || (key == worst.score && name > worst.name()) {
+                        continue;
+                    }
+                }
+                if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                    continue;
+                }
+                let Some(view) = read.view(crate::compact_index::EntryId(ord_usize)) else {
+                    continue;
+                };
+                if let Some(seen) = raw_order_excluding {
+                    if !seen.is_empty() {
+                        view.path_into(&mut path);
+                        if seen.contains(&path) {
+                            continue;
+                        }
+                    }
+                }
+                top.offer_path(ord_usize, key, view);
+            }
+        }
+        top.finish()
+            .into_iter()
+            .map(|candidate| (candidate.ordinal, 1.0f64, 0u32))
+            .collect()
+    } else if let Some(seen) = raw_order_excluding {
         let mut top = super::top_k::TopK::new(max_results);
         let mut path = String::new();
         let query_index = read.query_index();
@@ -265,7 +350,7 @@ fn search_index_tokens_inner(
                     targets_hidden,
                     0,
                 );
-                (candidate.ordinal, display_score, candidate.score)
+                (candidate.ordinal, display_score.to_f64(), candidate.score)
             })
             .collect()
     } else {
@@ -282,7 +367,7 @@ fn search_index_tokens_inner(
             },
         )
         .into_iter()
-        .map(|candidate| (candidate.ordinal, candidate.score, 0))
+        .map(|candidate| (candidate.ordinal, candidate.score.to_f64(), 0))
         .collect()
     };
     let mut indices = Vec::new();
@@ -306,7 +391,7 @@ fn search_index_tokens_inner(
             };
             let result = AdvancedSearchResult {
                 entry: view.materialize(),
-                score: score.to_f64(),
+                score,
                 match_positions: positions,
                 parent_match_positions: Vec::new(),
                 search_mode: SearchMode::Fuzzy,

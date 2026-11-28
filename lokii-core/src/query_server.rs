@@ -24,6 +24,8 @@ pub struct Request {
     pub case_sensitivity: Option<search::CaseSensitivity>,
     #[serde(default)]
     pub include_offline: Option<bool>,
+    #[serde(default)]
+    pub sort: Option<search::SearchSort>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -204,15 +206,18 @@ fn handle_connection(
             let mode = request.mode.unwrap_or(SearchMode::Auto);
             let case_sensitivity = request.case_sensitivity.unwrap_or_default();
             let include_offline = request.include_offline.unwrap_or(true);
+            let sort = request.sort.unwrap_or_default();
             match coordinator {
                 Some(coord) => {
-                    let (multi, is_case_sensitive, error, _) = coord.search(
+                    let (multi, is_case_sensitive, error, _) = coord.search_with_filter_and_sort(
                         store,
                         &request.q,
                         mode,
+                        search::QueryFilter::default(),
                         case_sensitivity,
                         limit,
                         include_offline,
+                        sort,
                     );
                     let mut results = Vec::with_capacity(multi.len());
                     let mut offline_indices = Vec::new();
@@ -230,12 +235,14 @@ fn handle_connection(
                     }
                 }
                 None => {
-                    let (results, is_case_sensitive, error) = search::dispatch_with_options(
+                    let (results, is_case_sensitive, error, _) = search::dispatch_with_filter_and_sort(
                         store,
                         &request.q,
                         mode,
+                        search::QueryFilter::default(),
                         case_sensitivity,
                         limit,
+                        sort,
                     );
                     Response {
                         results: results.into_iter().map(|r| r.entry).collect(),
@@ -538,5 +545,23 @@ mod tests {
             std::io::ErrorKind::AddrInUse
         );
         assert_eq!(std::fs::read(&regular_path).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn test_request_sort_deserialization_backward_compatible() {
+        let legacy: Request = serde_json::from_str(r#"{"q":"movie"}"#).unwrap();
+        assert_eq!(legacy.q, "movie");
+        assert_eq!(legacy.sort, None);
+
+        let size_desc: Request = serde_json::from_str(r#"{"q":"movie","sort":"size_desc"}"#).unwrap();
+        assert_eq!(size_desc.sort, Some(search::SearchSort::SizeDesc));
+
+        let modified_asc: Request =
+            serde_json::from_str(r#"{"q":"movie","sort":"modified_asc"}"#).unwrap();
+        assert_eq!(modified_asc.sort, Some(search::SearchSort::ModifiedAsc));
+
+        let created_desc: Request =
+            serde_json::from_str(r#"{"q":"movie","sort":"created_desc"}"#).unwrap();
+        assert_eq!(created_desc.sort, Some(search::SearchSort::CreatedDesc));
     }
 }

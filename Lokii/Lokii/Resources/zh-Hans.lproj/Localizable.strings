@@ -168,7 +168,7 @@
 "search.empty.action.tryFuzzy.subtitle" = "允许跳字容错匹配";
 "search.empty.action.tryFuzzy.activeSubtitle" = "已开启模糊匹配模式";
 "search.empty.action.checkFilters.title" = "检查过滤条件";
-"search.empty.action.checkFilters.subtitle" = "调整文件类型或大小筛选";
+"search.empty.action.checkFilters.subtitle" = "调整文件类型、大小或修改时间筛选";
 "search.empty.action.checkScope.title" = "确认索引范围";
 "search.empty.action.checkScope.subtitle" = "检查目标目录是否已索引";
 "search.empty.excluded.title" = "此位置未被索引";
@@ -228,8 +228,17 @@
 "search.trash.confirmMessage" = "移到废纸篓的项目可以在访达中放回原处。";
 "search.trash.confirmButton" = "移到废纸篓";
 "search.trash.cancelButton" = "取消";
+"search.trash.dataless.singleTitle" = "该文件仅保存在云端，确定移到废纸篓？";
+"search.trash.dataless.multiOneTitle" = "所选 %d 项中包含 1 个仅云端文件，确定移到废纸篓？";
+"search.trash.dataless.multiTitle" = "所选 %1$d 项中包含 %2$d 个仅云端文件，确定移到废纸篓？";
+"search.trash.dataless.message" = "仅云端占位文件尚未下载到本地，移到废纸篓不会释放本地磁盘空间，且会同步删除云端副本。删除后可在访达废纸篓中放回原处。";
+"search.trash.dataless.confirmButton" = "仍移到废纸篓";
 "search.trash.failedTitle" = "无法移到废纸篓";
 "search.trash.failedMessage" = "未能将以下 %1$d 个项目移到废纸篓：\n%2$@";
+"search.selection.summary" = "已选 %1$d 项 · 共 %2$@";
+"search.selection.summaryWithFolders" = "已选 %1$d 项 · 文件共 %2$@";
+"search.selection.summaryWithFoldersTooltip" = "已选 %1$d 项（含 %2$d 个文件夹），累计体积不含文件夹递归大小";
+"search.selection.foldersOnly" = "已选 %d 个文件夹";
 
 /* SearchWindow - sidebar */
 "search.sidebar.emptyHint" = "输入关键词后在此查看目录分布";
@@ -347,6 +356,14 @@
 "filter.size.under" = "小于";
 "filter.size.invalidRange" = "大小下限大于上限，区间互斥";
 "filter.size.folderMetadataNote" = "文件夹按目录项元数据大小筛选，非递归总大小";
+"filter.modified.title" = "修改时间";
+"filter.modified.any" = "不限";
+"filter.modified.last7Days" = "7 天内";
+"filter.modified.last30Days" = "30 天内";
+"filter.modified.olderThan90Days" = "3 个月前";
+"filter.modified.olderThan180Days" = "半年前";
+"filter.modified.olderThan1Year" = "1 年前";
+"filter.modified.custom" = "自定义条件：%@";
 "filter.done" = "完成";
 "filter.button.tooltip" = "过滤条件 (⌥F)";
 "filter.button.tooltip.active" = "过滤条件: %d 项已激活 (⌥F)";

@@ -18,6 +18,10 @@ protocol SearchMainSplitViewControllerDelegate: AnyObject {
     func searchMainSplitViewDidConsumeResult()
     /// 左侧目录作用域过滤引起主列表可见结果数变化时回调（用于联动更新底栏命中计数）
     func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?)
+    /// 用户切换需全量索引重排的列排序方式时回调（大小/修改日期/创建日期）
+    func searchMainSplitViewDidChangeServerSort(_ sort: FfiSearchSort)
+    /// 用户切换回客户端本地排序列（名称/路径/扩展名）时回调，用于同步清理服务端排序状态
+    func searchMainSplitViewDidSwitchToClientSort()
 }
 
 extension SearchMainSplitViewControllerDelegate {
@@ -28,6 +32,8 @@ extension SearchMainSplitViewControllerDelegate {
     func searchMainSplitViewDidTrashItems(paths: Set<String>, remainingCount: Int) {}
     func searchMainSplitViewDidConsumeResult() {}
     func searchMainSplitViewDidFilterResults(filteredCount: Int, totalCount: Int, activeDirectory: String?) {}
+    func searchMainSplitViewDidChangeServerSort(_ sort: FfiSearchSort) {}
+    func searchMainSplitViewDidSwitchToClientSort() {}
 }
 
 // MARK: - SearchMainSplitViewController
@@ -56,6 +62,8 @@ final class SearchMainSplitViewController: NSSplitViewController {
     private var isDirectoryTreeDirty = false
     /// 当前结果集是否应自动预选首行（活跃检索为 true，默认空查询列表为 false）
     private var autoSelectFirstResult = false
+    /// 当前结果集是否已按后端全量排序就绪（侧边栏切换目录前缀时沿用该状态避免客户端重排破坏全局 Top-K 顺序）
+    private var usesServerSortOrder = false
 
     /// 当前是否需要立即维护左侧目录聚合树（仅在侧边栏展开或存在生效目录过滤时为 true）
     var needsDirectoryTree: Bool {
@@ -94,6 +102,7 @@ final class SearchMainSplitViewController: NSSplitViewController {
 
         sidebarTreeViewController.delegate = self
         searchResultsViewController.delegate = self
+        searchResultsViewController.handlesServerSortRemotely = true
     }
 
     required init?(coder: NSCoder) {
@@ -166,13 +175,16 @@ final class SearchMainSplitViewController: NSSplitViewController {
         rawResults: [FfiSearchResult],
         tree: ResultDirectoryTree?,
         deferTreeBuild: Bool = false,
-        autoSelectFirstRow: Bool = false
+        autoSelectFirstRow: Bool = false,
+        preserveSortDescriptors: Bool = false,
+        skipLocalSort: Bool = false
     ) {
         isUpdatingSearchResults = true
         defer { isUpdatingSearchResults = false }
 
         self.rawResults = rawResults
         self.autoSelectFirstResult = autoSelectFirstRow
+        self.usesServerSortOrder = skipLocalSort
 
         if deferTreeBuild && !needsDirectoryTree {
             // 侧边栏折叠且无目录过滤时跳过 OutlineView 刷新，标记脏状态留待展开时补建
@@ -185,16 +197,26 @@ final class SearchMainSplitViewController: NSSplitViewController {
 
         // 2. 基于左侧当前选中的目录作用域过滤全量结果集，并推入主虚拟列表渲染
         let activePrefix = sidebarTreeViewController.selectedPath
-        displayResults(byDirectoryPrefix: activePrefix)
+        displayResults(
+            byDirectoryPrefix: activePrefix,
+            preserveSortDescriptors: preserveSortDescriptors,
+            skipLocalSort: skipLocalSort
+        )
     }
 
     /// 按目录作用域裁剪全量结果并刷新主列表，供首轮渲染、侧边栏选择与面包屑过滤共用
-    private func displayResults(byDirectoryPrefix path: String?) {
+    private func displayResults(
+        byDirectoryPrefix path: String?,
+        preserveSortDescriptors: Bool = false,
+        skipLocalSort: Bool = false
+    ) {
         let filtered = ResultDirectoryTree.filter(results: rawResults, byDirectoryPrefix: path)
         searchResultsViewController.displayResults(
             filtered,
             preserveSelection: false,
-            autoSelectFirstRow: autoSelectFirstResult
+            autoSelectFirstRow: autoSelectFirstResult,
+            preserveSortDescriptors: preserveSortDescriptors,
+            skipLocalSort: skipLocalSort
         )
         delegate?.searchMainSplitViewDidFilterResults(
             filteredCount: filtered.count,
@@ -220,7 +242,11 @@ final class SearchMainSplitViewController: NSSplitViewController {
         isUpdatingSearchResults = wasUpdating
 
         // 3. 核心兜底过滤：无论该路径是否在单链压缩折叠段中，统一执行一次全量结果集前缀裁剪
-        displayResults(byDirectoryPrefix: path)
+        displayResults(
+            byDirectoryPrefix: path,
+            preserveSortDescriptors: true,
+            skipLocalSort: usesServerSortOrder
+        )
     }
 
     // MARK: - Notifications & Localization
@@ -236,7 +262,11 @@ final class SearchMainSplitViewController: NSSplitViewController {
 extension SearchMainSplitViewController: SidebarTreeViewControllerDelegate {
     func sidebarDidSelectDirectory(path: String?) {
         guard !isUpdatingSearchResults else { return }
-        displayResults(byDirectoryPrefix: path)
+        displayResults(
+            byDirectoryPrefix: path,
+            preserveSortDescriptors: true,
+            skipLocalSort: usesServerSortOrder
+        )
     }
 }
 
@@ -278,5 +308,14 @@ extension SearchMainSplitViewController: SearchResultsViewControllerDelegate {
 
     func searchResultsDidConsumeResult() {
         delegate?.searchMainSplitViewDidConsumeResult()
+    }
+
+    func searchResultsDidChangeServerSort(_ sort: FfiSearchSort) {
+        delegate?.searchMainSplitViewDidChangeServerSort(sort)
+    }
+
+    func searchResultsDidSwitchToClientSort() {
+        usesServerSortOrder = false
+        delegate?.searchMainSplitViewDidSwitchToClientSort()
     }
 }

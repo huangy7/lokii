@@ -213,6 +213,8 @@ public struct FilterPopoverView: View {
             fileTypesSection
             Divider().opacity(isDark ? 0.4 : 0.6)
             fileSizeSection
+            Divider().opacity(isDark ? 0.4 : 0.6)
+            modifiedTimeSection
             bottomBarSection
         }
         .padding(16)
@@ -449,6 +451,134 @@ public struct FilterPopoverView: View {
                 .padding(.top, 2)
             }
         }
+    }
+
+    // MARK: - 修改时间预设筛选
+
+    private static let recentModifiedPresets: [ModifiedTimePreset] = [
+        .last7Days,
+        .last30Days,
+    ]
+
+    private static let olderModifiedPresets: [ModifiedTimePreset] = [
+        .olderThan90Days,
+        .olderThan180Days,
+        .olderThan1Year,
+    ]
+
+    private var modifiedTimeSection: some View {
+        let isAnySelected = state.modifiedTime == nil
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center) {
+                Text(L("filter.modified.title"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button(action: {
+                    selectModifiedTimePreset(nil)
+                }) {
+                    HStack(spacing: 4) {
+                        if isAnySelected {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9, weight: .bold))
+                        }
+                        Text(L("filter.modified.any"))
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .foregroundStyle(isAnySelected ? Color.accentColor : Color.secondary)
+                    .background(
+                        Capsule()
+                            .fill(isAnySelected
+                                  ? Color.accentColor.opacity(isDark ? 0.22 : 0.12)
+                                  : (isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)))
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+
+            VStack(spacing: 6) {
+                HStack(spacing: 6) {
+                    ForEach(Self.recentModifiedPresets) { preset in
+                        modifiedTimePresetButton(preset)
+                    }
+                }
+                HStack(spacing: 6) {
+                    ForEach(Self.olderModifiedPresets) { preset in
+                        modifiedTimePresetButton(preset)
+                    }
+                }
+            }
+
+            if case .custom(let tokens) = state.modifiedTime {
+                let summary = tokens.joined(separator: " ")
+                HStack(spacing: 6) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.accentColor)
+                    Text(String(format: L("filter.modified.custom"), summary))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Button(action: {
+                        selectModifiedTimePreset(nil)
+                    }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(cardBackground)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(cardBorder, lineWidth: 1)
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func modifiedTimePresetButton(_ preset: ModifiedTimePreset) -> some View {
+        let isSelected = state.modifiedTime == .preset(preset)
+        Button(action: {
+            selectModifiedTimePreset(preset)
+        }) {
+            Text(L(preset.titleKey))
+                .font(.system(size: 11.5, weight: isSelected ? .medium : .regular))
+                .foregroundStyle(isSelected ? (isDark ? Color.white : Color.accentColor) : Color.primary.opacity(0.9))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(isSelected
+                              ? Color.accentColor.opacity(isDark ? 0.20 : 0.10)
+                              : cardBackground)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(
+                            isSelected
+                                ? Color.accentColor.opacity(isDark ? 0.55 : 0.40)
+                                : cardBorder,
+                            lineWidth: 1
+                        )
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 底栏：完成关闭
@@ -762,6 +892,21 @@ public struct FilterPopoverView: View {
         localBox.isInternalUpdate = true
         // 无论当前是完全放行还是局部选定，点击「全部」均重置为无类型约束
         state.selectedTypes.removeAll()
+        onStateChanged?(state)
+    }
+
+    /// 切换或清除修改时间预设条件；传入 `nil` 表示恢复「不限」，再次点击已选预设时取消选中。
+    public func selectModifiedTimePreset(_ preset: ModifiedTimePreset?) {
+        localBox.isInternalUpdate = true
+        if let preset {
+            if state.modifiedTime == .preset(preset) {
+                state.modifiedTime = nil
+            } else {
+                state.modifiedTime = .preset(preset)
+            }
+        } else {
+            state.modifiedTime = nil
+        }
         onStateChanged?(state)
     }
 

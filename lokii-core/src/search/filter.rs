@@ -149,7 +149,41 @@ impl SizeFilter {
     }
 }
 
-/// 查询级过滤条件，包含预设文件类别、自定义扩展名、文件大小区间与 `!exclude` 否定排除规则。
+/// 文件修改时间范围过滤条件（Unix 秒时间戳，闭区间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModifiedFilter {
+    /// 最小 Unix 秒时间戳（包含），若为 `None` 则无下限。
+    pub min_secs: Option<u64>,
+    /// 最大 Unix 秒时间戳（包含），若为 `None` 则无上限。
+    pub max_secs: Option<u64>,
+}
+
+impl ModifiedFilter {
+    /// 判断当前修改时间过滤器是否未施加任何限制。
+    #[inline]
+    pub fn is_unconstrained(&self) -> bool {
+        self.min_secs.is_none() && self.max_secs.is_none()
+    }
+
+    /// 与另一修改时间过滤规则求交集。
+    /// 若区间倒置（min_secs > max_secs），初筛器将直接拒绝所有记录（零命中）。
+    pub fn intersect(&mut self, other: ModifiedFilter) {
+        if let Some(other_min) = other.min_secs {
+            self.min_secs = Some(match self.min_secs {
+                Some(curr_min) => curr_min.max(other_min),
+                None => other_min,
+            });
+        }
+        if let Some(other_max) = other.max_secs {
+            self.max_secs = Some(match self.max_secs {
+                Some(curr_max) => curr_max.min(other_max),
+                None => other_max,
+            });
+        }
+    }
+}
+
+/// 查询级过滤条件，包含预设文件类别、自定义扩展名、文件大小区间、修改时间区间与 `!exclude` 否定排除规则。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueryFilter {
     /// 目标文件类别，默认为 `FileType::All`（兼容单分类模式）。
@@ -162,6 +196,8 @@ pub struct QueryFilter {
     pub custom_exts: Vec<String>,
     /// 文件大小区间过滤条件。
     pub size_filter: SizeFilter,
+    /// 文件修改时间区间过滤条件。
+    pub modified_filter: ModifiedFilter,
     /// 是否显式指定了 `type:all` 过滤词元。
     pub has_explicit_type_all: bool,
     /// 由独立 `.ext` 语法隐式推断出的候选扩展名与原始词元 (extension, raw_token)
@@ -218,6 +254,12 @@ impl QueryFilter {
             caller.size_filter
         };
 
+        let effective_modified_filter = if !self.modified_filter.is_unconstrained() {
+            self.modified_filter
+        } else {
+            caller.modified_filter
+        };
+
         let mut exclude_terms = caller.exclude_terms.clone();
         for t in &self.exclude_terms {
             if !exclude_terms.contains(t) {
@@ -243,6 +285,7 @@ impl QueryFilter {
             file_types: effective_file_types,
             custom_exts: effective_custom_exts,
             size_filter: effective_size_filter,
+            modified_filter: effective_modified_filter,
             has_explicit_type_all: self.has_explicit_type_all || caller.has_explicit_type_all,
             inferred_exts: self.inferred_exts.clone(),
             inferred_exclude_exts: self.inferred_exclude_exts.clone(),
@@ -1014,6 +1057,322 @@ pub(crate) fn parse_size_token(payload: &str) -> Option<SizeFilter> {
     None
 }
 
+#[inline]
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+#[inline]
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => Some(if is_leap_year(year) { 29 } else { 28 }),
+        _ => None,
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn local_ymd_from_unix(secs: u64) -> Option<(i32, u32, u32)> {
+    let time = libc::time_t::try_from(secs).ok()?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ptr = unsafe { libc::localtime_r(&time, &mut tm) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some((tm.tm_year + 1900, (tm.tm_mon + 1) as u32, tm.tm_mday as u32))
+}
+
+fn local_timestamp(year: i32, month: u32, day: u32, hour: i32, min: i32, sec: i32) -> Option<u64> {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = (month as i32) - 1;
+    tm.tm_mday = day as i32;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    tm.tm_isdst = -1;
+    let t = unsafe { libc::mktime(&mut tm) };
+    // 1970-01-01 在东半球正时区 mktime 可能返回负值，非 -1 错误码时钳位至 0
+    if t == -1 && !(year == 1970 && month == 1 && day == 1) {
+        return None;
+    }
+    Some(t.max(0) as u64)
+}
+
+fn local_date_bounds(year: i32, month: u32, day: u32) -> Option<(u64, u64)> {
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let max_day = days_in_month(year, month)?;
+    if !(1..=max_day).contains(&day) {
+        return None;
+    }
+    let start = local_timestamp(year, month, day, 0, 0, 0)?;
+    let end = local_timestamp(year, month, day, 23, 59, 59)?;
+    Some((start, end))
+}
+
+fn previous_ymd(year: i32, month: u32, day: u32) -> Option<(i32, u32, u32)> {
+    if day > 1 {
+        return Some((year, month, day - 1));
+    }
+    if month > 1 {
+        let prev_month = month - 1;
+        let prev_day = days_in_month(year, prev_month)?;
+        return Some((year, prev_month, prev_day));
+    }
+    if year > 1970 {
+        return Some((year - 1, 12, 31));
+    }
+    None
+}
+
+/// 解析相对时长字符串（如 "7d"、"90d"、"6m"、"1y"、"12h"、"30min"）为秒数。
+pub(crate) fn parse_relative_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let split_idx = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    if split_idx == 0 {
+        return None;
+    }
+    let num_str = &s[..split_idx];
+    let unit = s[split_idx..].trim();
+    if unit.is_empty() || !unit.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    let multiplier: u64 = match unit.to_ascii_lowercase().as_str() {
+        "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "wk" | "wks" | "week" | "weeks" => 7 * 86_400,
+        "m" | "mo" | "mos" | "mon" | "month" | "months" => 30 * 86_400,
+        "y" | "yr" | "yrs" | "year" | "years" => 365 * 86_400,
+        _ => return None,
+    };
+
+    if let Ok(val) = num_str.parse::<u64>() {
+        return Some(val.saturating_mul(multiplier));
+    }
+    if let Ok(val) = num_str.parse::<f64>() {
+        if val.is_nan() || val.is_infinite() || val < 0.0 {
+            return None;
+        }
+        let result = val * (multiplier as f64);
+        if result >= u64::MAX as f64 {
+            return Some(u64::MAX);
+        }
+        return Some(result.round() as u64);
+    }
+    None
+}
+
+/// 解析日历日期或关键词（`today`/`yesterday`/`YYYY`/`YYYY-MM`/`YYYY-MM-DD`）为本地时间闭区间 `[start, end]`。
+fn parse_calendar_date_range(s: &str, now_secs: u64) -> Option<(u64, u64)> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("today") {
+        let (y, m, d) = local_ymd_from_unix(now_secs)?;
+        return local_date_bounds(y, m, d);
+    }
+    if trimmed.eq_ignore_ascii_case("yesterday") {
+        let (y, m, d) = local_ymd_from_unix(now_secs)?;
+        let (py, pm, pd) = previous_ymd(y, m, d)?;
+        return local_date_bounds(py, pm, pd);
+    }
+
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 4 && bytes.iter().all(|b| b.is_ascii_digit()) {
+        let year = trimmed.parse::<i32>().ok()?;
+        let (start, _) = local_date_bounds(year, 1, 1)?;
+        let (_, end) = local_date_bounds(year, 12, 31)?;
+        return Some((start, end));
+    }
+    if bytes.len() == 7
+        && bytes[4] == b'-'
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..].iter().all(|b| b.is_ascii_digit())
+    {
+        let year = trimmed[..4].parse::<i32>().ok()?;
+        let month = trimmed[5..].parse::<u32>().ok()?;
+        let last_day = days_in_month(year, month)?;
+        let (start, _) = local_date_bounds(year, month, 1)?;
+        let (_, end) = local_date_bounds(year, month, last_day)?;
+        return Some((start, end));
+    }
+    if bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..].iter().all(|b| b.is_ascii_digit())
+    {
+        let year = trimmed[..4].parse::<i32>().ok()?;
+        let month = trimmed[5..7].parse::<u32>().ok()?;
+        let day = trimmed[8..].parse::<u32>().ok()?;
+        return local_date_bounds(year, month, day);
+    }
+    None
+}
+
+/// 解析单个修改时间过滤语法词元（如 `<7d`、`>90d`、`30d..180d`、`today`、`>=2025-01-01`、`2025-01..2025-06`）。
+pub(crate) fn parse_modified_token(payload: &str, now_secs: u64) -> Option<ModifiedFilter> {
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return None;
+    }
+
+    if let Some((left, right)) = payload.split_once("..") {
+        let left = left.trim();
+        let right = right.trim();
+        if left.is_empty() && right.is_empty() {
+            return None;
+        }
+
+        let left_rel = if left.is_empty() {
+            None
+        } else {
+            parse_relative_duration_secs(left)
+        };
+        let right_rel = if right.is_empty() {
+            None
+        } else {
+            parse_relative_duration_secs(right)
+        };
+        if (left.is_empty() || left_rel.is_some()) && (right.is_empty() || right_rel.is_some()) {
+            return match (left_rel, right_rel) {
+                (Some(d1), Some(d2)) => {
+                    let lo = d1.min(d2);
+                    let hi = d1.max(d2);
+                    Some(ModifiedFilter {
+                        min_secs: Some(now_secs.saturating_sub(hi)),
+                        max_secs: Some(now_secs.saturating_sub(lo)),
+                    })
+                }
+                (Some(d), None) => Some(ModifiedFilter {
+                    min_secs: None,
+                    max_secs: Some(now_secs.saturating_sub(d)),
+                }),
+                (None, Some(d)) => Some(ModifiedFilter {
+                    min_secs: Some(now_secs.saturating_sub(d)),
+                    max_secs: None,
+                }),
+                (None, None) => None,
+            };
+        }
+
+        let left_cal = if left.is_empty() {
+            None
+        } else {
+            Some(parse_calendar_date_range(left, now_secs)?)
+        };
+        let right_cal = if right.is_empty() {
+            None
+        } else {
+            Some(parse_calendar_date_range(right, now_secs)?)
+        };
+        return Some(ModifiedFilter {
+            min_secs: left_cal.map(|(s, _)| s),
+            max_secs: right_cal.map(|(_, e)| e),
+        });
+    }
+
+    if let Some(rest) = payload.strip_prefix(">=") {
+        if let Some(d) = parse_relative_duration_secs(rest) {
+            return Some(ModifiedFilter {
+                min_secs: None,
+                max_secs: Some(now_secs.saturating_sub(d)),
+            });
+        }
+        let (start, _) = parse_calendar_date_range(rest, now_secs)?;
+        return Some(ModifiedFilter {
+            min_secs: Some(start),
+            max_secs: None,
+        });
+    }
+
+    if let Some(rest) = payload.strip_prefix('>') {
+        if let Some(d) = parse_relative_duration_secs(rest) {
+            return Some(ModifiedFilter {
+                min_secs: None,
+                max_secs: Some(now_secs.saturating_sub(d)),
+            });
+        }
+        let (_, end) = parse_calendar_date_range(rest, now_secs)?;
+        return Some(ModifiedFilter {
+            min_secs: Some(end.saturating_add(1)),
+            max_secs: None,
+        });
+    }
+
+    if let Some(rest) = payload.strip_prefix("<=") {
+        if let Some(d) = parse_relative_duration_secs(rest) {
+            return Some(ModifiedFilter {
+                min_secs: Some(now_secs.saturating_sub(d)),
+                max_secs: None,
+            });
+        }
+        let (_, end) = parse_calendar_date_range(rest, now_secs)?;
+        return Some(ModifiedFilter {
+            min_secs: None,
+            max_secs: Some(end),
+        });
+    }
+
+    if let Some(rest) = payload.strip_prefix('<') {
+        if let Some(d) = parse_relative_duration_secs(rest) {
+            return Some(ModifiedFilter {
+                min_secs: Some(now_secs.saturating_sub(d)),
+                max_secs: None,
+            });
+        }
+        let (start, _) = parse_calendar_date_range(rest, now_secs)?;
+        return Some(if start == 0 {
+            ModifiedFilter {
+                min_secs: Some(1),
+                max_secs: Some(0),
+            }
+        } else {
+            ModifiedFilter {
+                min_secs: None,
+                max_secs: Some(start - 1),
+            }
+        });
+    }
+
+    if let Some(rest) = payload.strip_prefix('=') {
+        let (start, end) = parse_calendar_date_range(rest, now_secs)?;
+        return Some(ModifiedFilter {
+            min_secs: Some(start),
+            max_secs: Some(end),
+        });
+    }
+
+    if let Some(d) = parse_relative_duration_secs(payload) {
+        return Some(ModifiedFilter {
+            min_secs: Some(now_secs.saturating_sub(d)),
+            max_secs: None,
+        });
+    }
+
+    if let Some((start, end)) = parse_calendar_date_range(payload, now_secs) {
+        return Some(ModifiedFilter {
+            min_secs: Some(start),
+            max_secs: Some(end),
+        });
+    }
+
+    None
+}
+
 /// 判断给定的词元或查询串是否为点文件（隐藏配置/工程文件）而非扩展名过滤。
 ///
 /// 判定规则：
@@ -1111,7 +1470,12 @@ pub fn is_dotfile_query(query: &str) -> bool {
 ///    - 含 `/`（如 `!node_modules/`、`!src/test`、`!"my dir/"`）-> 剥离尾 `/` 加入 `exclude_paths`；
 ///    - 其余（`!test`、`!.gitignore`、`!".pdf"`）-> `exclude_terms`。
 /// 6. 成对双引号 `"..."` 包裹的词元保留字面含义，不参与过滤标签与模式触发解析。
+/// 7. `mtime:<condition>` / `modified:<condition>`：按修改时间过滤（相对时长如 `<7d`、`>90d`、`30d..180d`，以及 `today`/`yesterday`/`YYYY`/`YYYY-MM`/`YYYY-MM-DD`）。
 pub fn parse_query_structured(input: &str) -> ParsedQuery {
+    parse_query_structured_at(input, current_unix_secs())
+}
+
+pub(crate) fn parse_query_structured_at(input: &str, now_secs: u64) -> ParsedQuery {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return ParsedQuery::default();
@@ -1126,6 +1490,7 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
     let mut inferred_exts = Vec::new();
     let mut inferred_exclude_exts = Vec::new();
     let mut size_filter = SizeFilter::default();
+    let mut modified_filter = ModifiedFilter::default();
     let mut has_explicit_type_all = false;
     let mut exclude_terms = Vec::new();
     let mut exclude_exts = Vec::new();
@@ -1239,6 +1604,25 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
             continue;
         }
 
+        // 3b. mtime:<condition> / modified:<condition>
+        if let Some(modified_payload) = term
+            .get(..6)
+            .filter(|p| p.eq_ignore_ascii_case("mtime:"))
+            .map(|_| &term[6..])
+            .or_else(|| {
+                term.get(..9)
+                    .filter(|p| p.eq_ignore_ascii_case("modified:"))
+                    .map(|_| &term[9..])
+            })
+        {
+            if let Some(parsed) = parse_modified_token(modified_payload, now_secs) {
+                modified_filter.intersect(parsed);
+                continue;
+            }
+            positive_tokens.push(token);
+            continue;
+        }
+
         // 4. 独立 .ext（非隐藏点文件与相对路径守卫；上限 16 字符以兼容 .markdown/.numbers/.xcodeproj 等长扩展名，
         // 后续由 `resolve_inferred_exts` 依托索引真实扩展名池裁决）
         if positive_candidate_count > 1
@@ -1286,6 +1670,7 @@ pub fn parse_query_structured(input: &str) -> ParsedQuery {
             file_types,
             custom_exts,
             size_filter,
+            modified_filter,
             has_explicit_type_all,
             inferred_exts,
             inferred_exclude_exts,
@@ -1437,6 +1822,9 @@ pub struct CompiledRecordFilter {
     min_size_bytes: u64,
     max_size_bytes: u64,
     has_size_filter: bool,
+    min_modified: u64,
+    max_modified: u64,
+    has_modified_filter: bool,
     has_explicit_type_all: bool,
     has_scope_filter: bool,
     scope_candidates: Vec<super::path_query::PathCandidate>,
@@ -1472,6 +1860,9 @@ impl Default for CompiledRecordFilter {
             min_size_bytes: 0,
             max_size_bytes: u64::MAX,
             has_size_filter: false,
+            min_modified: 0,
+            max_modified: u64::MAX,
+            has_modified_filter: false,
             has_explicit_type_all: false,
             has_scope_filter: false,
             scope_candidates: Vec::new(),
@@ -1494,10 +1885,26 @@ impl Default for CompiledRecordFilter {
 }
 
 impl CompiledRecordFilter {
-    /// 是否存在正向约束条件（类别、扩展名、大小或 `in:` 作用域过滤）。
+    /// 是否存在正向约束条件（类别、扩展名、大小、修改时间或 `in:` 作用域过滤）。
     #[inline]
     pub fn has_positive_filter(&self) -> bool {
-        self.has_type_filter || self.has_custom_ext || self.has_size_filter || self.has_scope_filter
+        self.has_type_filter
+            || self.has_custom_ext
+            || self.has_size_filter
+            || self.has_modified_filter
+            || self.has_scope_filter
+    }
+
+    /// 是否存在大小区间过滤。
+    #[inline]
+    pub fn has_size_filter(&self) -> bool {
+        self.has_size_filter
+    }
+
+    /// 是否存在修改时间区间过滤。
+    #[inline]
+    pub fn has_modified_filter(&self) -> bool {
+        self.has_modified_filter
     }
 
     /// 是否存在 `!` 否定排除条件。
@@ -1637,6 +2044,10 @@ impl CompiledRecordFilter {
         let max_size_bytes = filter.size_filter.max_bytes.unwrap_or(u64::MAX);
         let has_size_filter =
             filter.size_filter.min_bytes.is_some() || filter.size_filter.max_bytes.is_some();
+        let min_modified = filter.modified_filter.min_secs.unwrap_or(0);
+        let max_modified = filter.modified_filter.max_secs.unwrap_or(u64::MAX);
+        let has_modified_filter = filter.modified_filter.min_secs.is_some()
+            || filter.modified_filter.max_secs.is_some();
 
         // 3. 编译否定排除条件（术语、扩展名与路径/目录）
         let exclude_terms: Vec<String> = filter
@@ -1792,6 +2203,9 @@ impl CompiledRecordFilter {
             min_size_bytes,
             max_size_bytes,
             has_size_filter,
+            min_modified,
+            max_modified,
+            has_modified_filter,
             has_explicit_type_all: filter.has_explicit_type_all,
             has_scope_filter,
             scope_candidates: scope_candidates.to_vec(),
@@ -1877,6 +2291,14 @@ impl CompiledRecordFilter {
                     return false;
                 }
             }
+        }
+
+        if self.has_modified_filter
+            && (view.modified == 0
+                || view.modified < self.min_modified
+                || view.modified > self.max_modified)
+        {
+            return false;
         }
 
         if !self.has_type_filter && !self.has_custom_ext && !self.has_size_filter {
@@ -2040,6 +2462,14 @@ impl CompiledRecordFilter {
                     }
                 }
             }
+        }
+
+        if self.has_modified_filter
+            && (record.modified == 0
+                || record.modified < self.min_modified
+                || record.modified > self.max_modified)
+        {
+            return false;
         }
 
         if !self.has_type_filter && !self.has_custom_ext && !self.has_size_filter {
@@ -3721,5 +4151,152 @@ mod tests {
         let (no_hidden, _) = crate::search::dispatch(&store, "notes !.hidden", crate::search::SearchMode::Auto, 10);
         assert!(!no_hidden.iter().any(|r| r.entry.name == ".hidden_notes.md"));
         assert!(no_hidden.iter().any(|r| r.entry.name == "notes.md"));
+    }
+
+    #[test]
+    fn test_modified_time_filter_parsing_and_matching() {
+        let now_secs: u64 = 1_750_000_000;
+
+        let less_7d = parse_query_structured_at("mtime:<7d", now_secs);
+        assert_eq!(
+            less_7d.filter.modified_filter,
+            ModifiedFilter {
+                min_secs: Some(now_secs - 7 * 86_400),
+                max_secs: None,
+            }
+        );
+        assert!(less_7d.clean_query.is_empty());
+
+        let le_24h = parse_query_structured_at("mtime:<=24h", now_secs);
+        assert_eq!(
+            le_24h.filter.modified_filter,
+            ModifiedFilter {
+                min_secs: Some(now_secs - 24 * 3_600),
+                max_secs: None,
+            }
+        );
+
+        let ge_2w = parse_query_structured_at("mtime:>=2w", now_secs);
+        assert_eq!(
+            ge_2w.filter.modified_filter,
+            ModifiedFilter {
+                min_secs: None,
+                max_secs: Some(now_secs - 14 * 86_400),
+            }
+        );
+
+        let gt_6m = parse_query_structured_at("mtime:>6m", now_secs);
+        assert_eq!(
+            gt_6m.filter.modified_filter,
+            ModifiedFilter {
+                min_secs: None,
+                max_secs: Some(now_secs - 6 * 30 * 86_400),
+            }
+        );
+
+        let gt_1y = parse_query_structured_at("modified:>1y", now_secs);
+        assert_eq!(
+            gt_1y.filter.modified_filter,
+            ModifiedFilter {
+                min_secs: None,
+                max_secs: Some(now_secs - 365 * 86_400),
+            }
+        );
+
+        // 无比较符时默认语义为「最近 N 单位内」
+        let bare_30d = parse_query_structured_at("mtime:30d", now_secs);
+        assert_eq!(
+            bare_30d.filter.modified_filter,
+            ModifiedFilter {
+                min_secs: Some(now_secs - 30 * 86_400),
+                max_secs: None,
+            }
+        );
+
+        // today / yesterday 日界无缝衔接
+        let today = parse_modified_token("today", now_secs).unwrap();
+        let yesterday = parse_modified_token("yesterday", now_secs).unwrap();
+        assert_eq!(yesterday.max_secs.unwrap() + 1, today.min_secs.unwrap());
+        assert!(today.min_secs.unwrap() <= now_secs);
+        assert!(today.max_secs.unwrap() >= now_secs);
+
+        // 日历单日与日期区间
+        let single_day = parse_modified_token("2025-01-15", now_secs).unwrap();
+        assert!(single_day.max_secs.unwrap() > single_day.min_secs.unwrap());
+        let after_day = parse_modified_token(">2025-06-01", now_secs).unwrap();
+        assert!(after_day.min_secs.is_some() && after_day.max_secs.is_none());
+        let range = parse_modified_token("2025-01-01..2025-03-31", now_secs).unwrap();
+        assert!(range.min_secs.unwrap() < range.max_secs.unwrap());
+        let open_left = parse_modified_token("..2024-12-31", now_secs).unwrap();
+        assert!(open_left.min_secs.is_none() && open_left.max_secs.is_some());
+
+        // 非法日期不崩溃且不生效；反序日期区间返回不相交上下限；带引号视为字面关键词；大写前缀不触发 Smart Case
+        assert!(parse_modified_token("2025-02-30", now_secs).is_none());
+        assert!(parse_modified_token("notadate", now_secs).is_none());
+        let inverted = parse_modified_token("2025-05-01..2025-04-01", now_secs).unwrap();
+        assert!(inverted.min_secs.unwrap() > inverted.max_secs.unwrap());
+        let quoted = parse_query_structured_at("\"mtime:<7d\"", now_secs);
+        assert!(quoted.filter.modified_filter.is_unconstrained());
+        assert_eq!(quoted.clean_query, "mtime:<7d");
+
+        let upper_prefix = parse_query_structured_at("MTIME:>180D", now_secs);
+        assert!(!upper_prefix.filter.modified_filter.is_unconstrained());
+        assert!(upper_prefix.clean_query.is_empty());
+
+        // CompactIndex 过滤验证（包括拒绝 modified == 0 与组合过滤）
+        let store = crate::indexer::IndexStore::new();
+        let make = |name: &str, path: &str, size: u64, modified: u64, ext: &str| FileEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir: false,
+            size,
+            modified,
+            created_at: modified,
+            extension: ext.to_string(),
+        };
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store.replace(vec![
+            make("zero_ts.mp4", "/zero_ts.mp4", 2_000_000_000, 0, "mp4"),
+            make("recent.mp4", "/recent.mp4", 2_000_000_000, real_now.saturating_sub(2 * 86_400), "mp4"),
+            make("stale.mp4", "/stale.mp4", 2_000_000_000, real_now.saturating_sub(200 * 86_400), "mp4"),
+            make("archive_old.txt", "/archive_old.txt", 50, real_now.saturating_sub(400 * 86_400), "txt"),
+        ]);
+
+        let (stale_res, _) = crate::search::dispatch(
+            &store,
+            "size:>1gb mtime:>180d type:video",
+            crate::search::SearchMode::Auto,
+            20,
+        );
+        assert_eq!(
+            stale_res.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["stale.mp4"]
+        );
+
+        let (upper_hits, upper_cs, _, _) = crate::search::dispatch_with_filter(
+            &store,
+            "MTIME:>180D",
+            crate::search::SearchMode::Auto,
+            QueryFilter::default(),
+            crate::search::CaseSensitivity::Auto,
+            20,
+        );
+        assert!(!upper_cs);
+        assert!(upper_hits.iter().any(|r| r.entry.name == "stale.mp4"));
+
+        let (older_res, _) = crate::search::dispatch(
+            &store,
+            "mtime:>180d",
+            crate::search::SearchMode::Auto,
+            20,
+        );
+        let older_names: Vec<_> = older_res.iter().map(|r| r.entry.name.as_str()).collect();
+        assert!(older_names.contains(&"stale.mp4"));
+        assert!(older_names.contains(&"archive_old.txt"));
+        assert!(!older_names.contains(&"recent.mp4"));
+        assert!(!older_names.contains(&"zero_ts.mp4"));
     }
 }

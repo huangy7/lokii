@@ -330,6 +330,26 @@ pub fn search_index(
     case_sensitive: bool,
     explicit_lock: bool,
 ) -> Vec<AdvancedSearchResult> {
+    search_index_with_sort(
+        read,
+        query,
+        filter,
+        max_results,
+        case_sensitive,
+        explicit_lock,
+        super::SearchSort::Relevance,
+    )
+}
+
+pub(crate) fn search_index_with_sort(
+    read: &CompactIndex,
+    query: &PathQuery,
+    filter: &CompiledRecordFilter,
+    max_results: usize,
+    case_sensitive: bool,
+    explicit_lock: bool,
+    sort: super::SearchSort,
+) -> Vec<AdvancedSearchResult> {
     if max_results == 0 {
         return Vec::new();
     }
@@ -362,7 +382,9 @@ pub fn search_index(
         .any(|term| term.contains('*') || term.contains('?'));
     let all_terms_ascii = query.name_terms.iter().all(|t| t.is_ascii());
 
+    let use_custom_sort = sort != super::SearchSort::Relevance;
     let mut top_k = TopK::new(max_results);
+    let mut sorted_top_k: TopK<'_, u64> = TopK::new(max_results);
     let mut ascii_buf = Vec::with_capacity(128);
     let rank_ctx = RecordRankContext::default();
     let targets_hidden = path_query_targets_hidden(query);
@@ -414,6 +436,47 @@ pub fn search_index(
             ) else {
                 continue;
             };
+
+            if use_custom_sort {
+                for &ordinal in entries {
+                    let ord_usize = ordinal as usize;
+                    let Some(record) = records.get(ord_usize) else {
+                        continue;
+                    };
+                    if record.raw_path {
+                        continue;
+                    }
+                    let key = super::sort_key_for_record(record, sort);
+                    if let Some(worst) = sorted_top_k.worst() {
+                        if key < worst.score || (key == worst.score && name > worst.name()) {
+                            continue;
+                        }
+                    }
+                    let parent_quality = parent_status
+                        .get(record.path as usize)
+                        .copied()
+                        .unwrap_or(ParentQuality::None);
+                    let is_dir_self = parent_quality == ParentQuality::None
+                        && query.is_dir_only
+                        && record.is_dir
+                        && is_target_directory_self(read.record_parent(record), name, query);
+                    if parent_quality == ParentQuality::None && !is_dir_self {
+                        continue;
+                    }
+                    if let Some(ref matcher) = ext_matcher {
+                        if !matcher.matches(record.extension) {
+                            continue;
+                        }
+                    }
+                    if !passthrough && !filter.matches_record_in(read, record, Some(name)) {
+                        continue;
+                    }
+                    if let Some(view) = read.view(EntryId(ord_usize)) {
+                        sorted_top_k.offer_path(ord_usize, key, view);
+                    }
+                }
+                continue;
+            }
 
             let upper = base_score.upper_bound_with_extra(
                 &rank_ctx,
@@ -482,6 +545,14 @@ pub fn search_index(
                     continue;
                 }
                 let (parent, name) = read.split_record(record);
+                if use_custom_sort {
+                    let key = super::sort_key_for_record(record, sort);
+                    if let Some(worst) = sorted_top_k.worst() {
+                        if key < worst.score || (key == worst.score && name > worst.name()) {
+                            continue;
+                        }
+                    }
+                }
                 let parent_quality = evaluate_parent_quality(parent, query);
                 let is_dir_self = query.is_dir_only
                     && record.is_dir
@@ -511,25 +582,40 @@ pub fn search_index(
                 ) else {
                     continue;
                 };
-                let path_bonus = match parent_quality {
-                    ParentQuality::Direct => PATH_BONUS_DIRECT,
-                    ParentQuality::Ancestor => PATH_BONUS_ANCESTOR,
-                    ParentQuality::None => 0,
-                };
-                let final_score = ranking::score_record_with_extra(
-                    base_score,
-                    record.is_dir,
-                    parent,
-                    &rank_ctx,
-                    targets_hidden,
-                    path_bonus,
-                );
-                top_k.offer(ordinal, final_score, name);
+                if use_custom_sort {
+                    let key = super::sort_key_for_record(record, sort);
+                    if let Some(view) = read.view(EntryId(ordinal)) {
+                        sorted_top_k.offer_path(ordinal, key, view);
+                    }
+                } else {
+                    let path_bonus = match parent_quality {
+                        ParentQuality::Direct => PATH_BONUS_DIRECT,
+                        ParentQuality::Ancestor => PATH_BONUS_ANCESTOR,
+                        ParentQuality::None => 0,
+                    };
+                    let final_score = ranking::score_record_with_extra(
+                        base_score,
+                        record.is_dir,
+                        parent,
+                        &rank_ctx,
+                        targets_hidden,
+                        path_bonus,
+                    );
+                    top_k.offer(ordinal, final_score, name);
+                }
             }
         }
     } else {
         // 阶段 1B：纯目录列举模式（如 "Desktop/"、"in:src"）：先用父目录状态表快速淘汰 99%+ 非目标记录，再执行过滤器与单字节元数据评分
         for (ordinal, record) in records.iter().enumerate() {
+            if use_custom_sort {
+                let key = super::sort_key_for_record(record, sort);
+                if let Some(worst) = sorted_top_k.worst() {
+                    if key < worst.score {
+                        continue;
+                    }
+                }
+            }
             let parent_quality = if record.raw_path {
                 let (parent, _) = read.split_record(record);
                 evaluate_parent_quality(parent, query)
@@ -558,25 +644,32 @@ pub fn search_index(
                 continue;
             }
 
-            // 纯目录模式（如 "Desktop/"）：直属子项取 Prefix 而非 StemExact，避免 .app 子包反向越过目录自身
-            let base = if is_dir_self {
-                BaseNameScore::for_exact_fast_path(name)
-            } else if parent_quality == ParentQuality::Direct {
-                BaseNameScore::for_tier_only(name, MatchTier::Prefix, 0)
+            if use_custom_sort {
+                let key = super::sort_key_for_record(record, sort);
+                if let Some(view) = read.view(EntryId(ordinal)) {
+                    sorted_top_k.offer_path(ordinal, key, view);
+                }
             } else {
-                BaseNameScore::for_tier_only(name, MatchTier::Substring, 0)
-            };
-            let (parent_depth, parent_hidden) = read.record_parent_meta(record, query_index);
-            let final_score = ranking::score_record_with_meta(
-                base,
-                record.is_dir,
-                parent_depth,
-                parent_hidden,
-                &rank_ctx,
-                targets_hidden,
-                0,
-            );
-            top_k.offer(ordinal, final_score, name);
+                // 纯目录模式（如 "Desktop/"）：直属子项取 Prefix 而非 StemExact，避免 .app 子包反向越过目录自身
+                let base = if is_dir_self {
+                    BaseNameScore::for_exact_fast_path(name)
+                } else if parent_quality == ParentQuality::Direct {
+                    BaseNameScore::for_tier_only(name, MatchTier::Prefix, 0)
+                } else {
+                    BaseNameScore::for_tier_only(name, MatchTier::Substring, 0)
+                };
+                let (parent_depth, parent_hidden) = read.record_parent_meta(record, query_index);
+                let final_score = ranking::score_record_with_meta(
+                    base,
+                    record.is_dir,
+                    parent_depth,
+                    parent_hidden,
+                    &rank_ctx,
+                    targets_hidden,
+                    0,
+                );
+                top_k.offer(ordinal, final_score, name);
+            }
         }
     }
 
@@ -599,14 +692,26 @@ pub fn search_index(
         })
         .collect();
 
-    let candidates = top_k.finish();
-    candidates
+    let chosen: Vec<(usize, f64)> = if use_custom_sort {
+        sorted_top_k
+            .finish()
+            .into_iter()
+            .map(|c| (c.ordinal, 1.0))
+            .collect()
+    } else {
+        top_k
+            .finish()
+            .into_iter()
+            .map(|c| (c.ordinal, c.score.to_f64()))
+            .collect()
+    };
+    chosen
         .into_iter()
-        .map(|candidate| {
+        .map(|(ordinal, base_f64)| {
             let view = read
-                .view(EntryId(candidate.ordinal))
+                .view(EntryId(ordinal))
                 .expect("valid compact reference");
-            let (parent, name) = read.split_record(&read.records()[candidate.ordinal]);
+            let (parent, name) = read.split_record(&read.records()[ordinal]);
 
             let is_dir_self = view.is_dir && is_target_directory_self(parent, name, query);
             let parent_match_positions = find_parent_highlight_range(parent, query)
@@ -630,13 +735,15 @@ pub fn search_index(
                 find_positions(view.name, &name_folded, &kw_refs)
             };
 
-            let score = if query.name_terms.is_empty()
+            let score = if use_custom_sort {
+                1.0
+            } else if query.name_terms.is_empty()
                 && is_dir_self
                 && (targets_hidden || !ranking::is_record_hidden(name, parent))
             {
                 1.0
             } else {
-                candidate.score.to_f64()
+                base_f64
             };
 
             AdvancedSearchResult {
